@@ -1,0 +1,5 @@
+{
+  "name": "CodeCraft IDE",
+  "description": "A sleek, web-based code editor with multi-file support, AI assistance, and a simulated execution environment.",
+  "requestFramePermissions": []
+}
