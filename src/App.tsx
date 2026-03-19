@@ -25,6 +25,7 @@ import Editor, { DiffEditor } from '@monaco-editor/react';
 import { pyrightProvider, pyrightReady, reloadPyrightWithStubs, includeTypeshedModule } from './pyright';
 import type { UserFolder } from './pyright';
 import { csharpService, csharpReady, ensureCSharpReady } from './csharp-intellisage';
+import { configureMonacoSuggestionAcceptance } from './monaco-suggest';
 import { motion, AnimatePresence } from 'motion/react';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
@@ -3128,7 +3129,7 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
             </div>
           ) : (
             <div className="flex-1 overflow-hidden bg-[rgb(28,28,28)] w-full min-h-0 relative">
-              <Editor path={editorModelPath} height="100%" defaultLanguage={tabItem.language} language={tabItem.language} theme="vs-dark" value={tabItem.content} onMount={(editor) => { editorRef.current = editor; if (tabItem.language === 'python') { pyrightReady.then(() => { pyrightProvider.editorChangeListener?.dispose(); pyrightProvider.editorChangeListener = undefined as any; pyrightProvider.setupDiagnostics(editor); }); } if (tabItem.language === 'csharp') { csharpReady.then(() => { csharpService.setupEditor(editor); }); } }} onChange={(value) => { setFiles(prev => prev.map(f => f.id === resolvedTabItemId ? { ...f, content: value || '' } : f)); }} options={{ fontSize: settings.fontSize, fontFamily: '"JetBrains Mono", "Fira Code", monospace', minimap: { enabled: true }, scrollBeyondLastLine: false, automaticLayout: true, padding: { top: 20 }, lineNumbers: 'on', renderLineHighlight: 'all', scrollbar: { vertical: 'visible', horizontal: 'visible', useShadows: false, verticalScrollbarSize: 10, horizontalScrollbarSize: 10 } }} />
+              <Editor path={editorModelPath} height="100%" defaultLanguage={tabItem.language} language={tabItem.language} theme="vs-dark" value={tabItem.content} onMount={(editor) => { editorRef.current = editor; configureMonacoSuggestionAcceptance(editor); if (tabItem.language === 'python') { pyrightReady.then(() => { pyrightProvider.editorChangeListener?.dispose(); pyrightProvider.editorChangeListener = undefined as any; pyrightProvider.setupDiagnostics(editor); }); } if (tabItem.language === 'csharp') { csharpReady.then(() => { csharpService.setupEditor(editor); }); } }} onChange={(value) => { setFiles(prev => prev.map(f => f.id === resolvedTabItemId ? { ...f, content: value || '' } : f)); }} options={{ fontSize: settings.fontSize, fontFamily: '"JetBrains Mono", "Fira Code", monospace', minimap: { enabled: true }, scrollBeyondLastLine: false, automaticLayout: true, padding: { top: 20 }, lineNumbers: 'on', renderLineHighlight: 'all', acceptSuggestionOnEnter: 'on', acceptSuggestionOnCommitCharacter: true, scrollbar: { vertical: 'visible', horizontal: 'visible', useShadows: false, verticalScrollbarSize: 10, horizontalScrollbarSize: 10 } }} />
             </div>
           )}
         </div>

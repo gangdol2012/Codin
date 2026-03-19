@@ -22,7 +22,6 @@ class CSharpLanguageService {
   private lastCompletions = new Map<monaco.languages.CompletionItem, any>();
   private model: monaco.editor.ITextModel | null = null;
   private initialized = false;
-  private configuredEditors = new WeakSet<monaco.editor.IStandaloneCodeEditor>();
 
   private debouncedDiagnostics = debounce(this.getDiagnostics.bind(this), 100);
   private debouncedCompletions = this.rawProvideCompletionItems.bind(this);
@@ -107,16 +106,6 @@ class CSharpLanguageService {
   private modelChangeListener: monaco.IDisposable | null = null;
 
   setupEditor(editor: monaco.editor.IStandaloneCodeEditor) {
-    if (!this.configuredEditors.has(editor)) {
-      editor.updateOptions({ acceptSuggestionOnEnter: 'on' });
-      editor.addCommand(
-        monaco.KeyCode.Enter,
-        () => editor.trigger('csharp-intellisage', 'acceptSelectedSuggestion', undefined),
-        'suggestWidgetVisible && suggestWidgetHasFocusedSuggestion && textInputFocus'
-      );
-      this.configuredEditors.add(editor);
-    }
-
     this.setupDiagnostics(editor);
   }
 
