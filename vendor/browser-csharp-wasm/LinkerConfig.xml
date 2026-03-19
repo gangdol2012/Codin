@@ -1,0 +1,10 @@
+﻿<?xml version="1.0" encoding="UTF-8" ?>
+<linker>
+	<assembly fullname="mscorlib" />
+	<assembly fullname="netstandard" />
+	<assembly fullname="System" />
+	<assembly fullname="System.Core" />
+	<assembly fullname="System.Collections" />
+	<assembly fullname="System.Net.Http" />
+	<assembly fullname="System.Memory" />
+</linker>

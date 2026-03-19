@@ -32,7 +32,7 @@ import { twMerge } from 'tailwind-merge';
 import { GoogleGenAI, Type, type FunctionDeclaration } from "@google/genai";
 import ReactMarkdown from 'react-markdown';
 import { Layout, Model, TabNode, IJsonModel, Actions, DockLocation } from 'flexlayout-react';
-import { BrowserCSharp } from 'browser-csharp';
+import { BrowserCSharp } from './browser-csharp-api';
 import 'flexlayout-react/style/dark.css';
 import * as Tooltip from '@radix-ui/react-tooltip';
 import * as Separator from '@radix-ui/react-separator';
@@ -1617,10 +1617,10 @@ json.dumps(_extract(${JSON.stringify(pkgName)}))
     try {
       setOutput('');
       console.clear();
-      setOutput('Compiling and executing C# (WebAssembly)...');
+      setOutput('Compiling and executing C# (WebAssembly, regular program)...');
 
       await ensureCSharpRuntime();
-      const result = await BrowserCSharp.ExecuteScript(code);
+      const result = await BrowserCSharp.executeRegular(code);
 
       const stdOut = (result.stdOut || '').trim();
       const stdErr = (result.stdErr || '').trim();
