@@ -4,16 +4,16 @@ import random
 
 
 # Configuration
-WIDTH = 100
-HEIGHT = 27
-ALIVE = '█'
-DEAD = ' '
-GENERATIONS = 1000
+WIDTH = 20
+HEIGHT = 20
+ALIVE = '⬛'
+DEAD = '⬜'
+GENERATIONS = 400
 DELAY = 0
 
 def create_board():
     """Initializes a random board with a mix of alive and dead cells."""
-    return [[ALIVE if random.random() < 0.25 else DEAD for _ in range(WIDTH)] for _ in range(HEIGHT)]
+    return [[ALIVE if random.random() < 0.35 else DEAD for _ in range(WIDTH)] for _ in range(HEIGHT)]
 
 def print_board(board, gen):
     """Prints the board with a decorative border and generation counter."""
@@ -21,16 +21,16 @@ def print_board(board, gen):
     if os.name == 'nt':
         os.system('cls')
     else:
-        print("\033[H\033[J", end="") # ANSI escape sequence for clearing screen
+      pass
 
     header = f" Conway's Game of Life | Generation: {gen:3} "
-    border = "╔" + "═" * WIDTH + "╗"
-    footer = "╚" + "═" * WIDTH + "╝"
+    border = ""
+    footer = ""
 
     print(header.center(WIDTH + 2, " "))
     print(border)
     for row in board:
-        print("║" + "".join(row) + "║")
+        print("".join(row))
     print(border)
 
 def count_neighbors(board, r, c):

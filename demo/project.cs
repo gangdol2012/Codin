@@ -7,8 +7,8 @@ namespace CodeCraftDemo
 {
     class Program
     {
-        static int width = 60;
-        static int height = 20;
+        static int width = 10;
+        static int height = 10;
         static bool[,] grid = new bool[height, width];
         static Random random = new Random();
 
@@ -18,7 +18,7 @@ namespace CodeCraftDemo
             InitGrid();
 
             // Run for 100 generations autonomously
-            for (int gen = 0; gen < 1000; gen++)
+            for (int gen = 0; gen < 100; gen++)
             {
                 // Reset cursor to top-left for a smooth "animation" effect
                 try { Console.SetCursorPosition(0, 0); } catch { }
@@ -46,26 +46,18 @@ namespace CodeCraftDemo
             StringBuilder sb = new StringBuilder();
 
             // Header with box-drawing characters
-            sb.AppendLine("╔" + new string('═', width) + "╗");
             string title = $" CONWAY'S GAME OF LIFE - GEN: {gen:D3} ";
-            int padding = (width - title.Length) / 2;
-            sb.AppendLine("║" + new string(' ', padding) + title + new string(' ', width - title.Length - padding) + "║");
-            sb.AppendLine("╠" + new string('═', width) + "╣");
 
             // The Grid
             for (int y = 0; y < height; y++)
             {
-                sb.Append("║");
                 for (int x = 0; x < width; x++)
                 {
                     // Using full block for alive, space for dead
-                    sb.Append(grid[y, x] ? "█" : " ");
+                    sb.Append(grid[y, x] ? "⬛" : "⬜");
                 }
-                sb.AppendLine("║");
+                sb.AppendLine("");
             }
-
-            // Footer
-            sb.AppendLine("╚" + new string('═', width) + "╝");
 
             Console.Write(sb.ToString());
         }

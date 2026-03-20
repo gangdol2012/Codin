@@ -1353,7 +1353,7 @@ export default function App() {
   const [loadingAssistantChatId, setLoadingAssistantChatId] = useState<string | null>(null);
   const [assistantHistoryOpenByChatId, setAssistantHistoryOpenByChatId] = useState<Record<string, boolean>>({});
   const [outputPreviewHtml, setOutputPreviewHtml] = useState<string | null>(null);
-  const [pendingEdit, setPendingEdit] = useState<PendingEdit | null>(null);
+  const [pendingEdits, setPendingEdits] = useState<PendingEdit[]>([]);
   const [draggedItemId, setDraggedItemId] = useState<string | null>(null);
   const [layoutModel, setLayoutModel] = useState(() => Model.fromJson(loadSavedLayout()));
   const [namingState, setNamingState] = useState<{ type: 'file' | 'folder', parentId: string | null } | null>(null);
@@ -1382,6 +1382,7 @@ export default function App() {
   const [settingsCSharpNamespaceBusy, setSettingsCSharpNamespaceBusy] = useState(false);
   const [settingsCSharpNamespaceStatus, setSettingsCSharpNamespaceStatus] = useState('');
   const [syncMeta, setSyncMeta] = useState<SyncMeta[]>(loadSyncMeta);
+  const pendingEdit = pendingEdits[0] ?? null;
   const editorRef = useRef<any>(null);
   const pythonDiagnosticsEditorRef = useRef<any>(null);
   const csharpDiagnosticsEditorRef = useRef<any>(null);
@@ -2407,7 +2408,15 @@ json.dumps(_extract(${JSON.stringify(pkgName)}))
     'weakref', 'zipfile', 'zipimport'
   ];
 
+  const clearPyodideIdleTimer = () => {
+    if (pyodideIdleTimerRef.current) {
+      clearTimeout(pyodideIdleTimerRef.current);
+      pyodideIdleTimerRef.current = null;
+    }
+  };
+
   const unloadPyodide = () => {
+    clearPyodideIdleTimer();
     const py = (window as any).pyodide;
     if (py) {
       try { py.runPython(''); } catch { }
@@ -2431,7 +2440,7 @@ json.dumps(_extract(${JSON.stringify(pkgName)}))
   };
 
   const resetPyodideIdleTimer = () => {
-    if (pyodideIdleTimerRef.current) clearTimeout(pyodideIdleTimerRef.current);
+    clearPyodideIdleTimer();
     pyodideIdleTimerRef.current = setTimeout(unloadPyodide, PYODIDE_IDLE_TIMEOUT);
   };
 
@@ -2801,6 +2810,7 @@ json.dumps({
   };
 
   const ensurePyodideWithPackages = async (log?: (msg: string) => void) => {
+    clearPyodideIdleTimer();
     if (!(window as any).pyodide) {
       log?.('Loading Python runtime (Pyodide)... this may take a few seconds.');
       await ensurePyodideScript();
@@ -3013,6 +3023,7 @@ json.dumps(sorted(_imports))
   const runPython = async (code: string) => {
     try {
       await ensurePyodideWithPackages(msg => setOutput(prev => prev + (prev ? '\n' : '') + msg));
+      clearPyodideIdleTimer();
       await ensurePyodideUsesTypeshedSurface(code);
       const pyodide = (window as any).pyodide;
 
@@ -3044,6 +3055,8 @@ json.dumps(sorted(_imports))
       }
     } catch (err) {
       setOutput(prev => prev + (prev ? '\n' : '') + `Python Error: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      unloadPyodide();
     }
   };
 
@@ -3403,6 +3416,8 @@ json.dumps(sorted(_imports))
         You have access to tools to propose edits, navigate, move cursor, directly create/delete/move files or folders, and run built-in terminal commands.
         Do not suggest terminal-style commands for filesystem operations when a tool can be used, unless the user specifically asks for it.
         When you want to change code, use 'proposeEdit' so the user can review it.
+        You may use multiple tool calls in a single response when the task needs several actions.
+        If more than one action is needed, emit all needed tool calls in order in the same response instead of stopping after the first action.
         
         Current File System:
         ${files.map(f => `- Path: ${getPath(f.id)}, Type: ${f.type}, Language: ${f.language || 'N/A'}`).join('\n')}
@@ -3433,7 +3448,7 @@ json.dumps(sorted(_imports))
             const { pathOrName, newContent } = call.args as any;
             const targetFile = findItem(pathOrName);
             if (targetFile && targetFile.type === 'file') {
-              setPendingEdit({
+              enqueuePendingEdit({
                 fileId: targetFile.id,
                 originalContent: targetFile.content || '',
                 proposedContent: newContent
@@ -3571,14 +3586,24 @@ json.dumps(sorted(_imports))
     layoutModel.doAction(Actions.selectTab(targetTab.id));
   };
 
+  const enqueuePendingEdit = (nextEdit: PendingEdit) => {
+    setPendingEdits(prev => {
+      const existingIndex = prev.findIndex(edit => edit.fileId === nextEdit.fileId);
+      if (existingIndex === -1) return [...prev, nextEdit];
+      const next = [...prev];
+      next[existingIndex] = nextEdit;
+      return next;
+    });
+  };
+
   const acceptEdit = () => {
     if (!pendingEdit) return;
     setFiles(prev => prev.map(f => f.id === pendingEdit.fileId ? { ...f, content: pendingEdit.proposedContent } : f));
-    setPendingEdit(null);
+    setPendingEdits(prev => prev.slice(1));
   };
 
   const declineEdit = () => {
-    setPendingEdit(null);
+    setPendingEdits(prev => prev.slice(1));
   };
 
   const addNewItem = (type: 'file' | 'folder', parentId: string | null = null, mode: 'modal' | 'inline' = 'modal') => {
@@ -4719,6 +4744,11 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
                 <div className="flex items-center gap-2 text-xs font-medium text-indigo-300">
                   <Sparkles size={14} />
                   <span>Reviewing changes to {files.find(f => f.id === pendingEdit.fileId)?.name}</span>
+                  {pendingEdits.length > 1 ? (
+                    <span className="text-[10px] text-indigo-200/80">
+                      ({pendingEdits.length - 1} more queued)
+                    </span>
+                  ) : null}
                 </div>
                 <div className="flex items-center gap-2">
                   <button onClick={declineEdit} className="px-3 py-1 rounded bg-red-500/20 hover:bg-red-500/30 text-red-400 text-xs font-semibold transition-all flex items-center gap-1">
