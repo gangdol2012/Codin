@@ -1491,6 +1491,10 @@ export default function App() {
 
   const ensurePythonAuthoringReady = useCallback(async () => {
     const pyright = await getPyrightModule();
+    pyright.setInitialStubsGetter(() => {
+      const { mergedStubs } = buildMergedCachedPythonPackageStubs();
+      return cloneUserFolder(mergedStubs);
+    });
     await pyright.ensurePyrightReady();
     if (!persistedPipIncludesRestoredRef.current) {
       persistedPipIncludesRestoredRef.current = true;
@@ -2929,9 +2933,11 @@ json.dumps({
     if (hasUserFolderEntries(stubs)) {
       log('  Reloading Pyright LSP...');
       try {
-        persistedPythonPackageStubsRestoredRef.current = true;
+        const hadPersistedPythonPackageStubs = persistedPythonPackageStubsRestoredRef.current;
         const pyright = await ensurePythonAuthoringReady();
-        await pyright.reloadPyrightWithStubs(stubs);
+        if (hadPersistedPythonPackageStubs) {
+          await pyright.reloadPyrightWithStubs(stubs);
+        }
       } catch (reloadErr) {
         log(`  Pyright reload error: ${reloadErr instanceof Error ? reloadErr.message : String(reloadErr)}`);
       }

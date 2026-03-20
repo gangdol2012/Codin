@@ -11,6 +11,21 @@ let getInitialStubs: (() => UserFolder) | null = null;
 let pyrightProvider: MonacoPyrightProvider;
 let _pyrightReady: Promise<void> | null = null;
 
+const PYRIGHT_RUNTIME_SETTINGS = {
+  settings: {
+    python: {
+      analysis: {
+        typeshedPaths: ['/typeshed-fallback'],
+        stubPath: '/typings',
+        extraPaths: ['/typings'],
+        useLibraryCodeForTypes: true,
+      },
+      pythonVersion: '3.13',
+      pythonPlatform: 'All',
+    },
+  },
+};
+
 export function setInitialStubsGetter(fn: () => UserFolder) {
   getInitialStubs = fn;
 }
@@ -21,6 +36,10 @@ async function loadMinimalTypeshed(): Promise<ArrayBuffer> {
   return res.arrayBuffer();
 }
 
+async function applyPyrightRuntimeSettings(client: LspClient): Promise<void> {
+  await (client.connection as any).sendNotification('workspace/didChangeConfiguration', PYRIGHT_RUNTIME_SETTINGS);
+}
+
 export function ensurePyrightReady(): Promise<void> {
   if (!_pyrightReady) {
     _pyrightReady = (async () => {
@@ -29,6 +48,7 @@ export function ensurePyrightReady(): Promise<void> {
       accumulatedStubs = initialStubs;
       pyrightProvider = new MonacoPyrightProvider(undefined, { typeshed: typeshed || false, typeStubs: initialStubs });
       await pyrightProvider.init(monaco);
+      await applyPyrightRuntimeSettings(pyrightProvider.lspClient);
     })();
   }
   return _pyrightReady;
@@ -62,6 +82,7 @@ async function reloadLspWithAccumulatedStubs(): Promise<void> {
   const newClient = new LspClient();
   await newClient.initialize('/', accumulatedStubs, pyrightProvider.options.typeshed);
   await newClient.updateSettings();
+  await applyPyrightRuntimeSettings(newClient);
 
   pyrightProvider.lspClient = newClient;
 }
