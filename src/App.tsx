@@ -2786,17 +2786,6 @@ json.dumps(_extract(${JSON.stringify(pkgName)}))
     return folder;
   };
 
-  const ensurePyodideScript = async () => {
-    if ((window as any).loadPyodide) return;
-    await new Promise<void>((resolve, reject) => {
-      const script = document.createElement('script');
-      script.src = 'https://cdn.jsdelivr.net/pyodide/v0.29.3/full/pyodide.js';
-      script.onload = () => resolve();
-      script.onerror = () => reject(new Error('Failed to load Pyodide'));
-      document.head.appendChild(script);
-    });
-  };
-
   const pyodideRestoredRef = useRef(false);
   const pyodideIdleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pythonStubContributionsRef = useRef<Record<string, UserFolder>>({});
@@ -2806,6 +2795,8 @@ json.dumps(_extract(${JSON.stringify(pkgName)}))
   const pyodideFilteredStdlibUrlRef = useRef<string | null>(null);
   const pyodideFilteredStdlibSignatureRef = useRef('');
   const pyodideStdlibSurfaceSignatureRef = useRef('');
+  const pyodideHostFrameRef = useRef<HTMLIFrameElement | null>(null);
+  const pyodideScriptLoadPromiseRef = useRef<Promise<Window & typeof globalThis> | null>(null);
   const PYODIDE_IDLE_TIMEOUT = 60_000;
   const PYODIDE_INDEX_URL = 'https://cdn.jsdelivr.net/pyodide/v0.29.3/full';
   const PYODIDE_STDLIB_URL = `${PYODIDE_INDEX_URL}/python_stdlib.zip`;
@@ -2828,29 +2819,119 @@ json.dumps(_extract(${JSON.stringify(pkgName)}))
     }
   };
 
+  const getPyodideHostWindow = () => (
+    pyodideHostFrameRef.current?.contentWindow as (Window & typeof globalThis) | null
+  );
+
+  const destroyPyodideHostFrame = () => {
+    pyodideScriptLoadPromiseRef.current = null;
+    const frame = pyodideHostFrameRef.current;
+    if (!frame) return;
+    pyodideHostFrameRef.current = null;
+    try {
+      frame.src = 'about:blank';
+    } catch { }
+    try {
+      frame.remove();
+    } catch { }
+  };
+
+  const ensurePyodideHostWindow = async (): Promise<Window & typeof globalThis> => {
+    const existing = getPyodideHostWindow();
+    if (existing?.document?.head) {
+      return existing;
+    }
+
+    const frame = document.createElement('iframe');
+    frame.setAttribute('aria-hidden', 'true');
+    frame.tabIndex = -1;
+    frame.style.position = 'fixed';
+    frame.style.width = '0';
+    frame.style.height = '0';
+    frame.style.border = '0';
+    frame.style.opacity = '0';
+    frame.style.pointerEvents = 'none';
+    frame.style.visibility = 'hidden';
+
+    (document.body || document.documentElement).appendChild(frame);
+    const hostWindow = frame.contentWindow as (Window & typeof globalThis) | null;
+    if (!hostWindow) {
+      frame.remove();
+      throw new Error('Failed to create the Pyodide runtime host.');
+    }
+
+    hostWindow.document.open();
+    hostWindow.document.write('<!doctype html><html><head></head><body></body></html>');
+    hostWindow.document.close();
+    pyodideHostFrameRef.current = frame;
+    return hostWindow;
+  };
+
+  const ensurePyodideScript = async (): Promise<Window & typeof globalThis> => {
+    const hostWindow = await ensurePyodideHostWindow();
+    if ((hostWindow as any).loadPyodide) {
+      return hostWindow;
+    }
+    if (pyodideScriptLoadPromiseRef.current) {
+      return pyodideScriptLoadPromiseRef.current;
+    }
+
+    pyodideScriptLoadPromiseRef.current = new Promise<Window & typeof globalThis>((resolve, reject) => {
+      const script = hostWindow.document.createElement('script');
+      script.src = `${PYODIDE_INDEX_URL}/pyodide.js`;
+      script.async = true;
+      script.onload = () => resolve(hostWindow);
+      script.onerror = () => {
+        pyodideScriptLoadPromiseRef.current = null;
+        reject(new Error('Failed to load Pyodide'));
+      };
+      hostWindow.document.head.appendChild(script);
+    });
+
+    return pyodideScriptLoadPromiseRef.current;
+  };
+
   const unloadPyodide = () => {
     clearPyodideIdleTimer();
-    const py = (window as any).pyodide;
+    const hostWindow = getPyodideHostWindow();
+    const py = (window as any).pyodide || (hostWindow as any)?.pyodide;
     if (py) {
-      try { py.runPython(''); } catch { }
       try {
-        // Release internal FS, module loader, and WASM memory references
-        if (py._module) {
-          if (py._module.wasmMemory) py._module.wasmMemory = null;
-          if (py._module.wasmModule) py._module.wasmModule = null;
-          py._module = null;
-        }
-        if (py._api) py._api = null;
+        py.runPython(`
+import gc
+import sys
+
+sys.path_importer_cache.clear()
+sys.modules.clear()
+gc.collect()
+`);
       } catch { }
-      (window as any).pyodide = undefined;
-      (window as any).loadPyodide = undefined;
-      // Remove the CDN script so re-init starts fresh
-      const scripts = document.querySelectorAll('script[src*="pyodide"]');
-      scripts.forEach(s => s.remove());
-      pyodideRestoredRef.current = false;
-      pyodideStdlibSurfaceSignatureRef.current = '';
+      try { py.FS?.syncfs?.(false, () => {}); } catch { }
+      try { py.ffi?.destroy_proxies?.(); } catch { }
+    }
+    try {
+      if (hostWindow) {
+        (hostWindow as any).pyodide = undefined;
+        (hostWindow as any).loadPyodide = undefined;
+        hostWindow.stop?.();
+      }
+    } catch { }
+    (window as any).pyodide = undefined;
+    (window as any).loadPyodide = undefined;
+    destroyPyodideHostFrame();
+    pyodideRestoredRef.current = false;
+    pyodideStdlibSourceBufferRef.current = null;
+    pyodideStdlibSurfaceSignatureRef.current = '';
+    if (pyodideFilteredStdlibUrlRef.current) {
+      URL.revokeObjectURL(pyodideFilteredStdlibUrlRef.current);
+      pyodideFilteredStdlibUrlRef.current = null;
+      pyodideFilteredStdlibSignatureRef.current = '';
     }
   };
+
+  useEffect(() => () => {
+    unloadPyodide();
+  }, []);
 
   const resetPyodideIdleTimer = () => {
     clearPyodideIdleTimer();
@@ -3226,13 +3307,16 @@ json.dumps({
     clearPyodideIdleTimer();
     if (!(window as any).pyodide) {
       log?.('Loading Python runtime (Pyodide)... this may take a few seconds.');
-      await ensurePyodideScript();
+      const hostWindow = await ensurePyodideScript();
       const stdLibURL = await ensureFilteredPyodideStdlibUrl(log);
-      (window as any).pyodide = await (window as any).loadPyodide({
+      const pyodide = await (hostWindow as any).loadPyodide({
         enableRunUntilComplete: false,
         fullStdLib: false,
         stdLibURL,
       });
+      (hostWindow as any).pyodide = pyodide;
+      (window as any).loadPyodide = (hostWindow as any).loadPyodide;
+      (window as any).pyodide = pyodide;
     }
     if (!pyodideRestoredRef.current) {
       pyodideRestoredRef.current = true;
