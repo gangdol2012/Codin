@@ -229,6 +229,7 @@ function buildUncompressedZip(files: Map<string, Uint8Array>): ArrayBuffer {
 const CORE_TYPESHED_FILES = new Set([
   'stdlib/builtins.pyi', 'stdlib/typing.pyi', 'stdlib/sys.pyi', 'stdlib/types.pyi',
   'stdlib/abc.pyi', 'stdlib/io.pyi', 'stdlib/codecs.pyi', 'stdlib/re.pyi',
+  'stdlib/math.pyi',
   'stdlib/json/__init__.pyi', 'stdlib/dataclasses.pyi', 'stdlib/functools.pyi',
   'stdlib/contextlib.pyi', 'stdlib/itertools.pyi', 'stdlib/warnings.pyi',
   'stdlib/os/__init__.pyi', 'stdlib/pathlib.pyi', 'stdlib/collections/__init__.pyi',
@@ -312,6 +313,57 @@ export async function includeTypeshedModule(name: string, log?: (msg: string) =>
 
 export function isModuleIncluded(name: string): boolean {
   return includedModules.has(name);
+}
+
+function normalizeTopLevelModuleName(name: string): string | null {
+  const trimmed = name.trim();
+  if (!trimmed) return null;
+  const withoutExtension = trimmed.replace(/\.(pyi|py)$/i, '');
+  if (!withoutExtension || withoutExtension === '__init__') return null;
+  return withoutExtension;
+}
+
+function topLevelModuleFromTypeshedPath(path: string): string | null {
+  const parts = path.split('/').filter(Boolean);
+  if (parts.length < 2) return null;
+
+  if (parts[0] === 'stdlib') {
+    return normalizeTopLevelModuleName(parts[1]);
+  }
+
+  if (parts[0] === 'stubs') {
+    return normalizeTopLevelModuleName(parts[1]);
+  }
+
+  return null;
+}
+
+function collectTopLevelUserFolderModules(folder: UserFolder): string[] {
+  return Object.keys(folder)
+    .map(normalizeTopLevelModuleName)
+    .filter((name): name is string => Boolean(name));
+}
+
+export async function getCurrentPythonTypeModules(): Promise<string[]> {
+  await ensurePyrightReady();
+  await ensureTypeshedFiles();
+
+  const modules = new Set<string>(['__future__']);
+
+  for (const path of typeshedFiles!.keys()) {
+    const moduleName = topLevelModuleFromTypeshedPath(path);
+    if (moduleName) modules.add(moduleName);
+  }
+
+  for (const moduleName of includedModules) {
+    modules.add(moduleName);
+  }
+
+  for (const moduleName of collectTopLevelUserFolderModules(accumulatedStubs)) {
+    modules.add(moduleName);
+  }
+
+  return [...modules].sort();
 }
 
 function mergeUserFolders(base: UserFolder, overlay: UserFolder): UserFolder {

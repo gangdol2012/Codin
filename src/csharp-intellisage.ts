@@ -27,7 +27,7 @@ class CSharpLanguageService {
   private debouncedCompletions = this.rawProvideCompletionItems.bind(this);
   private debouncedResolve = this.rawResolveCompletionItem.bind(this);
 
-  async initialize(iframeUrl = 'https://intellisage.vercel.app/') {
+  async initialize(iframeUrl = '/intellisage/') {
     if (this.initialized) return;
     this.initialized = true;
 
@@ -141,6 +141,38 @@ class CSharpLanguageService {
     /does not contain a static 'Main' method/i,
     /entry point/i,
   ];
+
+  async includeNamespace(namespaceName: string): Promise<{
+    namespaceName?: string;
+    success?: boolean;
+    addedAssemblies?: string[];
+    matchedAssemblies?: string[];
+    message?: string;
+  }> {
+    await ensureCSharpReady();
+    if (!this.intellisage) {
+      return { success: false, message: 'C# authoring runtime is not ready.' };
+    }
+
+    const trimmedNamespace = namespaceName.trim();
+    if (!trimmedNamespace) {
+      return { success: false, message: 'Namespace is required.' };
+    }
+
+    const response = await this.intellisage('IncludeNamespaceAsync', trimmedNamespace) as {
+      namespaceName?: string;
+      success?: boolean;
+      addedAssemblies?: string[];
+      matchedAssemblies?: string[];
+      message?: string;
+    } | false;
+
+    if (this.model && this.model.getLanguageId() === 'csharp') {
+      await this.getDiagnostics(this.model.getValue());
+    }
+
+    return response || { success: false, message: `No response while including '${trimmedNamespace}'.` };
+  }
 
   private async getDiagnostics(code: string) {
     if (!this.intellisage || !this.model) return;

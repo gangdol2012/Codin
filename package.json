@@ -4,9 +4,10 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "prepare": "node scripts/build-minimal-typeshed.mjs && node scripts/sync-browser-csharp-runtime.mjs",
-    "postinstall": "node scripts/sync-browser-csharp-runtime.mjs",
-    "prebuild": "node scripts/build-minimal-typeshed.mjs && node scripts/sync-browser-csharp-runtime.mjs",
+    "prepare": "node scripts/build-minimal-typeshed.mjs && node scripts/sync-browser-csharp-runtime.mjs && node scripts/sync-intellisage-runtime.mjs",
+    "postinstall": "node scripts/sync-browser-csharp-runtime.mjs && node scripts/sync-intellisage-runtime.mjs",
+    "prebuild": "node scripts/build-minimal-typeshed.mjs && node scripts/sync-browser-csharp-runtime.mjs && node scripts/sync-intellisage-runtime.mjs",
+    "csharp:intellisage:publish": "dotnet publish vendor/intellisage-wasm/Intellisage.csproj -c Release",
     "dev": "vite",
     "build": "vite build",
     "lint": "node --stack-size=8192 ./node_modules/.bin/tsc --noEmit",

@@ -295,7 +295,8 @@ internal static class __CodeCraftEntry
 			}
 			catch (Exception ex)
 			{
-				return new ExecutionResult(null, null, $"{ex.GetType()}: {ex.Message}");
+				string stdOut = Console.Out is StringWriter sw ? sw.ToString() : null;
+				return new ExecutionResult(null, stdOut?.Length > 0 ? stdOut : null, FormatExecutionException(ex));
 			}
 			finally
 			{
@@ -358,11 +359,35 @@ internal static class __CodeCraftEntry
 			}
 			catch (Exception ex)
 			{
-				return new ExecutionResult(null, null, $"{ex.GetType()}: {ex.Message}");
+				string stdOut = Console.Out is StringWriter sw ? sw.ToString() : null;
+				return new ExecutionResult(null, stdOut?.Length > 0 ? stdOut : null, FormatExecutionException(ex));
 			}
 			finally
 			{
 				Console.SetOut(ogOut);
+			}
+		}
+
+		private static string FormatExecutionException(Exception exception)
+		{
+			return UnwrapExecutionException(exception).ToString();
+		}
+
+		private static Exception UnwrapExecutionException(Exception exception)
+		{
+			while (true)
+			{
+				switch (exception)
+				{
+					case TargetInvocationException tie when tie.InnerException != null:
+						exception = tie.InnerException;
+						continue;
+					case AggregateException aggregate when aggregate.InnerExceptions.Count == 1:
+						exception = aggregate.InnerExceptions[0];
+						continue;
+					default:
+						return exception;
+				}
 			}
 		}
 	}

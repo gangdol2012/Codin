@@ -22,7 +22,7 @@ import {
   Unlink
 } from 'lucide-react';
 import Editor, { DiffEditor } from '@monaco-editor/react';
-import { pyrightProvider, pyrightReady, reloadPyrightWithStubs, includeTypeshedModule } from './pyright';
+import { pyrightProvider, pyrightReady, reloadPyrightWithStubs, reloadPyrightAfterRemovingStubContribution, includeTypeshedModule, getCurrentPythonTypeModules } from './pyright';
 import type { UserFolder } from './pyright';
 import { csharpService, csharpReady, ensureCSharpReady } from './csharp-intellisage';
 import { configureMonacoSuggestionAcceptance } from './monaco-suggest';
@@ -114,7 +114,8 @@ const STORAGE_KEYS = {
   settings: 'codecraft-settings',
   assistantChats: 'codecraft-assistant-chats',
   layout: 'codecraft-layout',
-  pipPackages: 'codecraft-pip-packages'
+  pipPackages: 'codecraft-pip-packages',
+  csharpNamespaces: 'codecraft-csharp-namespaces'
 };
 
 const EXT_TO_LANGUAGE: Record<string, string> = {
@@ -392,23 +393,43 @@ const geminiAi = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || '' });
 
 interface SavedPipPackage { name: string; version: string; }
 
+function normalizeSavedPipPackageName(pkg: string) {
+  return pkg.toLowerCase().replace(/[=<>!].*/, '').trim();
+}
+
+function sortSavedPipPackages(pkgs: SavedPipPackage[]) {
+  return [...pkgs].sort((a, b) => a.name.localeCompare(b.name));
+}
+
 function loadSavedPipPackages(): SavedPipPackage[] {
   try {
     const raw = JSON.parse(localStorage.getItem(STORAGE_KEYS.pipPackages) || '[]');
     if (Array.isArray(raw) && raw.length > 0 && typeof raw[0] === 'string') {
-      return raw.map((s: string) => ({ name: s, version: '' }));
+      return sortSavedPipPackages(raw.map((s: string) => ({ name: normalizeSavedPipPackageName(s), version: '' })));
     }
-    return raw;
+    return sortSavedPipPackages(
+      Array.isArray(raw)
+        ? raw
+          .filter((value): value is { name: string; version?: string } => (
+            !!value
+            && typeof value.name === 'string'
+          ))
+          .map(value => ({
+            name: normalizeSavedPipPackageName(value.name),
+            version: typeof value.version === 'string' ? value.version : '',
+          }))
+        : []
+    );
   } catch { return []; }
 }
 
 function savePipPackages(pkgs: SavedPipPackage[]) {
-  localStorage.setItem(STORAGE_KEYS.pipPackages, JSON.stringify(pkgs));
+  localStorage.setItem(STORAGE_KEYS.pipPackages, JSON.stringify(sortSavedPipPackages(pkgs)));
 }
 
 function addSavedPipPackage(pkg: string, version: string) {
   const pkgs = loadSavedPipPackages();
-  const normalized = pkg.toLowerCase().replace(/[=<>!].*/, '');
+  const normalized = normalizeSavedPipPackageName(pkg);
   const idx = pkgs.findIndex(p => p.name === normalized);
   if (idx >= 0) {
     pkgs[idx].version = version;
@@ -419,8 +440,34 @@ function addSavedPipPackage(pkg: string, version: string) {
 }
 
 function removeSavedPipPackage(pkg: string) {
-  const normalized = pkg.toLowerCase().replace(/[=<>!].*/, '');
+  const normalized = normalizeSavedPipPackageName(pkg);
   savePipPackages(loadSavedPipPackages().filter(p => p.name !== normalized));
+}
+
+function loadSavedCSharpNamespaces(): string[] {
+  try {
+    const raw = JSON.parse(localStorage.getItem(STORAGE_KEYS.csharpNamespaces) || '[]');
+    return Array.isArray(raw)
+      ? raw.filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveCSharpNamespaces(namespaces: string[]) {
+  localStorage.setItem(STORAGE_KEYS.csharpNamespaces, JSON.stringify(namespaces));
+}
+
+function addSavedCSharpNamespace(namespaceName: string) {
+  const normalized = namespaceName.trim();
+  if (!normalized) return;
+  const current = loadSavedCSharpNamespaces();
+  if (!current.includes(normalized)) {
+    current.push(normalized);
+    current.sort((a, b) => a.localeCompare(b));
+    saveCSharpNamespaces(current);
+  }
 }
 
 const GLOBAL_STYLE_HTML = {
@@ -738,6 +785,11 @@ export default function App() {
     const parsed = JSON.parse(saved);
     return { ...DEFAULT_SETTINGS, ...parsed };
   });
+  const [settingsPipPackages, setSettingsPipPackages] = useState<SavedPipPackage[]>(() => loadSavedPipPackages());
+  const [settingsPipInput, setSettingsPipInput] = useState('');
+  const [settingsPipForceBuild, setSettingsPipForceBuild] = useState(false);
+  const [settingsPipBusy, setSettingsPipBusy] = useState(false);
+  const [settingsPipStatus, setSettingsPipStatus] = useState('');
   const [syncMeta, setSyncMeta] = useState<SyncMeta[]>(loadSyncMeta);
   const editorRef = useRef<any>(null);
   const outputContainerRef = useRef<HTMLDivElement>(null);
@@ -1136,6 +1188,13 @@ export default function App() {
     localStorage.setItem(STORAGE_KEYS.settings, JSON.stringify(settings));
   }, [settings]);
 
+  useEffect(() => {
+    if (isSettingsOpen) {
+      setSettingsPipPackages(loadSavedPipPackages());
+      setSettingsPipStatus('');
+    }
+  }, [isSettingsOpen]);
+
 
   useEffect(() => {
     if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
@@ -1169,9 +1228,19 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    ensureCSharpReady().catch(error => {
-      console.warn('Failed to initialize C# IntelliSense on app startup:', error);
-    });
+    ensureCSharpReady()
+      .then(async () => {
+        for (const namespaceName of loadSavedCSharpNamespaces()) {
+          try {
+            await csharpService.includeNamespace(namespaceName);
+          } catch (error) {
+            console.warn(`Failed to restore C# namespace '${namespaceName}':`, error);
+          }
+        }
+      })
+      .catch(error => {
+        console.warn('Failed to initialize C# IntelliSense on app startup:', error);
+      });
     ensureCSharpRuntime().catch(error => {
       console.warn('Failed to initialize C# runtime on app startup:', error);
     });
@@ -1473,6 +1542,7 @@ json.dumps(_extract(${JSON.stringify(pkgName)}))
 
   const pyodideRestoredRef = useRef(false);
   const pyodideIdleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pythonStubContributionsRef = useRef<Record<string, UserFolder>>({});
   const PYODIDE_IDLE_TIMEOUT = 60_000;
 
   const unloadPyodide = () => {
@@ -1494,6 +1564,7 @@ json.dumps(_extract(${JSON.stringify(pkgName)}))
       const scripts = document.querySelectorAll('script[src*="pyodide"]');
       scripts.forEach(s => s.remove());
       pyodideRestoredRef.current = false;
+      pythonStubContributionsRef.current = {};
     }
   };
 
@@ -1510,6 +1581,7 @@ json.dumps(_extract(${JSON.stringify(pkgName)}))
     }
     if (!pyodideRestoredRef.current) {
       pyodideRestoredRef.current = true;
+      pythonStubContributionsRef.current = {};
       const savedPkgs = loadSavedPipPackages();
       if (savedPkgs.length > 0) {
         const pyodide = (window as any).pyodide;
@@ -1529,6 +1601,7 @@ json.dumps(_extract(${JSON.stringify(pkgName)}))
           try {
             const stubs = await extractPyodideStubs(p.name);
             if (Object.keys(stubs).length > 0) {
+              pythonStubContributionsRef.current[p.name.toLowerCase()] = stubs;
               mergedStubs = { ...mergedStubs, ...stubs };
             }
           } catch { alert('Failed to extract stubs from Pyodide package'); }
@@ -1547,9 +1620,74 @@ json.dumps(_extract(${JSON.stringify(pkgName)}))
     resetPyodideIdleTimer();
   };
 
+  const collectImportedPythonModules = async (code: string): Promise<string[]> => {
+    const pyodide = (window as any).pyodide;
+    if (!pyodide) return [];
+    try {
+      const json = await pyodide.runPythonAsync(`
+import ast, json
+
+_code = ${JSON.stringify(code)}
+_imports = set()
+
+try:
+    _tree = ast.parse(_code)
+except SyntaxError:
+    _tree = None
+
+if _tree is not None:
+    for _node in ast.walk(_tree):
+        if isinstance(_node, ast.Import):
+            for _alias in _node.names:
+                _root = (_alias.name or '').split('.')[0]
+                if _root:
+                    _imports.add(_root)
+        elif isinstance(_node, ast.ImportFrom):
+            if _node.module:
+                _root = _node.module.split('.')[0]
+                if _root:
+                    _imports.add(_root)
+        elif isinstance(_node, ast.Call):
+            if isinstance(_node.func, ast.Name) and _node.func.id == '__import__' and _node.args:
+                _arg = _node.args[0]
+                if isinstance(_arg, ast.Constant) and isinstance(_arg.value, str):
+                    _root = _arg.value.split('.')[0]
+                    if _root:
+                        _imports.add(_root)
+            elif isinstance(_node.func, ast.Attribute) and _node.func.attr == 'import_module' and _node.args:
+                _base = _node.func.value
+                _arg = _node.args[0]
+                if isinstance(_base, ast.Name) and _base.id == 'importlib' and isinstance(_arg, ast.Constant) and isinstance(_arg.value, str):
+                    _root = _arg.value.split('.')[0]
+                    if _root:
+                        _imports.add(_root)
+
+json.dumps(sorted(_imports))
+`);
+      return JSON.parse(json);
+    } catch {
+      return [];
+    }
+  };
+
+  const ensurePyodideUsesTypeshedSurface = async (code: string) => {
+    const importedModules = await collectImportedPythonModules(code);
+    if (importedModules.length === 0) return;
+
+    const allowedModules = new Set(await getCurrentPythonTypeModules());
+    const missingModules = importedModules.filter(moduleName => !allowedModules.has(moduleName));
+
+    if (missingModules.length > 0) {
+      throw new Error(
+        `Pyodide runtime is limited to modules that exist in the current typeshed/stub set. Missing: ${missingModules.join(', ')}. Use \`pip include <module>\` for stdlib modules or install a package that provides stubs first.`
+      );
+    }
+  };
+
   const runPython = async (code: string) => {
     try {
       await ensurePyodideWithPackages(msg => setOutput(prev => prev + (prev ? '\n' : '') + msg));
+      await ensurePyodideUsesTypeshedSurface(code);
       const pyodide = (window as any).pyodide;
 
       pyodide.setStdout({
@@ -2932,6 +3070,7 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
               const stubCount = Object.keys(stubs).length;
               setTerminalOutput(prev => [...prev, `  Found ${stubCount} stub entries`]);
               if (stubCount > 0) {
+                pythonStubContributionsRef.current[pkg.toLowerCase().replace(/[=<>!].*/, '')] = stubs;
                 setTerminalOutput(prev => [...prev, '  Reloading Pyright LSP...']);
                 try {
                   await reloadPyrightWithStubs(stubs);
@@ -2963,6 +3102,15 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
           await pyodide.loadPackage("micropip");
           const micropip = pyodide.pyimport("micropip");
           micropip.uninstall(pkg);
+          const normalizedPkg = pkg.toLowerCase().replace(/[=<>!].*/, '');
+          const stubContribution = pythonStubContributionsRef.current[normalizedPkg];
+          if (stubContribution && Object.keys(stubContribution).length > 0) {
+            await reloadPyrightAfterRemovingStubContribution(stubContribution);
+            delete pythonStubContributionsRef.current[normalizedPkg];
+            if (editorRef.current) {
+              pyrightProvider.setupDiagnostics(editorRef.current);
+            }
+          }
           removeSavedPipPackage(pkg);
           setTerminalOutput([...newOutput, `Successfully uninstalled ${pkg}`]);
         } catch (err) {
@@ -2988,8 +3136,41 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
       } else {
         setTerminalOutput([...newOutput, 'Usage: pip install <package> [-force] | pip upgrade <package> [-version <ver>] | pip uninstall <package> | pip include <module> | pip list']);
       }
+    } else if (cmd === 'nuget') {
+      const subCmd = (args[1] || '').toLowerCase();
+      const namespaceName = args[2];
+
+      if (subCmd === 'include' && namespaceName) {
+        setTerminalOutput([...newOutput, `Including C# namespace '${namespaceName}'...`]);
+        try {
+          const result = await csharpService.includeNamespace(namespaceName);
+          if (result.success) {
+            addSavedCSharpNamespace(namespaceName);
+          }
+
+          const lines = [result.message || `Finished processing '${namespaceName}'.`];
+          if (result.matchedAssemblies && result.matchedAssemblies.length > 0) {
+            lines.push(`Matched assemblies: ${result.matchedAssemblies.join(', ')}`);
+          }
+          if (result.addedAssemblies && result.addedAssemblies.length > 0) {
+            lines.push(`Added metadata references: ${result.addedAssemblies.join(', ')}`);
+          }
+          setTerminalOutput(prev => [...prev, ...lines]);
+        } catch (err) {
+          setTerminalOutput(prev => [...prev, `nuget include error: ${err instanceof Error ? err.message : String(err)}`]);
+        }
+      } else if (subCmd === 'list') {
+        const namespaces = loadSavedCSharpNamespaces();
+        if (namespaces.length === 0) {
+          setTerminalOutput([...newOutput, 'No C# namespaces have been included yet.']);
+        } else {
+          setTerminalOutput([...newOutput, `Included C# namespaces (${namespaces.length}):`, ...namespaces.map(name => `  ${name}`)]);
+        }
+      } else {
+        setTerminalOutput([...newOutput, 'Usage: nuget include <namespace> | nuget list']);
+      }
     } else if (cmd === 'help') {
-      setTerminalOutput([...newOutput, 'Standard commands: ls, pwd, cd, mkdir, touch, open, cat, rm, clear, help, date, echo', 'Python: pip install <package> [-force] | pip upgrade <package> [-version <ver>] | pip uninstall <package> | pip include <module> | pip list']);
+      setTerminalOutput([...newOutput, 'Standard commands: ls, pwd, cd, mkdir, touch, open, cat, rm, clear, help, date, echo', 'Python: pip install <package> [-force] | pip upgrade <package> [-version <ver>] | pip uninstall <package> | pip include <module> | pip list', 'C#: nuget include <namespace> | nuget list']);
     } else if (cmd === 'date') {
       setTerminalOutput([...newOutput, new Date().toLocaleString()]);
     } else if (cmd === 'echo') {
@@ -3003,6 +3184,64 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
     }
 
     if (clearInputAfter) setTerminalInput('');
+  };
+
+  const refreshSettingsPipPackages = () => {
+    const saved = loadSavedPipPackages();
+    setSettingsPipPackages(saved);
+    return saved;
+  };
+
+  const runSettingsPipCommand = async (command: string) => {
+    setSettingsPipBusy(true);
+    setSettingsPipStatus(`Running \`${command}\`. Detailed logs will appear in Terminal.`);
+    try {
+      await executeTerminalCommand(command, false);
+      return refreshSettingsPipPackages();
+    } finally {
+      setSettingsPipBusy(false);
+    }
+  };
+
+  const handleSettingsPipApply = async () => {
+    const pkg = settingsPipInput.trim();
+    if (!pkg) {
+      setSettingsPipStatus('Enter a Python package name first.');
+      return;
+    }
+
+    const normalized = normalizeSavedPipPackageName(pkg);
+    const alreadyInstalled = settingsPipPackages.some(p => p.name === normalized);
+    const command = alreadyInstalled
+      ? `pip upgrade ${pkg}`
+      : `pip install ${pkg}${settingsPipForceBuild ? ' -force' : ''}`;
+
+    const saved = await runSettingsPipCommand(command);
+    const nowInstalled = saved.some(p => p.name === normalized);
+
+    if (nowInstalled) {
+      setSettingsPipStatus(
+        alreadyInstalled
+          ? `Finished checking ${normalized}. Review Terminal output for upgrade details.`
+          : `Installed ${normalized}.`
+      );
+      if (!alreadyInstalled) {
+        setSettingsPipInput('');
+        setSettingsPipForceBuild(false);
+      }
+    } else {
+      setSettingsPipStatus(`No saved package entry was added for ${normalized}. Check Terminal output for the failure details.`);
+    }
+  };
+
+  const handleSettingsPipUninstall = async (pkg: string) => {
+    const normalized = normalizeSavedPipPackageName(pkg);
+    const saved = await runSettingsPipCommand(`pip uninstall ${normalized}`);
+    if (saved.some(p => p.name === normalized)) {
+      setSettingsPipStatus(`Could not remove ${normalized}. Check Terminal output for the failure details.`);
+    } else {
+      setSettingsPipStatus(`Removed ${normalized}.`);
+    }
   };
 
   const handleTerminalCommand = async (e: React.KeyboardEvent) => {
@@ -3635,6 +3874,100 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
                         )} />
                       </button>
                     </div>
+                  </div>
+                </section>
+
+                <section>
+                  <h4 className="text-xs font-bold uppercase tracking-widest text-zinc-500 mb-4">Python Packages</h4>
+                  <div className="space-y-4">
+                    <div className="rounded-2xl border border-white/10 bg-white/5 p-4 space-y-4">
+                      <div>
+                        <div className="text-sm font-medium text-white">Manage Restored `pip` Packages</div>
+                        <div className="text-xs text-zinc-500 mt-1">Packages saved here are restored automatically the next time the Pyodide runtime loads.</div>
+                      </div>
+
+                      <div className="grid grid-cols-1 sm:grid-cols-[minmax(0,1fr)_auto] gap-3">
+                        <input
+                          type="text"
+                          value={settingsPipInput}
+                          onChange={(e) => setSettingsPipInput(e.target.value)}
+                          onKeyDown={async (e) => {
+                            if (e.key === 'Enter' && !settingsPipBusy) {
+                              e.preventDefault();
+                              await handleSettingsPipApply();
+                            }
+                          }}
+                          placeholder="Package name, e.g. requests"
+                          className="w-full rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-sm text-white outline-none transition-colors focus:border-indigo-500"
+                        />
+                        <button
+                          onClick={handleSettingsPipApply}
+                          disabled={settingsPipBusy}
+                          className={cn(
+                            "px-4 py-2 rounded-xl text-sm font-semibold transition-colors",
+                            settingsPipBusy
+                              ? "bg-zinc-700 text-zinc-400 cursor-not-allowed"
+                              : "bg-indigo-600 hover:bg-indigo-500 text-white"
+                          )}
+                        >
+                          {settingsPipBusy ? 'Working...' : 'Install / Upgrade'}
+                        </button>
+                      </div>
+
+                      <label className="flex items-center justify-between gap-4">
+                        <div>
+                          <div className="text-sm font-medium text-white">Force Build Fallback</div>
+                          <div className="text-xs text-zinc-500">Only used for new installs when a pure wheel is unavailable.</div>
+                        </div>
+                        <button
+                          onClick={() => setSettingsPipForceBuild(flag => !flag)}
+                          disabled={settingsPipBusy}
+                          className={cn(
+                            "w-10 h-5 rounded-full transition-all relative shrink-0",
+                            settingsPipForceBuild ? "bg-indigo-600" : "bg-zinc-700",
+                            settingsPipBusy && "opacity-60 cursor-not-allowed"
+                          )}
+                        >
+                          <div className={cn(
+                            "absolute top-1 w-3 h-3 bg-white rounded-full transition-all",
+                            settingsPipForceBuild ? "right-1" : "left-1"
+                          )} />
+                        </button>
+                      </label>
+
+                      {settingsPipStatus && (
+                        <p className="text-xs text-indigo-300 bg-indigo-500/10 border border-indigo-500/20 rounded-xl px-3 py-2">
+                          {settingsPipStatus}
+                        </p>
+                      )}
+                    </div>
+
+                    {settingsPipPackages.length === 0 ? (
+                      <p className="text-sm text-zinc-500">No saved Python packages yet.</p>
+                    ) : (
+                      <div className="space-y-2">
+                        {settingsPipPackages.map(pkg => (
+                          <div key={pkg.name} className="flex items-center justify-between gap-3 p-3 rounded-xl bg-white/5 border border-white/10">
+                            <div className="min-w-0">
+                              <div className="text-sm font-medium text-white truncate">{pkg.name}</div>
+                              <div className="text-xs text-zinc-500">{pkg.version ? `Version ${pkg.version}` : 'Version not recorded'}</div>
+                            </div>
+                            <button
+                              onClick={() => handleSettingsPipUninstall(pkg.name)}
+                              disabled={settingsPipBusy}
+                              className={cn(
+                                "px-3 py-1.5 rounded-lg text-xs font-medium transition-colors shrink-0",
+                                settingsPipBusy
+                                  ? "bg-zinc-700 text-zinc-400 cursor-not-allowed"
+                                  : "bg-red-500/10 text-red-300 hover:bg-red-500/20 border border-red-500/20"
+                              )}
+                            >
+                              Uninstall
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
                   </div>
                 </section>
 

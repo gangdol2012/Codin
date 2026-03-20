@@ -20,6 +20,7 @@ const FULL_COPY = join(ROOT, 'public/typeshed-full.zip');
 const INCLUDE = new Set([
   'stdlib/builtins.pyi', 'stdlib/typing.pyi', 'stdlib/sys.pyi', 'stdlib/types.pyi',
   'stdlib/abc.pyi', 'stdlib/io.pyi', 'stdlib/codecs.pyi', 'stdlib/re.pyi',
+  'stdlib/math.pyi',
   'stdlib/json/__init__.pyi', 'stdlib/dataclasses.pyi', 'stdlib/functools.pyi',
   'stdlib/contextlib.pyi', 'stdlib/itertools.pyi', 'stdlib/warnings.pyi',
   'stdlib/os/__init__.pyi', 'stdlib/pathlib.pyi', 'stdlib/collections/__init__.pyi',
