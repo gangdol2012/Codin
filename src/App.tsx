@@ -22,7 +22,7 @@ import {
   Unlink
 } from 'lucide-react';
 import Editor, { DiffEditor } from '@monaco-editor/react';
-import { pyrightProvider, pyrightReady, reloadPyrightWithStubs, reloadPyrightAfterRemovingStubContribution, includeTypeshedModule, getCurrentPythonTypeModules } from './pyright';
+import { pyrightProvider, pyrightReady, reloadPyrightWithStubs, reloadPyrightAfterRemovingStubContribution, includeTypeshedModule, getCurrentPythonTypeModules, isModuleIncluded } from './pyright';
 import type { UserFolder } from './pyright';
 import { csharpService, csharpReady, ensureCSharpReady } from './csharp-intellisage';
 import { configureMonacoSuggestionAcceptance } from './monaco-suggest';
@@ -115,6 +115,7 @@ const STORAGE_KEYS = {
   assistantChats: 'codecraft-assistant-chats',
   layout: 'codecraft-layout',
   pipPackages: 'codecraft-pip-packages',
+  pipIncludedModules: 'codecraft-pip-included-modules',
   csharpNamespaces: 'codecraft-csharp-namespaces'
 };
 
@@ -442,6 +443,38 @@ function addSavedPipPackage(pkg: string, version: string) {
 function removeSavedPipPackage(pkg: string) {
   const normalized = normalizeSavedPipPackageName(pkg);
   savePipPackages(loadSavedPipPackages().filter(p => p.name !== normalized));
+}
+
+function loadSavedPipIncludedModules(): string[] {
+  try {
+    const raw = JSON.parse(localStorage.getItem(STORAGE_KEYS.pipIncludedModules) || '[]');
+    return Array.isArray(raw)
+      ? [...new Set(
+        raw
+          .filter((value): value is string => typeof value === 'string')
+          .map(value => value.trim())
+          .filter(Boolean)
+      )].sort((a, b) => a.localeCompare(b))
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function savePipIncludedModules(modules: string[]) {
+  localStorage.setItem(STORAGE_KEYS.pipIncludedModules, JSON.stringify(
+    [...new Set(modules.map(value => value.trim()).filter(Boolean))].sort((a, b) => a.localeCompare(b))
+  ));
+}
+
+function addSavedPipIncludedModule(moduleName: string) {
+  const normalized = moduleName.trim();
+  if (!normalized) return;
+  const current = loadSavedPipIncludedModules();
+  if (!current.includes(normalized)) {
+    current.push(normalized);
+    savePipIncludedModules(current);
+  }
 }
 
 function loadSavedCSharpNamespaces(): string[] {
@@ -786,10 +819,18 @@ export default function App() {
     return { ...DEFAULT_SETTINGS, ...parsed };
   });
   const [settingsPipPackages, setSettingsPipPackages] = useState<SavedPipPackage[]>(() => loadSavedPipPackages());
+  const [settingsPipIncludedModules, setSettingsPipIncludedModules] = useState<string[]>(() => loadSavedPipIncludedModules());
+  const [settingsCSharpNamespaces, setSettingsCSharpNamespaces] = useState<string[]>(() => loadSavedCSharpNamespaces());
   const [settingsPipInput, setSettingsPipInput] = useState('');
   const [settingsPipForceBuild, setSettingsPipForceBuild] = useState(false);
   const [settingsPipBusy, setSettingsPipBusy] = useState(false);
   const [settingsPipStatus, setSettingsPipStatus] = useState('');
+  const [settingsPipIncludeInput, setSettingsPipIncludeInput] = useState('');
+  const [settingsPipIncludeBusy, setSettingsPipIncludeBusy] = useState(false);
+  const [settingsPipIncludeStatus, setSettingsPipIncludeStatus] = useState('');
+  const [settingsCSharpNamespaceInput, setSettingsCSharpNamespaceInput] = useState('');
+  const [settingsCSharpNamespaceBusy, setSettingsCSharpNamespaceBusy] = useState(false);
+  const [settingsCSharpNamespaceStatus, setSettingsCSharpNamespaceStatus] = useState('');
   const [syncMeta, setSyncMeta] = useState<SyncMeta[]>(loadSyncMeta);
   const editorRef = useRef<any>(null);
   const outputContainerRef = useRef<HTMLDivElement>(null);
@@ -1191,7 +1232,11 @@ export default function App() {
   useEffect(() => {
     if (isSettingsOpen) {
       setSettingsPipPackages(loadSavedPipPackages());
+      setSettingsPipIncludedModules(loadSavedPipIncludedModules());
+      setSettingsCSharpNamespaces(loadSavedCSharpNamespaces());
       setSettingsPipStatus('');
+      setSettingsPipIncludeStatus('');
+      setSettingsCSharpNamespaceStatus('');
     }
   }, [isSettingsOpen]);
 
@@ -1224,6 +1269,35 @@ export default function App() {
     }
     return () => {
       if (pyodideIdleTimerRef.current) clearTimeout(pyodideIdleTimerRef.current);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (persistedPipIncludesRestoredRef.current) return;
+    persistedPipIncludesRestoredRef.current = true;
+
+    let cancelled = false;
+    (async () => {
+      const savedModules = loadSavedPipIncludedModules();
+      if (savedModules.length === 0) return;
+
+      for (const moduleName of savedModules) {
+        try {
+          await includeTypeshedModule(moduleName);
+        } catch (err) {
+          console.warn(`Failed to restore persisted pip include '${moduleName}':`, err);
+        }
+      }
+
+      if (!cancelled && editorRef.current) {
+        try {
+          pyrightProvider.setupDiagnostics(editorRef.current);
+        } catch { }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
     };
   }, []);
 
@@ -1543,6 +1617,7 @@ json.dumps(_extract(${JSON.stringify(pkgName)}))
   const pyodideRestoredRef = useRef(false);
   const pyodideIdleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pythonStubContributionsRef = useRef<Record<string, UserFolder>>({});
+  const persistedPipIncludesRestoredRef = useRef(false);
   const PYODIDE_IDLE_TIMEOUT = 60_000;
 
   const unloadPyodide = () => {
@@ -3120,6 +3195,9 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
         setTerminalOutput([...newOutput, `Including '${pkg}' in Pyright type checker...`]);
         try {
           const reloaded = await includeTypeshedModule(pkg, msg => setTerminalOutput(prev => [...prev, msg]));
+          if (reloaded || isModuleIncluded(pkg)) {
+            addSavedPipIncludedModule(pkg);
+          }
           if (reloaded && editorRef.current) {
             pyrightProvider.setupDiagnostics(editorRef.current);
           }
@@ -3192,6 +3270,18 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
     return saved;
   };
 
+  const refreshSettingsPipIncludedModules = () => {
+    const saved = loadSavedPipIncludedModules();
+    setSettingsPipIncludedModules(saved);
+    return saved;
+  };
+
+  const refreshSettingsCSharpNamespaces = () => {
+    const saved = loadSavedCSharpNamespaces();
+    setSettingsCSharpNamespaces(saved);
+    return saved;
+  };
+
   const runSettingsPipCommand = async (command: string) => {
     setSettingsPipBusy(true);
     setSettingsPipStatus(`Running \`${command}\`. Detailed logs will appear in Terminal.`);
@@ -3200,6 +3290,28 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
       return refreshSettingsPipPackages();
     } finally {
       setSettingsPipBusy(false);
+    }
+  };
+
+  const runSettingsPipIncludeCommand = async (command: string) => {
+    setSettingsPipIncludeBusy(true);
+    setSettingsPipIncludeStatus(`Running \`${command}\`. Detailed logs will appear in Terminal.`);
+    try {
+      await executeTerminalCommand(command, false);
+      return refreshSettingsPipIncludedModules();
+    } finally {
+      setSettingsPipIncludeBusy(false);
+    }
+  };
+
+  const runSettingsCSharpNamespaceCommand = async (command: string) => {
+    setSettingsCSharpNamespaceBusy(true);
+    setSettingsCSharpNamespaceStatus(`Running \`${command}\`. Detailed logs will appear in Terminal.`);
+    try {
+      await executeTerminalCommand(command, false);
+      return refreshSettingsCSharpNamespaces();
+    } finally {
+      setSettingsCSharpNamespaceBusy(false);
     }
   };
 
@@ -3242,6 +3354,52 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
     } else {
       setSettingsPipStatus(`Removed ${normalized}.`);
     }
+  };
+
+  const handleSettingsPipIncludeApply = async () => {
+    const moduleName = settingsPipIncludeInput.trim();
+    if (!moduleName) {
+      setSettingsPipIncludeStatus('Enter a Python module name first.');
+      return;
+    }
+
+    const saved = await runSettingsPipIncludeCommand(`pip include ${moduleName}`);
+    if (saved.includes(moduleName)) {
+      setSettingsPipIncludeStatus(`Saved ${moduleName} for future restores.`);
+      setSettingsPipIncludeInput('');
+    } else {
+      setSettingsPipIncludeStatus(`No saved include entry was added for ${moduleName}. Check Terminal output for the failure details.`);
+    }
+  };
+
+  const handleSettingsPipIncludeRemove = (moduleName: string) => {
+    const next = settingsPipIncludedModules.filter(name => name !== moduleName);
+    savePipIncludedModules(next);
+    setSettingsPipIncludedModules(next);
+    setSettingsPipIncludeStatus(`Removed saved include ${moduleName}.`);
+  };
+
+  const handleSettingsCSharpNamespaceApply = async () => {
+    const namespaceName = settingsCSharpNamespaceInput.trim();
+    if (!namespaceName) {
+      setSettingsCSharpNamespaceStatus('Enter a C# namespace first.');
+      return;
+    }
+
+    const saved = await runSettingsCSharpNamespaceCommand(`nuget include ${namespaceName}`);
+    if (saved.includes(namespaceName)) {
+      setSettingsCSharpNamespaceStatus(`Saved ${namespaceName} for future restores.`);
+      setSettingsCSharpNamespaceInput('');
+    } else {
+      setSettingsCSharpNamespaceStatus(`No saved namespace entry was added for ${namespaceName}. Check Terminal output for the failure details.`);
+    }
+  };
+
+  const handleSettingsCSharpNamespaceRemove = (namespaceName: string) => {
+    const next = settingsCSharpNamespaces.filter(name => name !== namespaceName);
+    saveCSharpNamespaces(next);
+    setSettingsCSharpNamespaces(next);
+    setSettingsCSharpNamespaceStatus(`Removed saved namespace ${namespaceName}.`);
   };
 
   const handleTerminalCommand = async (e: React.KeyboardEvent) => {
@@ -3968,6 +4126,141 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
                         ))}
                       </div>
                     )}
+                  </div>
+                </section>
+
+                <section>
+                  <h4 className="text-xs font-bold uppercase tracking-widest text-zinc-500 mb-4">Package Includes</h4>
+                  <div className="space-y-4">
+                    <div className="rounded-2xl border border-white/10 bg-white/5 p-4 space-y-3">
+                      <div>
+                        <div className="text-sm font-medium text-white">Manage Saved `pip include` Modules</div>
+                        <div className="text-xs text-zinc-500 mt-1">These modules are restored into Pyright when the app starts.</div>
+                      </div>
+
+                      <div className="grid grid-cols-1 sm:grid-cols-[minmax(0,1fr)_auto] gap-3">
+                        <input
+                          type="text"
+                          value={settingsPipIncludeInput}
+                          onChange={(e) => setSettingsPipIncludeInput(e.target.value)}
+                          onKeyDown={async (e) => {
+                            if (e.key === 'Enter' && !settingsPipIncludeBusy) {
+                              e.preventDefault();
+                              await handleSettingsPipIncludeApply();
+                            }
+                          }}
+                          placeholder="Module name, e.g. asyncio"
+                          className="w-full rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-sm text-white outline-none transition-colors focus:border-indigo-500"
+                        />
+                        <button
+                          onClick={handleSettingsPipIncludeApply}
+                          disabled={settingsPipIncludeBusy}
+                          className={cn(
+                            "px-4 py-2 rounded-xl text-sm font-semibold transition-colors",
+                            settingsPipIncludeBusy
+                              ? "bg-zinc-700 text-zinc-400 cursor-not-allowed"
+                              : "bg-indigo-600 hover:bg-indigo-500 text-white"
+                          )}
+                        >
+                          {settingsPipIncludeBusy ? 'Working...' : 'Include'}
+                        </button>
+                      </div>
+
+                      {settingsPipIncludeStatus && (
+                        <p className="text-xs text-indigo-300 bg-indigo-500/10 border border-indigo-500/20 rounded-xl px-3 py-2">
+                          {settingsPipIncludeStatus}
+                        </p>
+                      )}
+
+                      {settingsPipIncludedModules.length === 0 ? (
+                        <p className="text-sm text-zinc-500">No saved `pip include` modules.</p>
+                      ) : (
+                        <div className="space-y-2">
+                          {settingsPipIncludedModules.map(moduleName => (
+                            <div key={moduleName} className="flex items-center justify-between gap-3 p-3 rounded-xl bg-black/20 border border-white/10">
+                              <div className="text-sm font-medium text-white break-all min-w-0">{moduleName}</div>
+                              <button
+                                onClick={() => handleSettingsPipIncludeRemove(moduleName)}
+                                disabled={settingsPipIncludeBusy}
+                                className={cn(
+                                  "px-3 py-1.5 rounded-lg text-xs font-medium transition-colors shrink-0",
+                                  settingsPipIncludeBusy
+                                    ? "bg-zinc-700 text-zinc-400 cursor-not-allowed"
+                                    : "bg-red-500/10 text-red-300 hover:bg-red-500/20 border border-red-500/20"
+                                )}
+                              >
+                                Remove
+                              </button>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+
+                    <div className="rounded-2xl border border-white/10 bg-white/5 p-4 space-y-3">
+                      <div>
+                        <div className="text-sm font-medium text-white">Manage Saved `nuget include` Namespaces</div>
+                        <div className="text-xs text-zinc-500 mt-1">These namespaces are restored when C# authoring initializes.</div>
+                      </div>
+
+                      <div className="grid grid-cols-1 sm:grid-cols-[minmax(0,1fr)_auto] gap-3">
+                        <input
+                          type="text"
+                          value={settingsCSharpNamespaceInput}
+                          onChange={(e) => setSettingsCSharpNamespaceInput(e.target.value)}
+                          onKeyDown={async (e) => {
+                            if (e.key === 'Enter' && !settingsCSharpNamespaceBusy) {
+                              e.preventDefault();
+                              await handleSettingsCSharpNamespaceApply();
+                            }
+                          }}
+                          placeholder="Namespace, e.g. System.Xml"
+                          className="w-full rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-sm text-white outline-none transition-colors focus:border-indigo-500"
+                        />
+                        <button
+                          onClick={handleSettingsCSharpNamespaceApply}
+                          disabled={settingsCSharpNamespaceBusy}
+                          className={cn(
+                            "px-4 py-2 rounded-xl text-sm font-semibold transition-colors",
+                            settingsCSharpNamespaceBusy
+                              ? "bg-zinc-700 text-zinc-400 cursor-not-allowed"
+                              : "bg-indigo-600 hover:bg-indigo-500 text-white"
+                          )}
+                        >
+                          {settingsCSharpNamespaceBusy ? 'Working...' : 'Include'}
+                        </button>
+                      </div>
+
+                      {settingsCSharpNamespaceStatus && (
+                        <p className="text-xs text-indigo-300 bg-indigo-500/10 border border-indigo-500/20 rounded-xl px-3 py-2">
+                          {settingsCSharpNamespaceStatus}
+                        </p>
+                      )}
+
+                      {settingsCSharpNamespaces.length === 0 ? (
+                        <p className="text-sm text-zinc-500">No saved `nuget include` namespaces.</p>
+                      ) : (
+                        <div className="space-y-2">
+                          {settingsCSharpNamespaces.map(namespaceName => (
+                            <div key={namespaceName} className="flex items-center justify-between gap-3 p-3 rounded-xl bg-black/20 border border-white/10">
+                              <div className="text-sm font-medium text-white break-all min-w-0">{namespaceName}</div>
+                              <button
+                                onClick={() => handleSettingsCSharpNamespaceRemove(namespaceName)}
+                                disabled={settingsCSharpNamespaceBusy}
+                                className={cn(
+                                  "px-3 py-1.5 rounded-lg text-xs font-medium transition-colors shrink-0",
+                                  settingsCSharpNamespaceBusy
+                                    ? "bg-zinc-700 text-zinc-400 cursor-not-allowed"
+                                    : "bg-red-500/10 text-red-300 hover:bg-red-500/20 border border-red-500/20"
+                                )}
+                              >
+                                Remove
+                              </button>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
                   </div>
                 </section>
 
