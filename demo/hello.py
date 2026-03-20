@@ -2,6 +2,7 @@ import time
 import os
 import random
 
+
 # Configuration
 WIDTH = 100
 HEIGHT = 27

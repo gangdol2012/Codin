@@ -20,7 +20,6 @@ namespace CodeCraftDemo
             // Run for 100 generations autonomously
             for (int gen = 0; gen < 1000; gen++)
             {
-                gen.
                 // Reset cursor to top-left for a smooth "animation" effect
                 try { Console.SetCursorPosition(0, 0); } catch { }
 

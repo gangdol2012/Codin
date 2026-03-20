@@ -109,11 +109,16 @@ class CSharpLanguageService {
     this.setupDiagnostics(editor);
   }
 
-  setupDiagnostics(editor: monaco.editor.IStandaloneCodeEditor) {
+  clearEditor() {
     this.modelChangeListener?.dispose();
     this.modelChangeListener = null;
     this.editorChangeListener?.dispose();
     this.editorChangeListener = null;
+    this.model = null;
+  }
+
+  setupDiagnostics(editor: monaco.editor.IStandaloneCodeEditor) {
+    this.clearEditor();
 
     const updateModel = () => {
       this.modelChangeListener?.dispose();

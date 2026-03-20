@@ -22,9 +22,6 @@ import {
   Unlink
 } from 'lucide-react';
 import Editor, { DiffEditor } from '@monaco-editor/react';
-import { pyrightProvider, pyrightReady, reloadPyrightWithStubs, reloadPyrightAfterRemovingStubContribution, includeTypeshedModule, getCurrentPythonTypeModules, isModuleIncluded } from './pyright';
-import type { UserFolder } from './pyright';
-import { csharpService, csharpReady, ensureCSharpReady } from './csharp-intellisage';
 import { configureMonacoSuggestionAcceptance } from './monaco-suggest';
 import { motion, AnimatePresence } from 'motion/react';
 import { clsx, type ClassValue } from 'clsx';
@@ -32,10 +29,33 @@ import { twMerge } from 'tailwind-merge';
 import { GoogleGenAI, Type, type FunctionDeclaration } from "@google/genai";
 import ReactMarkdown from 'react-markdown';
 import { Layout, Model, TabNode, IJsonModel, Actions, DockLocation } from 'flexlayout-react';
-import { BrowserCSharp } from './browser-csharp-api';
 import 'flexlayout-react/style/dark.css';
 import * as Tooltip from '@radix-ui/react-tooltip';
 import * as Separator from '@radix-ui/react-separator';
+
+type UserFolder = import('./pyright').UserFolder;
+type PyrightModule = typeof import('./pyright');
+type CSharpAuthoringModule = typeof import('./csharp-intellisage');
+type BrowserCSharpModule = typeof import('./browser-csharp-api');
+
+let pyrightModulePromise: Promise<PyrightModule> | null = null;
+let csharpAuthoringModulePromise: Promise<CSharpAuthoringModule> | null = null;
+let browserCSharpModulePromise: Promise<BrowserCSharpModule> | null = null;
+
+const loadPyrightModule = () => {
+  if (!pyrightModulePromise) pyrightModulePromise = import('./pyright');
+  return pyrightModulePromise;
+};
+
+const loadCSharpAuthoringModule = () => {
+  if (!csharpAuthoringModulePromise) csharpAuthoringModulePromise = import('./csharp-intellisage');
+  return csharpAuthoringModulePromise;
+};
+
+const loadBrowserCSharpModule = () => {
+  if (!browserCSharpModulePromise) browserCSharpModulePromise = import('./browser-csharp-api');
+  return browserCSharpModulePromise;
+};
 
 const SYNC_DB_NAME = 'codecraft-sync';
 const SYNC_STORE_NAME = 'handles';
@@ -90,11 +110,292 @@ async function loadAllSyncHandles(): Promise<Map<string, FileSystemDirectoryHand
   });
 }
 
+interface ZipArchiveEntry {
+  name: string;
+  method: number;
+  compSize: number;
+  uncompSize: number;
+  localOff: number;
+}
+
+function zipU16(buf: Uint8Array, off: number) {
+  return buf[off] | (buf[off + 1] << 8);
+}
+
+function zipU32(buf: Uint8Array, off: number) {
+  return (buf[off] | (buf[off + 1] << 8) | (buf[off + 2] << 16) | (buf[off + 3] << 24)) >>> 0;
+}
+
+function parseZipEntries(data: Uint8Array): ZipArchiveEntry[] {
+  let eocd = -1;
+  for (let i = data.length - 22; i >= Math.max(0, data.length - 65557); i--) {
+    if (zipU32(data, i) === 0x06054b50) {
+      eocd = i;
+      break;
+    }
+  }
+  if (eocd === -1) return [];
+
+  const cdOff = zipU32(data, eocd + 16);
+  const cdSize = zipU32(data, eocd + 12);
+  const entries: ZipArchiveEntry[] = [];
+  let p = cdOff;
+
+  while (p < cdOff + cdSize) {
+    if (zipU32(data, p) !== 0x02014b50) break;
+    const method = zipU16(data, p + 10);
+    const compSize = zipU32(data, p + 20);
+    const uncompSize = zipU32(data, p + 24);
+    const nameLen = zipU16(data, p + 28);
+    const extraLen = zipU16(data, p + 30);
+    const commentLen = zipU16(data, p + 32);
+    const localOff = zipU32(data, p + 42);
+    const name = new TextDecoder().decode(data.subarray(p + 46, p + 46 + nameLen));
+    entries.push({ name, method, compSize, uncompSize, localOff });
+    p += 46 + nameLen + extraLen + commentLen;
+  }
+
+  return entries;
+}
+
+function readZipEntryRaw(data: Uint8Array, entry: ZipArchiveEntry): Uint8Array {
+  const nameLen = zipU16(data, entry.localOff + 26);
+  const extraLen = zipU16(data, entry.localOff + 28);
+  const start = entry.localOff + 30 + nameLen + extraLen;
+  return data.subarray(start, start + entry.compSize);
+}
+
+async function readZipEntryData(data: Uint8Array, entry: ZipArchiveEntry): Promise<Uint8Array> {
+  const raw = readZipEntryRaw(data, entry);
+  if (entry.method === 0) return raw;
+  if (entry.method === 8) {
+    const ds = new DecompressionStream('deflate-raw');
+    const writer = ds.writable.getWriter();
+    writer.write(raw as unknown as BufferSource);
+    writer.close();
+
+    const chunks: Uint8Array[] = [];
+    const reader = ds.readable.getReader();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+    }
+
+    const total = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+    const out = new Uint8Array(total);
+    let off = 0;
+    for (const chunk of chunks) {
+      out.set(chunk, off);
+      off += chunk.length;
+    }
+    return out;
+  }
+  throw new Error(`Unsupported ZIP method: ${entry.method}`);
+}
+
+function crc32(data: Uint8Array): number {
+  let crc = 0xFFFFFFFF;
+  for (let i = 0; i < data.length; i++) {
+    crc ^= data[i];
+    for (let j = 0; j < 8; j++) {
+      crc = (crc >>> 1) ^ (crc & 1 ? 0xEDB88320 : 0);
+    }
+  }
+  return (crc ^ 0xFFFFFFFF) >>> 0;
+}
+
+function buildStoredZip(files: Map<string, Uint8Array>): ArrayBuffer {
+  const enc = new TextEncoder();
+  const fileEntries: { name: Uint8Array; data: Uint8Array; crc: number; offset: number }[] = [];
+  let offset = 0;
+
+  for (const [name, data] of files) {
+    const nameBytes = enc.encode(name);
+    fileEntries.push({ name: nameBytes, data, crc: crc32(data), offset });
+    offset += 30 + nameBytes.length + data.length;
+  }
+
+  const cdStart = offset;
+  let cdSize = 0;
+  for (const entry of fileEntries) {
+    cdSize += 46 + entry.name.length;
+  }
+
+  const totalSize = cdStart + cdSize + 22;
+  const buf = new Uint8Array(totalSize);
+  const view = new DataView(buf.buffer);
+
+  let pos = 0;
+  for (const entry of fileEntries) {
+    view.setUint32(pos, 0x04034b50, true); pos += 4;
+    view.setUint16(pos, 20, true); pos += 2;
+    view.setUint16(pos, 0, true); pos += 2;
+    view.setUint16(pos, 0, true); pos += 2;
+    view.setUint32(pos, 0, true); pos += 4;
+    view.setUint32(pos, entry.crc, true); pos += 4;
+    view.setUint32(pos, entry.data.length, true); pos += 4;
+    view.setUint32(pos, entry.data.length, true); pos += 4;
+    view.setUint16(pos, entry.name.length, true); pos += 2;
+    view.setUint16(pos, 0, true); pos += 2;
+    buf.set(entry.name, pos); pos += entry.name.length;
+    buf.set(entry.data, pos); pos += entry.data.length;
+  }
+
+  for (const entry of fileEntries) {
+    view.setUint32(pos, 0x02014b50, true); pos += 4;
+    view.setUint16(pos, 20, true); pos += 2;
+    view.setUint16(pos, 20, true); pos += 2;
+    view.setUint16(pos, 0, true); pos += 2;
+    view.setUint16(pos, 0, true); pos += 2;
+    view.setUint32(pos, 0, true); pos += 4;
+    view.setUint32(pos, entry.crc, true); pos += 4;
+    view.setUint32(pos, entry.data.length, true); pos += 4;
+    view.setUint32(pos, entry.data.length, true); pos += 4;
+    view.setUint16(pos, entry.name.length, true); pos += 2;
+    view.setUint16(pos, 0, true); pos += 2;
+    view.setUint16(pos, 0, true); pos += 2;
+    view.setUint16(pos, 0, true); pos += 2;
+    view.setUint16(pos, 0, true); pos += 2;
+    view.setUint32(pos, 0, true); pos += 4;
+    view.setUint32(pos, entry.offset, true); pos += 4;
+    buf.set(entry.name, pos); pos += entry.name.length;
+  }
+
+  view.setUint32(pos, 0x06054b50, true); pos += 4;
+  view.setUint16(pos, 0, true); pos += 2;
+  view.setUint16(pos, 0, true); pos += 2;
+  view.setUint16(pos, fileEntries.length, true); pos += 2;
+  view.setUint16(pos, fileEntries.length, true); pos += 2;
+  view.setUint32(pos, cdSize, true); pos += 4;
+  view.setUint32(pos, cdStart, true); pos += 4;
+  view.setUint16(pos, 0, true);
+
+  return buf.buffer;
+}
+
+function pyodideStdlibRootFromZipEntry(name: string): string | null {
+  const first = name.split('/')[0]?.trim();
+  if (!first || first === '__pycache__' || first === 'site-packages') {
+    return null;
+  }
+  if (first === 'lib-dynload') {
+    const base = name.split('/').pop()?.trim() || '';
+    if (!base) return null;
+    return base.replace(/(\.cpython-[^.]+)?\.(so|pyd)$/i, '');
+  }
+  if (first.endsWith('.py') || first.endsWith('.pyi')) {
+    return first.replace(/\.(py|pyi)$/i, '');
+  }
+  return first;
+}
+
+function collectImportedTopLevelModulesFromPythonSource(source: string, currentRoot: string): string[] {
+  const normalized = source
+    .replace(/\\\r?\n/g, ' ')
+    .replace(/#[^\n]*/g, '');
+  const imports = new Set<string>();
+
+  for (const match of normalized.matchAll(/^\s*import\s+([^\n]+)/gm)) {
+    const clause = match[1] || '';
+    for (const part of clause.split(',')) {
+      const spec = part.trim().replace(/\s+as\s+.+$/, '');
+      const root = spec.split('.')[0]?.trim();
+      if (root) imports.add(root);
+    }
+  }
+
+  for (const match of normalized.matchAll(/^\s*from\s+([.\w]+)\s+import\b/gm)) {
+    const spec = (match[1] || '').trim();
+    if (!spec) continue;
+    if (spec.startsWith('.')) {
+      imports.add(currentRoot);
+      continue;
+    }
+    const root = spec.split('.')[0]?.trim();
+    if (root) imports.add(root);
+  }
+
+  return [...imports];
+}
+
+function shouldAlwaysKeepPyodideStdlibRoot(root: string): boolean {
+  return root.startsWith('_sysconfigdata__');
+}
+
+async function expandPyodideStdlibAllowedRoots(stdlibZip: ArrayBuffer, allowedRoots: Set<string>) {
+  const data = new Uint8Array(stdlibZip);
+  const entries = parseZipEntries(data);
+  const rootToEntries = new Map<string, ZipArchiveEntry[]>();
+  const textCache = new Map<string, string>();
+
+  for (const entry of entries) {
+    if (entry.name.endsWith('/')) continue;
+    const root = pyodideStdlibRootFromZipEntry(entry.name);
+    if (!root) continue;
+    const list = rootToEntries.get(root) || [];
+    list.push(entry);
+    rootToEntries.set(root, list);
+  }
+
+  const expandedRoots = new Set<string>(allowedRoots);
+  for (const root of rootToEntries.keys()) {
+    if (shouldAlwaysKeepPyodideStdlibRoot(root)) {
+      expandedRoots.add(root);
+    }
+  }
+  const queue = [...allowedRoots].filter(root => rootToEntries.has(root));
+
+  while (queue.length > 0) {
+    const root = queue.shift()!;
+    const rootEntries = rootToEntries.get(root) || [];
+    for (const entry of rootEntries) {
+      if (!entry.name.endsWith('.py') && !entry.name.endsWith('.pyi')) continue;
+
+      let source = textCache.get(entry.name);
+      if (source === undefined) {
+        source = new TextDecoder().decode(await readZipEntryData(data, entry));
+        textCache.set(entry.name, source);
+      }
+
+      const importedRoots = collectImportedTopLevelModulesFromPythonSource(source, root);
+      for (const importedRoot of importedRoots) {
+        if (!rootToEntries.has(importedRoot) || expandedRoots.has(importedRoot)) continue;
+        expandedRoots.add(importedRoot);
+        queue.push(importedRoot);
+      }
+    }
+  }
+
+  return { data, entries, expandedRoots };
+}
+
+async function buildFilteredPyodideStdlibZip(stdlibZip: ArrayBuffer, allowedRoots: Set<string>): Promise<ArrayBuffer> {
+  const { data, entries, expandedRoots } = await expandPyodideStdlibAllowedRoots(stdlibZip, allowedRoots);
+
+  const filtered = new Map<string, Uint8Array>();
+
+  for (const entry of entries) {
+    if (entry.name.endsWith('/')) continue;
+    const root = pyodideStdlibRootFromZipEntry(entry.name);
+    if (!root || !expandedRoots.has(root)) continue;
+    filtered.set(entry.name, await readZipEntryData(data, entry));
+  }
+
+  return buildStoredZip(filtered);
+}
+
 interface SyncMeta {
   folderId: string;
   folderName: string;
   localPath: string;
   connectedAt: number;
+}
+
+interface SharedEditorTarget {
+  tabId: string;
+  itemId: string;
+  version: number;
 }
 
 function loadSyncMeta(): SyncMeta[] {
@@ -255,6 +556,146 @@ const INITIAL_LAYOUT: IJsonModel = {
   }
 };
 
+const buildSharedEditorOptions = (fontSize: number) => ({
+  fontSize,
+  fontFamily: '"JetBrains Mono", "Fira Code", monospace',
+  readOnly: false,
+  domReadOnly: false,
+  tabFocusMode: false,
+  useTabStops: true,
+  stickyTabStops: false,
+  insertSpaces: true,
+  detectIndentation: true,
+  minimap: { enabled: true },
+  scrollBeyondLastLine: false,
+  scrollBeyondLastColumn: 5,
+  automaticLayout: true,
+  smoothScrolling: false,
+  padding: { top: 20 },
+  lineNumbers: 'on' as const,
+  lineNumbersMinChars: 5,
+  renderLineHighlight: 'all' as const,
+  renderValidationDecorations: 'editable' as const,
+  selectionHighlight: true,
+  occurrencesHighlight: 'singleFile' as const,
+  emptySelectionClipboard: true,
+  copyWithSyntaxHighlighting: true,
+  formatOnType: false,
+  formatOnPaste: false,
+  autoIndent: 'advanced' as const,
+  autoClosingBrackets: 'languageDefined' as const,
+  autoClosingComments: 'languageDefined' as const,
+  autoClosingQuotes: 'languageDefined' as const,
+  autoClosingDelete: 'auto' as const,
+  autoClosingOvertype: 'auto' as const,
+  autoSurround: 'languageDefined' as const,
+  matchBrackets: 'always' as const,
+  linkedEditing: false,
+  codeLens: true,
+  folding: true,
+  foldingStrategy: 'auto' as const,
+  foldingHighlight: true,
+  hover: {
+    enabled: true,
+    delay: 300,
+    sticky: true,
+    hidingDelay: 300,
+    above: false,
+  },
+  guides: {
+    indentation: true,
+    highlightActiveIndentation: true,
+    bracketPairs: false,
+    bracketPairsHorizontal: false,
+    highlightActiveBracketPair: false,
+  },
+  unicodeHighlight: {
+    ambiguousCharacters: false,
+    invisibleCharacters: false,
+    nonBasicASCII: false,
+    includeComments: false,
+    includeStrings: false,
+    allowedCharacters: {},
+    allowedLocales: { _os: true as const, _vscode: true as const },
+  },
+  inlayHints: {
+    enabled: 'on' as const,
+    fontSize: 0,
+    fontFamily: '',
+    padding: false,
+  },
+  quickSuggestions: {
+    other: true,
+    comments: false,
+    strings: true
+  },
+  quickSuggestionsDelay: 10,
+  suggest: {
+    insertMode: 'insert' as const,
+    filterGraceful: true,
+    snippetsPreventQuickSuggestions: false,
+    localityBonus: false,
+    shareSuggestSelections: false,
+    selectionMode: 'always' as const,
+    showIcons: true,
+    showStatusBar: false,
+    preview: false,
+    previewMode: 'prefix' as const,
+    showInlineDetails: true,
+    showMethods: true,
+    showFunctions: true,
+    showConstructors: true,
+    showDeprecated: true,
+    matchOnWordStartOnly: false,
+    showFields: true,
+    showVariables: true,
+    showClasses: true,
+    showStructs: true,
+    showInterfaces: true,
+    showModules: true,
+    showProperties: true,
+    showEvents: true,
+    showOperators: true,
+    showUnits: true,
+    showValues: true,
+    showConstants: true,
+    showEnums: true,
+    showEnumMembers: true,
+    showKeywords: true,
+    showWords: true,
+    showColors: true,
+    showFiles: true,
+    showReferences: true,
+    showFolders: true,
+    showTypeParameters: true,
+    showIssues: true,
+    showUsers: true,
+    showSnippets: true,
+  },
+  suggestOnTriggerCharacters: true,
+  acceptSuggestionOnEnter: 'on' as const,
+  acceptSuggestionOnCommitCharacter: true,
+  tabCompletion: 'off' as const,
+  snippetSuggestions: 'inline' as const,
+  suggestSelection: 'first' as const,
+  parameterHints: {
+    enabled: true,
+    cycle: true
+  },
+  inlineSuggest: {
+    enabled: true
+  },
+  wordBasedSuggestions: 'currentDocument' as const,
+  wordBasedSuggestionsOnlySameLanguage: false,
+  scrollbar: {
+    vertical: 'visible' as const,
+    horizontal: 'visible' as const,
+    useShadows: false,
+    verticalScrollbarSize: 10,
+    horizontalScrollbarSize: 10
+  }
+});
+
 // Define AI tools
 const proposeEditTool: FunctionDeclaration = {
   name: "proposeEdit",
@@ -393,6 +834,24 @@ function cn(...inputs: ClassValue[]) {
 const geminiAi = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || '' });
 
 interface SavedPipPackage { name: string; version: string; }
+type PyodidePackageInstallSource = 'pyodide-prebuilt' | 'micropip' | 'sdist' | 'url';
+
+interface CachedPyodideSiteFile {
+  relativePath: string;
+  data: Uint8Array;
+}
+
+interface CachedPyodidePackageMeta {
+  version: string;
+  source: PyodidePackageInstallSource;
+  stubs: UserFolder;
+}
+
+interface CachedPyodideEnvironmentSnapshot {
+  signature: string;
+  files: CachedPyodideSiteFile[];
+  packages: Record<string, CachedPyodidePackageMeta>;
+}
 
 function normalizeSavedPipPackageName(pkg: string) {
   return pkg.toLowerCase().replace(/[=<>!].*/, '').trim();
@@ -443,6 +902,97 @@ function addSavedPipPackage(pkg: string, version: string) {
 function removeSavedPipPackage(pkg: string) {
   const normalized = normalizeSavedPipPackageName(pkg);
   savePipPackages(loadSavedPipPackages().filter(p => p.name !== normalized));
+}
+
+function cloneUserFolder(folder: UserFolder): UserFolder {
+  const cloned: UserFolder = {};
+  for (const [name, value] of Object.entries(folder)) {
+    if (typeof value === 'string') {
+      cloned[name] = value;
+      continue;
+    }
+    if (value instanceof ArrayBuffer) {
+      cloned[name] = value.slice(0);
+      continue;
+    }
+    cloned[name] = cloneUserFolder(value);
+  }
+  return cloned;
+}
+
+function hasUserFolderEntries(folder: UserFolder) {
+  return Object.keys(folder).length > 0;
+}
+
+function buildSavedPipPackageSignature(pkgs: SavedPipPackage[]) {
+  return sortSavedPipPackages(pkgs)
+    .map(pkg => `${pkg.name}==${pkg.version}`)
+    .join('\n');
+}
+
+function ensurePyodideFsDirectory(pyodide: any, dirPath: string) {
+  const parts = dirPath.split('/').filter(Boolean);
+  let current = '';
+  for (const part of parts) {
+    current += `/${part}`;
+    try {
+      pyodide.FS.mkdir(current);
+    } catch { }
+  }
+}
+
+function readPyodideFsTree(pyodide: any, rootPath: string): CachedPyodideSiteFile[] {
+  const files: CachedPyodideSiteFile[] = [];
+
+  const visit = (currentPath: string) => {
+    let entries: string[] = [];
+    try {
+      entries = pyodide.FS.readdir(currentPath);
+    } catch {
+      return;
+    }
+
+    for (const entry of entries) {
+      if (entry === '.' || entry === '..') continue;
+      const fullPath = currentPath === '/' ? `/${entry}` : `${currentPath}/${entry}`;
+      let stat: any;
+      try {
+        stat = pyodide.FS.stat(fullPath);
+      } catch {
+        continue;
+      }
+
+      if (pyodide.FS.isDir(stat.mode)) {
+        visit(fullPath);
+        continue;
+      }
+      if (!pyodide.FS.isFile(stat.mode)) continue;
+
+      try {
+        const data = pyodide.FS.readFile(fullPath, { encoding: 'binary' });
+        const bytes = data instanceof Uint8Array ? new Uint8Array(data) : new Uint8Array(data);
+        const relativePath = fullPath.startsWith(`${rootPath}/`)
+          ? fullPath.slice(rootPath.length + 1)
+          : fullPath.slice(rootPath.length).replace(/^\/+/, '');
+        files.push({ relativePath, data: bytes });
+      } catch { }
+    }
+  };
+
+  visit(rootPath);
+  return files.sort((a, b) => a.relativePath.localeCompare(b.relativePath));
+}
+
+function writePyodideFsTree(pyodide: any, rootPath: string, files: CachedPyodideSiteFile[]) {
+  ensurePyodideFsDirectory(pyodide, rootPath);
+  for (const file of files) {
+    const fullPath = `${rootPath}/${file.relativePath}`.replace(/\/+/g, '/');
+    const lastSlash = fullPath.lastIndexOf('/');
+    if (lastSlash > 0) {
+      ensurePyodideFsDirectory(pyodide, fullPath.slice(0, lastSlash));
+    }
+    pyodide.FS.writeFile(fullPath, file.data);
+  }
 }
 
 function loadSavedPipIncludedModules(): string[] {
@@ -833,10 +1383,19 @@ export default function App() {
   const [settingsCSharpNamespaceStatus, setSettingsCSharpNamespaceStatus] = useState('');
   const [syncMeta, setSyncMeta] = useState<SyncMeta[]>(loadSyncMeta);
   const editorRef = useRef<any>(null);
+  const pythonDiagnosticsEditorRef = useRef<any>(null);
+  const csharpDiagnosticsEditorRef = useRef<any>(null);
+  const pyrightModuleRef = useRef<PyrightModule | null>(null);
+  const csharpAuthoringModuleRef = useRef<CSharpAuthoringModule | null>(null);
+  const browserCSharpModuleRef = useRef<BrowserCSharpModule | null>(null);
+  const [activeEditorTabId, setActiveEditorTabId] = useState<string | null>(null);
+  const [mountedSharedEditorTarget, setMountedSharedEditorTarget] = useState<SharedEditorTarget | null>(null);
   const outputContainerRef = useRef<HTMLDivElement>(null);
   const terminalContainerRef = useRef<HTMLDivElement>(null);
   const csharpRuntimeReadyRef = useRef<Promise<void> | null>(null);
   const skipEditorSyncRef = useRef(false);
+  const pendingSharedEditorTargetRef = useRef<{ tabId: string; itemId: string } | null>(null);
+  const sharedEditorVersionRef = useRef(0);
   const filesRef = useRef(files);
   filesRef.current = files;
   const syncHandlesRef = useRef<Map<string, FileSystemDirectoryHandle>>(new Map());
@@ -844,8 +1403,226 @@ export default function App() {
   const syncInitializedRef = useRef<Set<string>>(new Set());
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [activeSyncIds, setActiveSyncIds] = useState<Set<string>>(new Set());
+  const persistedPipIncludesRestoredRef = useRef(false);
+  const persistedCSharpNamespacesRestoredRef = useRef(false);
+  const persistedPythonPackageStubsRestoredRef = useRef(false);
 
   const activeItem = files.find(f => f.id === activeFileId);
+  const activeEditorTabNode: any = activeEditorTabId ? layoutModel.getNodeById(activeEditorTabId) : null;
+  const activeEditorTabItemId =
+    activeEditorTabNode?.getComponent?.() === 'editor'
+    && typeof activeEditorTabNode?.getConfig?.()?.itemId === 'string'
+      ? activeEditorTabNode.getConfig().itemId
+      : null;
+  const activeEditorTabItem = activeEditorTabItemId ? files.find(f => f.id === activeEditorTabItemId) : null;
+
+  const createSharedEditorTarget = useCallback((tabId: string, itemId: string): SharedEditorTarget => {
+    sharedEditorVersionRef.current += 1;
+    return {
+      tabId,
+      itemId,
+      version: sharedEditorVersionRef.current,
+    };
+  }, []);
+
+  const getPyrightModule = useCallback(async () => {
+    if (!pyrightModuleRef.current) {
+      pyrightModuleRef.current = await loadPyrightModule();
+    }
+    return pyrightModuleRef.current;
+  }, []);
+
+  const getCSharpAuthoringModule = useCallback(async () => {
+    if (!csharpAuthoringModuleRef.current) {
+      csharpAuthoringModuleRef.current = await loadCSharpAuthoringModule();
+    }
+    return csharpAuthoringModuleRef.current;
+  }, []);
+
+  const getBrowserCSharpModule = useCallback(async () => {
+    if (!browserCSharpModuleRef.current) {
+      browserCSharpModuleRef.current = await loadBrowserCSharpModule();
+    }
+    return browserCSharpModuleRef.current;
+  }, []);
+
+  const clearPyrightEditorBinding = useCallback(() => {
+    const provider = pyrightModuleRef.current?.pyrightProvider;
+    if (!provider) return;
+    provider.editorChangeListener?.dispose();
+    provider.editorChangeListener = undefined as any;
+  }, []);
+
+  const clearCSharpEditorBinding = useCallback(() => {
+    csharpAuthoringModuleRef.current?.csharpService.clearEditor();
+  }, []);
+
+  const resetSharedEditorOptions = useCallback((editor: any) => {
+    editor.updateOptions(buildSharedEditorOptions(settings.fontSize));
+    editor.getModel?.()?.updateOptions?.({
+      tabSize: 2,
+      indentSize: 2,
+      insertSpaces: true,
+      trimAutoWhitespace: true,
+      bracketColorizationOptions: {
+        enabled: false,
+        independentColorPoolPerBracketType: false,
+      },
+    });
+  }, [settings.fontSize]);
+
+  const buildMergedCachedPythonPackageStubs = useCallback(() => {
+    const nextStubContributions: Record<string, UserFolder> = {};
+    let mergedStubs: UserFolder = {};
+
+    for (const pkg of loadSavedPipPackages()) {
+      const normalized = normalizeSavedPipPackageName(pkg.name);
+      const cachedMeta = pyodideCachedPackageMetaRef.current[normalized];
+      if (!cachedMeta || !hasUserFolderEntries(cachedMeta.stubs)) continue;
+
+      const clonedStubs = cloneUserFolder(cachedMeta.stubs);
+      nextStubContributions[normalized] = clonedStubs;
+      mergedStubs = { ...mergedStubs, ...clonedStubs };
+    }
+
+    return { nextStubContributions, mergedStubs };
+  }, []);
+
+  const ensurePythonAuthoringReady = useCallback(async () => {
+    const pyright = await getPyrightModule();
+    await pyright.ensurePyrightReady();
+    if (!persistedPipIncludesRestoredRef.current) {
+      persistedPipIncludesRestoredRef.current = true;
+
+      for (const moduleName of loadSavedPipIncludedModules()) {
+        try {
+          await pyright.includeTypeshedModule(moduleName);
+        } catch (error) {
+          console.warn(`Failed to restore persisted pip include '${moduleName}':`, error);
+        }
+      }
+    }
+
+    if (!persistedPythonPackageStubsRestoredRef.current) {
+      const { nextStubContributions, mergedStubs } = buildMergedCachedPythonPackageStubs();
+      if (Object.keys(nextStubContributions).length > 0) {
+        pythonStubContributionsRef.current = nextStubContributions;
+      }
+      persistedPythonPackageStubsRestoredRef.current = true;
+
+      if (hasUserFolderEntries(mergedStubs)) {
+        try {
+          await pyright.reloadPyrightWithStubs(mergedStubs);
+        } catch (error) {
+          console.warn('Failed to restore cached Python package stubs into Pyright:', error);
+        }
+      }
+    }
+
+    return pyright;
+  }, [buildMergedCachedPythonPackageStubs, getPyrightModule]);
+
+  const ensureCSharpAuthoringReady = useCallback(async () => {
+    const csharpAuthoring = await getCSharpAuthoringModule();
+    await csharpAuthoring.ensureCSharpReady();
+    if (persistedCSharpNamespacesRestoredRef.current) return csharpAuthoring;
+    persistedCSharpNamespacesRestoredRef.current = true;
+
+    for (const namespaceName of loadSavedCSharpNamespaces()) {
+      try {
+        await csharpAuthoring.csharpService.includeNamespace(namespaceName);
+      } catch (error) {
+        console.warn(`Failed to restore C# namespace '${namespaceName}':`, error);
+      }
+    }
+    return csharpAuthoring;
+  }, [getCSharpAuthoringModule]);
+
+  const refreshPythonDiagnostics = useCallback(async () => {
+    const editor = pythonDiagnosticsEditorRef.current;
+    if (!editor) return;
+    if (editorRef.current !== editor) return;
+    if (editor.getModel?.()?.getLanguageId?.() !== 'python') return;
+
+    const pyright = await ensurePythonAuthoringReady();
+    if (pythonDiagnosticsEditorRef.current !== editor) return;
+    if (editorRef.current !== editor) return;
+    if (editor.getModel?.()?.getLanguageId?.() !== 'python') return;
+
+    clearPyrightEditorBinding();
+    pyright.pyrightProvider.setupDiagnostics(editor);
+  }, [clearPyrightEditorBinding, ensurePythonAuthoringReady]);
+
+  const refreshCSharpDiagnostics = useCallback(async () => {
+    const editor = csharpDiagnosticsEditorRef.current;
+    if (!editor) return;
+    if (editorRef.current !== editor) return;
+    if (editor.getModel?.()?.getLanguageId?.() !== 'csharp') return;
+
+    const csharpAuthoring = await ensureCSharpAuthoringReady();
+    if (csharpDiagnosticsEditorRef.current !== editor) return;
+    if (editorRef.current !== editor) return;
+    if (editor.getModel?.()?.getLanguageId?.() !== 'csharp') return;
+
+    csharpAuthoring.csharpService.setupEditor(editor);
+  }, [ensureCSharpAuthoringReady]);
+
+  const bindLanguageServicesToEditor = useCallback((editor: any) => {
+    editorRef.current = editor;
+    configureMonacoSuggestionAcceptance(editor);
+    resetSharedEditorOptions(editor);
+    const languageId = editor.getModel?.()?.getLanguageId?.();
+
+    if (languageId === 'python') {
+      pythonDiagnosticsEditorRef.current = editor;
+      void refreshPythonDiagnostics();
+    } else if (pythonDiagnosticsEditorRef.current === editor) {
+      clearPyrightEditorBinding();
+      pythonDiagnosticsEditorRef.current = null;
+    }
+
+    if (languageId === 'csharp') {
+      csharpDiagnosticsEditorRef.current = editor;
+      void refreshCSharpDiagnostics();
+    } else if (csharpDiagnosticsEditorRef.current === editor) {
+      clearCSharpEditorBinding();
+      csharpDiagnosticsEditorRef.current = null;
+    }
+  }, [clearCSharpEditorBinding, clearPyrightEditorBinding, refreshCSharpDiagnostics, refreshPythonDiagnostics, resetSharedEditorOptions]);
+
+  const handleEditorMount = useCallback((editor: any) => {
+    bindLanguageServicesToEditor(editor);
+    editor.onDidFocusEditorText(() => bindLanguageServicesToEditor(editor));
+    editor.onDidChangeModel(() => bindLanguageServicesToEditor(editor));
+    editor.onDidDispose(() => {
+      if (pythonDiagnosticsEditorRef.current === editor) {
+        clearPyrightEditorBinding();
+        pythonDiagnosticsEditorRef.current = null;
+      }
+      if (csharpDiagnosticsEditorRef.current === editor) {
+        clearCSharpEditorBinding();
+        csharpDiagnosticsEditorRef.current = null;
+      }
+      if (editorRef.current === editor) {
+        editorRef.current = null;
+      }
+
+      const pendingTarget = pendingSharedEditorTargetRef.current;
+      if (pendingTarget) {
+        pendingSharedEditorTargetRef.current = null;
+        setMountedSharedEditorTarget(current =>
+          current ?? createSharedEditorTarget(pendingTarget.tabId, pendingTarget.itemId)
+        );
+      }
+    });
+  }, [bindLanguageServicesToEditor, clearCSharpEditorBinding, clearPyrightEditorBinding, createSharedEditorTarget]);
+
+  const disposeMountedSharedEditor = useCallback(() => {
+    const editor = editorRef.current;
+    if (!editor) return false;
+    editor.dispose();
+    return true;
+  }, []);
 
   // Helper to get full path
   const getPath = (id: string | undefined): string => {
@@ -953,6 +1730,7 @@ export default function App() {
     const fallbackTabIds = collectFallbackEditorTabIds(jsonModel.layout);
     const existingTab = findEditorTabByItemId(jsonModel.layout, itemId);
     if (existingTab?.id) {
+      setActiveEditorTabId(existingTab.id);
       layoutModel.doAction(Actions.selectTab(existingTab.id));
       fallbackTabIds
         .filter(id => id !== existingTab.id)
@@ -974,6 +1752,7 @@ export default function App() {
           config: { itemId },
           enableClose: true
         }, parentTabsetId, DockLocation.CENTER, -1, true));
+        setActiveEditorTabId(`editor-panel-tab-${itemId}`);
         fallbackTabIds.forEach(id => layoutModel.doAction(Actions.deleteTab(id)));
       }
       skipEditorSyncRef.current = false;
@@ -994,6 +1773,7 @@ export default function App() {
       config: { itemId },
       enableClose: true
     }, editorTabsetId, DockLocation.CENTER, -1, true));
+    setActiveEditorTabId(`editor-panel-tab-${itemId}`);
     skipEditorSyncRef.current = false;
   };
 
@@ -1240,6 +2020,46 @@ export default function App() {
     }
   }, [isSettingsOpen]);
 
+  useEffect(() => {
+    if (!activeEditorTabId || !activeEditorTabItemId || activeEditorTabItem?.type !== 'file') {
+      pendingSharedEditorTargetRef.current = null;
+      setMountedSharedEditorTarget(null);
+      void disposeMountedSharedEditor();
+      return;
+    }
+
+    if (!mountedSharedEditorTarget) {
+      if (pendingSharedEditorTargetRef.current) {
+        return;
+      }
+      pendingSharedEditorTargetRef.current = null;
+      setMountedSharedEditorTarget(createSharedEditorTarget(activeEditorTabId, activeEditorTabItemId));
+      return;
+    }
+
+    if (
+      mountedSharedEditorTarget.tabId === activeEditorTabId
+      && mountedSharedEditorTarget.itemId === activeEditorTabItemId
+    ) {
+      pendingSharedEditorTargetRef.current = null;
+      return;
+    }
+
+    pendingSharedEditorTargetRef.current = { tabId: activeEditorTabId, itemId: activeEditorTabItemId };
+    setMountedSharedEditorTarget(null);
+    if (!disposeMountedSharedEditor()) {
+      pendingSharedEditorTargetRef.current = null;
+      setMountedSharedEditorTarget(createSharedEditorTarget(activeEditorTabId, activeEditorTabItemId));
+    }
+  }, [activeEditorTabId, activeEditorTabItem?.type, activeEditorTabItemId, createSharedEditorTarget, disposeMountedSharedEditor, mountedSharedEditorTarget]);
+
+  useEffect(() => {
+    const editor = editorRef.current;
+    if (!editor) return;
+    resetSharedEditorOptions(editor);
+    bindLanguageServicesToEditor(editor);
+  }, [bindLanguageServicesToEditor, mountedSharedEditorTarget?.version, resetSharedEditorOptions, settings.fontSize]);
+
 
   useEffect(() => {
     if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
@@ -1264,60 +2084,9 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (loadSavedPipPackages().length > 0) {
-      ensurePyodideWithPackages(msg => setTerminalOutput(prev => [...prev, msg]));
-    }
     return () => {
       if (pyodideIdleTimerRef.current) clearTimeout(pyodideIdleTimerRef.current);
     };
-  }, []);
-
-  useEffect(() => {
-    if (persistedPipIncludesRestoredRef.current) return;
-    persistedPipIncludesRestoredRef.current = true;
-
-    let cancelled = false;
-    (async () => {
-      const savedModules = loadSavedPipIncludedModules();
-      if (savedModules.length === 0) return;
-
-      for (const moduleName of savedModules) {
-        try {
-          await includeTypeshedModule(moduleName);
-        } catch (err) {
-          console.warn(`Failed to restore persisted pip include '${moduleName}':`, err);
-        }
-      }
-
-      if (!cancelled && editorRef.current) {
-        try {
-          pyrightProvider.setupDiagnostics(editorRef.current);
-        } catch { }
-      }
-    })();
-
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  useEffect(() => {
-    ensureCSharpReady()
-      .then(async () => {
-        for (const namespaceName of loadSavedCSharpNamespaces()) {
-          try {
-            await csharpService.includeNamespace(namespaceName);
-          } catch (error) {
-            console.warn(`Failed to restore C# namespace '${namespaceName}':`, error);
-          }
-        }
-      })
-      .catch(error => {
-        console.warn('Failed to initialize C# IntelliSense on app startup:', error);
-      });
-    ensureCSharpRuntime().catch(error => {
-      console.warn('Failed to initialize C# runtime on app startup:', error);
-    });
   }, []);
 
   useEffect(() => {
@@ -1381,7 +2150,7 @@ export default function App() {
     if (!pyodide) return {};
     try {
       const json = await pyodide.runPythonAsync(`
-import json, os, importlib, site
+import json, os, site, sys
 
 def _extract(pkg_name):
     MAX_TOTAL = 2 * 1024 * 1024  # 2MB total cap
@@ -1392,7 +2161,7 @@ def _extract(pkg_name):
         pkg_name.lower(),
     ]))
 
-    importlib.invalidate_caches()
+    sys.path_importer_cache.clear()
 
     # Find package directories to scan
     scan_dirs = []  # list of (base_dir, rel_parent)
@@ -1617,8 +2386,26 @@ json.dumps(_extract(${JSON.stringify(pkgName)}))
   const pyodideRestoredRef = useRef(false);
   const pyodideIdleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pythonStubContributionsRef = useRef<Record<string, UserFolder>>({});
-  const persistedPipIncludesRestoredRef = useRef(false);
+  const pyodideCachedPackageMetaRef = useRef<Record<string, CachedPyodidePackageMeta>>({});
+  const pyodidePackageSnapshotRef = useRef<CachedPyodideEnvironmentSnapshot | null>(null);
+  const pyodideStdlibSourceBufferRef = useRef<ArrayBuffer | null>(null);
+  const pyodideFilteredStdlibUrlRef = useRef<string | null>(null);
+  const pyodideFilteredStdlibSignatureRef = useRef('');
+  const pyodideStdlibSurfaceSignatureRef = useRef('');
   const PYODIDE_IDLE_TIMEOUT = 60_000;
+  const PYODIDE_INDEX_URL = 'https://cdn.jsdelivr.net/pyodide/v0.29.3/full';
+  const PYODIDE_STDLIB_URL = `${PYODIDE_INDEX_URL}/python_stdlib.zip`;
+  const PYODIDE_INTERNAL_RUNTIME_MODULES = [
+    '__future__', '_collections_abc', '_frozen_importlib', '_frozen_importlib_external', '_imp', '_io',
+    '_pyodide', '_pyodide_core', '_sitebuiltins', '_stat', '_thread', 'abc', 'ast', 'base64', 'binascii', 'builtins', 'codecs',
+    'collections', 'configparser', 'contextlib', 'copy', 'copyreg', 'dataclasses', 'email',
+    'encodings', 'enum', 'fnmatch', 'functools', 'genericpath', 'glob', 'hashlib', 'html',
+    'importlib', 'inspect', 'io', 'js', 'json', 'keyword', 'linecache', 'marshal', 'math', 'os',
+    'pathlib', 'pkgutil', 'platform', 'posixpath', 'queue', 're', 'reprlib', 'shutil', 'site',
+    'stat', 'string', 'struct', 'sys', 'sysconfig', 'tarfile', 'tempfile', 'textwrap',
+    'threading', 'token', 'tokenize', 'traceback', 'types', 'typing', 'urllib', 'warnings',
+    'weakref', 'zipfile', 'zipimport'
+  ];
 
   const unloadPyodide = () => {
     const py = (window as any).pyodide;
@@ -1639,7 +2426,7 @@ json.dumps(_extract(${JSON.stringify(pkgName)}))
       const scripts = document.querySelectorAll('script[src*="pyodide"]');
       scripts.forEach(s => s.remove());
       pyodideRestoredRef.current = false;
-      pythonStubContributionsRef.current = {};
+      pyodideStdlibSurfaceSignatureRef.current = '';
     }
   };
 
@@ -1648,52 +2435,515 @@ json.dumps(_extract(${JSON.stringify(pkgName)}))
     pyodideIdleTimerRef.current = setTimeout(unloadPyodide, PYODIDE_IDLE_TIMEOUT);
   };
 
+  const rememberCachedPyodidePackageMeta = useCallback((
+    pkgName: string,
+    version: string,
+    source: PyodidePackageInstallSource,
+    stubs: UserFolder
+  ) => {
+    const normalized = normalizeSavedPipPackageName(pkgName);
+    const clonedStubs = cloneUserFolder(stubs);
+    pyodideCachedPackageMetaRef.current[normalized] = {
+      version,
+      source,
+      stubs: clonedStubs,
+    };
+    pythonStubContributionsRef.current[normalized] = cloneUserFolder(clonedStubs);
+  }, []);
+
+  const forgetCachedPyodidePackageMeta = useCallback((pkgName: string) => {
+    const normalized = normalizeSavedPipPackageName(pkgName);
+    delete pyodideCachedPackageMetaRef.current[normalized];
+    delete pythonStubContributionsRef.current[normalized];
+  }, []);
+
+  const getCurrentPyodideSitePackagesPath = useCallback(async () => {
+    const pyodide = (window as any).pyodide;
+    if (!pyodide) throw new Error('Pyodide runtime is not loaded.');
+
+    const json = await pyodide.runPythonAsync(`
+import json
+import site
+import sys
+
+try:
+    _paths = site.getsitepackages()
+except Exception:
+    _paths = []
+
+if not _paths:
+    _paths = [next(
+        (_path for _path in sys.path if _path and _path.endswith('site-packages')),
+        "/lib/python{}.{}/site-packages".format(*sys.version_info[:2])
+    )]
+
+json.dumps(_paths[0])
+`);
+    return JSON.parse(json);
+  }, []);
+
+  const capturePyodidePackageRestoreSnapshot = useCallback(async (log?: (msg: string) => void) => {
+    const pyodide = (window as any).pyodide;
+    if (!pyodide) return;
+
+    const savedPkgs = loadSavedPipPackages();
+    if (savedPkgs.length === 0) {
+      pyodidePackageSnapshotRef.current = null;
+      return;
+    }
+
+    const sitePackagesPath = await getCurrentPyodideSitePackagesPath();
+    const files = readPyodideFsTree(pyodide, sitePackagesPath);
+    const packages: Record<string, CachedPyodidePackageMeta> = {};
+
+    for (const pkg of savedPkgs) {
+      const normalized = normalizeSavedPipPackageName(pkg.name);
+      const cachedMeta = pyodideCachedPackageMetaRef.current[normalized];
+      const stubs = cachedMeta?.stubs || pythonStubContributionsRef.current[normalized] || {};
+      packages[normalized] = {
+        version: pkg.version,
+        source: cachedMeta?.source || 'micropip',
+        stubs: cloneUserFolder(stubs),
+      };
+    }
+
+    pyodidePackageSnapshotRef.current = {
+      signature: buildSavedPipPackageSignature(savedPkgs),
+      files,
+      packages,
+    };
+    log?.(`Cached ${savedPkgs.length} package(s) in memory for fast restore.`);
+  }, [getCurrentPyodideSitePackagesPath]);
+
+  const restorePyodidePackageRestoreSnapshot = useCallback(async (
+    savedPkgs: SavedPipPackage[],
+    log?: (msg: string) => void
+  ): Promise<UserFolder | null> => {
+    const pyodide = (window as any).pyodide;
+    const snapshot = pyodidePackageSnapshotRef.current;
+    if (!pyodide || !snapshot) return null;
+    if (snapshot.signature !== buildSavedPipPackageSignature(savedPkgs)) return null;
+
+    const sitePackagesPath = await getCurrentPyodideSitePackagesPath();
+    writePyodideFsTree(pyodide, sitePackagesPath, snapshot.files);
+    await pyodide.runPythonAsync(`
+import sys
+sys.path_importer_cache.clear()
+`);
+
+    const prebuiltPackages = savedPkgs
+      .filter(pkg => snapshot.packages[normalizeSavedPipPackageName(pkg.name)]?.source === 'pyodide-prebuilt')
+      .map(pkg => pkg.name);
+    if (prebuiltPackages.length > 0) {
+      log?.(`Rehydrating ${prebuiltPackages.length} Pyodide prebuilt package(s): ${prebuiltPackages.join(', ')}...`);
+      await pyodide.loadPackage(prebuiltPackages);
+    }
+
+    const nextStubContributions: Record<string, UserFolder> = {};
+    let mergedStubs: UserFolder = {};
+
+    for (const pkg of savedPkgs) {
+      const normalized = normalizeSavedPipPackageName(pkg.name);
+      const cachedMeta = snapshot.packages[normalized];
+      if (!cachedMeta) continue;
+
+      rememberCachedPyodidePackageMeta(
+        normalized,
+        pkg.version || cachedMeta.version,
+        cachedMeta.source,
+        cachedMeta.stubs
+      );
+
+      if (!hasUserFolderEntries(cachedMeta.stubs)) continue;
+      const clonedStubs = cloneUserFolder(cachedMeta.stubs);
+      nextStubContributions[normalized] = clonedStubs;
+      mergedStubs = { ...mergedStubs, ...clonedStubs };
+    }
+
+    pythonStubContributionsRef.current = nextStubContributions;
+    log?.(`Restored ${savedPkgs.length} package(s) from in-memory cache.`);
+    return mergedStubs;
+  }, [getCurrentPyodideSitePackagesPath, rememberCachedPyodidePackageMeta]);
+
+  const getAllowedPyodideStdlibModules = useCallback(() => (
+    [...new Set([
+      ...PYODIDE_INTERNAL_RUNTIME_MODULES,
+      ...loadSavedPipIncludedModules(),
+    ])].sort((a, b) => a.localeCompare(b))
+  ), []);
+
+  const ensureFilteredPyodideStdlibUrl = useCallback(async (log?: (msg: string) => void) => {
+    const allowedModules = getAllowedPyodideStdlibModules();
+    const nextSignature = allowedModules.join('\n');
+    if (
+      pyodideFilteredStdlibSignatureRef.current === nextSignature
+      && pyodideFilteredStdlibUrlRef.current
+    ) {
+      return pyodideFilteredStdlibUrlRef.current;
+    }
+
+    if (!pyodideStdlibSourceBufferRef.current) {
+      log?.('Preparing filtered Pyodide standard library...');
+      const stdlibRes = await fetch(PYODIDE_STDLIB_URL);
+      if (!stdlibRes.ok) {
+        throw new Error('Failed to download Pyodide standard library archive.');
+      }
+      pyodideStdlibSourceBufferRef.current = await stdlibRes.arrayBuffer();
+    }
+
+    const filteredZip = await buildFilteredPyodideStdlibZip(
+      pyodideStdlibSourceBufferRef.current,
+      new Set(allowedModules)
+    );
+
+    if (pyodideFilteredStdlibUrlRef.current) {
+      URL.revokeObjectURL(pyodideFilteredStdlibUrlRef.current);
+    }
+
+    pyodideFilteredStdlibUrlRef.current = URL.createObjectURL(
+      new Blob([filteredZip], { type: 'application/zip' })
+    );
+    pyodideFilteredStdlibSignatureRef.current = nextSignature;
+    return pyodideFilteredStdlibUrlRef.current;
+  }, [PYODIDE_STDLIB_URL, getAllowedPyodideStdlibModules]);
+
+  const syncPyodideStdlibSurface = async (log?: (msg: string) => void) => {
+    const pyodide = (window as any).pyodide;
+    if (!pyodide) return;
+    const allowedModules = getAllowedPyodideStdlibModules();
+    const expandedAllowedModules = pyodideStdlibSourceBufferRef.current
+      ? [...(await expandPyodideStdlibAllowedRoots(
+        pyodideStdlibSourceBufferRef.current,
+        new Set(allowedModules)
+      )).expandedRoots].sort((a, b) => a.localeCompare(b))
+      : allowedModules;
+
+    const nextSignature = expandedAllowedModules.join('\n');
+    if (pyodideStdlibSurfaceSignatureRef.current === nextSignature) {
+      return;
+    }
+
+    const summaryJson = await pyodide.runPythonAsync(`
+import json
+import os
+import re
+import shutil
+import sys
+import sysconfig
+import zipfile
+
+_allowed = set(json.loads(${JSON.stringify(JSON.stringify(expandedAllowedModules))}))
+_target_root = "/tmp/codecraft-stdlib"
+_target_stdlib = os.path.join(_target_root, "stdlib")
+_target_dynload = os.path.join(_target_stdlib, "lib-dynload")
+
+if os.path.isdir(_target_root):
+    shutil.rmtree(_target_root)
+os.makedirs(_target_stdlib, exist_ok=True)
+os.makedirs(_target_dynload, exist_ok=True)
+
+def _stdlib_root_from_entry(name: str):
+    first = name.split('/', 1)[0].strip()
+    if not first or first in {"__pycache__", "site-packages", "lib-dynload"}:
+        return None
+    if first.endswith((".py", ".pyi")):
+        return re.sub(r'\\.(pyi|py)$', '', first)
+    return first
+
+def _dynload_root_from_entry(name: str):
+    base = os.path.basename(name).strip()
+    if not base or base == "__pycache__":
+        return None
+    return re.sub(r'(\\.cpython-[^.]+)?\\.(so|pyd)$', '', base)
+
+def _copy_file(src: str, dest: str):
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    with open(src, 'rb') as _sf:
+        _data = _sf.read()
+    with open(dest, 'wb') as _df:
+        _df.write(_data)
+
+_stdlib_dir = sysconfig.get_paths().get('stdlib') or ''
+_stdlib_parent = os.path.dirname(_stdlib_dir) if _stdlib_dir else ''
+_dynload_dir = os.path.join(_stdlib_dir, 'lib-dynload') if _stdlib_dir else ''
+_zip_paths = [
+    _path for _path in list(sys.path)
+    if _path
+    and _path.endswith('.zip')
+    and os.path.isfile(_path)
+    and (
+        os.path.basename(_path).startswith('python')
+        or (_stdlib_parent and os.path.dirname(_path) == _stdlib_parent)
+    )
+]
+
+_copied_roots = set()
+_copied_dynload = set()
+
+if _stdlib_dir and os.path.isdir(_stdlib_dir):
+    for _entry in os.listdir(_stdlib_dir):
+        _src = os.path.join(_stdlib_dir, _entry)
+        if _entry == 'site-packages':
+            continue
+        if _entry == 'lib-dynload':
+            if os.path.isdir(_src):
+                for _dyn_entry in os.listdir(_src):
+                    _root = _dynload_root_from_entry(_dyn_entry)
+                    if _root and _root in _allowed:
+                        _copy_file(os.path.join(_src, _dyn_entry), os.path.join(_target_dynload, _dyn_entry))
+                        _copied_dynload.add(_root)
+            continue
+
+        _root = _stdlib_root_from_entry(_entry)
+        if not _root or _root not in _allowed:
+            continue
+
+        _dest = os.path.join(_target_stdlib, _entry)
+        if os.path.isdir(_src):
+            shutil.copytree(_src, _dest, dirs_exist_ok=True)
+        elif os.path.isfile(_src):
+            _copy_file(_src, _dest)
+        _copied_roots.add(_root)
+
+for _zip_path in _zip_paths:
+    try:
+        with zipfile.ZipFile(_zip_path) as _zf:
+            for _member in _zf.infolist():
+                if _member.is_dir():
+                    continue
+                _name = _member.filename
+                if _name.startswith('lib-dynload/'):
+                    _root = _dynload_root_from_entry(_name)
+                    if not _root or _root not in _allowed:
+                        continue
+                    _dest = os.path.join(_target_stdlib, _name)
+                    os.makedirs(os.path.dirname(_dest), exist_ok=True)
+                    with open(_dest, 'wb') as _df:
+                        _df.write(_zf.read(_member))
+                    _copied_dynload.add(_root)
+                    continue
+
+                _root = _stdlib_root_from_entry(_name)
+                if not _root or _root not in _allowed:
+                    continue
+                _dest = os.path.join(_target_stdlib, _name)
+                os.makedirs(os.path.dirname(_dest), exist_ok=True)
+                with open(_dest, 'wb') as _df:
+                    _df.write(_zf.read(_member))
+                _copied_roots.add(_root)
+    except Exception:
+        pass
+
+_removed_path_entries = set(_zip_paths)
+if _stdlib_dir:
+    _removed_path_entries.add(_stdlib_dir)
+if _dynload_dir:
+    _removed_path_entries.add(_dynload_dir)
+
+_preserved_sys_path = [
+    _path for _path in sys.path
+    if _path not in _removed_path_entries
+]
+_next_sys_path = [_target_stdlib]
+if os.path.isdir(_target_dynload) and os.listdir(_target_dynload):
+    _next_sys_path.append(_target_dynload)
+_next_sys_path.extend(_preserved_sys_path)
+sys.path[:] = _next_sys_path
+
+_removed_modules = []
+def _is_stdlib_origin(origin):
+    if not origin or origin in ('built-in', 'frozen'):
+        return False
+    _origin = str(origin)
+    if _origin.startswith(_target_stdlib) or _origin.startswith(_target_dynload):
+        return True
+    if _stdlib_dir and _origin.startswith(_stdlib_dir):
+        return True
+    if _dynload_dir and _origin.startswith(_dynload_dir):
+        return True
+    for _zip_path in _zip_paths:
+        if _origin.startswith(_zip_path) or os.path.basename(_zip_path) in _origin:
+            return True
+    return False
+
+for _name in list(sys.modules.keys()):
+    _root = _name.split('.', 1)[0]
+    if not _root or _root in _allowed:
+        continue
+    _module = sys.modules.get(_name)
+    _origin = getattr(getattr(_module, '__spec__', None), 'origin', None) if _module is not None else None
+    if not _is_stdlib_origin(_origin):
+        continue
+    sys.modules.pop(_name, None)
+    _removed_modules.append(_name)
+
+sys.path_importer_cache.clear()
+
+json.dumps({
+    "allowed_count": len(_allowed),
+    "copied_stdlib_roots": sorted(_copied_roots),
+    "copied_dynload_roots": sorted(_copied_dynload),
+    "removed_modules_count": len(_removed_modules),
+})
+`);
+
+    pyodideStdlibSurfaceSignatureRef.current = nextSignature;
+
+    try {
+      const summary = JSON.parse(summaryJson);
+      log?.(
+        `Pyodide stdlib synced to ${summary.allowed_count} allowed top-level modules ` +
+        `(${summary.copied_stdlib_roots.length} stdlib, ${summary.copied_dynload_roots.length} dynload).`
+      );
+    } catch {
+      log?.('Pyodide stdlib surface updated.');
+    }
+  };
+
   const ensurePyodideWithPackages = async (log?: (msg: string) => void) => {
     if (!(window as any).pyodide) {
       log?.('Loading Python runtime (Pyodide)... this may take a few seconds.');
       await ensurePyodideScript();
-      (window as any).pyodide = await (window as any).loadPyodide({ enableRunUntilComplete: false });
+      const stdLibURL = await ensureFilteredPyodideStdlibUrl(log);
+      (window as any).pyodide = await (window as any).loadPyodide({
+        enableRunUntilComplete: false,
+        fullStdLib: false,
+        stdLibURL,
+      });
     }
     if (!pyodideRestoredRef.current) {
       pyodideRestoredRef.current = true;
-      pythonStubContributionsRef.current = {};
       const savedPkgs = loadSavedPipPackages();
+      let mergedStubs: UserFolder = {};
+
       if (savedPkgs.length > 0) {
-        const pyodide = (window as any).pyodide;
-        const specs = savedPkgs.map(p => p.version ? `${p.name}==${p.version}` : p.name);
-        log?.(`Restoring ${savedPkgs.length} package(s): ${specs.join(', ')}...`);
-        try {
-          await pyodide.loadPackage("micropip");
-          const micropip = pyodide.pyimport("micropip");
-          await micropip.install(specs, { keep_going: true });
-          log?.(`Restored: ${specs.join(', ')}`);
-        } catch (err) {
-          log?.(`Warning: some packages could not be restored: ${err instanceof Error ? err.message : String(err)}`);
+        const restoredFromCache = await restorePyodidePackageRestoreSnapshot(savedPkgs, log);
+        if (restoredFromCache) {
+          mergedStubs = restoredFromCache;
+        } else {
+          const pyodide = (window as any).pyodide;
+          const specs = savedPkgs.map(p => p.version ? `${p.name}==${p.version}` : p.name);
+          const nextStubContributions: Record<string, UserFolder> = {};
+          let restoredFromNetwork = false;
+
+          log?.(`Restoring ${savedPkgs.length} package(s): ${specs.join(', ')}...`);
+          try {
+            await pyodide.loadPackage("micropip");
+            const micropip = pyodide.pyimport("micropip");
+            await micropip.install(specs, { keep_going: true });
+            restoredFromNetwork = true;
+            log?.(`Restored: ${specs.join(', ')}`);
+          } catch (err) {
+            log?.(`Warning: some packages could not be restored: ${err instanceof Error ? err.message : String(err)}`);
+          }
+
+          for (const pkg of savedPkgs) {
+            const normalized = normalizeSavedPipPackageName(pkg.name);
+            const cachedMeta = pyodideCachedPackageMetaRef.current[normalized];
+            let stubs = cachedMeta?.stubs && hasUserFolderEntries(cachedMeta.stubs)
+              ? cloneUserFolder(cachedMeta.stubs)
+              : {};
+
+            if (!hasUserFolderEntries(stubs)) {
+              try {
+                stubs = await extractPyodideStubs(pkg.name);
+              } catch {
+                alert('Failed to extract stubs from Pyodide package');
+                stubs = {};
+              }
+            }
+
+            rememberCachedPyodidePackageMeta(
+              pkg.name,
+              pkg.version,
+              cachedMeta?.source || 'micropip',
+              stubs
+            );
+
+            if (!hasUserFolderEntries(stubs)) continue;
+            nextStubContributions[normalized] = cloneUserFolder(stubs);
+            mergedStubs = { ...mergedStubs, ...stubs };
+          }
+
+          pythonStubContributionsRef.current = nextStubContributions;
+
+          if (restoredFromNetwork) {
+            try {
+              await capturePyodidePackageRestoreSnapshot(log);
+            } catch (snapshotError) {
+              log?.(`Warning: failed to cache restored packages in memory: ${snapshotError instanceof Error ? snapshotError.message : String(snapshotError)}`);
+            }
+          }
         }
 
-        let mergedStubs: UserFolder = {};
-        for (const p of savedPkgs) {
-          try {
-            const stubs = await extractPyodideStubs(p.name);
-            if (Object.keys(stubs).length > 0) {
-              pythonStubContributionsRef.current[p.name.toLowerCase()] = stubs;
-              mergedStubs = { ...mergedStubs, ...stubs };
-            }
-          } catch { alert('Failed to extract stubs from Pyodide package'); }
-        }
         if (Object.keys(mergedStubs).length > 0) {
           log?.('Updating Pyright language support...');
           try {
-            await reloadPyrightWithStubs(mergedStubs);
-            if (editorRef.current) {
-              pyrightProvider.setupDiagnostics(editorRef.current);
-            }
+            persistedPythonPackageStubsRestoredRef.current = true;
+            const pyright = await ensurePythonAuthoringReady();
+            await pyright.reloadPyrightWithStubs(mergedStubs);
+            await refreshPythonDiagnostics();
           } catch { }
         }
+      } else {
+        pythonStubContributionsRef.current = {};
       }
     }
+    await syncPyodideStdlibSurface(log);
     resetPyodideIdleTimer();
   };
+
+  const syncInstalledPythonPackageSupport = useCallback(async (
+    pkgName: string,
+    version: string,
+    source: PyodidePackageInstallSource,
+    log: (msg: string) => void
+  ) => {
+    const normalized = normalizeSavedPipPackageName(pkgName);
+    let stubs: UserFolder = {};
+
+    addSavedPipPackage(pkgName, version);
+    log('Updating editor language support...');
+    log('  Extracting type stubs...');
+
+    try {
+      stubs = await extractPyodideStubs(pkgName);
+      log(`  Found ${Object.keys(stubs).length} stub entries`);
+    } catch (extractErr) {
+      log(`  Stub extraction error: ${extractErr instanceof Error ? extractErr.message : String(extractErr)}`);
+      stubs = {};
+    }
+
+    rememberCachedPyodidePackageMeta(pkgName, version, source, stubs);
+
+    if (hasUserFolderEntries(stubs)) {
+      log('  Reloading Pyright LSP...');
+      try {
+        persistedPythonPackageStubsRestoredRef.current = true;
+        const pyright = await ensurePythonAuthoringReady();
+        await pyright.reloadPyrightWithStubs(stubs);
+      } catch (reloadErr) {
+        log(`  Pyright reload error: ${reloadErr instanceof Error ? reloadErr.message : String(reloadErr)}`);
+      }
+
+      try {
+        await refreshPythonDiagnostics();
+      } catch (diagErr) {
+        log(`  Diagnostics setup error: ${diagErr instanceof Error ? diagErr.message : String(diagErr)}`);
+      }
+
+      log(`Language support updated for ${pkgName}`);
+    } else {
+      delete pythonStubContributionsRef.current[normalized];
+      log(`No type stubs found for ${pkgName} (import may still work)`);
+    }
+
+    try {
+      await capturePyodidePackageRestoreSnapshot();
+    } catch (snapshotErr) {
+      log(`Warning: Could not cache installed packages for fast restore: ${snapshotErr instanceof Error ? snapshotErr.message : String(snapshotErr)}`);
+    }
+  }, [capturePyodidePackageRestoreSnapshot, ensurePythonAuthoringReady, extractPyodideStubs, rememberCachedPyodidePackageMeta, refreshPythonDiagnostics]);
 
   const collectImportedPythonModules = async (code: string): Promise<string[]> => {
     const pyodide = (window as any).pyodide;
@@ -1749,7 +2999,8 @@ json.dumps(sorted(_imports))
     const importedModules = await collectImportedPythonModules(code);
     if (importedModules.length === 0) return;
 
-    const allowedModules = new Set(await getCurrentPythonTypeModules());
+    const pyright = await ensurePythonAuthoringReady();
+    const allowedModules = new Set(await pyright.getCurrentPythonTypeModules());
     const missingModules = importedModules.filter(moduleName => !allowedModules.has(moduleName));
 
     if (missingModules.length > 0) {
@@ -1808,19 +3059,25 @@ json.dumps(sorted(_imports))
         else reject(error || new Error('Failed to initialize C# WebAssembly runtime.'));
       };
 
-      BrowserCSharp.OnReady((success) => {
-        settle(success, new Error('C# WebAssembly runtime failed to load.'));
-      });
+      void getBrowserCSharpModule()
+        .then(({ BrowserCSharp }) => {
+          BrowserCSharp.OnReady((success) => {
+            settle(success, new Error('C# WebAssembly runtime failed to load.'));
+          });
 
-      const scriptId = 'codecraft-csharp-wasm-loader';
-      if (document.getElementById(scriptId)) return;
+          const scriptId = 'codecraft-csharp-wasm-loader';
+          if (document.getElementById(scriptId)) return;
 
-      const script = document.createElement('script');
-      script.id = scriptId;
-      script.src = '/_framework/blazor.webassembly.js';
-      script.async = true;
-      script.onerror = () => settle(false, new Error('Unable to load blazor.webassembly.js for C# runtime.'));
-      document.body.appendChild(script);
+          const script = document.createElement('script');
+          script.id = scriptId;
+          script.src = '/_framework/blazor.webassembly.js';
+          script.async = true;
+          script.onerror = () => settle(false, new Error('Unable to load blazor.webassembly.js for C# runtime.'));
+          document.body.appendChild(script);
+        })
+        .catch((error) => {
+          settle(false, error instanceof Error ? error : new Error(String(error)));
+        });
     });
 
     return csharpRuntimeReadyRef.current;
@@ -1833,6 +3090,7 @@ json.dumps(sorted(_imports))
       setOutput('Compiling and executing C# (WebAssembly, regular program)...');
 
       await ensureCSharpRuntime();
+      const { BrowserCSharp } = await getBrowserCSharpModule();
       const result = await BrowserCSharp.executeRegular(code);
 
       const stdOut = (result.stdOut || '').trim();
@@ -2038,6 +3296,7 @@ json.dumps(sorted(_imports))
     const jsonModel = layoutModel.toJson() as IJsonModel;
     const assistantChatIds = new Set<string>();
     let selectedEditorItemId: string | null = null;
+    let selectedEditorTabId: string | null = null;
     let hasSelectedEditorTab = false;
 
     const collectLayoutState = (node: any) => {
@@ -2049,6 +3308,7 @@ json.dumps(sorted(_imports))
         const selectedTab = node.children[selectedIndex];
         if (selectedTab?.component === 'editor') {
           hasSelectedEditorTab = true;
+          selectedEditorTabId = typeof selectedTab.id === 'string' ? selectedTab.id : null;
           selectedEditorItemId = typeof selectedTab.config?.itemId === 'string' ? selectedTab.config.itemId : null;
         }
       }
@@ -2076,11 +3336,8 @@ json.dumps(sorted(_imports))
       });
     }
     if (skipEditorSyncRef.current) return;
-    const shouldSyncEditorSelection =
-      action?.type === Actions.SELECT_TAB || action?.type === Actions.DELETE_TAB;
-    if (shouldSyncEditorSelection && hasSelectedEditorTab) {
-      setActiveFileId(selectedEditorItemId || '');
-    }
+    setActiveEditorTabId(selectedEditorTabId);
+    setActiveFileId(hasSelectedEditorTab ? (selectedEditorItemId || '') : '');
   };
 
   useEffect(() => {
@@ -2549,6 +3806,7 @@ json.dumps(sorted(_imports))
           setTerminalOutput(prev => [...prev, `Installing from URL: ${name}`]);
           await micropip.install(name, { deps: false });
           setTerminalOutput(prev => [...prev, `Successfully installed from URL`]);
+          await syncInstalledPythonPackageSupport(name, '', 'url', msg => setTerminalOutput(prev => [...prev, msg]));
           return;
         }
 
@@ -2571,7 +3829,7 @@ json.dumps(sorted(_imports))
           await micropip.install(spec, { deps: false });
         }
         setTerminalOutput(prev => [...prev, `Successfully upgraded ${name} to ${data.info.version}`]);
-        addSavedPipPackage(name, data.info.version);
+        await syncInstalledPythonPackageSupport(name, data.info.version, 'micropip', msg => setTerminalOutput(prev => [...prev, msg]));
       };
 
       if (subCmd === 'upgrade' && pkg) {
@@ -2627,6 +3885,7 @@ json.dumps(sorted(_imports))
           };
 
           let installed = false;
+          let installSource: PyodidePackageInstallSource | null = null;
           const isUrl = /^https?:\/\//i.test(pkg);
 
           if (isUrl) {
@@ -2636,6 +3895,7 @@ json.dumps(sorted(_imports))
               await micropipInstallWithRetry(pkg);
               setTerminalOutput(prev => [...prev, `Installed from URL`]);
               installed = true;
+              installSource = 'url';
             } catch (urlErr) {
               setTerminalOutput(prev => [...prev, `Failed to install from URL: ${urlErr instanceof Error ? urlErr.message : String(urlErr)}`]);
             }
@@ -2646,6 +3906,7 @@ json.dumps(sorted(_imports))
               await pyodide.loadPackage(pkg);
               setTerminalOutput(prev => [...prev, `[Tier 1] Loaded pre-built WASM package: ${pkg}`]);
               installed = true;
+              installSource = 'pyodide-prebuilt';
             } catch {
               setTerminalOutput(prev => [...prev, `[Tier 1] ${pkg} not in Pyodide pre-built index, trying PyPI...`]);
             }
@@ -2657,6 +3918,7 @@ json.dumps(sorted(_imports))
                 await micropipInstallWithRetry(pkg);
                 setTerminalOutput(prev => [...prev, `[Tier 2] Installed ${pkg} from PyPI`]);
                 installed = true;
+                installSource = 'micropip';
               } catch {
                 setTerminalOutput(prev => [...prev, `[Tier 2a] micropip index resolution failed, trying direct wheel URL...`]);
               }
@@ -2680,6 +3942,7 @@ json.dumps(sorted(_imports))
                     await micropipInstallWithRetry(wheel.url);
                     setTerminalOutput(prev => [...prev, `[Tier 2] Installed ${pkg} from direct wheel URL`]);
                     installed = true;
+                    installSource = 'micropip';
                   } catch (directErr) {
                     const errMsg = directErr instanceof Error ? directErr.message : String(directErr);
                     const conflict = errMsg.match(/Requested '([^']+)'.*but\s+(\S+)==\S+\s+is already installed/);
@@ -2968,7 +4231,7 @@ _json.dumps(_result)
 
               // Install the pure Python portions into Pyodide's filesystem
               const installResultJson = await pyodide.runPythonAsync(`
-import os, sys, json, importlib, configparser
+import os, sys, json, configparser
 
 _pkg_dir = ${JSON.stringify(buildInfo.pkg_dir)}
 _pkg_name = ${JSON.stringify(pkg)}
@@ -3092,8 +4355,8 @@ if _file_count > 0:
     with open(_top_level, 'w') as _tlf:
         _tlf.write("\\n".join(_import_names) + "\\n")
 
-# --- Invalidate import caches so Python discovers the new modules ---
-importlib.invalidate_caches()
+# --- Clear importer caches so Python discovers the new modules ---
+sys.path_importer_cache.clear()
 
 # Also clear any failed import attempts from sys.modules
 for _mod in list(sys.modules.keys()):
@@ -3107,6 +4370,7 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
               if (installResult.count > 0) {
                 setTerminalOutput(prev => [...prev, `[Tier 3] Installed ${installResult.count} files (modules: ${installResult.modules.join(', ')})`]);
                 installed = true;
+                installSource = 'sdist';
               } else {
                 throw new Error(`No installable Python files found in ${pkg} source`);
               }
@@ -3120,49 +4384,20 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
 
           if (installed) {
             let installedVersion = '';
-            try {
-              installedVersion = await pyodide.runPythonAsync(
-                `__import__('importlib.metadata').metadata.version(${JSON.stringify(pkg.replace(/-/g, '_'))})`
-              );
-            } catch {
+            if (!/^https?:\/\//i.test(pkg)) {
               try {
                 const pypiRes2 = await fetch(`https://pypi.org/pypi/${pkg}/json`);
                 if (pypiRes2.ok) installedVersion = (await pypiRes2.json()).info.version;
               } catch { }
             }
-            addSavedPipPackage(pkg, installedVersion);
             setTerminalOutput(prev => [...prev, `Successfully installed ${pkg}${installedVersion ? `==${installedVersion}` : ''}`]);
-            setTerminalOutput(prev => [...prev, 'Updating editor language support...']);
             try {
-              setTerminalOutput(prev => [...prev, '  Extracting type stubs...']);
-              let stubs: UserFolder;
-              try {
-                stubs = await extractPyodideStubs(pkg);
-              } catch (extractErr) {
-                setTerminalOutput(prev => [...prev, `  Stub extraction error: ${extractErr instanceof Error ? extractErr.message : String(extractErr)}`]);
-                stubs = {};
-              }
-              const stubCount = Object.keys(stubs).length;
-              setTerminalOutput(prev => [...prev, `  Found ${stubCount} stub entries`]);
-              if (stubCount > 0) {
-                pythonStubContributionsRef.current[pkg.toLowerCase().replace(/[=<>!].*/, '')] = stubs;
-                setTerminalOutput(prev => [...prev, '  Reloading Pyright LSP...']);
-                try {
-                  await reloadPyrightWithStubs(stubs);
-                } catch (reloadErr) {
-                  setTerminalOutput(prev => [...prev, `  Pyright reload error: ${reloadErr instanceof Error ? reloadErr.message : String(reloadErr)}`]);
-                }
-                if (editorRef.current) {
-                  try {
-                    pyrightProvider.setupDiagnostics(editorRef.current);
-                  } catch (diagErr) {
-                    setTerminalOutput(prev => [...prev, `  Diagnostics setup error: ${diagErr instanceof Error ? diagErr.message : String(diagErr)}`]);
-                  }
-                }
-                setTerminalOutput(prev => [...prev, `Language support updated for ${pkg}`]);
-              } else {
-                setTerminalOutput(prev => [...prev, `No type stubs found for ${pkg} (import may still work)`]);
-              }
+              await syncInstalledPythonPackageSupport(
+                pkg,
+                installedVersion,
+                installSource || 'micropip',
+                msg => setTerminalOutput(prev => [...prev, msg])
+              );
             } catch (stubErr) {
               setTerminalOutput(prev => [...prev, `Warning: Could not update language support: ${stubErr instanceof Error ? stubErr.message : String(stubErr)}`]);
             }
@@ -3177,16 +4412,16 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
           await pyodide.loadPackage("micropip");
           const micropip = pyodide.pyimport("micropip");
           micropip.uninstall(pkg);
-          const normalizedPkg = pkg.toLowerCase().replace(/[=<>!].*/, '');
+          const normalizedPkg = normalizeSavedPipPackageName(pkg);
           const stubContribution = pythonStubContributionsRef.current[normalizedPkg];
           if (stubContribution && Object.keys(stubContribution).length > 0) {
-            await reloadPyrightAfterRemovingStubContribution(stubContribution);
-            delete pythonStubContributionsRef.current[normalizedPkg];
-            if (editorRef.current) {
-              pyrightProvider.setupDiagnostics(editorRef.current);
-            }
+            const pyright = await ensurePythonAuthoringReady();
+            await pyright.reloadPyrightAfterRemovingStubContribution(stubContribution);
+            await refreshPythonDiagnostics();
           }
+          forgetCachedPyodidePackageMeta(pkg);
           removeSavedPipPackage(pkg);
+          await capturePyodidePackageRestoreSnapshot();
           setTerminalOutput([...newOutput, `Successfully uninstalled ${pkg}`]);
         } catch (err) {
           setTerminalOutput([...newOutput, `pip uninstall error: ${err instanceof Error ? err.message : String(err)}`]);
@@ -3194,12 +4429,25 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
       } else if (subCmd === 'include' && pkg) {
         setTerminalOutput([...newOutput, `Including '${pkg}' in Pyright type checker...`]);
         try {
-          const reloaded = await includeTypeshedModule(pkg, msg => setTerminalOutput(prev => [...prev, msg]));
-          if (reloaded || isModuleIncluded(pkg)) {
+          const pyright = await ensurePythonAuthoringReady();
+          const reloaded = await pyright.includeTypeshedModule(pkg, msg => setTerminalOutput(prev => [...prev, msg]));
+          if (reloaded || pyright.isModuleIncluded(pkg)) {
             addSavedPipIncludedModule(pkg);
+            if ((window as any).pyodide) {
+              try {
+                await capturePyodidePackageRestoreSnapshot();
+              } catch (snapshotErr) {
+                setTerminalOutput(prev => [...prev, `Warning: failed to cache installed packages before restarting Pyodide: ${snapshotErr instanceof Error ? snapshotErr.message : String(snapshotErr)}`]);
+              }
+              unloadPyodide();
+              setTerminalOutput(prev => [
+                ...prev,
+                'Pyodide runtime unloaded. The next Python action will boot with the updated filtered stdlib.'
+              ]);
+            }
           }
-          if (reloaded && editorRef.current) {
-            pyrightProvider.setupDiagnostics(editorRef.current);
+          if (reloaded) {
+            await refreshPythonDiagnostics();
           }
         } catch (err) {
           setTerminalOutput(prev => [...prev, `pip include error: ${err instanceof Error ? err.message : String(err)}`]);
@@ -3221,7 +4469,8 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
       if (subCmd === 'include' && namespaceName) {
         setTerminalOutput([...newOutput, `Including C# namespace '${namespaceName}'...`]);
         try {
-          const result = await csharpService.includeNamespace(namespaceName);
+          const csharpAuthoring = await ensureCSharpAuthoringReady();
+          const result = await csharpAuthoring.csharpService.includeNamespace(namespaceName);
           if (result.success) {
             addSavedCSharpNamespace(namespaceName);
           }
@@ -3372,10 +4621,20 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
     }
   };
 
-  const handleSettingsPipIncludeRemove = (moduleName: string) => {
+  const handleSettingsPipIncludeRemove = async (moduleName: string) => {
     const next = settingsPipIncludedModules.filter(name => name !== moduleName);
     savePipIncludedModules(next);
     setSettingsPipIncludedModules(next);
+    if ((window as any).pyodide) {
+      try {
+        await capturePyodidePackageRestoreSnapshot();
+      } catch (snapshotErr) {
+        setSettingsPipIncludeStatus(`Removed saved include ${moduleName}, but failed to cache installed packages before restart: ${snapshotErr instanceof Error ? snapshotErr.message : String(snapshotErr)}`);
+      }
+      unloadPyodide();
+      setSettingsPipIncludeStatus(`Removed saved include ${moduleName}. Pyodide will reload with the reduced stdlib on the next Python action.`);
+      return;
+    }
     setSettingsPipIncludeStatus(`Removed saved include ${moduleName}.`);
   };
 
@@ -3443,10 +4702,14 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
   const factoryImpl = (node: TabNode) => {
     const component = node.getComponent();
     if (component === "editor") {
+      const tabNodeId = node.getId();
       const tabItemId = (node as any).getConfig?.()?.itemId as string | undefined;
       const resolvedTabItemId = tabItemId || activeFileId;
       const tabItem = resolvedTabItemId ? files.find(f => f.id === resolvedTabItemId) : undefined;
-      const editorModelPath = tabItem ? `file:///${encodeURI(getPath(tabItem.id))}` : undefined;
+      const editorModelPath = tabItem ? `codecraft-model/${tabItem.id}/${encodeURI(getPath(tabItem.id))}` : undefined;
+      const shouldRenderSharedEditor =
+        mountedSharedEditorTarget?.tabId === tabNodeId
+        && mountedSharedEditorTarget.itemId === resolvedTabItemId;
 
       return (
         <div className="h-full w-full flex flex-col bg-[rgb(28,28,28)] text-zinc-300 relative">
@@ -3526,7 +4789,26 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
             </div>
           ) : (
             <div className="flex-1 overflow-hidden bg-[rgb(28,28,28)] w-full min-h-0 relative">
-              <Editor path={editorModelPath} height="100%" defaultLanguage={tabItem.language} language={tabItem.language} theme="vs-dark" value={tabItem.content} onMount={(editor) => { editorRef.current = editor; configureMonacoSuggestionAcceptance(editor); if (tabItem.language === 'python') { pyrightReady.then(() => { pyrightProvider.editorChangeListener?.dispose(); pyrightProvider.editorChangeListener = undefined as any; pyrightProvider.setupDiagnostics(editor); }); } if (tabItem.language === 'csharp') { csharpReady.then(() => { csharpService.setupEditor(editor); }); } }} onChange={(value) => { setFiles(prev => prev.map(f => f.id === resolvedTabItemId ? { ...f, content: value || '' } : f)); }} options={{ fontSize: settings.fontSize, fontFamily: '"JetBrains Mono", "Fira Code", monospace', minimap: { enabled: true }, scrollBeyondLastLine: false, automaticLayout: true, padding: { top: 20 }, lineNumbers: 'on', renderLineHighlight: 'all', acceptSuggestionOnEnter: 'on', acceptSuggestionOnCommitCharacter: true, scrollbar: { vertical: 'visible', horizontal: 'visible', useShadows: false, verticalScrollbarSize: 10, horizontalScrollbarSize: 10 } }} />
+              {shouldRenderSharedEditor ? (
+                <Editor
+                  key={`shared-editor:${mountedSharedEditorTarget.version}`}
+                  defaultPath={editorModelPath}
+                  saveViewState={false}
+                  keepCurrentModel={false}
+                  height="100%"
+                  defaultLanguage={tabItem.language}
+                  language={tabItem.language}
+                  theme="vs-dark"
+                  value={tabItem.content}
+                  onMount={handleEditorMount}
+                  onChange={(value) => {
+                    setFiles(prev => prev.map(f => f.id === resolvedTabItemId ? { ...f, content: value || '' } : f));
+                  }}
+                  options={buildSharedEditorOptions(settings.fontSize)}
+                />
+              ) : (
+                <div className="h-full w-full bg-[rgb(28,28,28)]" />
+              )}
             </div>
           )}
         </div>
@@ -4135,7 +5417,7 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
                     <div className="rounded-2xl border border-white/10 bg-white/5 p-4 space-y-3">
                       <div>
                         <div className="text-sm font-medium text-white">Manage Saved `pip include` Modules</div>
-                        <div className="text-xs text-zinc-500 mt-1">These modules are restored into Pyright when the app starts.</div>
+                        <div className="text-xs text-zinc-500 mt-1">These modules are restored the first time Python authoring loads.</div>
                       </div>
 
                       <div className="grid grid-cols-1 sm:grid-cols-[minmax(0,1fr)_auto] gap-3">
