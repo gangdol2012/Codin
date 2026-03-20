@@ -60,6 +60,10 @@ const loadBrowserCSharpModule = () => {
 const SYNC_DB_NAME = 'codecraft-sync';
 const SYNC_STORE_NAME = 'handles';
 const SYNC_META_KEY = 'codecraft-sync-meta';
+const PYTHON_CACHE_DB_NAME = 'codecraft-python-cache';
+const PYTHON_CACHE_STORE_NAME = 'pyodide-package-meta';
+const PYTHON_CACHE_PACKAGE_META_KEY = 'packages';
+const PYTHON_CACHE_PACKAGE_SNAPSHOT_KEY = 'snapshot';
 
 function openSyncDB(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
@@ -106,6 +110,19 @@ async function loadAllSyncHandles(): Promise<Map<string, FileSystemDirectoryHand
         resolve(map);
       }
     };
+    req.onerror = () => reject(req.error);
+  });
+}
+
+function openPythonCacheDB(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(PYTHON_CACHE_DB_NAME, 1);
+    req.onupgradeneeded = () => {
+      if (!req.result.objectStoreNames.contains(PYTHON_CACHE_STORE_NAME)) {
+        req.result.createObjectStore(PYTHON_CACHE_STORE_NAME);
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
   });
 }
@@ -954,6 +971,137 @@ function cloneUserFolder(folder: UserFolder): UserFolder {
   return cloned;
 }
 
+function cloneCachedPyodidePackageMetaRecord(
+  cache: Record<string, CachedPyodidePackageMeta>
+): Record<string, CachedPyodidePackageMeta> {
+  const cloned: Record<string, CachedPyodidePackageMeta> = {};
+  for (const [pkgName, meta] of Object.entries(cache)) {
+    cloned[pkgName] = {
+      version: meta.version,
+      source: meta.source,
+      stubs: cloneUserFolder(meta.stubs),
+    };
+  }
+  return cloned;
+}
+
+function cloneCachedPyodideEnvironmentSnapshot(
+  snapshot: CachedPyodideEnvironmentSnapshot | null
+): CachedPyodideEnvironmentSnapshot | null {
+  if (!snapshot) return null;
+  return {
+    signature: snapshot.signature,
+    files: snapshot.files.map(file => ({
+      relativePath: file.relativePath,
+      data: new Uint8Array(file.data),
+    })),
+    packages: cloneCachedPyodidePackageMetaRecord(snapshot.packages),
+  };
+}
+
+async function loadPersistedPyodidePackageMetaCache(): Promise<Record<string, CachedPyodidePackageMeta>> {
+  try {
+    const db = await openPythonCacheDB();
+    return await new Promise((resolve, reject) => {
+      const tx = db.transaction(PYTHON_CACHE_STORE_NAME, 'readonly');
+      const req = tx.objectStore(PYTHON_CACHE_STORE_NAME).get(PYTHON_CACHE_PACKAGE_META_KEY);
+      tx.oncomplete = () => {
+        const raw = req.result;
+        if (!raw || typeof raw !== 'object') {
+          resolve({});
+          return;
+        }
+
+        const next: Record<string, CachedPyodidePackageMeta> = {};
+        for (const [pkgName, value] of Object.entries(raw as Record<string, CachedPyodidePackageMeta>)) {
+          if (!value || typeof value !== 'object') continue;
+          if (typeof value.version !== 'string') continue;
+          if (typeof value.source !== 'string') continue;
+          const stubs = value.stubs && typeof value.stubs === 'object'
+            ? cloneUserFolder(value.stubs as UserFolder)
+            : {};
+          next[pkgName] = {
+            version: value.version,
+            source: value.source as PyodidePackageInstallSource,
+            stubs,
+          };
+        }
+        resolve(next);
+      };
+      tx.onerror = () => reject(tx.error);
+      req.onerror = () => reject(req.error);
+    });
+  } catch {
+    return {};
+  }
+}
+
+async function savePersistedPyodidePackageMetaCache(cache: Record<string, CachedPyodidePackageMeta>) {
+  const db = await openPythonCacheDB();
+  const snapshot = cloneCachedPyodidePackageMetaRecord(cache);
+  return new Promise<void>((resolve, reject) => {
+    const tx = db.transaction(PYTHON_CACHE_STORE_NAME, 'readwrite');
+    tx.objectStore(PYTHON_CACHE_STORE_NAME).put(snapshot, PYTHON_CACHE_PACKAGE_META_KEY);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+async function loadPersistedPyodidePackageSnapshot(): Promise<CachedPyodideEnvironmentSnapshot | null> {
+  try {
+    const db = await openPythonCacheDB();
+    return await new Promise((resolve, reject) => {
+      const tx = db.transaction(PYTHON_CACHE_STORE_NAME, 'readonly');
+      const req = tx.objectStore(PYTHON_CACHE_STORE_NAME).get(PYTHON_CACHE_PACKAGE_SNAPSHOT_KEY);
+      tx.oncomplete = () => {
+        const raw = req.result;
+        if (!raw || typeof raw !== 'object' || typeof raw.signature !== 'string' || !Array.isArray(raw.files)) {
+          resolve(null);
+          return;
+        }
+        const files = raw.files
+          .filter((file: CachedPyodideSiteFile) => (
+            !!file
+            && typeof file.relativePath === 'string'
+            && file.data instanceof Uint8Array
+          ))
+          .map((file: CachedPyodideSiteFile) => ({
+            relativePath: file.relativePath,
+            data: new Uint8Array(file.data),
+          }));
+        const packages = raw.packages && typeof raw.packages === 'object'
+          ? cloneCachedPyodidePackageMetaRecord(raw.packages as Record<string, CachedPyodidePackageMeta>)
+          : {};
+        resolve({
+          signature: raw.signature,
+          files,
+          packages,
+        });
+      };
+      tx.onerror = () => reject(tx.error);
+      req.onerror = () => reject(req.error);
+    });
+  } catch {
+    return null;
+  }
+}
+
+async function savePersistedPyodidePackageSnapshot(snapshot: CachedPyodideEnvironmentSnapshot | null) {
+  const db = await openPythonCacheDB();
+  const clonedSnapshot = cloneCachedPyodideEnvironmentSnapshot(snapshot);
+  return new Promise<void>((resolve, reject) => {
+    const tx = db.transaction(PYTHON_CACHE_STORE_NAME, 'readwrite');
+    const store = tx.objectStore(PYTHON_CACHE_STORE_NAME);
+    if (clonedSnapshot) {
+      store.put(clonedSnapshot, PYTHON_CACHE_PACKAGE_SNAPSHOT_KEY);
+    } else {
+      store.delete(PYTHON_CACHE_PACKAGE_SNAPSHOT_KEY);
+    }
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
 function hasUserFolderEntries(folder: UserFolder) {
   return Object.keys(folder).length > 0;
 }
@@ -1623,6 +1771,10 @@ export default function App() {
   const skipEditorSyncRef = useRef(false);
   const pendingSharedEditorTargetRef = useRef<{ tabId: string; itemId: string } | null>(null);
   const sharedEditorVersionRef = useRef(0);
+  const pyodideEnsurePromiseRef = useRef<Promise<void> | null>(null);
+  const persistedPyodidePackageMetaLoadPromiseRef = useRef<Promise<void> | null>(null);
+  const persistedPyodidePackageMetaLoadedRef = useRef(false);
+  const persistedPyodidePackageSnapshotLoadPromiseRef = useRef<Promise<void> | null>(null);
   const filesRef = useRef(files);
   filesRef.current = files;
   const syncHandlesRef = useRef<Map<string, FileSystemDirectoryHandle>>(new Map());
@@ -1715,7 +1867,80 @@ export default function App() {
     return { nextStubContributions, mergedStubs };
   }, []);
 
+  const ensurePersistedPyodidePackageMetaLoaded = useCallback(async () => {
+    if (persistedPyodidePackageMetaLoadedRef.current) return;
+    if (persistedPyodidePackageMetaLoadPromiseRef.current) {
+      await persistedPyodidePackageMetaLoadPromiseRef.current;
+      return;
+    }
+
+    const loadPromise = (async () => {
+      try {
+        const persistedCache = await loadPersistedPyodidePackageMetaCache();
+        if (Object.keys(persistedCache).length > 0) {
+          pyodideCachedPackageMetaRef.current = {
+            ...persistedCache,
+            ...pyodideCachedPackageMetaRef.current,
+          };
+        }
+      } catch (error) {
+        console.warn('Failed to load persisted Python package language-support cache:', error);
+      } finally {
+        persistedPyodidePackageMetaLoadedRef.current = true;
+      }
+    })();
+
+    persistedPyodidePackageMetaLoadPromiseRef.current = loadPromise;
+    try {
+      await loadPromise;
+    } finally {
+      if (persistedPyodidePackageMetaLoadPromiseRef.current === loadPromise) {
+        persistedPyodidePackageMetaLoadPromiseRef.current = null;
+      }
+    }
+  }, []);
+
+  const ensurePersistedPyodidePackageSnapshotLoaded = useCallback(async (savedPkgs: SavedPipPackage[]) => {
+    if (savedPkgs.length === 0) {
+      pyodidePackageSnapshotRef.current = null;
+      return;
+    }
+
+    const signature = buildSavedPipPackageSignature(savedPkgs);
+    if (pyodidePackageSnapshotRef.current?.signature === signature) {
+      return;
+    }
+    if (persistedPyodidePackageSnapshotLoadPromiseRef.current) {
+      await persistedPyodidePackageSnapshotLoadPromiseRef.current;
+      return;
+    }
+
+    const loadPromise = (async () => {
+      try {
+        const persistedSnapshot = await loadPersistedPyodidePackageSnapshot();
+        if (persistedSnapshot?.signature === signature) {
+          pyodidePackageSnapshotRef.current = persistedSnapshot;
+        }
+      } catch (error) {
+        console.warn('Failed to load persisted Pyodide package snapshot:', error);
+      }
+    })();
+
+    persistedPyodidePackageSnapshotLoadPromiseRef.current = loadPromise;
+    try {
+      await loadPromise;
+    } finally {
+      if (persistedPyodidePackageSnapshotLoadPromiseRef.current === loadPromise) {
+        persistedPyodidePackageSnapshotLoadPromiseRef.current = null;
+      }
+    }
+  }, []);
+
   const ensurePythonAuthoringReady = useCallback(async () => {
+    await ensurePersistedPyodidePackageMetaLoaded();
+
+    const initialCachedStubs = buildMergedCachedPythonPackageStubs();
+
     const pyright = await getPyrightModule();
     pyright.setInitialStubsGetter(() => {
       const { mergedStubs } = buildMergedCachedPythonPackageStubs();
@@ -1751,7 +1976,7 @@ export default function App() {
     }
 
     return pyright;
-  }, [buildMergedCachedPythonPackageStubs, getPyrightModule]);
+  }, [buildMergedCachedPythonPackageStubs, ensurePersistedPyodidePackageMetaLoaded, getPyrightModule]);
 
   const ensureCSharpAuthoringReady = useCallback(async () => {
     const csharpAuthoring = await getCSharpAuthoringModule();
@@ -2938,6 +3163,22 @@ gc.collect()
     pyodideIdleTimerRef.current = setTimeout(unloadPyodide, PYODIDE_IDLE_TIMEOUT);
   };
 
+  const persistPyodidePackageMetaCache = useCallback(async () => {
+    try {
+      await savePersistedPyodidePackageMetaCache(pyodideCachedPackageMetaRef.current);
+    } catch (error) {
+      console.warn('Failed to persist Python package language-support cache:', error);
+    }
+  }, []);
+
+  const persistPyodidePackageSnapshot = useCallback(async () => {
+    try {
+      await savePersistedPyodidePackageSnapshot(pyodidePackageSnapshotRef.current);
+    } catch (error) {
+      console.warn('Failed to persist Pyodide package snapshot:', error);
+    }
+  }, []);
+
   const rememberCachedPyodidePackageMeta = useCallback((
     pkgName: string,
     version: string,
@@ -2952,13 +3193,15 @@ gc.collect()
       stubs: clonedStubs,
     };
     pythonStubContributionsRef.current[normalized] = cloneUserFolder(clonedStubs);
-  }, []);
+    void persistPyodidePackageMetaCache();
+  }, [persistPyodidePackageMetaCache]);
 
   const forgetCachedPyodidePackageMeta = useCallback((pkgName: string) => {
     const normalized = normalizeSavedPipPackageName(pkgName);
     delete pyodideCachedPackageMetaRef.current[normalized];
     delete pythonStubContributionsRef.current[normalized];
-  }, []);
+    void persistPyodidePackageMetaCache();
+  }, [persistPyodidePackageMetaCache]);
 
   const getCurrentPyodideSitePackagesPath = useCallback(async () => {
     const pyodide = (window as any).pyodide;
@@ -2992,6 +3235,7 @@ json.dumps(_paths[0])
     const savedPkgs = loadSavedPipPackages();
     if (savedPkgs.length === 0) {
       pyodidePackageSnapshotRef.current = null;
+      await persistPyodidePackageSnapshot();
       return;
     }
 
@@ -3015,8 +3259,9 @@ json.dumps(_paths[0])
       files,
       packages,
     };
+    await persistPyodidePackageSnapshot();
     log?.(`Cached ${savedPkgs.length} package(s) in memory for fast restore.`);
-  }, [getCurrentPyodideSitePackagesPath]);
+  }, [getCurrentPyodideSitePackagesPath, persistPyodidePackageSnapshot]);
 
   const restorePyodidePackageRestoreSnapshot = useCallback(async (
     savedPkgs: SavedPipPackage[],
@@ -3026,6 +3271,7 @@ json.dumps(_paths[0])
     const snapshot = pyodidePackageSnapshotRef.current;
     if (!pyodide || !snapshot) return null;
     if (snapshot.signature !== buildSavedPipPackageSignature(savedPkgs)) return null;
+    if (snapshot.files.length === 0) return null;
 
     const sitePackagesPath = await getCurrentPyodideSitePackagesPath();
     writePyodideFsTree(pyodide, sitePackagesPath, snapshot.files);
@@ -3064,9 +3310,10 @@ sys.path_importer_cache.clear()
     }
 
     pythonStubContributionsRef.current = nextStubContributions;
-    log?.(`Restored ${savedPkgs.length} package(s) from in-memory cache.`);
+    await persistPyodidePackageMetaCache();
+    log?.(`Restored ${savedPkgs.length} package(s) from cached package snapshot.`);
     return mergedStubs;
-  }, [getCurrentPyodideSitePackagesPath, rememberCachedPyodidePackageMeta]);
+  }, [getCurrentPyodideSitePackagesPath, persistPyodidePackageMetaCache, rememberCachedPyodidePackageMeta]);
 
   const getAllowedPyodideStdlibModules = useCallback(() => (
     [...new Set([
@@ -3304,100 +3551,118 @@ json.dumps({
   };
 
   const ensurePyodideWithPackages = async (log?: (msg: string) => void) => {
-    clearPyodideIdleTimer();
-    if (!(window as any).pyodide) {
-      log?.('Loading Python runtime (Pyodide)... this may take a few seconds.');
-      const hostWindow = await ensurePyodideScript();
-      const stdLibURL = await ensureFilteredPyodideStdlibUrl(log);
-      const pyodide = await (hostWindow as any).loadPyodide({
-        enableRunUntilComplete: false,
-        fullStdLib: false,
-        stdLibURL,
-      });
-      (hostWindow as any).pyodide = pyodide;
-      (window as any).loadPyodide = (hostWindow as any).loadPyodide;
-      (window as any).pyodide = pyodide;
+    if (pyodideEnsurePromiseRef.current) {
+      await pyodideEnsurePromiseRef.current;
+      return;
     }
-    if (!pyodideRestoredRef.current) {
-      pyodideRestoredRef.current = true;
-      const savedPkgs = loadSavedPipPackages();
-      let mergedStubs: UserFolder = {};
 
-      if (savedPkgs.length > 0) {
-        const restoredFromCache = await restorePyodidePackageRestoreSnapshot(savedPkgs, log);
-        if (restoredFromCache) {
-          mergedStubs = restoredFromCache;
-        } else {
-          const pyodide = (window as any).pyodide;
-          const specs = savedPkgs.map(p => p.version ? `${p.name}==${p.version}` : p.name);
-          const nextStubContributions: Record<string, UserFolder> = {};
-          let restoredFromNetwork = false;
+    const ensurePromise = (async () => {
+      clearPyodideIdleTimer();
+      if (!(window as any).pyodide) {
+        log?.('Loading Python runtime (Pyodide)... this may take a few seconds.');
+        const hostWindow = await ensurePyodideScript();
+        const stdLibURL = await ensureFilteredPyodideStdlibUrl(log);
+        const pyodide = await (hostWindow as any).loadPyodide({
+          enableRunUntilComplete: false,
+          fullStdLib: false,
+          stdLibURL,
+        });
+        (hostWindow as any).pyodide = pyodide;
+        (window as any).loadPyodide = (hostWindow as any).loadPyodide;
+        (window as any).pyodide = pyodide;
+      }
+      if (!pyodideRestoredRef.current) {
+        pyodideRestoredRef.current = true;
+        const savedPkgs = loadSavedPipPackages();
+        let mergedStubs: UserFolder = {};
 
-          log?.(`Restoring ${savedPkgs.length} package(s): ${specs.join(', ')}...`);
-          try {
-            await pyodide.loadPackage("micropip");
-            const micropip = pyodide.pyimport("micropip");
-            await micropip.install(specs, { keep_going: true });
-            restoredFromNetwork = true;
-            log?.(`Restored: ${specs.join(', ')}`);
-          } catch (err) {
-            log?.(`Warning: some packages could not be restored: ${err instanceof Error ? err.message : String(err)}`);
-          }
+        if (savedPkgs.length > 0) {
+          await ensurePersistedPyodidePackageSnapshotLoaded(savedPkgs);
+          const restoredFromCache = await restorePyodidePackageRestoreSnapshot(savedPkgs, log);
+          if (restoredFromCache) {
+            mergedStubs = restoredFromCache;
+          } else {
+            const pyodide = (window as any).pyodide;
+            const specs = savedPkgs.map(p => p.version ? `${p.name}==${p.version}` : p.name);
+            const nextStubContributions: Record<string, UserFolder> = {};
+            let restoredFromNetwork = false;
 
-          for (const pkg of savedPkgs) {
-            const normalized = normalizeSavedPipPackageName(pkg.name);
-            const cachedMeta = pyodideCachedPackageMetaRef.current[normalized];
-            let stubs = cachedMeta?.stubs && hasUserFolderEntries(cachedMeta.stubs)
-              ? cloneUserFolder(cachedMeta.stubs)
-              : {};
+            log?.(`Restoring ${savedPkgs.length} package(s): ${specs.join(', ')}...`);
+            try {
+              await pyodide.loadPackage("micropip");
+              const micropip = pyodide.pyimport("micropip");
+              await micropip.install(specs, { keep_going: true });
+              restoredFromNetwork = true;
+              log?.(`Restored: ${specs.join(', ')}`);
+            } catch (err) {
+              log?.(`Warning: some packages could not be restored: ${err instanceof Error ? err.message : String(err)}`);
+            }
 
-            if (!hasUserFolderEntries(stubs)) {
+            for (const pkg of savedPkgs) {
+              const normalized = normalizeSavedPipPackageName(pkg.name);
+              const cachedMeta = pyodideCachedPackageMetaRef.current[normalized];
+              let stubs = cachedMeta?.stubs && hasUserFolderEntries(cachedMeta.stubs)
+                ? cloneUserFolder(cachedMeta.stubs)
+                : {};
+
+              if (!hasUserFolderEntries(stubs)) {
+                try {
+                  stubs = await extractPyodideStubs(pkg.name);
+                } catch {
+                  alert('Failed to extract stubs from Pyodide package');
+                  stubs = {};
+                }
+              }
+
+              rememberCachedPyodidePackageMeta(
+                pkg.name,
+                pkg.version,
+                cachedMeta?.source || 'micropip',
+                stubs
+              );
+
+              if (!hasUserFolderEntries(stubs)) continue;
+              nextStubContributions[normalized] = cloneUserFolder(stubs);
+              mergedStubs = { ...mergedStubs, ...stubs };
+            }
+
+            pythonStubContributionsRef.current = nextStubContributions;
+            await persistPyodidePackageMetaCache();
+
+            if (restoredFromNetwork) {
               try {
-                stubs = await extractPyodideStubs(pkg.name);
-              } catch {
-                alert('Failed to extract stubs from Pyodide package');
-                stubs = {};
+                await capturePyodidePackageRestoreSnapshot(log);
+              } catch (snapshotError) {
+                log?.(`Warning: failed to cache restored packages in memory: ${snapshotError instanceof Error ? snapshotError.message : String(snapshotError)}`);
               }
             }
-
-            rememberCachedPyodidePackageMeta(
-              pkg.name,
-              pkg.version,
-              cachedMeta?.source || 'micropip',
-              stubs
-            );
-
-            if (!hasUserFolderEntries(stubs)) continue;
-            nextStubContributions[normalized] = cloneUserFolder(stubs);
-            mergedStubs = { ...mergedStubs, ...stubs };
           }
 
-          pythonStubContributionsRef.current = nextStubContributions;
-
-          if (restoredFromNetwork) {
+          if (Object.keys(mergedStubs).length > 0) {
+            log?.('Updating Pyright language support...');
             try {
-              await capturePyodidePackageRestoreSnapshot(log);
-            } catch (snapshotError) {
-              log?.(`Warning: failed to cache restored packages in memory: ${snapshotError instanceof Error ? snapshotError.message : String(snapshotError)}`);
-            }
+              persistedPythonPackageStubsRestoredRef.current = true;
+              const pyright = await ensurePythonAuthoringReady();
+              await pyright.reloadPyrightWithStubs(mergedStubs);
+              await refreshPythonDiagnostics();
+            } catch { }
           }
+        } else {
+          pythonStubContributionsRef.current = {};
         }
+      }
+      await syncPyodideStdlibSurface(log);
+      resetPyodideIdleTimer();
+    })();
 
-        if (Object.keys(mergedStubs).length > 0) {
-          log?.('Updating Pyright language support...');
-          try {
-            persistedPythonPackageStubsRestoredRef.current = true;
-            const pyright = await ensurePythonAuthoringReady();
-            await pyright.reloadPyrightWithStubs(mergedStubs);
-            await refreshPythonDiagnostics();
-          } catch { }
-        }
-      } else {
-        pythonStubContributionsRef.current = {};
+    pyodideEnsurePromiseRef.current = ensurePromise;
+    try {
+      await ensurePromise;
+    } finally {
+      if (pyodideEnsurePromiseRef.current === ensurePromise) {
+        pyodideEnsurePromiseRef.current = null;
       }
     }
-    await syncPyodideStdlibSurface(log);
-    resetPyodideIdleTimer();
   };
 
   const syncInstalledPythonPackageSupport = useCallback(async (
@@ -3423,6 +3688,7 @@ json.dumps({
     }
 
     rememberCachedPyodidePackageMeta(pkgName, version, source, stubs);
+    await persistPyodidePackageMetaCache();
 
     if (hasUserFolderEntries(stubs)) {
       log('  Reloading Pyright LSP...');
@@ -3453,7 +3719,7 @@ json.dumps({
     } catch (snapshotErr) {
       log(`Warning: Could not cache installed packages for fast restore: ${snapshotErr instanceof Error ? snapshotErr.message : String(snapshotErr)}`);
     }
-  }, [capturePyodidePackageRestoreSnapshot, ensurePythonAuthoringReady, extractPyodideStubs, rememberCachedPyodidePackageMeta, refreshPythonDiagnostics]);
+  }, [capturePyodidePackageRestoreSnapshot, ensurePythonAuthoringReady, extractPyodideStubs, persistPyodidePackageMetaCache, rememberCachedPyodidePackageMeta, refreshPythonDiagnostics]);
 
   const collectImportedPythonModules = async (code: string): Promise<string[]> => {
     const pyodide = (window as any).pyodide;
@@ -4946,6 +5212,7 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
           }
           forgetCachedPyodidePackageMeta(pkg);
           removeSavedPipPackage(pkg);
+          await persistPyodidePackageMetaCache();
           await capturePyodidePackageRestoreSnapshot();
           setTerminalOutput([...newOutput, `Successfully uninstalled ${pkg}`]);
         } catch (err) {
