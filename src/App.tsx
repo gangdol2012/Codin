@@ -410,6 +410,8 @@ function saveSyncMeta(meta: SyncMeta[]) {
 const DEFAULT_ASSISTANT_CHAT_NAME = "AI assistant";
 const createAssistantChatId = () => `chat_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
 const INITIAL_ASSISTANT_CHAT_ID = createAssistantChatId();
+const DEFAULT_PYI_IMPORT_SIZE_LIMIT_BYTES = 200 * 1024;
+const ABSOLUTE_PYI_IMPORT_SIZE_LIMIT_BYTES = 2 * 1024 * 1024;
 const STORAGE_KEYS = {
   files: 'codecraft-files',
   settings: 'codecraft-settings',
@@ -417,7 +419,8 @@ const STORAGE_KEYS = {
   layout: 'codecraft-layout',
   pipPackages: 'codecraft-pip-packages',
   pipIncludedModules: 'codecraft-pip-included-modules',
-  csharpNamespaces: 'codecraft-csharp-namespaces'
+  csharpNamespaces: 'codecraft-csharp-namespaces',
+  pyiImportSizeLimits: 'codecraft-pyi-import-size-limits'
 };
 
 const EXT_TO_LANGUAGE: Record<string, string> = {
@@ -834,6 +837,7 @@ function cn(...inputs: ClassValue[]) {
 const geminiAi = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || '' });
 
 interface SavedPipPackage { name: string; version: string; }
+interface SavedPyiImportSizeLimitOverride { moduleName: string; maxBytes: number | null; }
 type PyodidePackageInstallSource = 'pyodide-prebuilt' | 'micropip' | 'sdist' | 'url';
 
 interface CachedPyodideSiteFile {
@@ -851,6 +855,36 @@ interface CachedPyodideEnvironmentSnapshot {
   signature: string;
   files: CachedPyodideSiteFile[];
   packages: Record<string, CachedPyodidePackageMeta>;
+}
+
+interface PyodideStubExtractionSummary {
+  namesTried: string[];
+  discovery: string;
+  scanDirCount: number;
+  scanRoots: string[];
+  stubLimit: number;
+  maxTotal: number;
+  pyiCandidateCount: number;
+  pyiTotalSize: number;
+  nativeMinimalCandidateCount: number;
+  nativeMinimalTotalSize: number;
+  nativeCompressionAttempted: boolean;
+  generatedCandidateCount: number;
+  generatedTotalSize: number;
+  generatedMinimalCandidateCount: number;
+  generatedMinimalTotalSize: number;
+  generatedPhaseAttempted: boolean;
+  pyTotalSize: number;
+  rawPhaseAttempted: boolean;
+  phase: string;
+  returnedEntryCount: number;
+  returnedTotalSize: number;
+  returnedSamplePaths: string[];
+}
+
+interface PyodideStubExtractionResult {
+  folder: UserFolder;
+  summary: PyodideStubExtractionSummary;
 }
 
 function normalizeSavedPipPackageName(pkg: string) {
@@ -922,6 +956,131 @@ function cloneUserFolder(folder: UserFolder): UserFolder {
 
 function hasUserFolderEntries(folder: UserFolder) {
   return Object.keys(folder).length > 0;
+}
+
+function createEmptyPyodideStubExtractionSummary(
+  pkgName: string,
+  stubLimit = DEFAULT_PYI_IMPORT_SIZE_LIMIT_BYTES
+): PyodideStubExtractionSummary {
+  return {
+    namesTried: [pkgName],
+    discovery: 'not-started',
+    scanDirCount: 0,
+    scanRoots: [],
+    stubLimit,
+    maxTotal: ABSOLUTE_PYI_IMPORT_SIZE_LIMIT_BYTES,
+    pyiCandidateCount: 0,
+    pyiTotalSize: 0,
+    nativeMinimalCandidateCount: 0,
+    nativeMinimalTotalSize: 0,
+    nativeCompressionAttempted: false,
+    generatedCandidateCount: 0,
+    generatedTotalSize: 0,
+    generatedMinimalCandidateCount: 0,
+    generatedMinimalTotalSize: 0,
+    generatedPhaseAttempted: false,
+    pyTotalSize: 0,
+    rawPhaseAttempted: false,
+    phase: 'none',
+    returnedEntryCount: 0,
+    returnedTotalSize: 0,
+    returnedSamplePaths: [],
+  };
+}
+
+function formatByteSize(bytes: number) {
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0 B';
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+}
+
+function describePyodideStubExtractionPhase(phase: string) {
+  switch (phase) {
+    case 'native-pyi-full':
+      return 'used the complete native .pyi surface';
+    case 'native-pyi-minimal-full':
+      return 'compressed native .pyi files into a minimal stub surface and kept the full compressed set';
+    case 'native-pyi-minimal-partial':
+      return 'compressed native .pyi files into a minimal stub surface, but still had to return a prioritized subset';
+    case 'native-pyi-partial':
+      return 'native .pyi files were too large, so a prioritized subset of native .pyi files was returned';
+    case 'generated-pyi-full':
+      return 'generated .pyi files from .py sources and kept the full generated set';
+    case 'generated-pyi-partial':
+      return 'generated .pyi files from .py sources, but had to return a prioritized subset';
+    case 'minimal-pyi-full':
+      return 'generated absolute-minimal .pyi files and kept the full minimal set';
+    case 'minimal-pyi-partial':
+      return 'generated absolute-minimal .pyi files, but still had to return a prioritized subset';
+    case 'raw-py-full':
+      return 'fell back to raw .py files and kept the full raw source surface';
+    case 'raw-py-too-large':
+      return 'raw .py fallback exceeded the size limit';
+    case 'import-single-py':
+      return 'resolved a single-file module directly by import';
+    case 'site-packages-single-py':
+      return 'resolved a single-file module directly from site-packages';
+    case 'not-found':
+      return 'no matching importable package surface was found';
+    case 'empty':
+      return 'package files were found, but no usable stub or raw-source payload fit the extraction limits';
+    case 'pyodide-not-loaded':
+      return 'Pyodide was not loaded, so extraction could not start';
+    case 'error':
+      return 'stub extraction failed before a usable surface was produced';
+    default:
+      return phase;
+  }
+}
+
+function formatPyodideStubCandidateSummary(attempted: boolean, count: number, totalSize: number, skipReason: string) {
+  if (!attempted) return skipReason;
+  return `${count} file(s), ${formatByteSize(totalSize)}`;
+}
+
+function formatPyodideStubFallbackSummary(attempted: boolean, totalSize: number, skipReason: string) {
+  if (!attempted) return skipReason;
+  return formatByteSize(totalSize);
+}
+
+function logPyodideStubExtractionSummary(
+  pkgName: string,
+  summary: PyodideStubExtractionSummary,
+  log: (msg: string) => void
+) {
+  const resolvedFromNativePyi = summary.phase === 'native-pyi-full';
+  const nativeOverflowed = summary.pyiCandidateCount > 0 && summary.pyiTotalSize > summary.stubLimit && !resolvedFromNativePyi;
+  const skippedGeneratedReason = resolvedFromNativePyi
+    ? 'skipped because native .pyi files were already available'
+    : 'not reached';
+  const skippedRawReason = summary.generatedPhaseAttempted || resolvedFromNativePyi
+    ? 'skipped because a stub surface was already selected'
+    : 'not reached';
+  const nativeDisposition = summary.pyiCandidateCount === 0
+    ? 'no native .pyi files found'
+    : resolvedFromNativePyi
+      ? 'kept the native .pyi surface'
+      : nativeOverflowed
+        ? 'discarded the oversized native .pyi surface and continued to generated stubs'
+        : 'native .pyi files were found but not selected';
+  log(`  Stub extraction package: ${pkgName}`);
+  log(`  Stub extraction order: native .pyi -> generated .pyi -> generated .pyi compression -> raw .py`);
+  log(`  Names tried: ${summary.namesTried.join(', ') || '(none)'}`);
+  log(`  Discovery mode: ${summary.discovery}`);
+  log(`  Scan roots (${summary.scanDirCount}): ${summary.scanRoots.join(', ') || '(none)'}`);
+  log(`  Size limits: stub cap ${formatByteSize(summary.stubLimit)}, absolute cap ${formatByteSize(summary.maxTotal)}`);
+  log(`  Native .pyi candidates: ${summary.pyiCandidateCount} file(s), ${formatByteSize(summary.pyiTotalSize)}`);
+  log(`  Native .pyi disposition: ${nativeDisposition}`);
+  log(`  Generated .pyi candidates: ${formatPyodideStubCandidateSummary(summary.generatedPhaseAttempted, summary.generatedCandidateCount, summary.generatedTotalSize, skippedGeneratedReason)}`);
+  log(`  Generated minimal .pyi candidates: ${formatPyodideStubCandidateSummary(summary.generatedPhaseAttempted, summary.generatedMinimalCandidateCount, summary.generatedMinimalTotalSize, skippedGeneratedReason)}`);
+  log(`  Raw .py fallback size: ${formatPyodideStubFallbackSummary(summary.rawPhaseAttempted, summary.pyTotalSize, skippedRawReason)}`);
+  log(`  Selected extraction phase: ${summary.phase}`);
+  log(`  Outcome: ${describePyodideStubExtractionPhase(summary.phase)}`);
+  log(`  Returned payload: ${summary.returnedEntryCount} file(s), ${formatByteSize(summary.returnedTotalSize)}`);
+  if (summary.returnedSamplePaths.length > 0) {
+    log(`  Returned sample paths: ${summary.returnedSamplePaths.join(', ')}`);
+  }
 }
 
 function buildSavedPipPackageSignature(pkgs: SavedPipPackage[]) {
@@ -1025,6 +1184,68 @@ function addSavedPipIncludedModule(moduleName: string) {
     current.push(normalized);
     savePipIncludedModules(current);
   }
+}
+
+function normalizePyiImportSizeLimitModuleName(moduleName: string) {
+  return moduleName.trim().toLowerCase();
+}
+
+function sortSavedPyiImportSizeLimitOverrides(overrides: SavedPyiImportSizeLimitOverride[]) {
+  return [...overrides].sort((a, b) => a.moduleName.localeCompare(b.moduleName));
+}
+
+function loadSavedPyiImportSizeLimitOverrides(): SavedPyiImportSizeLimitOverride[] {
+  try {
+    const raw = JSON.parse(localStorage.getItem(STORAGE_KEYS.pyiImportSizeLimits) || '[]');
+    if (!Array.isArray(raw)) return [];
+
+    const deduped = new Map<string, SavedPyiImportSizeLimitOverride>();
+    for (const value of raw) {
+      if (!value || typeof value.moduleName !== 'string') continue;
+      const moduleName = normalizePyiImportSizeLimitModuleName(value.moduleName);
+      if (!moduleName) continue;
+
+      const numericMaxBytes = Number(value.maxBytes);
+      const maxBytes = value.maxBytes == null
+        ? null
+        : Number.isFinite(numericMaxBytes) && numericMaxBytes > 0
+          ? Math.min(Math.round(numericMaxBytes), ABSOLUTE_PYI_IMPORT_SIZE_LIMIT_BYTES)
+          : DEFAULT_PYI_IMPORT_SIZE_LIMIT_BYTES;
+
+      deduped.set(moduleName, { moduleName, maxBytes });
+    }
+
+    return sortSavedPyiImportSizeLimitOverrides([...deduped.values()]);
+  } catch {
+    return [];
+  }
+}
+
+function saveSavedPyiImportSizeLimitOverrides(overrides: SavedPyiImportSizeLimitOverride[]) {
+  localStorage.setItem(
+    STORAGE_KEYS.pyiImportSizeLimits,
+    JSON.stringify(sortSavedPyiImportSizeLimitOverrides(
+      overrides.map(override => ({
+        moduleName: normalizePyiImportSizeLimitModuleName(override.moduleName),
+        maxBytes: override.maxBytes == null
+          ? null
+          : Math.min(Math.max(1, Math.round(override.maxBytes)), ABSOLUTE_PYI_IMPORT_SIZE_LIMIT_BYTES),
+      })).filter(override => override.moduleName.length > 0)
+    ))
+  );
+}
+
+function getSavedPyiImportSizeLimitOverride(moduleName: string): SavedPyiImportSizeLimitOverride | null {
+  const normalized = normalizePyiImportSizeLimitModuleName(moduleName);
+  if (!normalized) return null;
+  return loadSavedPyiImportSizeLimitOverrides().find(override => override.moduleName === normalized) || null;
+}
+
+function resolveSavedPyiImportSizeLimit(moduleName: string): number {
+  const override = getSavedPyiImportSizeLimitOverride(moduleName);
+  if (!override) return DEFAULT_PYI_IMPORT_SIZE_LIMIT_BYTES;
+  if (override.maxBytes == null) return ABSOLUTE_PYI_IMPORT_SIZE_LIMIT_BYTES;
+  return Math.min(Math.max(1, override.maxBytes), ABSOLUTE_PYI_IMPORT_SIZE_LIMIT_BYTES);
 }
 
 function loadSavedCSharpNamespaces(): string[] {
@@ -1370,6 +1591,7 @@ export default function App() {
   });
   const [settingsPipPackages, setSettingsPipPackages] = useState<SavedPipPackage[]>(() => loadSavedPipPackages());
   const [settingsPipIncludedModules, setSettingsPipIncludedModules] = useState<string[]>(() => loadSavedPipIncludedModules());
+  const [settingsPyiImportSizeLimitOverrides, setSettingsPyiImportSizeLimitOverrides] = useState<SavedPyiImportSizeLimitOverride[]>(() => loadSavedPyiImportSizeLimitOverrides());
   const [settingsCSharpNamespaces, setSettingsCSharpNamespaces] = useState<string[]>(() => loadSavedCSharpNamespaces());
   const [settingsPipInput, setSettingsPipInput] = useState('');
   const [settingsPipForceBuild, setSettingsPipForceBuild] = useState(false);
@@ -1378,6 +1600,10 @@ export default function App() {
   const [settingsPipIncludeInput, setSettingsPipIncludeInput] = useState('');
   const [settingsPipIncludeBusy, setSettingsPipIncludeBusy] = useState(false);
   const [settingsPipIncludeStatus, setSettingsPipIncludeStatus] = useState('');
+  const [settingsPyiImportSizeLimitModuleInput, setSettingsPyiImportSizeLimitModuleInput] = useState('');
+  const [settingsPyiImportSizeLimitInput, setSettingsPyiImportSizeLimitInput] = useState('200');
+  const [settingsPyiImportSizeUnlimited, setSettingsPyiImportSizeUnlimited] = useState(false);
+  const [settingsPyiImportSizeLimitStatus, setSettingsPyiImportSizeLimitStatus] = useState('');
   const [settingsCSharpNamespaceInput, setSettingsCSharpNamespaceInput] = useState('');
   const [settingsCSharpNamespaceBusy, setSettingsCSharpNamespaceBusy] = useState(false);
   const [settingsCSharpNamespaceStatus, setSettingsCSharpNamespaceStatus] = useState('');
@@ -2018,9 +2244,11 @@ export default function App() {
     if (isSettingsOpen) {
       setSettingsPipPackages(loadSavedPipPackages());
       setSettingsPipIncludedModules(loadSavedPipIncludedModules());
+      setSettingsPyiImportSizeLimitOverrides(loadSavedPyiImportSizeLimitOverrides());
       setSettingsCSharpNamespaces(loadSavedCSharpNamespaces());
       setSettingsPipStatus('');
       setSettingsPipIncludeStatus('');
+      setSettingsPyiImportSizeLimitStatus('');
       setSettingsCSharpNamespaceStatus('');
     }
   }, [isSettingsOpen]);
@@ -2150,26 +2378,102 @@ export default function App() {
     }
   };
 
-  const extractPyodideStubs = async (pkgName: string): Promise<UserFolder> => {
+  const extractPyodideStubsDetailed = async (pkgName: string): Promise<PyodideStubExtractionResult> => {
     const pyodide = (window as any).pyodide;
-    if (!pyodide) return {};
+    const stubLimitOverride = getSavedPyiImportSizeLimitOverride(pkgName);
+    const resolvedStubLimit = resolveSavedPyiImportSizeLimit(pkgName);
+    if (!pyodide) {
+      return {
+        folder: {},
+        summary: {
+          ...createEmptyPyodideStubExtractionSummary(pkgName, resolvedStubLimit),
+          discovery: 'pyodide-not-loaded',
+          phase: 'pyodide-not-loaded',
+        },
+      };
+    }
     try {
       const json = await pyodide.runPythonAsync(`
-import json, os, site, sys
+import importlib, json, os, site, sys
 
 def _extract(pkg_name):
-    MAX_TOTAL = 2 * 1024 * 1024  # 2MB total cap
+    MAX_TOTAL = ${ABSOLUTE_PYI_IMPORT_SIZE_LIMIT_BYTES}
+    USER_PYI_LIMIT = ${stubLimitOverride?.maxBytes == null && stubLimitOverride ? 'None' : JSON.stringify(resolvedStubLimit)}
+    PY_MAX = MAX_TOTAL if USER_PYI_LIMIT is None else min(MAX_TOTAL, max(1, int(USER_PYI_LIMIT)))
     _names_to_try = list(dict.fromkeys([
         pkg_name,
         pkg_name.replace('-', '_').lower(),
         pkg_name.replace('-', '_'),
         pkg_name.lower(),
     ]))
+    _summary = {
+        "namesTried": list(_names_to_try),
+        "discovery": "not-found",
+        "scanDirCount": 0,
+        "scanRoots": [],
+        "stubLimit": PY_MAX,
+        "maxTotal": MAX_TOTAL,
+        "pyiCandidateCount": 0,
+        "pyiTotalSize": 0,
+        "nativeMinimalCandidateCount": 0,
+        "nativeMinimalTotalSize": 0,
+        "nativeCompressionAttempted": False,
+        "generatedCandidateCount": 0,
+        "generatedTotalSize": 0,
+        "generatedMinimalCandidateCount": 0,
+        "generatedMinimalTotalSize": 0,
+        "generatedPhaseAttempted": False,
+        "pyTotalSize": 0,
+        "rawPhaseAttempted": False,
+        "phase": "none",
+        "returnedEntryCount": 0,
+        "returnedTotalSize": 0,
+        "returnedSamplePaths": [],
+    }
 
     sys.path_importer_cache.clear()
 
     # Find package directories to scan
     scan_dirs = []  # list of (base_dir, rel_parent)
+
+    def _entry_priority(item):
+        rel, _content = item
+        parts = rel.split('/')
+        name = parts[-1] if parts else rel
+        depth = max(0, len(parts) - 1)
+        is_init = name in ('__init__.pyi', '__init__.py')
+        is_root = depth == 0
+        is_public = not name.startswith('_') or is_init
+        is_typing_related = 'typing' in name
+        return (
+            0 if is_init else (1 if is_root else 2),
+            0 if is_public else 1,
+            0 if is_typing_related else 1,
+            depth,
+            len(rel),
+            rel,
+        )
+
+    def _pack_entries(entries, limit):
+        packed = {}
+        packed_size = 0
+        for rel, content in sorted(entries, key=_entry_priority):
+            if packed_size + len(content) > limit:
+                continue
+            packed[rel] = content
+            packed_size += len(content)
+        return packed
+
+    def _emit(files, phase, discovery=None):
+        if discovery is not None:
+            _summary["discovery"] = discovery
+        _summary["phase"] = phase
+        _summary["scanDirCount"] = len(scan_dirs)
+        _summary["scanRoots"] = [base for base, _ in scan_dirs]
+        _summary["returnedEntryCount"] = len(files)
+        _summary["returnedTotalSize"] = sum(len(v) for v in files.values())
+        _summary["returnedSamplePaths"] = [rel for rel, _content in sorted(files.items(), key=_entry_priority)[:8]]
+        return {"files": files, "summary": _summary}
 
     # Try import first to get __path__
     for _n in _names_to_try:
@@ -2177,6 +2481,7 @@ def _extract(pkg_name):
             mod = importlib.import_module(_n)
             paths = getattr(mod, '__path__', None)
             if paths:
+                _summary["discovery"] = "import-package"
                 for base in paths:
                     scan_dirs.append((base, os.path.dirname(base)))
             else:
@@ -2184,7 +2489,7 @@ def _extract(pkg_name):
                 if f and os.path.isfile(f):
                     with open(f, 'r', errors='replace') as fp:
                         content = fp.read()
-                    return {os.path.basename(f): content[:MAX_TOTAL]}
+                    return _emit({os.path.basename(f): content[:MAX_TOTAL]}, "import-single-py", "import-single-py")
             break
         except Exception:
             continue
@@ -2198,54 +2503,36 @@ def _extract(pkg_name):
             for _n in _names_to_try:
                 pkg_path = os.path.join(sp, _n)
                 if os.path.isdir(pkg_path):
+                    _summary["discovery"] = "site-packages-directory"
                     scan_dirs.append((pkg_path, sp))
                     break
                 single = pkg_path + '.py'
                 if os.path.isfile(single):
                     with open(single, 'r', errors='replace') as fp:
-                        return {_n + '.py': fp.read()[:MAX_TOTAL]}
+                        return _emit({_n + '.py': fp.read()[:MAX_TOTAL]}, "site-packages-single-py", "site-packages-single-py")
             if scan_dirs:
                 break
 
     if not scan_dirs:
-        return {}
+        return _emit({}, "not-found", "not-found")
 
-    result = {}
-    total_size = 0
-    PY_MAX = 10 * 1024
-
-    # Phase 1: collect .pyi files (cap at PY_MAX, include up to limit)
-    pyi_total = 0
-    for base, parent in scan_dirs:
-        for root, dirs, files in os.walk(base):
-            for fn in files:
-                if fn.endswith('.pyi'):
-                    try:
-                        pyi_total += os.path.getsize(os.path.join(root, fn))
-                    except Exception:
-                        pass
-    if pyi_total > 0:
-        for base, parent in scan_dirs:
-            for root, dirs, files in os.walk(base):
-                for fn in files:
-                    if not fn.endswith('.pyi'):
-                        continue
-                    full = os.path.join(root, fn)
-                    rel = os.path.relpath(full, parent)
-                    try:
-                        with open(full, 'r', errors='replace') as fp:
-                            c = fp.read()
-                        if total_size + len(c) > min(PY_MAX, MAX_TOTAL):
-                            continue
-                        result[rel] = c
-                        total_size += len(c)
-                    except Exception:
-                        pass
-        if result:
-            return result
+    stub_limit = min(PY_MAX, MAX_TOTAL)
 
     # Phase 1B: generate .pyi stubs from .py files using ast
     import ast
+    def _iter_named_targets(target):
+        if isinstance(target, ast.Name):
+            yield target.id
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            for item in target.elts:
+                yield from _iter_named_targets(item)
+
+    def _collect_named_targets(targets):
+        names = []
+        for target in targets:
+            names.extend(_iter_named_targets(target))
+        return names
+
     def _make_stub(source):
         try:
             tree = ast.parse(source)
@@ -2258,15 +2545,15 @@ def _extract(pkg_name):
             elif isinstance(node, ast.ImportFrom):
                 lines.append(ast.unparse(node))
             elif isinstance(node, ast.Assign):
-                for t in node.targets:
-                    if isinstance(t, ast.Name):
-                        if node.type_comment:
-                            lines.append(f'{t.id}: {node.type_comment}')
-                        else:
-                            lines.append(f'{t.id}: ...')
-            elif isinstance(node, ast.AnnAssign) and node.target and isinstance(node.target, ast.Name):
-                ann = ast.unparse(node.annotation)
-                lines.append(f'{node.target.id}: {ann}')
+                for name in _collect_named_targets(node.targets):
+                    if node.type_comment:
+                        lines.append(f'{name}: {node.type_comment}')
+                    else:
+                        lines.append(f'{name}: ...')
+            elif isinstance(node, ast.AnnAssign) and node.target:
+                for name in _iter_named_targets(node.target):
+                    ann = ast.unparse(node.annotation)
+                    lines.append(f'{name}: {ann}')
             elif isinstance(node, ast.FunctionDef) or isinstance(node, ast.AsyncFunctionDef):
                 args = ast.unparse(node.args)
                 ret = ''
@@ -2285,14 +2572,15 @@ def _extract(pkg_name):
                         decs = ''
                         for d in item.decorator_list:
                             decs += f'    @{ast.unparse(d)}\\n'
-                            cls_lines.append(f'{decs}    {p}{item.name}({a}){r}: ...')
-                    elif isinstance(item, ast.AnnAssign) and item.target and isinstance(item.target, ast.Name):
+                        cls_lines.append(f'{decs}    {p}{item.name}({a}){r}: ...')
+                    elif isinstance(item, ast.AnnAssign) and item.target:
                         ann = ast.unparse(item.annotation)
-                        cls_lines.append(f'    {item.target.id}: {ann}')
+                        for name in _iter_named_targets(item.target):
+                            cls_lines.append(f'    {name}: {ann}')
                     elif isinstance(item, ast.Assign):
-                        for t in item.targets:
-                            if isinstance(t, ast.Name):
-                                cls_lines.append(f'    {t.id}: ...')
+                        for target in item.targets:
+                            for name in _iter_named_targets(target):
+                                cls_lines.append(f'    {name}: ...')
                 header = f'class {node.name}({bases}):' if bases else f'class {node.name}:'
                 if cls_lines:
                     lines.append(header + '\\n' + '\\n'.join(cls_lines))
@@ -2301,6 +2589,83 @@ def _extract(pkg_name):
         if not lines:
             return None
         return '\\n'.join(lines) + '\\n'
+
+    def _make_minimal_stub(source):
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:
+            return None
+        lines = []
+
+        def _append_minimal_var(name, indent=''):
+            lines.append(f'{indent}{name} = ...')
+
+        def _append_minimal_func(node, indent=''):
+            prefix = 'async def ' if isinstance(node, ast.AsyncFunctionDef) else 'def '
+            lines.append(f'{indent}{prefix}{node.name}(*args, **kwargs): ...')
+
+        for node in ast.iter_child_nodes(tree):
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    for name in _iter_named_targets(target):
+                        _append_minimal_var(name)
+            elif isinstance(node, ast.AnnAssign) and node.target:
+                for name in _iter_named_targets(node.target):
+                    _append_minimal_var(name)
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                _append_minimal_func(node)
+            elif isinstance(node, ast.ClassDef):
+                cls_lines = []
+                for item in ast.iter_child_nodes(node):
+                    if isinstance(item, ast.Assign):
+                        for target in item.targets:
+                            for name in _iter_named_targets(target):
+                                cls_lines.append(f'    {name} = ...')
+                    elif isinstance(item, ast.AnnAssign) and item.target:
+                        for name in _iter_named_targets(item.target):
+                            cls_lines.append(f'    {name} = ...')
+                    elif isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        prefix = 'async def ' if isinstance(item, ast.AsyncFunctionDef) else 'def '
+                        cls_lines.append(f'    {prefix}{item.name}(*args, **kwargs): ...')
+                if cls_lines:
+                    lines.append(f'class {node.name}:\\n' + '\\n'.join(cls_lines))
+                else:
+                    lines.append(f'class {node.name}: ...')
+
+        if not lines:
+            return None
+        return '\\n'.join(lines) + '\\n'
+
+    # Phase 1: keep native .pyi files only if the full surface fits the cap
+    pyi_total = 0
+    pyi_candidate_count = 0
+    pyi_entries = []
+    for base, parent in scan_dirs:
+        for root, dirs, files in os.walk(base):
+            for fn in files:
+                if not fn.endswith('.pyi'):
+                    continue
+                pyi_candidate_count += 1
+                full = os.path.join(root, fn)
+                rel = os.path.relpath(full, parent)
+                try:
+                    with open(full, 'r', errors='replace') as fp:
+                        c = fp.read()
+                    pyi_total += len(c)
+                    pyi_entries.append((rel, c))
+                except Exception:
+                    pass
+    _summary["pyiCandidateCount"] = pyi_candidate_count
+    _summary["pyiTotalSize"] = pyi_total
+    if pyi_entries:
+        if pyi_total <= stub_limit:
+            return _emit({rel: content for rel, content in sorted(pyi_entries, key=_entry_priority)}, "native-pyi-full")
+
+    generated_entries = []
+    generated_total_size = 0
+    minimal_entries = []
+    minimal_total_size = 0
+    _summary["generatedPhaseAttempted"] = True
 
     for base, parent in scan_dirs:
         for root, dirs, files in os.walk(base):
@@ -2314,16 +2679,35 @@ def _extract(pkg_name):
                     with open(full, 'r', errors='replace') as fp:
                         src = fp.read()
                     stub = _make_stub(src)
-                    if stub and total_size + len(stub) <= min(PY_MAX, MAX_TOTAL):
-                        result[stub_rel] = stub
-                        total_size += len(stub)
+                    if stub:
+                        generated_entries.append((stub_rel, stub))
+                        generated_total_size += len(stub)
+                    minimal_stub = _make_minimal_stub(src)
+                    if minimal_stub:
+                        minimal_entries.append((stub_rel, minimal_stub))
+                        minimal_total_size += len(minimal_stub)
                 except Exception:
                     pass
 
-    if result:
-        return result
+    _summary["generatedCandidateCount"] = len(generated_entries)
+    _summary["generatedTotalSize"] = generated_total_size
+    _summary["generatedMinimalCandidateCount"] = len(minimal_entries)
+    _summary["generatedMinimalTotalSize"] = minimal_total_size
+    if generated_entries or minimal_entries:
+        if generated_entries and generated_total_size <= stub_limit:
+            return _emit({rel: content for rel, content in sorted(generated_entries, key=_entry_priority)}, "generated-pyi-full")
+        if minimal_entries:
+            if minimal_total_size <= stub_limit:
+                return _emit({rel: content for rel, content in sorted(minimal_entries, key=_entry_priority)}, "minimal-pyi-full")
+            result = _pack_entries(minimal_entries, stub_limit)
+            if result:
+                return _emit(result, "minimal-pyi-partial")
+        result = _pack_entries(generated_entries, stub_limit)
+        if result:
+            return _emit(result, "generated-pyi-partial")
 
-    # Phase 2: fall back to .py files only if total .py size <= 10KB
+    # Phase 2: fall back to .py files only if total .py size <= 200KB
+    _summary["rawPhaseAttempted"] = True
     py_total_size = 0
     for base, parent in scan_dirs:
         for root, dirs, files in os.walk(base):
@@ -2333,10 +2717,13 @@ def _extract(pkg_name):
                         py_total_size += os.path.getsize(os.path.join(root, fn))
                     except Exception:
                         pass
+    _summary["pyTotalSize"] = py_total_size
 
     if py_total_size > PY_MAX:
-        return result
+        return _emit({}, "raw-py-too-large")
 
+    result = {}
+    total_size = 0
     for base, parent in scan_dirs:
         for root, dirs, files in os.walk(base):
             for fn in files:
@@ -2354,11 +2741,21 @@ def _extract(pkg_name):
                 except Exception:
                     pass
 
-    return result
+    if result:
+        return _emit(result, "raw-py-full")
+
+    return _emit({}, "empty")
 
 json.dumps(_extract(${JSON.stringify(pkgName)}))
 `);
-      const flat: Record<string, string> = JSON.parse(json);
+      const parsed = JSON.parse(json) as { files?: Record<string, string>, summary?: Partial<PyodideStubExtractionSummary> } | Record<string, string>;
+      const flat = parsed && typeof parsed === 'object' && 'files' in parsed
+        ? ((parsed as { files?: Record<string, string> }).files || {})
+        : (parsed as Record<string, string>);
+      const summary = {
+        ...createEmptyPyodideStubExtractionSummary(pkgName, resolvedStubLimit),
+        ...(parsed && typeof parsed === 'object' && 'summary' in parsed ? (parsed as { summary?: Partial<PyodideStubExtractionSummary> }).summary : {}),
+      };
       const folder: UserFolder = {};
       for (const [path, content] of Object.entries(flat)) {
         const parts = path.split('/');
@@ -2371,10 +2768,22 @@ json.dumps(_extract(${JSON.stringify(pkgName)}))
         }
         current[parts[parts.length - 1]] = content;
       }
-      return folder;
+      return { folder, summary };
     } catch {
-      return {};
+      return {
+        folder: {},
+        summary: {
+          ...createEmptyPyodideStubExtractionSummary(pkgName, resolvedStubLimit),
+          discovery: 'error',
+          phase: 'error',
+        },
+      };
     }
+  };
+
+  const extractPyodideStubs = async (pkgName: string): Promise<UserFolder> => {
+    const { folder } = await extractPyodideStubsDetailed(pkgName);
+    return folder;
   };
 
   const ensurePyodideScript = async () => {
@@ -2921,8 +3330,9 @@ json.dumps({
     log('  Extracting type stubs...');
 
     try {
-      stubs = await extractPyodideStubs(pkgName);
-      log(`  Found ${Object.keys(stubs).length} stub entries`);
+      const extraction = await extractPyodideStubsDetailed(pkgName);
+      stubs = extraction.folder;
+      logPyodideStubExtractionSummary(pkgName, extraction.summary, log);
     } catch (extractErr) {
       log(`  Stub extraction error: ${extractErr instanceof Error ? extractErr.message : String(extractErr)}`);
       stubs = {};
@@ -4556,10 +4966,23 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
     return saved;
   };
 
+  const refreshSettingsPyiImportSizeLimitOverrides = () => {
+    const saved = loadSavedPyiImportSizeLimitOverrides();
+    setSettingsPyiImportSizeLimitOverrides(saved);
+    return saved;
+  };
+
   const refreshSettingsCSharpNamespaces = () => {
     const saved = loadSavedCSharpNamespaces();
     setSettingsCSharpNamespaces(saved);
     return saved;
+  };
+
+  const formatSettingsPyiImportSizeLimit = (maxBytes: number | null) => {
+    if (maxBytes == null) {
+      return `Unlimited (up to ${formatByteSize(ABSOLUTE_PYI_IMPORT_SIZE_LIMIT_BYTES)} overall)`;
+    }
+    return formatByteSize(maxBytes);
   };
 
   const runSettingsPipCommand = async (command: string) => {
@@ -4667,6 +5090,51 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
       return;
     }
     setSettingsPipIncludeStatus(`Removed saved include ${moduleName}.`);
+  };
+
+  const handleSettingsPyiImportSizeLimitApply = () => {
+    const moduleName = normalizePyiImportSizeLimitModuleName(settingsPyiImportSizeLimitModuleInput);
+    if (!moduleName) {
+      setSettingsPyiImportSizeLimitStatus('Enter a module or package name first.');
+      return;
+    }
+
+    let maxBytes: number | null = null;
+    if (!settingsPyiImportSizeUnlimited) {
+      const parsedKb = Number(settingsPyiImportSizeLimitInput);
+      if (!Number.isFinite(parsedKb) || parsedKb <= 0) {
+        setSettingsPyiImportSizeLimitStatus('Enter a positive size in KB or switch the override to Unlimited.');
+        return;
+      }
+      maxBytes = Math.min(
+        Math.max(1, Math.round(parsedKb * 1024)),
+        ABSOLUTE_PYI_IMPORT_SIZE_LIMIT_BYTES
+      );
+    }
+
+    const next = refreshSettingsPyiImportSizeLimitOverrides()
+      .filter(override => override.moduleName !== moduleName);
+    next.push({ moduleName, maxBytes });
+    saveSavedPyiImportSizeLimitOverrides(next);
+    setSettingsPyiImportSizeLimitOverrides(sortSavedPyiImportSizeLimitOverrides(next));
+    setSettingsPyiImportSizeLimitStatus(
+      maxBytes == null
+        ? `Saved ${moduleName} with an unlimited per-module cap. It will apply the next time stubs are extracted for that module.`
+        : `Saved ${moduleName} with a ${formatByteSize(maxBytes)} cap. It will apply the next time stubs are extracted for that module.`
+    );
+    setSettingsPyiImportSizeLimitModuleInput('');
+    if (!settingsPyiImportSizeUnlimited) {
+      setSettingsPyiImportSizeLimitInput(String(Math.max(1, Math.round(maxBytes! / 1024))));
+    }
+  };
+
+  const handleSettingsPyiImportSizeLimitRemove = (moduleName: string) => {
+    const next = settingsPyiImportSizeLimitOverrides.filter(override => override.moduleName !== moduleName);
+    saveSavedPyiImportSizeLimitOverrides(next);
+    setSettingsPyiImportSizeLimitOverrides(next);
+    setSettingsPyiImportSizeLimitStatus(
+      `Removed the custom stub cap for ${moduleName}. The default ${formatByteSize(DEFAULT_PYI_IMPORT_SIZE_LIMIT_BYTES)} cap will apply the next time stubs are extracted.`
+    );
   };
 
   const handleSettingsCSharpNamespaceApply = async () => {
@@ -5444,6 +5912,102 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
                         ))}
                       </div>
                     )}
+
+                    <div className="rounded-2xl border border-white/10 bg-white/5 p-4 space-y-4">
+                      <div>
+                        <div className="text-sm font-medium text-white">Calibrate `.pyi` Import Size Per Module</div>
+                        <div className="text-xs text-zinc-500 mt-1">
+                          Default imports stop at {formatByteSize(DEFAULT_PYI_IMPORT_SIZE_LIMIT_BYTES)} per module. Add an override here or mark a module as unlimited to use only the overall {formatByteSize(ABSOLUTE_PYI_IMPORT_SIZE_LIMIT_BYTES)} extraction ceiling.
+                        </div>
+                      </div>
+
+                      <div className="grid grid-cols-1 sm:grid-cols-[minmax(0,1.2fr)_120px_auto] gap-3">
+                        <input
+                          type="text"
+                          value={settingsPyiImportSizeLimitModuleInput}
+                          onChange={(e) => setSettingsPyiImportSizeLimitModuleInput(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter') {
+                              e.preventDefault();
+                              handleSettingsPyiImportSizeLimitApply();
+                            }
+                          }}
+                          placeholder="Module or package, e.g. numpy"
+                          className="w-full rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-sm text-white outline-none transition-colors focus:border-indigo-500"
+                        />
+                        <input
+                          type="number"
+                          min="1"
+                          step="1"
+                          value={settingsPyiImportSizeLimitInput}
+                          onChange={(e) => setSettingsPyiImportSizeLimitInput(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter') {
+                              e.preventDefault();
+                              handleSettingsPyiImportSizeLimitApply();
+                            }
+                          }}
+                          placeholder="Size KB"
+                          disabled={settingsPyiImportSizeUnlimited}
+                          className={cn(
+                            "w-full rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-sm text-white outline-none transition-colors focus:border-indigo-500",
+                            settingsPyiImportSizeUnlimited && "opacity-60 cursor-not-allowed"
+                          )}
+                        />
+                        <button
+                          onClick={handleSettingsPyiImportSizeLimitApply}
+                          className="px-4 py-2 rounded-xl text-sm font-semibold transition-colors bg-indigo-600 hover:bg-indigo-500 text-white"
+                        >
+                          Save Limit
+                        </button>
+                      </div>
+
+                      <label className="flex items-center justify-between gap-4">
+                        <div>
+                          <div className="text-sm font-medium text-white">Unlimited</div>
+                          <div className="text-xs text-zinc-500">Disables the per-module cap and relies only on the overall extraction ceiling.</div>
+                        </div>
+                        <button
+                          onClick={() => setSettingsPyiImportSizeUnlimited(flag => !flag)}
+                          className={cn(
+                            "w-10 h-5 rounded-full transition-all relative shrink-0",
+                            settingsPyiImportSizeUnlimited ? "bg-indigo-600" : "bg-zinc-700"
+                          )}
+                        >
+                          <div className={cn(
+                            "absolute top-1 w-3 h-3 bg-white rounded-full transition-all",
+                            settingsPyiImportSizeUnlimited ? "right-1" : "left-1"
+                          )} />
+                        </button>
+                      </label>
+
+                      {settingsPyiImportSizeLimitStatus && (
+                        <p className="text-xs text-indigo-300 bg-indigo-500/10 border border-indigo-500/20 rounded-xl px-3 py-2">
+                          {settingsPyiImportSizeLimitStatus}
+                        </p>
+                      )}
+
+                      {settingsPyiImportSizeLimitOverrides.length === 0 ? (
+                        <p className="text-sm text-zinc-500">No custom `.pyi` import size overrides yet.</p>
+                      ) : (
+                        <div className="space-y-2">
+                          {settingsPyiImportSizeLimitOverrides.map(override => (
+                            <div key={override.moduleName} className="flex items-center justify-between gap-3 p-3 rounded-xl bg-black/20 border border-white/10">
+                              <div className="min-w-0">
+                                <div className="text-sm font-medium text-white break-all">{override.moduleName}</div>
+                                <div className="text-xs text-zinc-500">{formatSettingsPyiImportSizeLimit(override.maxBytes)}</div>
+                              </div>
+                              <button
+                                onClick={() => handleSettingsPyiImportSizeLimitRemove(override.moduleName)}
+                                className="px-3 py-1.5 rounded-lg text-xs font-medium transition-colors shrink-0 bg-red-500/10 text-red-300 hover:bg-red-500/20 border border-red-500/20"
+                              >
+                                Remove
+                              </button>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
                   </div>
                 </section>
 

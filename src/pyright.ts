@@ -30,6 +30,59 @@ export function setInitialStubsGetter(fn: () => UserFolder) {
   getInitialStubs = fn;
 }
 
+function deepCloneUserFolder(folder: UserFolder): UserFolder {
+  const cloned: UserFolder = {};
+  for (const [name, value] of Object.entries(folder)) {
+    if (typeof value === 'string') {
+      cloned[name] = value;
+      continue;
+    }
+    if (value instanceof ArrayBuffer) {
+      cloned[name] = value.slice(0);
+      continue;
+    }
+    cloned[name] = deepCloneUserFolder(value);
+  }
+  return cloned;
+}
+
+function flattenUserFolderFiles(
+  folder: UserFolder,
+  pathPrefix = '',
+  out: Map<string, Uint8Array> = new Map(),
+  encoder = new TextEncoder()
+): Map<string, Uint8Array> {
+  for (const [name, value] of Object.entries(folder)) {
+    const nextPath = pathPrefix ? `${pathPrefix}/${name}` : name;
+    if (typeof value === 'string') {
+      out.set(nextPath, encoder.encode(value));
+      continue;
+    }
+    if (value instanceof ArrayBuffer) {
+      out.set(nextPath, new Uint8Array(value.slice(0)));
+      continue;
+    }
+    flattenUserFolderFiles(value, nextPath, out, encoder);
+  }
+  return out;
+}
+
+function encodeUserFolderForPyrightTransport(folder: UserFolder): UserFolder {
+  const encoded: UserFolder = {};
+  for (const [name, value] of Object.entries(folder)) {
+    if (typeof value === 'string') {
+      encoded[name] = value;
+      continue;
+    }
+    if (value instanceof ArrayBuffer) {
+      encoded[name] = value.slice(0);
+      continue;
+    }
+    encoded[name] = buildUncompressedZip(flattenUserFolderFiles(value));
+  }
+  return encoded;
+}
+
 async function loadMinimalTypeshed(): Promise<ArrayBuffer> {
   const res = await fetch('/minimal-typeshed.zip');
   if (!res.ok) return undefined as any;
@@ -44,8 +97,8 @@ export function ensurePyrightReady(): Promise<void> {
   if (!_pyrightReady) {
     _pyrightReady = (async () => {
       const typeshed = await loadMinimalTypeshed();
-      const initialStubs = getInitialStubs ? getInitialStubs() : {};
-      accumulatedStubs = initialStubs;
+      const initialStubs = encodeUserFolderForPyrightTransport(getInitialStubs ? getInitialStubs() : {});
+      accumulatedStubs = deepCloneUserFolder(initialStubs);
       pyrightProvider = new MonacoPyrightProvider(undefined, { typeshed: typeshed || false, typeStubs: initialStubs });
       await pyrightProvider.init(monaco);
       await applyPyrightRuntimeSettings(pyrightProvider.lspClient);
@@ -60,7 +113,8 @@ export const pyrightReady = { then: (fn: () => void) => ensurePyrightReady().the
 export async function reloadPyrightWithStubs(newStubs: UserFolder, replace = false): Promise<void> {
   await ensurePyrightReady();
 
-  accumulatedStubs = replace ? newStubs : mergeUserFolders(accumulatedStubs, newStubs);
+  const transportStubs = encodeUserFolderForPyrightTransport(newStubs);
+  accumulatedStubs = replace ? transportStubs : mergeUserFolders(accumulatedStubs, transportStubs);
 
   await reloadLspWithAccumulatedStubs();
 }
@@ -88,7 +142,7 @@ async function reloadLspWithAccumulatedStubs(): Promise<void> {
 }
 
 function removeStubContribution(base: UserFolder, contribution: UserFolder): UserFolder {
-  const result = JSON.parse(JSON.stringify(base)) as UserFolder;
+  const result = deepCloneUserFolder(base);
   function remove(baseObj: Record<string, unknown>, remObj: Record<string, unknown>) {
     for (const key of Object.keys(remObj)) {
       const rem = remObj[key];
