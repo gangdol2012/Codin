@@ -28,6 +28,7 @@ import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 import { GoogleGenAI, Type, type FunctionDeclaration } from "@google/genai";
 import ReactMarkdown from 'react-markdown';
+import { flushSync } from 'react-dom';
 import { Layout, Model, TabNode, IJsonModel, Actions, DockLocation } from 'flexlayout-react';
 import 'flexlayout-react/style/dark.css';
 import * as Tooltip from '@radix-ui/react-tooltip';
@@ -2896,16 +2897,27 @@ export default function App() {
     return window.prompt(message, defaultValue) ?? null;
   };
 
-  const requestPythonInput = (queuedLines: string[]) => {
-    if (queuedLines.length > 0) {
-      return queuedLines.shift() ?? '';
-    }
+  const requestPythonInput = (promptText = '') => {
+    const normalizedPrompt = typeof promptText === 'string' ? promptText : String(promptText ?? '');
 
     if (settings.pythonIOMode === 'interactive-output-panel') {
       selectDockPanel('output');
-      setOutput(prev => prev + (prev ? '\n' : '') + '[INPUT] Python requested more input than was supplied in the Output panel. Falling back to browser prompt.');
+      setOutputPreviewHtml(null);
+      if (normalizedPrompt) {
+        flushSync(() => {
+          setOutput(prev => prev + normalizedPrompt);
+        });
+      }
     }
-    const value = window.prompt('Python input:', '');
+
+    const value = window.prompt(normalizedPrompt || 'Python input:', '');
+
+    if (settings.pythonIOMode === 'interactive-output-panel') {
+      flushSync(() => {
+        setOutput(prev => prev + (value ?? '') + '\n');
+      });
+    }
+
     return value ?? '';
   };
 
@@ -4986,21 +4998,23 @@ for _name in (
 
   const installPyodideInlineInputOverride = async (
     pyodide: any,
-    takeQueuedLine: () => string | null
+    requestInput: (prompt: string) => string
   ) => {
     try {
-      pyodide.globals.set('__codecraft_take_python_input_line', takeQueuedLine);
+      pyodide.globals.set('__codecraft_request_python_input', requestInput);
       await pyodide.runPythonAsync(`
 import builtins
 
 __codecraft_original_input = builtins.input
 
 def __codecraft_inline_input(prompt=""):
-    _take = globals().get("__codecraft_take_python_input_line")
-    if _take is not None:
-        _queued = _take()
-        if _queued is not None:
-            return str(_queued)
+    _request = globals().get("__codecraft_request_python_input")
+    if _request is not None:
+        try:
+            _value = _request("" if prompt is None else str(prompt))
+            return "" if _value is None else str(_value)
+        except Exception:
+            pass
     return __codecraft_original_input(prompt)
 
 builtins.input = __codecraft_inline_input
@@ -5019,13 +5033,13 @@ if "__codecraft_original_input" in globals():
 for _name in (
     "__codecraft_inline_input",
     "__codecraft_original_input",
-    "__codecraft_take_python_input_line",
+    "__codecraft_request_python_input",
 ):
     globals().pop(_name, None)
 `);
     } catch { }
     try {
-      pyodide.globals.delete('__codecraft_take_python_input_line');
+      pyodide.globals.delete('__codecraft_request_python_input');
     } catch { }
   };
 
@@ -5067,21 +5081,11 @@ for _name in (
       });
       setOutput('');
       console.clear();
-      const queuedPythonInputLines = await collectPythonOutputPanelInput(pyodide, code);
-      const takeQueuedPythonInputLine = () => (
-        queuedPythonInputLines.length > 0 ? (queuedPythonInputLines.shift() ?? '') : null
-      );
       pyodide.setStdin({
-        stdin: () => {
-          const queued = takeQueuedPythonInputLine();
-          if (queued !== null) {
-            return queued;
-          }
-          return requestPythonInput(queuedPythonInputLines);
-        },
+        stdin: () => requestPythonInput(''),
         isatty: true
       });
-      await installPyodideInlineInputOverride(pyodide, takeQueuedPythonInputLine);
+      await installPyodideInlineInputOverride(pyodide, requestPythonInput);
 
       installPyodideExecutionTimeoutGuard(pyodide, timeoutMs);
       const result = await withExecutionTimeout(
