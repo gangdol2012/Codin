@@ -425,6 +425,7 @@ function saveSyncMeta(meta: SyncMeta[]) {
 }
 
 const DEFAULT_ASSISTANT_CHAT_NAME = "AI assistant";
+const MAX_ASSISTANT_TOOL_PASSES = 4;
 const createAssistantChatId = () => `chat_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
 const INITIAL_ASSISTANT_CHAT_ID = createAssistantChatId();
 const DEFAULT_PYI_IMPORT_SIZE_LIMIT_BYTES = 200 * 1024;
@@ -1466,11 +1467,48 @@ interface PendingEdit {
   proposedContent: string;
 }
 
+interface AssistantToolExecutionResult {
+  summary: string;
+  detail: string;
+}
+
+type JavaScriptExecutionMode = 'classic-function' | 'async-function';
+type RuntimeIOMode = 'alert-output' | 'interactive-output-panel';
+type PythonRuntimeLifecycle = 'dispose-after-run' | 'keep-warm';
+type CSharpExecutionMode = 'regular' | 'script' | 'script-context';
+type RuntimeInteractionKind = 'alert' | 'confirm' | 'prompt' | 'stdin';
+type RuntimeInteractionLanguage = 'javascript' | 'python' | 'csharp';
+
+interface OutputPanelInteraction {
+  id: number;
+  kind: RuntimeInteractionKind;
+  language: RuntimeInteractionLanguage;
+  message: string;
+  defaultValue: string;
+  transcriptPrompt?: string;
+  transcriptPromptSequence?: string[];
+  inputMode?: 'single-line' | 'buffered-lines';
+  expectedLineCount?: number | null;
+  placeholder?: string;
+  submitLabel?: string;
+  cancelLabel?: string;
+}
+
 interface AppSettings {
   clearOutputOnRun: boolean;
   showExecutionDivisor: boolean;
   fontSize: number;
   autoSave: boolean;
+  javascriptExecutionTimeoutMs: number;
+  javascriptExecutionMode: JavaScriptExecutionMode;
+  javascriptIOMode: RuntimeIOMode;
+  pythonExecutionTimeoutMs: number;
+  pythonRuntimeLifecycle: PythonRuntimeLifecycle;
+  pythonIOMode: RuntimeIOMode;
+  csharpExecutionTimeoutMs: number;
+  csharpExecutionMode: CSharpExecutionMode;
+  csharpResetScriptContextBeforeRun: boolean;
+  csharpIOMode: RuntimeIOMode;
 }
 
 const loadSavedAssistantChats = (): AssistantChat[] => {
@@ -1516,7 +1554,35 @@ const DEFAULT_SETTINGS: AppSettings = {
   showExecutionDivisor: true,
   fontSize: 14,
   autoSave: true,
+  javascriptExecutionTimeoutMs: 0,
+  javascriptExecutionMode: 'classic-function',
+  javascriptIOMode: 'alert-output',
+  pythonExecutionTimeoutMs: 0,
+  pythonRuntimeLifecycle: 'dispose-after-run',
+  pythonIOMode: 'alert-output',
+  csharpExecutionTimeoutMs: 0,
+  csharpExecutionMode: 'regular',
+  csharpResetScriptContextBeforeRun: false,
+  csharpIOMode: 'alert-output',
 };
+
+function normalizeExecutionTimeoutMs(value: number) {
+  if (!Number.isFinite(value)) return 0;
+  return Math.max(0, Math.floor(value));
+}
+
+function formatExecutionTimeoutLabel(timeoutMs: number) {
+  if (timeoutMs <= 0) return 'Disabled';
+  if (timeoutMs < 1000) return `${timeoutMs} ms`;
+  if (timeoutMs % 1000 === 0) return `${timeoutMs / 1000}s`;
+  return `${(timeoutMs / 1000).toFixed(1)}s`;
+}
+
+function createExecutionTimeoutError(label: string, timeoutMs: number) {
+  return new Error(`${label} timed out after ${formatExecutionTimeoutLabel(timeoutMs)}.`);
+}
+
+const PYODIDE_TIMEOUT_ERROR_MARKER = '__CODECRAFT_PYTHON_TIMEOUT__';
 
 const INITIAL_FILES: FSItem[] = [
   {
@@ -1708,6 +1774,10 @@ export default function App() {
   });
   const [activeFileId, setActiveFileId] = useState<string>('');
   const [output, setOutput] = useState<string>('Click "Run" to see output...');
+  const [executionStartupStatus, setExecutionStartupStatus] = useState('');
+  const [outputInteraction, setOutputInteraction] = useState<OutputPanelInteraction | null>(null);
+  const [outputInteractionInput, setOutputInteractionInput] = useState('');
+  const [outputInteractionBufferedLines, setOutputInteractionBufferedLines] = useState<string[]>([]);
   const [terminalOutput, setTerminalOutput] = useState<string[]>([
     'Welcome to CodeCraft Terminal v2.0',
     'Type "help" for a list of commands.'
@@ -1735,7 +1805,13 @@ export default function App() {
     const saved = localStorage.getItem(STORAGE_KEYS.settings);
     if (!saved) return DEFAULT_SETTINGS;
     const parsed = JSON.parse(saved);
-    return { ...DEFAULT_SETTINGS, ...parsed };
+    const merged = { ...DEFAULT_SETTINGS, ...parsed };
+    return {
+      ...merged,
+      javascriptExecutionTimeoutMs: normalizeExecutionTimeoutMs(merged.javascriptExecutionTimeoutMs),
+      pythonExecutionTimeoutMs: normalizeExecutionTimeoutMs(merged.pythonExecutionTimeoutMs),
+      csharpExecutionTimeoutMs: normalizeExecutionTimeoutMs(merged.csharpExecutionTimeoutMs),
+    };
   });
   const [settingsPipPackages, setSettingsPipPackages] = useState<SavedPipPackage[]>(() => loadSavedPipPackages());
   const [settingsPipIncludedModules, setSettingsPipIncludedModules] = useState<string[]>(() => loadSavedPipIncludedModules());
@@ -1766,7 +1842,10 @@ export default function App() {
   const [activeEditorTabId, setActiveEditorTabId] = useState<string | null>(null);
   const [mountedSharedEditorTarget, setMountedSharedEditorTarget] = useState<SharedEditorTarget | null>(null);
   const outputContainerRef = useRef<HTMLDivElement>(null);
+  const outputInteractionInputRef = useRef<HTMLInputElement>(null);
   const terminalContainerRef = useRef<HTMLDivElement>(null);
+  const outputInteractionResolverRef = useRef<((value: string | boolean | null | undefined) => void) | null>(null);
+  const outputInteractionIdRef = useRef(0);
   const csharpRuntimeReadyRef = useRef<Promise<void> | null>(null);
   const skipEditorSyncRef = useRef(false);
   const pendingSharedEditorTargetRef = useRef<{ tabId: string; itemId: string } | null>(null);
@@ -2175,16 +2254,13 @@ export default function App() {
     enableClose: false
   });
 
-  const openEditorTab = (itemId: string) => {
-    const item = files.find(f => f.id === itemId);
-    if (!item) return;
-
+  const openEditorTabWithItem = (item: FSItem) => {
     skipEditorSyncRef.current = true;
-    setActiveFileId(itemId);
+    setActiveFileId(item.id);
 
     const jsonModel = layoutModel.toJson() as IJsonModel;
     const fallbackTabIds = collectFallbackEditorTabIds(jsonModel.layout);
-    const existingTab = findEditorTabByItemId(jsonModel.layout, itemId);
+    const existingTab = findEditorTabByItemId(jsonModel.layout, item.id);
     if (existingTab?.id) {
       setActiveEditorTabId(existingTab.id);
       layoutModel.doAction(Actions.selectTab(existingTab.id));
@@ -2202,13 +2278,13 @@ export default function App() {
       if (parentTabsetId) {
         layoutModel.doAction(Actions.addNode({
           type: 'tab',
-          id: `editor-panel-tab-${itemId}`,
+          id: `editor-panel-tab-${item.id}`,
           name: item.name,
           component: 'editor',
-          config: { itemId },
+          config: { itemId: item.id },
           enableClose: true
         }, parentTabsetId, DockLocation.CENTER, -1, true));
-        setActiveEditorTabId(`editor-panel-tab-${itemId}`);
+        setActiveEditorTabId(`editor-panel-tab-${item.id}`);
         fallbackTabIds.forEach(id => layoutModel.doAction(Actions.deleteTab(id)));
       }
       skipEditorSyncRef.current = false;
@@ -2223,14 +2299,20 @@ export default function App() {
 
     layoutModel.doAction(Actions.addNode({
       type: 'tab',
-      id: `editor-panel-tab-${itemId}`,
+      id: `editor-panel-tab-${item.id}`,
       name: item.name,
       component: 'editor',
-      config: { itemId },
+      config: { itemId: item.id },
       enableClose: true
     }, editorTabsetId, DockLocation.CENTER, -1, true));
-    setActiveEditorTabId(`editor-panel-tab-${itemId}`);
+    setActiveEditorTabId(`editor-panel-tab-${item.id}`);
     skipEditorSyncRef.current = false;
+  };
+
+  const openEditorTab = (itemId: string) => {
+    const item = files.find(f => f.id === itemId);
+    if (!item) return;
+    openEditorTabWithItem(item);
   };
 
   const aiRef = useRef(geminiAi);
@@ -2562,7 +2644,23 @@ export default function App() {
     if (outputContainerRef.current) {
       outputContainerRef.current.scrollTop = outputContainerRef.current.scrollHeight;
     }
-  }, [output]);
+  }, [output, outputInteraction]);
+
+  useEffect(() => {
+    if (!outputInteraction || (outputInteraction.kind !== 'prompt' && outputInteraction.kind !== 'stdin')) return;
+    const timeoutId = window.setTimeout(() => {
+      outputInteractionInputRef.current?.focus();
+      outputInteractionInputRef.current?.select?.();
+    }, 0);
+    return () => clearTimeout(timeoutId);
+  }, [outputInteraction]);
+
+  useEffect(() => {
+    return () => {
+      outputInteractionResolverRef.current?.(null);
+      outputInteractionResolverRef.current = null;
+    };
+  }, []);
 
   useEffect(() => {
     if (terminalContainerRef.current) {
@@ -2570,36 +2668,1003 @@ export default function App() {
     }
   }, [terminalOutput]);
 
-  const runJavaScript = (code: string) => {
-    const originalLog = console.log;
-    const originalError = console.error;
+  const withExecutionTimeout = useCallback(async <T,>(
+    label: string,
+    timeoutMs: number,
+    task: () => Promise<T>,
+    onTimeout?: () => void | Promise<void>
+  ): Promise<T> => {
+    const normalizedTimeout = normalizeExecutionTimeoutMs(timeoutMs);
+    if (normalizedTimeout <= 0) {
+      return task();
+    }
 
-    // Capture logs and stream to output
-    console.log = (...args) => {
-      const msg = args.map(a => typeof a === 'object' ? JSON.stringify(a, null, 2) : String(a)).join(' ');
-      setOutput(prev => prev + (prev ? '\n' : '') + msg);
-      originalLog(...args);
-    };
-    console.error = (...args) => {
-      const msg = `[ERROR] ${args.map(a => String(a)).join(' ')}`;
-      setOutput(prev => prev + (prev ? '\n' : '') + msg);
-      originalError(...args);
+    return new Promise<T>((resolve, reject) => {
+      let settled = false;
+      const timeoutId = window.setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        Promise.resolve(onTimeout?.())
+          .catch(() => {})
+          .finally(() => reject(createExecutionTimeoutError(label, normalizedTimeout)));
+      }, normalizedTimeout);
+
+      Promise.resolve(task())
+        .then(result => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timeoutId);
+          resolve(result);
+        })
+        .catch(error => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timeoutId);
+          reject(error);
+      });
+    });
+  }, []);
+
+  const appendExecutionStartupStatus = (message: string) => {
+    setExecutionStartupStatus(prev => prev ? `${prev}\n${message}` : message);
+  };
+
+  const resolveOutputPanelInteraction = (value: string | boolean | null | undefined) => {
+    const resolver = outputInteractionResolverRef.current;
+    outputInteractionResolverRef.current = null;
+    setOutputInteraction(null);
+    setOutputInteractionInput('');
+    setOutputInteractionBufferedLines([]);
+    resolver?.(value);
+  };
+
+  const requestOutputPanelInteraction = (
+    language: RuntimeInteractionLanguage,
+    kind: RuntimeInteractionKind,
+    message: string,
+    defaultValue = '',
+    options?: {
+      transcriptPrompt?: string;
+      transcriptPromptSequence?: string[];
+      inputMode?: 'single-line' | 'buffered-lines';
+      expectedLineCount?: number | null;
+      placeholder?: string;
+      submitLabel?: string;
+      cancelLabel?: string;
+    }
+  ) => {
+    if (outputInteractionResolverRef.current) {
+      throw new Error('Another interactive output request is already active.');
+    }
+
+    selectDockPanel('output');
+    setOutputPreviewHtml(null);
+    outputInteractionIdRef.current += 1;
+    setOutputInteractionInput(defaultValue);
+    setOutputInteractionBufferedLines([]);
+
+    return new Promise<string | boolean | null | undefined>((resolve) => {
+      outputInteractionResolverRef.current = resolve;
+      setOutputInteraction({
+        id: outputInteractionIdRef.current,
+        language,
+        kind,
+        message,
+        defaultValue,
+        transcriptPrompt: options?.transcriptPrompt,
+        transcriptPromptSequence: options?.transcriptPromptSequence,
+        inputMode: options?.inputMode,
+        expectedLineCount: options?.expectedLineCount ?? null,
+        placeholder: options?.placeholder,
+        submitLabel: options?.submitLabel,
+        cancelLabel: options?.cancelLabel,
+      });
+    });
+  };
+
+  const getVisibleOutputInteractionMessage = (
+    interaction: OutputPanelInteraction,
+    transcriptLineIndex = outputInteractionBufferedLines.length
+  ) => {
+    if (interaction.kind === 'stdin') {
+      if (interaction.inputMode === 'buffered-lines' && interaction.transcriptPromptSequence?.length) {
+        return interaction.transcriptPromptSequence[Math.min(transcriptLineIndex, interaction.transcriptPromptSequence.length - 1)] || '';
+      }
+      return interaction.transcriptPrompt || '';
+    }
+    return interaction.transcriptPrompt || interaction.message || '';
+  };
+
+  const appendOutputInteractionTranscript = (text: string) => {
+    if (!text) return;
+    setOutput(prev => prev + text);
+  };
+
+  const commitResolvedOutputInteraction = (
+    interaction: OutputPanelInteraction,
+    resolvedValue: string | boolean | null | undefined,
+    options?: {
+      appendNewline?: boolean;
+      transcriptLineIndex?: number;
+    }
+  ) => {
+    const message = getVisibleOutputInteractionMessage(
+      interaction,
+      options?.transcriptLineIndex ?? outputInteractionBufferedLines.length
+    );
+    let text = message;
+
+    if (interaction.kind === 'stdin' || interaction.kind === 'prompt') {
+      text += typeof resolvedValue === 'string' ? resolvedValue : '';
+    }
+
+    if (options?.appendNewline) {
+      text += '\n';
+    }
+
+    appendOutputInteractionTranscript(text);
+  };
+
+  const shouldAutoSubmitBufferedOutputInteraction = (
+    interaction: OutputPanelInteraction,
+    nextLines: string[]
+  ) => (
+    interaction.kind === 'stdin'
+    && interaction.inputMode === 'buffered-lines'
+    && interaction.expectedLineCount != null
+    && interaction.expectedLineCount > 0
+    && nextLines.length >= interaction.expectedLineCount
+  );
+
+  const queueBufferedOutputInteractionLine = () => {
+    if (!outputInteraction || outputInteraction.kind !== 'stdin') return;
+    const nextLine = outputInteractionInput;
+    commitResolvedOutputInteraction(outputInteraction, nextLine, {
+      appendNewline: true,
+      transcriptLineIndex: outputInteractionBufferedLines.length,
+    });
+    const nextLines = [...outputInteractionBufferedLines, nextLine];
+    if (shouldAutoSubmitBufferedOutputInteraction(outputInteraction, nextLines)) {
+      resolveOutputPanelInteraction(nextLines.join('\n'));
+      return;
+    }
+    setOutputInteractionBufferedLines(nextLines);
+    setOutputInteractionInput('');
+  };
+
+  const submitOutputPanelStdinInteraction = () => {
+    if (!outputInteraction || outputInteraction.kind !== 'stdin') return;
+
+    if (outputInteraction.inputMode === 'buffered-lines') {
+      let nextLines = [...outputInteractionBufferedLines];
+      if (outputInteractionInput !== '') {
+        commitResolvedOutputInteraction(outputInteraction, outputInteractionInput, {
+          appendNewline: true,
+          transcriptLineIndex: outputInteractionBufferedLines.length,
+        });
+        nextLines = [...nextLines, outputInteractionInput];
+      }
+      resolveOutputPanelInteraction(nextLines.join('\n'));
+      return;
+    }
+
+    commitResolvedOutputInteraction(outputInteraction, outputInteractionInput);
+    resolveOutputPanelInteraction(outputInteractionInput);
+  };
+
+  const completeSharedBufferInteraction = (
+    headerBuffer: SharedArrayBuffer,
+    payloadBuffer: SharedArrayBuffer,
+    payload: unknown
+  ) => {
+    const header = new Int32Array(headerBuffer);
+    const buffer = new Uint8Array(payloadBuffer);
+    const encoded = new TextEncoder().encode(JSON.stringify(payload));
+    const maxLength = Math.min(encoded.length, buffer.byteLength);
+    buffer.fill(0);
+    buffer.set(encoded.subarray(0, maxLength), 0);
+    Atomics.store(header, 1, maxLength);
+    Atomics.store(header, 0, 1);
+    Atomics.notify(header, 0, 1);
+  };
+
+  const performRuntimeInteraction = async (
+    language: RuntimeInteractionLanguage,
+    ioMode: RuntimeIOMode,
+    kind: RuntimeInteractionKind,
+    message: string,
+    defaultValue = ''
+  ) => {
+    if (ioMode === 'interactive-output-panel') {
+      return requestOutputPanelInteraction(language, kind, message, defaultValue, kind === 'stdin'
+        ? {
+          inputMode: 'single-line',
+          placeholder: 'Type input and press Enter',
+          submitLabel: 'Send',
+          cancelLabel: 'Cancel',
+        }
+        : undefined);
+    }
+
+    if (kind === 'alert') {
+      window.alert(message);
+      return undefined;
+    }
+    if (kind === 'confirm') {
+      return window.confirm(message);
+    }
+    return window.prompt(message, defaultValue) ?? null;
+  };
+
+  const requestPythonInput = (queuedLines: string[]) => {
+    if (queuedLines.length > 0) {
+      return queuedLines.shift() ?? '';
+    }
+
+    if (settings.pythonIOMode === 'interactive-output-panel') {
+      selectDockPanel('output');
+      setOutput(prev => prev + (prev ? '\n' : '') + '[INPUT] Python requested more input than was supplied in the Output panel. Falling back to browser prompt.');
+    }
+    const value = window.prompt('Python input:', '');
+    return value ?? '';
+  };
+
+  const collectPythonOutputPanelInput = async (pyodide: any, code: string) => {
+    if (settings.pythonIOMode !== 'interactive-output-panel') {
+      return [] as string[];
+    }
+
+    let requiresInput = false;
+    let detectedPrompts: string[] = [];
+
+    try {
+      const raw = await pyodide.runPythonAsync(`
+import ast, json, re
+
+_code = ${JSON.stringify(code)}
+_result = {
+    "requiresInput": False,
+    "prompts": [],
+}
+
+try:
+    _tree = ast.parse(_code)
+except Exception:
+    _tree = None
+
+if _tree is not None:
+    class _InputVisitor(ast.NodeVisitor):
+        def visit_Call(self, node):
+            func = node.func
+            if isinstance(func, ast.Name) and func.id == "input":
+                _result["requiresInput"] = True
+                prompt = ""
+                if node.args:
+                    first = node.args[0]
+                    if isinstance(first, ast.Constant) and isinstance(first.value, str):
+                        prompt = first.value
+                _result["prompts"].append(prompt)
+            self.generic_visit(node)
+
+    _InputVisitor().visit(_tree)
+
+if not _result["requiresInput"]:
+    _patterns = (
+        r"\\binput\\s*\\(",
+        r"\\bsys\\s*\\.\\s*stdin\\s*\\.\\s*(?:read|readline|readlines)\\s*\\(",
+        r"\\bstdin\\s*\\.\\s*(?:read|readline|readlines)\\s*\\(",
+        r"\\bopen\\s*\\(\\s*0\\s*(?:,|\\))",
+    )
+    _result["requiresInput"] = any(re.search(pattern, _code) for pattern in _patterns)
+
+json.dumps(_result)
+`);
+      const parsed = JSON.parse(String(raw));
+      requiresInput = !!parsed?.requiresInput;
+      detectedPrompts = Array.isArray(parsed?.prompts)
+        ? parsed.prompts.filter((prompt: unknown): prompt is string => typeof prompt === 'string')
+        : [];
+    } catch {
+      requiresInput = /\binput\s*\(|\bsys\s*\.\s*stdin\s*\.\s*(?:read|readline|readlines)\s*\(|\bstdin\s*\.\s*(?:read|readline|readlines)\s*\(|\bopen\s*\(\s*0\s*(?:,|\))/m.test(code);
+      detectedPrompts = [];
+    }
+
+    if (!requiresInput) {
+      return [] as string[];
+    }
+
+    const response = await requestOutputPanelInteraction(
+      'python',
+      'stdin',
+      '',
+      '',
+      {
+        transcriptPromptSequence: detectedPrompts,
+        inputMode: 'buffered-lines',
+        expectedLineCount: detectedPrompts.length > 0 ? detectedPrompts.length : null,
+        submitLabel: 'Start Run',
+        cancelLabel: 'Cancel Run',
+      }
+    );
+
+    if (response === null) {
+      throw new Error('Python execution cancelled while waiting for Output panel input.');
+    }
+
+    return String(response ?? '').replace(/\r\n/g, '\n').split('\n');
+  };
+
+  const runJavaScript = async (code: string) => {
+    setExecutionStartupStatus('');
+    setOutput('');
+    console.clear();
+
+    const timeoutMs = normalizeExecutionTimeoutMs(settings.javascriptExecutionTimeoutMs);
+    const mode = settings.javascriptExecutionMode;
+    const ioMode = settings.javascriptIOMode;
+
+    if (ioMode === 'interactive-output-panel') {
+      selectDockPanel('output');
+    }
+
+    const workerSource = `
+const formatValue = (value) => {
+  if (typeof value === 'string') return value;
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
+};
+
+const post = (type, payload = {}) => self.postMessage({ type, ...payload });
+const postStream = (level, message = '') => post('stream', {
+  level,
+  message: typeof message === 'string' ? message : String(message),
+});
+const runtimeState = {
+  activeTimeouts: new Set(),
+  activeIntervals: new Set(),
+  pendingMicrotasks: 0,
+  waiters: [],
+  notify() {
+    if (this.waiters.length === 0) return;
+    const waiters = this.waiters.splice(0, this.waiters.length);
+    waiters.forEach((resolve) => resolve());
+  },
+  hasActiveHandles() {
+    return this.activeTimeouts.size > 0 || this.activeIntervals.size > 0 || this.pendingMicrotasks > 0;
+  },
+  waitForChange() {
+    return new Promise((resolve) => {
+      this.waiters.push(resolve);
+    });
+  },
+};
+const nativeSetTimeout = self.setTimeout.bind(self);
+const nativeClearTimeout = self.clearTimeout.bind(self);
+const nativeSetInterval = self.setInterval.bind(self);
+const nativeClearInterval = self.clearInterval.bind(self);
+const nativeQueueMicrotask = self.queueMicrotask.bind(self);
+const registerTimer = (bucket, handle) => {
+  bucket.add(handle);
+  runtimeState.notify();
+  return handle;
+};
+const unregisterTimer = (bucket, handle) => {
+  if (bucket.delete(handle)) {
+    runtimeState.notify();
+  }
+};
+const queueMicrotask = (callback) => {
+  runtimeState.pendingMicrotasks += 1;
+  runtimeState.notify();
+  nativeQueueMicrotask(() => {
+    try {
+      callback();
+    } finally {
+      runtimeState.pendingMicrotasks = Math.max(0, runtimeState.pendingMicrotasks - 1);
+      runtimeState.notify();
+    }
+  });
+};
+self.queueMicrotask = queueMicrotask;
+self.setTimeout = (callback, delay = 0, ...args) => {
+  let handle;
+  const wrapped = (...innerArgs) => {
+    unregisterTimer(runtimeState.activeTimeouts, handle);
+    return callback(...innerArgs);
+  };
+  handle = registerTimer(runtimeState.activeTimeouts, nativeSetTimeout(wrapped, delay, ...args));
+  return handle;
+};
+self.clearTimeout = (handle) => {
+  unregisterTimer(runtimeState.activeTimeouts, handle);
+  return nativeClearTimeout(handle);
+};
+self.setInterval = (callback, delay = 0, ...args) => registerTimer(
+  runtimeState.activeIntervals,
+  nativeSetInterval(callback, delay, ...args)
+);
+self.clearInterval = (handle) => {
+  unregisterTimer(runtimeState.activeIntervals, handle);
+  return nativeClearInterval(handle);
+};
+const waitForRuntimeToSettle = async () => {
+  while (true) {
+    await Promise.resolve();
+    if (!runtimeState.hasActiveHandles()) {
+      await new Promise((resolve) => nativeSetTimeout(resolve, 0));
+      await Promise.resolve();
+      if (!runtimeState.hasActiveHandles()) {
+        return;
+      }
+    }
+    await runtimeState.waitForChange();
+  }
+};
+const createProcessExitSignal = (code = 0) => ({
+  __codecraftProcessExit: true,
+  code: Number.isFinite(Number(code)) ? Math.trunc(Number(code)) : 0,
+});
+const createProcessStream = (level) => ({
+  write: (chunk = '') => {
+    postStream(level, chunk);
+    return true;
+  },
+  clear: () => {},
+  clearLine: () => {},
+  cursorTo: () => {},
+  moveCursor: () => {},
+  isTTY: false,
+  columns: 80,
+  rows: 24,
+});
+const requestStdinValue = (message = 'JavaScript stdin requested.', defaultValue = '') => {
+  const response = self.__codecraftRequestSyncIO(
+    'stdin',
+    String(message),
+    defaultValue == null ? '' : String(defaultValue)
+  );
+  return response && Object.prototype.hasOwnProperty.call(response, 'value')
+    ? (response.value == null ? null : String(response.value))
+    : null;
+};
+const createProcessStdin = () => {
+  const listeners = {
+    data: [],
+    readable: [],
+    end: [],
+    close: [],
+    error: [],
+  };
+  const queue = [];
+  let encoding = 'utf8';
+  let destroyed = false;
+  let ended = false;
+  let paused = true;
+  let flowing = false;
+  let pumping = false;
+  let readableFlowing = null;
+
+  const getListeners = (event) => (
+    Array.isArray(listeners[event]) ? listeners[event] : []
+  );
+
+  const listenerCount = (event) => getListeners(event).length;
+
+  const emit = (event, ...args) => {
+    const handlers = getListeners(event);
+    if (handlers.length === 0) return false;
+    let handled = false;
+    const snapshot = [...handlers];
+    snapshot.forEach((handler) => {
+      handled = true;
+      if (!getListeners(event).includes(handler)) return;
+      if (handler && handler.__codecraftOnce) {
+        api.off(event, handler);
+      }
+      try {
+        handler(...args);
+      } catch (error) {
+        post('error', {
+          message: error && error.stack ? String(error.stack) : (error && error.message ? String(error.message) : String(error))
+        });
+      }
+    });
+    return handled;
+  };
+
+  const updateFlowState = () => {
+    api.readable = !destroyed;
+    api.readableEnded = ended;
+    api.destroyed = destroyed;
+    api.readableFlowing = readableFlowing;
+  };
+
+  const toChunk = (text) => {
+    const normalized = String(text);
+    if (encoding != null) {
+      return normalized;
+    }
+    const bytes = new TextEncoder().encode(normalized);
+    try {
+      Object.defineProperty(bytes, 'toString', {
+        value: () => normalized,
+        configurable: true,
+      });
+    } catch { }
+    return bytes;
+  };
+
+  const finishStream = (event = 'end') => {
+    if (ended) return;
+    ended = true;
+    flowing = false;
+    paused = true;
+    readableFlowing = false;
+    updateFlowState();
+    emit(event);
+    emit('close');
+  };
+
+  const pullChunk = () => {
+    if (destroyed || ended) return null;
+    const raw = requestStdinValue();
+    if (raw === null) {
+      finishStream('end');
+      return null;
+    }
+    return toChunk(raw);
+  };
+
+  const ensureBufferedChunk = () => {
+    if (destroyed || ended) return null;
+    if (queue.length > 0) return queue[0] ?? null;
+    const chunk = pullChunk();
+    if (chunk === null) return null;
+    queue.push(chunk);
+    emit('readable');
+    return chunk;
+  };
+
+  const scheduleReadable = () => {
+    if (destroyed || ended) return;
+    if (queue.length > 0 || listenerCount('readable') === 0 || listenerCount('data') > 0) return;
+    queueMicrotask(() => {
+      if (destroyed || ended) return;
+      if (queue.length > 0 || listenerCount('readable') === 0 || listenerCount('data') > 0) return;
+      ensureBufferedChunk();
+    });
+  };
+
+  const pump = () => {
+    if (pumping || destroyed || ended || paused || !flowing || listenerCount('data') === 0) return;
+    pumping = true;
+    try {
+      while (!destroyed && !ended && !paused && flowing && listenerCount('data') > 0) {
+        const chunk = queue.length > 0 ? queue.shift() ?? null : pullChunk();
+        if (chunk === null) {
+          break;
+        }
+        emit('data', chunk);
+      }
+    } finally {
+      pumping = false;
+    }
+  };
+
+  const schedulePump = () => {
+    if (destroyed || ended || paused || !flowing || listenerCount('data') === 0) return;
+    queueMicrotask(() => {
+      pump();
+    });
+  };
+
+  const addHandler = (event, handler, prepend = false, once = false) => {
+    if (typeof handler !== 'function') {
+      return api;
+    }
+    const bucket = getListeners(event);
+    if (!Array.isArray(bucket)) {
+      return api;
+    }
+    const wrapped = once
+      ? Object.assign((...args) => handler(...args), {
+        __codecraftOnce: true,
+        __codecraftOriginalHandler: handler,
+      })
+      : handler;
+    if (prepend) {
+      bucket.unshift(wrapped);
+    } else {
+      bucket.push(wrapped);
+    }
+
+    if (event === 'data') {
+      paused = false;
+      flowing = true;
+      readableFlowing = true;
+      updateFlowState();
+      schedulePump();
+    } else if (event === 'readable') {
+      if (!flowing) {
+        paused = true;
+        readableFlowing = false;
+        updateFlowState();
+      }
+      scheduleReadable();
+    }
+
+    return api;
+  };
+
+  const api = {
+    isTTY: false,
+    readable: true,
+    readableEnded: false,
+    readableFlowing: null,
+    readableEncoding: encoding,
+    destroyed: false,
+    setEncoding: (value) => {
+      encoding = value == null ? null : String(value);
+      api.readableEncoding = encoding;
+      for (let index = 0; index < queue.length; index += 1) {
+        const queued = queue[index];
+        queue[index] = typeof queued === 'string'
+          ? toChunk(queued)
+          : queued;
+      }
+      return api;
+    },
+    isPaused: () => paused,
+    pause: () => {
+      paused = true;
+      flowing = false;
+      readableFlowing = false;
+      updateFlowState();
+      return api;
+    },
+    resume: () => {
+      if (destroyed || ended) return api;
+      paused = false;
+      flowing = true;
+      readableFlowing = true;
+      updateFlowState();
+      schedulePump();
+      return api;
+    },
+    read: () => {
+      if (destroyed) return null;
+      if (queue.length === 0) {
+        ensureBufferedChunk();
+      }
+      return queue.length > 0 ? queue.shift() ?? null : null;
+    },
+    on: (event, handler) => addHandler(event, handler, false, false),
+    addListener: (event, handler) => addHandler(event, handler, false, false),
+    once: (event, handler) => addHandler(event, handler, false, true),
+    prependListener: (event, handler) => addHandler(event, handler, true, false),
+    prependOnceListener: (event, handler) => addHandler(event, handler, true, true),
+    off: (event, handler) => {
+      if (!Array.isArray(listeners[event])) return api;
+      listeners[event] = listeners[event].filter((candidate) => (
+        candidate !== handler
+        && candidate?.__codecraftOriginalHandler !== handler
+      ));
+      if (event === 'data' && listenerCount('data') === 0) {
+        flowing = false;
+        paused = true;
+        readableFlowing = false;
+        updateFlowState();
+      }
+      return api;
+    },
+    removeListener: (event, handler) => api.off(event, handler),
+    removeAllListeners: (event) => {
+      if (typeof event === 'string' && Array.isArray(listeners[event])) {
+        listeners[event] = [];
+        return api;
+      }
+      Object.keys(listeners).forEach((key) => {
+        listeners[key] = [];
+      });
+      flowing = false;
+      paused = true;
+      readableFlowing = false;
+      updateFlowState();
+      return api;
+    },
+    listeners: (event) => getListeners(event).map((handler) => handler?.__codecraftOriginalHandler || handler),
+    listenerCount: (event) => listenerCount(event),
+    emit: (event, ...args) => emit(event, ...args),
+    destroy: () => {
+      if (destroyed) return api;
+      destroyed = true;
+      flowing = false;
+      paused = true;
+      readableFlowing = false;
+      updateFlowState();
+      finishStream('end');
+      return api;
+    },
+    [Symbol.asyncIterator]: () => ({
+      next: async () => {
+        const chunk = api.read();
+        if (chunk === null) {
+          return { value: undefined, done: true };
+        }
+        return { value: chunk, done: false };
+      },
+      return: async () => {
+        api.pause();
+        return { value: undefined, done: true };
+      },
+    }),
+  };
+
+  updateFlowState();
+  return api;
+};
+const createProcessShim = () => {
+  const nowSeconds = () => performance.now() / 1000;
+  const normalizeExitCode = (code) => (
+    Number.isFinite(Number(code)) ? Math.trunc(Number(code)) : 0
+  );
+  const hrtime = (previous) => {
+    const totalNanoseconds = Math.floor(performance.now() * 1e6);
+    const seconds = Math.floor(totalNanoseconds / 1e9);
+    const nanoseconds = totalNanoseconds - seconds * 1e9;
+    if (!Array.isArray(previous) || previous.length !== 2) {
+      return [seconds, nanoseconds];
+    }
+    let diffSeconds = seconds - Number(previous[0] || 0);
+    let diffNanoseconds = nanoseconds - Number(previous[1] || 0);
+    if (diffNanoseconds < 0) {
+      diffSeconds -= 1;
+      diffNanoseconds += 1e9;
+    }
+    return [diffSeconds, diffNanoseconds];
+  };
+  const processShim = {
+    env: Object.create(null),
+    argv: [],
+    browser: true,
+    platform: 'browser',
+    version: '',
+    versions: {},
+    arch: 'wasm32',
+    exitCode: 0,
+    cwd: () => '/',
+    chdir: () => {
+      throw new Error('process.chdir is not supported in CodeCraft\\'s JavaScript runtime.');
+    },
+    exit: (code = 0) => {
+      processShim.exitCode = normalizeExitCode(code);
+      throw createProcessExitSignal(processShim.exitCode);
+    },
+    nextTick: (callback, ...args) => queueMicrotask(() => callback(...args)),
+    hrtime,
+    uptime: nowSeconds,
+    stdout: createProcessStream('stdout'),
+    stderr: createProcessStream('stderr'),
+    stdin: createProcessStdin(),
+  };
+  return processShim;
+};
+if (typeof self.global === 'undefined') {
+  self.global = self;
+}
+if (typeof self.process === 'undefined') {
+  self.process = createProcessShim();
+}
+self.__codecraftRequestSyncIO = (kind, message, defaultValue = '') => {
+  if (typeof SharedArrayBuffer !== 'function') {
+    throw new Error('SharedArrayBuffer is required for JavaScript runtime dialogs in worker execution.');
+  }
+  const headerBuffer = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT * 2);
+  const payloadBuffer = new SharedArrayBuffer(262144);
+  const header = new Int32Array(headerBuffer);
+  post('io-request', { kind, message, defaultValue, headerBuffer, payloadBuffer });
+  Atomics.wait(header, 0, 0);
+  const payloadLength = Math.max(0, Atomics.load(header, 1));
+  const sharedPayload = new Uint8Array(payloadBuffer, 0, payloadLength);
+  const decodedPayload = new Uint8Array(payloadLength);
+  decodedPayload.set(sharedPayload);
+  const json = new TextDecoder().decode(decodedPayload);
+  if (!json) return { value: null };
+  const parsed = JSON.parse(json);
+  if (parsed && parsed.__codecraftError) {
+    throw new Error(parsed.__codecraftError);
+  }
+  return parsed;
+};
+self.alert = (message = '') => {
+  self.__codecraftRequestSyncIO('alert', String(message));
+};
+self.confirm = (message = '') => {
+  return Boolean(self.__codecraftRequestSyncIO('confirm', String(message)).value);
+};
+self.prompt = (message = '', defaultValue = '') => {
+  const response = self.__codecraftRequestSyncIO(
+    'prompt',
+    String(message),
+    defaultValue == null ? '' : String(defaultValue)
+  );
+  return response && Object.prototype.hasOwnProperty.call(response, 'value')
+    ? response.value
+    : null;
+};
+self.console = {
+  log: (...args) => post('log', { level: 'log', message: args.map(formatValue).join(' ') }),
+  error: (...args) => post('log', { level: 'error', message: '[ERROR] ' + args.map(formatValue).join(' ') }),
+  warn: (...args) => post('log', { level: 'warn', message: '[WARN] ' + args.map(formatValue).join(' ') }),
+  clear: () => {}
+};
+
+self.onmessage = async (event) => {
+  const { code, mode } = event.data || {};
+  try {
+    let result;
+    if (mode === 'async-function') {
+      const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+      const fn = new AsyncFunction(code);
+      result = await fn();
+    } else {
+      const fn = new Function(code);
+      result = fn();
+      if (result && typeof result.then === 'function') {
+        result = await result;
+      }
+    }
+    if (result !== undefined) {
+      post('result', { message: 'Return value: ' + formatValue(result) });
+    }
+    await waitForRuntimeToSettle();
+    post('done');
+  } catch (error) {
+    if (error && error.__codecraftProcessExit) {
+      post('done', { exitCode: error.code ?? 0 });
+      return;
+    }
+    post('error', { message: error && error.stack ? String(error.stack) : (error && error.message ? String(error.message) : String(error)) });
+  }
+};
+`;
+
+    const workerUrl = URL.createObjectURL(new Blob([workerSource], { type: 'text/javascript' }));
+    const worker = new Worker(workerUrl);
+    let streamOutput = '';
+    const applyJavaScriptStreamChunk = (chunk: string) => {
+      const normalizedChunk = chunk.replace(/\r\n/g, '\n');
+      let nextOutput = streamOutput;
+      let index = 0;
+
+      const trimCurrentLine = () => {
+        const lastNewlineIndex = nextOutput.lastIndexOf('\n');
+        nextOutput = lastNewlineIndex >= 0 ? nextOutput.slice(0, lastNewlineIndex + 1) : '';
+      };
+
+      while (index < normalizedChunk.length) {
+        const clearIndex = normalizedChunk.indexOf('\x1b[2J', index);
+        const homeIndex = normalizedChunk.indexOf('\x1b[H', index);
+        const carriageReturnIndex = normalizedChunk.indexOf('\r', index);
+        const controlIndexCandidates = [clearIndex, homeIndex, carriageReturnIndex].filter((value) => value >= 0);
+        const nextControlIndex = controlIndexCandidates.length > 0 ? Math.min(...controlIndexCandidates) : -1;
+
+        if (nextControlIndex === -1) {
+          nextOutput += normalizedChunk.slice(index);
+          break;
+        }
+
+        if (nextControlIndex > index) {
+          nextOutput += normalizedChunk.slice(index, nextControlIndex);
+        }
+
+        if (nextControlIndex === clearIndex) {
+          nextOutput = '';
+          index = clearIndex + '\x1b[2J'.length;
+          continue;
+        }
+
+        if (nextControlIndex === homeIndex) {
+          nextOutput = '';
+          index = homeIndex + '\x1b[H'.length;
+          continue;
+        }
+
+        trimCurrentLine();
+        index = carriageReturnIndex + 1;
+      }
+
+      streamOutput = nextOutput;
+      setOutput(nextOutput);
     };
 
     try {
-      setOutput('');
-      console.clear();
-      const fn = new Function(code);
-      const result = fn();
+      await new Promise<void>((resolve, reject) => {
+        let timeoutId: number | null = null;
+        let finished = false;
+        const finish = (callback: () => void) => {
+          if (finished) return;
+          finished = true;
+          if (timeoutId != null) {
+            clearTimeout(timeoutId);
+          }
+          worker.terminate();
+          URL.revokeObjectURL(workerUrl);
+          callback();
+        };
 
-      if (result !== undefined) {
-        setOutput(prev => prev + (prev ? '\n' : '') + `Return value: ${String(result)}`);
-      }
+        if (timeoutMs > 0) {
+          timeoutId = window.setTimeout(() => {
+            finish(() => reject(createExecutionTimeoutError('JavaScript execution', timeoutMs)));
+          }, timeoutMs);
+        }
+
+        worker.onmessage = (event) => {
+          const message = event.data || {};
+          if (message.type === 'stream' && typeof message.message === 'string') {
+            applyJavaScriptStreamChunk(message.message);
+            return;
+          }
+          if (message.type === 'log' && typeof message.message === 'string') {
+            setOutput(prev => prev + (prev ? '\n' : '') + message.message);
+            return;
+          }
+          if (message.type === 'result' && typeof message.message === 'string') {
+            setOutput(prev => prev + (prev ? '\n' : '') + message.message);
+            return;
+          }
+          if (message.type === 'error' && typeof message.message === 'string') {
+            finish(() => reject(new Error(message.message)));
+            return;
+          }
+          if (
+            message.type === 'io-request'
+            && message.headerBuffer instanceof SharedArrayBuffer
+            && message.payloadBuffer instanceof SharedArrayBuffer
+          ) {
+            void performRuntimeInteraction(
+              'javascript',
+              ioMode,
+              message.kind === 'confirm'
+                ? 'confirm'
+                : message.kind === 'prompt'
+                  ? 'prompt'
+                  : message.kind === 'stdin'
+                    ? 'stdin'
+                    : 'alert',
+              typeof message.message === 'string' ? message.message : '',
+              typeof message.defaultValue === 'string' ? message.defaultValue : ''
+            ).then((value) => {
+              completeSharedBufferInteraction(
+                message.headerBuffer,
+                message.payloadBuffer,
+                { value: value ?? null }
+              );
+            }).catch((error) => {
+              completeSharedBufferInteraction(
+                message.headerBuffer,
+                message.payloadBuffer,
+                { __codecraftError: error instanceof Error ? error.message : String(error) }
+              );
+            });
+            return;
+          }
+          if (message.type === 'done') {
+            finish(resolve);
+          }
+        };
+
+        worker.onerror = (event) => {
+          finish(() => reject(new Error(event.message || 'JavaScript execution failed.')));
+        };
+
+        worker.postMessage({ code, mode });
+      });
     } catch (err) {
       setOutput(prev => prev + (prev ? '\n' : '') + `Runtime Error: ${err instanceof Error ? err.message : String(err)}`);
-    } finally {
-      console.log = originalLog;
-      console.error = originalError;
     }
   };
 
@@ -3022,9 +4087,36 @@ json.dumps(_extract(${JSON.stringify(pkgName)}))
   const pyodideStdlibSurfaceSignatureRef = useRef('');
   const pyodideHostFrameRef = useRef<HTMLIFrameElement | null>(null);
   const pyodideScriptLoadPromiseRef = useRef<Promise<Window & typeof globalThis> | null>(null);
+  const pyodideRuntimeSourceRef = useRef<{
+    kind: 'cdn' | 'local';
+    indexURL: string;
+    lockFileURL: string;
+    stdlibURL: string;
+    scriptURL: string;
+    packageBaseUrl: string;
+  } | null>(null);
   const PYODIDE_IDLE_TIMEOUT = 60_000;
-  const PYODIDE_INDEX_URL = 'https://cdn.jsdelivr.net/pyodide/v0.29.3/full';
-  const PYODIDE_STDLIB_URL = `${PYODIDE_INDEX_URL}/python_stdlib.zip`;
+  const PYODIDE_RUNTIME_VERSION = '0.29.3';
+  const PYODIDE_CDN_INDEX_URL = `https://cdn.jsdelivr.net/pyodide/v${PYODIDE_RUNTIME_VERSION}/full/`;
+  const PYODIDE_LOCAL_INDEX_URL = new URL('pyodide/', document.baseURI).toString();
+  const PYODIDE_RUNTIME_SOURCES = [
+    {
+      kind: 'cdn' as const,
+      indexURL: PYODIDE_CDN_INDEX_URL,
+      lockFileURL: `${PYODIDE_CDN_INDEX_URL}pyodide-lock.json`,
+      stdlibURL: `${PYODIDE_CDN_INDEX_URL}python_stdlib.zip`,
+      scriptURL: `${PYODIDE_CDN_INDEX_URL}pyodide.js`,
+      packageBaseUrl: PYODIDE_CDN_INDEX_URL,
+    },
+    {
+      kind: 'local' as const,
+      indexURL: PYODIDE_LOCAL_INDEX_URL,
+      lockFileURL: `${PYODIDE_LOCAL_INDEX_URL}pyodide-lock.json`,
+      stdlibURL: `${PYODIDE_LOCAL_INDEX_URL}python_stdlib.zip`,
+      scriptURL: `${PYODIDE_LOCAL_INDEX_URL}pyodide.js`,
+      packageBaseUrl: PYODIDE_CDN_INDEX_URL,
+    },
+  ];
   const PYODIDE_INTERNAL_RUNTIME_MODULES = [
     '__future__', '_collections_abc', '_frozen_importlib', '_frozen_importlib_external', '_imp', '_io',
     '_pyodide', '_pyodide_core', '_sitebuiltins', '_stat', '_thread', 'abc', 'ast', 'base64', 'binascii', 'builtins', 'codecs',
@@ -3047,6 +4139,29 @@ json.dumps(_extract(${JSON.stringify(pkgName)}))
   const getPyodideHostWindow = () => (
     pyodideHostFrameRef.current?.contentWindow as (Window & typeof globalThis) | null
   );
+
+  const getActivePyodideRuntimeSource = () => (
+    pyodideRuntimeSourceRef.current ?? PYODIDE_RUNTIME_SOURCES[1]
+  );
+
+  const resolvePyodideRuntimeLoadSource = async () => {
+    const activeSource = getActivePyodideRuntimeSource();
+    if (activeSource.kind !== 'cdn') {
+      return activeSource;
+    }
+
+    try {
+      const probe = await fetch(activeSource.lockFileURL, {
+        method: 'HEAD',
+        cache: 'no-store',
+      });
+      if (probe.ok) {
+        return activeSource;
+      }
+    } catch { }
+
+    return PYODIDE_RUNTIME_SOURCES[1];
+  };
 
   const destroyPyodideHostFrame = () => {
     pyodideScriptLoadPromiseRef.current = null;
@@ -3101,17 +4216,37 @@ json.dumps(_extract(${JSON.stringify(pkgName)}))
       return pyodideScriptLoadPromiseRef.current;
     }
 
-    pyodideScriptLoadPromiseRef.current = new Promise<Window & typeof globalThis>((resolve, reject) => {
-      const script = hostWindow.document.createElement('script');
-      script.src = `${PYODIDE_INDEX_URL}/pyodide.js`;
-      script.async = true;
-      script.onload = () => resolve(hostWindow);
-      script.onerror = () => {
-        pyodideScriptLoadPromiseRef.current = null;
-        reject(new Error('Failed to load Pyodide'));
-      };
-      hostWindow.document.head.appendChild(script);
-    });
+    const tryLoadScriptFromSource = (source: typeof PYODIDE_RUNTIME_SOURCES[number]) => (
+      new Promise<Window & typeof globalThis>((resolve, reject) => {
+        const script = hostWindow.document.createElement('script');
+        script.src = source.scriptURL;
+        script.async = true;
+        script.onload = () => {
+          pyodideRuntimeSourceRef.current = source;
+          resolve(hostWindow);
+        };
+        script.onerror = () => {
+          try {
+            script.remove();
+          } catch { }
+          reject(new Error(`Failed to load Pyodide from ${source.kind}.`));
+        };
+        hostWindow.document.head.appendChild(script);
+      })
+    );
+
+    pyodideScriptLoadPromiseRef.current = (async () => {
+      let lastError: unknown = null;
+      for (const source of PYODIDE_RUNTIME_SOURCES) {
+        try {
+          return await tryLoadScriptFromSource(source);
+        } catch (error) {
+          lastError = error;
+        }
+      }
+      pyodideScriptLoadPromiseRef.current = null;
+      throw (lastError instanceof Error ? lastError : new Error('Failed to load Pyodide.'));
+    })();
 
     return pyodideScriptLoadPromiseRef.current;
   };
@@ -3144,6 +4279,7 @@ gc.collect()
     (window as any).pyodide = undefined;
     (window as any).loadPyodide = undefined;
     destroyPyodideHostFrame();
+    pyodideRuntimeSourceRef.current = null;
     pyodideRestoredRef.current = false;
     pyodideStdlibSourceBufferRef.current = null;
     pyodideStdlibSurfaceSignatureRef.current = '';
@@ -3285,7 +4421,14 @@ sys.path_importer_cache.clear()
       .map(pkg => pkg.name);
     if (prebuiltPackages.length > 0) {
       log?.(`Rehydrating ${prebuiltPackages.length} Pyodide prebuilt package(s): ${prebuiltPackages.join(', ')}...`);
-      await pyodide.loadPackage(prebuiltPackages);
+      try {
+        await pyodide.loadPackage(prebuiltPackages);
+      } catch (error) {
+        log?.(
+          `Continuing with cached package snapshot after prebuilt package rehydrate failed: ` +
+          `${error instanceof Error ? error.message : String(error)}`
+        );
+      }
     }
 
     const nextStubContributions: Record<string, UserFolder> = {};
@@ -3324,6 +4467,7 @@ sys.path_importer_cache.clear()
 
   const ensureFilteredPyodideStdlibUrl = useCallback(async (log?: (msg: string) => void) => {
     const allowedModules = getAllowedPyodideStdlibModules();
+    const runtimeSource = await resolvePyodideRuntimeLoadSource();
     const nextSignature = allowedModules.join('\n');
     if (
       pyodideFilteredStdlibSignatureRef.current === nextSignature
@@ -3334,7 +4478,7 @@ sys.path_importer_cache.clear()
 
     if (!pyodideStdlibSourceBufferRef.current) {
       log?.('Preparing filtered Pyodide standard library...');
-      const stdlibRes = await fetch(PYODIDE_STDLIB_URL);
+      const stdlibRes = await fetch(runtimeSource.stdlibURL);
       if (!stdlibRes.ok) {
         throw new Error('Failed to download Pyodide standard library archive.');
       }
@@ -3355,7 +4499,7 @@ sys.path_importer_cache.clear()
     );
     pyodideFilteredStdlibSignatureRef.current = nextSignature;
     return pyodideFilteredStdlibUrlRef.current;
-  }, [PYODIDE_STDLIB_URL, getAllowedPyodideStdlibModules]);
+  }, [getAllowedPyodideStdlibModules]);
 
   const syncPyodideStdlibSurface = async (log?: (msg: string) => void) => {
     const pyodide = (window as any).pyodide;
@@ -3561,8 +4705,12 @@ json.dumps({
       if (!(window as any).pyodide) {
         log?.('Loading Python runtime (Pyodide)... this may take a few seconds.');
         const hostWindow = await ensurePyodideScript();
+        const runtimeSource = await resolvePyodideRuntimeLoadSource();
         const stdLibURL = await ensureFilteredPyodideStdlibUrl(log);
         const pyodide = await (hostWindow as any).loadPyodide({
+          indexURL: runtimeSource.indexURL,
+          lockFileURL: runtimeSource.lockFileURL,
+          packageBaseUrl: runtimeSource.packageBaseUrl,
           enableRunUntilComplete: false,
           fullStdLib: false,
           stdLibURL,
@@ -3786,43 +4934,185 @@ json.dumps(sorted(_imports))
     }
   };
 
-  const runPython = async (code: string) => {
+  const getCSharpScriptContextId = (fileId: string) => `codecraft-csharp-script:${fileId}`;
+
+  const installPyodideExecutionTimeoutGuard = (pyodide: any, timeoutMs: number) => {
+    const normalizedTimeout = normalizeExecutionTimeoutMs(timeoutMs);
+    if (normalizedTimeout <= 0) return;
+
+    const timeoutMessage = JSON.stringify(createExecutionTimeoutError('Python execution', normalizedTimeout).message);
+    pyodide.runPython(`
+import js
+import sys
+
+__codecraft_timeout_deadline_ms = js.performance.now() + ${normalizedTimeout}
+
+class __CodeCraftPythonExecutionTimeout(Exception):
+    pass
+
+def __codecraft_timeout_trace(frame, event, arg):
+    if event in ("call", "line") and js.performance.now() >= __codecraft_timeout_deadline_ms:
+        raise __CodeCraftPythonExecutionTimeout(${JSON.stringify(PYODIDE_TIMEOUT_ERROR_MARKER)} + ":" + ${timeoutMessage})
+    return __codecraft_timeout_trace
+
+sys.settrace(__codecraft_timeout_trace)
+`);
+  };
+
+  const clearPyodideExecutionTimeoutGuard = (pyodide: any) => {
     try {
-      await ensurePyodideWithPackages(msg => setOutput(prev => prev + (prev ? '\n' : '') + msg));
+      pyodide.runPython(`
+import sys
+
+sys.settrace(None)
+
+for _name in (
+    "__codecraft_timeout_trace",
+    "__codecraft_timeout_deadline_ms",
+    "__CodeCraftPythonExecutionTimeout",
+):
+    globals().pop(_name, None)
+`);
+    } catch { }
+  };
+
+  const normalizePythonExecutionError = (error: unknown, timeoutMs: number) => {
+    const message = error instanceof Error ? error.message : String(error);
+    if (message.includes(`${PYODIDE_TIMEOUT_ERROR_MARKER}:`)) {
+      return createExecutionTimeoutError('Python execution', timeoutMs);
+    }
+    return error instanceof Error ? error : new Error(message);
+  };
+
+  const installPyodideInlineInputOverride = async (
+    pyodide: any,
+    takeQueuedLine: () => string | null
+  ) => {
+    try {
+      pyodide.globals.set('__codecraft_take_python_input_line', takeQueuedLine);
+      await pyodide.runPythonAsync(`
+import builtins
+
+__codecraft_original_input = builtins.input
+
+def __codecraft_inline_input(prompt=""):
+    _take = globals().get("__codecraft_take_python_input_line")
+    if _take is not None:
+        _queued = _take()
+        if _queued is not None:
+            return str(_queued)
+    return __codecraft_original_input(prompt)
+
+builtins.input = __codecraft_inline_input
+`);
+    } catch { }
+  };
+
+  const clearPyodideInlineInputOverride = (pyodide: any) => {
+    try {
+      pyodide.runPython(`
+import builtins
+
+if "__codecraft_original_input" in globals():
+    builtins.input = __codecraft_original_input
+
+for _name in (
+    "__codecraft_inline_input",
+    "__codecraft_original_input",
+    "__codecraft_take_python_input_line",
+):
+    globals().pop(_name, None)
+`);
+    } catch { }
+    try {
+      pyodide.globals.delete('__codecraft_take_python_input_line');
+    } catch { }
+  };
+
+  const runPython = async (code: string) => {
+    const timeoutMs = normalizeExecutionTimeoutMs(settings.pythonExecutionTimeoutMs);
+    const pythonStdoutDecoder = new TextDecoder();
+    const flushPythonStdout = () => {
+      try {
+        const remaining = pythonStdoutDecoder.decode();
+        if (remaining) {
+          setOutput(prev => prev + remaining);
+        }
+      } catch { }
+    };
+    try {
+      if (settings.pythonIOMode === 'interactive-output-panel') {
+        selectDockPanel('output');
+      }
+      await ensurePyodideWithPackages(appendExecutionStartupStatus);
+      setExecutionStartupStatus('');
       clearPyodideIdleTimer();
       await ensurePyodideUsesTypeshedSurface(code);
       const pyodide = (window as any).pyodide;
 
       pyodide.setStdout({
-        batched: (text: string) => {
-          setOutput(prev => prev + (prev ? '\n' : '') + text);
-        }
+        write: (buffer: Uint8Array) => {
+          const safeBuffer = buffer.buffer instanceof SharedArrayBuffer ? new Uint8Array(buffer) : buffer;
+          const text = pythonStdoutDecoder.decode(safeBuffer, { stream: true });
+          if (text) {
+            setOutput(prev => prev + text);
+          }
+          return buffer.length;
+        },
       });
       pyodide.setStderr({
         batched: (text: string) => {
-          setOutput(prev => prev + (prev ? '\n' : '') + `[STDERR] ${text}`);
-        }
+          setOutput(prev => prev + `[STDERR] ${text}`);
+        },
       });
+      setOutput('');
+      console.clear();
+      const queuedPythonInputLines = await collectPythonOutputPanelInput(pyodide, code);
+      const takeQueuedPythonInputLine = () => (
+        queuedPythonInputLines.length > 0 ? (queuedPythonInputLines.shift() ?? '') : null
+      );
       pyodide.setStdin({
         stdin: () => {
-          const value = window.prompt('Python input:', '');
-          return value ?? '';
+          const queued = takeQueuedPythonInputLine();
+          if (queued !== null) {
+            return queued;
+          }
+          return requestPythonInput(queuedPythonInputLines);
         },
         isatty: true
       });
+      await installPyodideInlineInputOverride(pyodide, takeQueuedPythonInputLine);
 
-      setOutput(prev => prev + (prev ? '\n' : '') + 'Executing Python...');
-      setOutput('');
-      console.clear();
-      const result = await pyodide.runPythonAsync(code);
+      installPyodideExecutionTimeoutGuard(pyodide, timeoutMs);
+      const result = await withExecutionTimeout(
+        'Python execution',
+        timeoutMs,
+        () => pyodide.runPythonAsync(code),
+        async () => {
+          unloadPyodide();
+        }
+      );
 
+      flushPythonStdout();
       if (result !== undefined) {
         setOutput(prev => prev + (prev ? '\n' : '') + `Return value: ${String(result)}`);
       }
     } catch (err) {
-      setOutput(prev => prev + (prev ? '\n' : '') + `Python Error: ${err instanceof Error ? err.message : String(err)}`);
+      setExecutionStartupStatus('');
+      flushPythonStdout();
+      const normalizedError = normalizePythonExecutionError(err, timeoutMs);
+      setOutput(prev => prev + (prev ? '\n' : '') + `Python Error: ${normalizedError.message}`);
     } finally {
-      unloadPyodide();
+      flushPythonStdout();
+      if ((window as any).pyodide) {
+        clearPyodideInlineInputOverride((window as any).pyodide);
+        clearPyodideExecutionTimeoutGuard((window as any).pyodide);
+      }
+      if (settings.pythonRuntimeLifecycle === 'keep-warm' && (window as any).pyodide) {
+        resetPyodideIdleTimer();
+      } else {
+        unloadPyodide();
+      }
     }
   };
 
@@ -3862,15 +5152,53 @@ json.dumps(sorted(_imports))
     return csharpRuntimeReadyRef.current;
   };
 
-  const runCSharp = async (code: string) => {
+  const runCSharp = async (code: string, fileId: string) => {
     try {
+      if (settings.csharpIOMode === 'interactive-output-panel') {
+        selectDockPanel('output');
+      }
       setOutput('');
       console.clear();
-      setOutput('Compiling and executing C# (WebAssembly, regular program)...');
+      const modeLabel =
+        settings.csharpExecutionMode === 'regular'
+          ? 'regular program'
+          : settings.csharpExecutionMode === 'script'
+            ? 'script'
+            : 'script context';
+      setExecutionStartupStatus(`Compiling and executing C# (WebAssembly, ${modeLabel})...`);
 
       await ensureCSharpRuntime();
       const { BrowserCSharp } = await getBrowserCSharpModule();
-      const result = await BrowserCSharp.executeRegular(code);
+      const contextId = getCSharpScriptContextId(fileId);
+
+      const executeCSharp = async () => {
+        if (settings.csharpExecutionMode === 'script-context') {
+          if (settings.csharpResetScriptContextBeforeRun) {
+            try {
+              await BrowserCSharp.clearScriptContext(contextId);
+            } catch { }
+          }
+          return BrowserCSharp.executeScriptInContext(code, contextId);
+        }
+        if (settings.csharpExecutionMode === 'script') {
+          return BrowserCSharp.ExecuteScript(code);
+        }
+        return BrowserCSharp.executeRegular(code);
+      };
+
+      setExecutionStartupStatus('');
+      const result = await withExecutionTimeout(
+        'C# execution',
+        settings.csharpExecutionTimeoutMs,
+        executeCSharp,
+        async () => {
+          if (settings.csharpExecutionMode === 'script-context') {
+            try {
+              await BrowserCSharp.clearScriptContext(contextId);
+            } catch { }
+          }
+        }
+      );
 
       const stdOut = (result.stdOut || '').trim();
       const stdErr = (result.stdErr || '').trim();
@@ -3885,6 +5213,7 @@ json.dumps(sorted(_imports))
 
       setOutput(chunks.join('\n') || 'C# executed successfully with no output.');
     } catch (err) {
+      setExecutionStartupStatus('');
       setOutput(`C# Error: ${err instanceof Error ? err.message : String(err)}`);
     }
   };
@@ -3896,19 +5225,21 @@ json.dumps(sorted(_imports))
     }
     setIsRunning(true);
 
+    setExecutionStartupStatus('');
     if (settings.clearOutputOnRun) {
-      setOutput('Starting execution...\n');
+      setOutput('');
+      setExecutionStartupStatus('Starting execution...');
     } else {
       const divisor = settings.showExecutionDivisor
         ? `\n\n${'='.repeat(20)} EXECUTION: ${new Date().toLocaleTimeString()} ${'='.repeat(20)}\n`
         : '\n';
-      setOutput(prev => prev + divisor + 'Starting execution...\n');
+      setExecutionStartupStatus(`${divisor}Starting execution...`);
     }
 
     try {
       if (activeItem.type === 'file' && (activeItem.language === 'javascript' || activeItem.language === 'js')) {
         setOutputPreviewHtml(null);
-        runJavaScript(activeItem.content || '');
+        await runJavaScript(activeItem.content || '');
         return;
       }
 
@@ -3919,6 +5250,7 @@ json.dumps(sorted(_imports))
       }
 
       if (activeItem.type === 'file' && activeItem.language === 'html') {
+        setExecutionStartupStatus('');
         setOutputPreviewHtml(activeItem.content || '');
         selectDockPanel('output');
         setOutput('Preview rendered in Output panel.');
@@ -3927,17 +5259,20 @@ json.dumps(sorted(_imports))
 
       if (activeItem.type === 'file' && (activeItem.language === 'cs' || activeItem.language === 'csharp')) {
         setOutputPreviewHtml(null);
-        await runCSharp(activeItem.content || '');
+        await runCSharp(activeItem.content || '', activeItem.id);
         return;
       }
 
       // Fallback for unsupported languages
       if (activeItem.type === 'file') {
+        setExecutionStartupStatus('');
         setOutput(`Error: No local runtime available for ${activeItem.language}. Supported: HTML, JavaScript, Python, and C#.`);
       } else {
+        setExecutionStartupStatus('');
         setOutput('Error: Cannot run a folder.');
       }
     } catch (error) {
+      setExecutionStartupStatus('');
       setOutput(`Error: ${error instanceof Error ? error.message : 'Execution failed'}`);
     } finally {
       setIsRunning(false);
@@ -4175,7 +5510,50 @@ json.dumps(sorted(_imports))
 
     try {
       const history = currentChat.messages.map(msg => `${msg.role.toUpperCase()}: ${msg.content}`).join('\n');
-      const prompt = `
+      let assistantFiles = files.map(file => ({ ...file }));
+      let assistantActiveItemId = activeItem?.id || activeFileId || '';
+      const toolProgressNotes: string[] = [];
+      const assistantLiveNotes: string[] = [];
+      let emittedAssistantMessage = false;
+
+      const getPathFromSnapshot = (id: string | undefined): string => {
+        if (!id) return '';
+        const item = assistantFiles.find(f => f.id === id);
+        if (!item) return '';
+        if (!item.parentId) return item.name;
+        return `${getPathFromSnapshot(item.parentId)}/${item.name}`;
+      };
+
+      const findItemInSnapshot = (pathOrName: string): FSItem | undefined => {
+        const byPath = assistantFiles.find(f => getPathFromSnapshot(f.id) === pathOrName);
+        if (byPath) return byPath;
+        return assistantFiles.find(f => f.name === pathOrName);
+      };
+
+      const isDescendantInSnapshot = (descendantId: string, ancestorId: string) => {
+        let cursorId: string | null = descendantId;
+        while (cursorId) {
+          if (cursorId === ancestorId) return true;
+          const item = assistantFiles.find(f => f.id === cursorId);
+          cursorId = item?.parentId || null;
+        }
+        return false;
+      };
+
+      const getActiveSnapshotItem = () => (
+        assistantActiveItemId ? assistantFiles.find(f => f.id === assistantActiveItemId) || null : null
+      );
+
+      const buildAssistantPrompt = () => {
+        const activeSnapshotItem = getActiveSnapshotItem();
+        const toolProgress = toolProgressNotes.length > 0
+          ? `\nTurn Progress:\n${toolProgressNotes.map((note, index) => `${index + 1}. ${note}`).join('\n')}\nUse the updated workspace state above when deciding the next action. If the task is complete, respond to the user normally.`
+          : '';
+        const liveAssistantProgress = assistantLiveNotes.length > 0
+          ? `\nAssistant Messages Already Shown This Turn:\n${assistantLiveNotes.map((note, index) => `${index + 1}. ${note}`).join('\n')}\nContinue from there and avoid repeating the same message word-for-word.`
+          : '';
+
+        return `
         Context: You are an AI coding assistant inside CodeCraft IDE.
         Internal Chat ID: ${chatId}
         Keep continuity with the existing chat history for this chat.
@@ -4183,146 +5561,299 @@ json.dumps(sorted(_imports))
         Do not suggest terminal-style commands for filesystem operations when a tool can be used, unless the user specifically asks for it.
         When you want to change code, use 'proposeEdit' so the user can review it.
         You may use multiple tool calls in a single response when the task needs several actions.
+        If you have a plan, progress update, or explanation, include it in the same response as your tool calls. That text is shown to the user immediately.
+        Do not save every explanation for one final summary if the work is happening in multiple steps.
+        If you need the contents of another file before editing it, navigate to it first. On the next tool round in the same turn, the updated active item and its content will be shown to you.
         If more than one action is needed, emit all needed tool calls in order in the same response instead of stopping after the first action.
-        
+
         Current File System:
-        ${files.map(f => `- Path: ${getPath(f.id)}, Type: ${f.type}, Language: ${f.language || 'N/A'}`).join('\n')}
-        
-        Active Item: ${activeItem ? getPath(activeItem.id) : 'None selected'}
-        ${activeItem ? (activeItem.type === 'file' ? `Content:\n${activeItem.content}` : 'This is a folder.') : 'No file is currently active.'}
-        
+        ${assistantFiles.map(f => `- Path: ${getPathFromSnapshot(f.id)}, Type: ${f.type}, Language: ${f.language || 'N/A'}`).join('\n')}
+
+        Active Item: ${activeSnapshotItem ? getPathFromSnapshot(activeSnapshotItem.id) : 'None selected'}
+        ${activeSnapshotItem ? (activeSnapshotItem.type === 'file' ? `Content:\n${activeSnapshotItem.content || ''}` : 'This is a folder.') : 'No file is currently active.'}
+
         Chat History:
         ${history || '(empty)'}
-        
+        ${toolProgress}
+        ${liveAssistantProgress}
+
         USER: ${userMsg.content}
-      `;
+        `;
+      };
 
-      const response = await aiRef.current.models.generateContent({
-        model: "gemini-3-flash-preview",
-        contents: prompt,
-        config: {
-          tools: [{
-            functionDeclarations: [proposeEditTool, navigateToTool, moveCursorTool, createItemTool, deleteItemTool, moveItemTool, runTerminalCommandTool]
-          }],
-        }
-      });
+      const emitAssistantLiveMessage = (content: string) => {
+        const trimmed = content.trim();
+        if (!trimmed) return;
+        emittedAssistantMessage = true;
+        assistantLiveNotes.push(trimmed);
+        appendAssistantMessage(chatId, {
+          role: 'assistant',
+          content: trimmed,
+        });
+      };
 
-      const functionCalls = response.functionCalls;
-      if (functionCalls) {
-        for (const call of functionCalls) {
-          if (call.name === 'proposeEdit') {
-            const { pathOrName, newContent } = call.args as any;
-            const targetFile = findItem(pathOrName);
-            if (targetFile && targetFile.type === 'file') {
-              enqueuePendingEdit({
-                fileId: targetFile.id,
-                originalContent: targetFile.content || '',
-                proposedContent: newContent
-              });
-              appendAssistantMessage(chatId, { role: 'assistant', content: `I've proposed some changes to \`${targetFile.name}\`. Please review them in the editor.` });
-            } else {
-              appendAssistantMessage(chatId, { role: 'assistant', content: `I couldn't find a file at \`${pathOrName}\` to edit.` });
-            }
-          } else if (call.name === 'navigateTo') {
-            const { pathOrName } = call.args as any;
-            const target = findItem(pathOrName);
-            if (target) {
-              openEditorTab(target.id);
-              if (target.type === 'folder') {
-                setFiles(prev => prev.map(f => f.id === target.id ? { ...f, isOpen: true } : f));
-              }
-              appendAssistantMessage(chatId, { role: 'assistant', content: `Navigated to \`${pathOrName}\`.` });
-            } else {
-              appendAssistantMessage(chatId, { role: 'assistant', content: `I couldn't find \`${pathOrName}\`.` });
-            }
-          } else if (call.name === 'moveCursor') {
-            const { line, column } = call.args as any;
-            if (editorRef.current) {
-              editorRef.current.setPosition({ lineNumber: line, column: column });
-              editorRef.current.revealPositionInCenter({ lineNumber: line, column: column });
-              editorRef.current.focus();
-            }
-            appendAssistantMessage(chatId, { role: 'assistant', content: `Moved cursor to line ${line}, column ${column}.` });
-          } else if (call.name === 'createItem') {
-            const { type, name, parentPathOrName, content } = call.args as any;
-            const normalizedType = type === 'folder' ? 'folder' : type === 'file' ? 'file' : null;
-            const trimmedName = typeof name === 'string' ? name.trim() : '';
-            const parent = parentPathOrName ? findItem(parentPathOrName) : undefined;
-
-            if (!normalizedType || !trimmedName) {
-              appendAssistantMessage(chatId, { role: 'assistant', content: "I couldn't create the item because type/name were invalid." });
-            } else if (parentPathOrName && (!parent || parent.type !== 'folder')) {
-              appendAssistantMessage(chatId, { role: 'assistant', content: `I couldn't find destination folder \`${parentPathOrName}\`.` });
-            } else {
-              const id = Math.random().toString(36).substr(2, 9);
-              const parentId = parent ? parent.id : null;
-              const newItem: FSItem = {
-                id,
-                name: trimmedName,
-                type: normalizedType,
-                parentId,
-                isOpen: normalizedType === 'folder',
-                content: normalizedType === 'file' ? (typeof content === 'string' ? content : '') : undefined,
-                language: normalizedType === 'file' ? langFromFilename(trimmedName) : undefined
-              };
-
-              setFiles(prev => {
-                const updated = [...prev, newItem];
-                if (parentId) {
-                  return updated.map(f => f.id === parentId ? { ...f, isOpen: true } : f);
-                }
-                return updated;
-              });
-
-              if (normalizedType === 'file') {
-                openEditorTab(id);
-              }
-
-              appendAssistantMessage(chatId, { role: 'assistant', content: `Created ${normalizedType} \`${trimmedName}\`.` });
-            }
-          } else if (call.name === 'deleteItem') {
-            const { pathOrName } = call.args as any;
-            const target = findItem(pathOrName);
-            if (!target) {
-              appendAssistantMessage(chatId, { role: 'assistant', content: `I couldn't find \`${pathOrName}\` to delete.` });
-            } else {
-              deleteItem(target.id);
-              appendAssistantMessage(chatId, { role: 'assistant', content: `Deleted \`${pathOrName}\`.` });
-            }
-          } else if (call.name === 'moveItem') {
-            const { sourcePathOrName, destinationFolderPathOrName } = call.args as any;
-            const source = findItem(sourcePathOrName);
-            const moveToRoot = destinationFolderPathOrName === '/' || destinationFolderPathOrName === '~' || destinationFolderPathOrName === '';
-            const destination = moveToRoot ? null : findItem(destinationFolderPathOrName);
-
-            if (!source) {
-              appendAssistantMessage(chatId, { role: 'assistant', content: `I couldn't find \`${sourcePathOrName}\` to move.` });
-            } else if (!moveToRoot && (!destination || destination.type !== 'folder')) {
-              appendAssistantMessage(chatId, { role: 'assistant', content: `I couldn't find destination folder \`${destinationFolderPathOrName}\`.` });
-            } else if (destination && source.type === 'folder' && isDescendant(destination.id, source.id)) {
-              appendAssistantMessage(chatId, { role: 'assistant', content: "I can't move a folder into itself or one of its descendants." });
-            } else {
-              setFiles(prev => prev.map(f => f.id === source.id ? { ...f, parentId: destination ? destination.id : null } : f));
-              if (destination) {
-                setFiles(prev => prev.map(f => f.id === destination.id ? { ...f, isOpen: true } : f));
-              }
-              appendAssistantMessage(chatId, { role: 'assistant', content: `Moved \`${source.name}\` to ${destination ? `\`${destination.name}\`` : '`root`'}.` });
-            }
-          } else if (call.name === 'runTerminalCommand') {
-            const { command } = call.args as any;
-            if (typeof command === 'string' && command.trim()) {
-              selectDockPanel('terminal');
-              await executeTerminalCommand(command, false);
-              appendAssistantMessage(chatId, { role: 'assistant', content: `Executed terminal command: \`${command}\`.` });
-            } else {
-              appendAssistantMessage(chatId, { role: 'assistant', content: "I couldn't run the terminal command because it was empty." });
-            }
+      const executeAssistantToolCall = async (call: any): Promise<AssistantToolExecutionResult> => {
+        if (call.name === 'proposeEdit') {
+          const { pathOrName, newContent } = call.args as any;
+          const targetFile = typeof pathOrName === 'string' ? findItemInSnapshot(pathOrName) : undefined;
+          if (targetFile && targetFile.type === 'file' && typeof newContent === 'string') {
+            enqueuePendingEdit({
+              fileId: targetFile.id,
+              originalContent: targetFile.content || '',
+              proposedContent: newContent
+            });
+            return {
+              summary: `Proposed changes to \`${getPathFromSnapshot(targetFile.id)}\`.`,
+              detail: `Proposed reviewed edits for ${getPathFromSnapshot(targetFile.id)}.`
+            };
           }
+          return {
+            summary: `I couldn't find a file at \`${String(pathOrName || '')}\` to edit.`,
+            detail: `Edit failed because the target file ${String(pathOrName || '')} was not found.`
+          };
         }
+
+        if (call.name === 'navigateTo') {
+          const { pathOrName } = call.args as any;
+          const target = typeof pathOrName === 'string' ? findItemInSnapshot(pathOrName) : undefined;
+          if (!target) {
+            return {
+              summary: `I couldn't find \`${String(pathOrName || '')}\`.`,
+              detail: `Navigation failed because ${String(pathOrName || '')} was not found.`
+            };
+          }
+
+          assistantActiveItemId = target.id;
+          openEditorTabWithItem(target);
+          if (target.type === 'folder') {
+            assistantFiles = assistantFiles.map(f => f.id === target.id ? { ...f, isOpen: true } : f);
+            setFiles(assistantFiles);
+          }
+
+          return {
+            summary: `Navigated to \`${getPathFromSnapshot(target.id)}\`.`,
+            detail: `Navigated to ${getPathFromSnapshot(target.id)} (${target.type}).`
+          };
+        }
+
+        if (call.name === 'moveCursor') {
+          const { line, column } = call.args as any;
+          if (typeof line === 'number' && typeof column === 'number' && editorRef.current) {
+            editorRef.current.setPosition({ lineNumber: line, column: column });
+            editorRef.current.revealPositionInCenter({ lineNumber: line, column: column });
+            editorRef.current.focus();
+            return {
+              summary: `Moved cursor to line ${line}, column ${column}.`,
+              detail: `Moved the editor cursor to line ${line}, column ${column}.`
+            };
+          }
+          return {
+            summary: "I couldn't move the cursor because the editor wasn't ready.",
+            detail: 'Cursor movement failed because there was no mounted editor.'
+          };
+        }
+
+        if (call.name === 'createItem') {
+          const { type, name, parentPathOrName, content } = call.args as any;
+          const normalizedType = type === 'folder' ? 'folder' : type === 'file' ? 'file' : null;
+          const trimmedName = typeof name === 'string' ? name.trim() : '';
+          const parent = typeof parentPathOrName === 'string' && parentPathOrName
+            ? findItemInSnapshot(parentPathOrName)
+            : undefined;
+
+          if (!normalizedType || !trimmedName) {
+            return {
+              summary: "I couldn't create the item because type or name was invalid.",
+              detail: 'Create item failed because the type or name was invalid.'
+            };
+          }
+          if (parentPathOrName && (!parent || parent.type !== 'folder')) {
+            return {
+              summary: `I couldn't find destination folder \`${parentPathOrName}\`.`,
+              detail: `Create item failed because destination folder ${parentPathOrName} was not found.`
+            };
+          }
+
+          const id = Math.random().toString(36).substr(2, 9);
+          const parentId = parent ? parent.id : null;
+          const newItem: FSItem = {
+            id,
+            name: trimmedName,
+            type: normalizedType,
+            parentId,
+            isOpen: normalizedType === 'folder',
+            content: normalizedType === 'file' ? (typeof content === 'string' ? content : '') : undefined,
+            language: normalizedType === 'file' ? langFromFilename(trimmedName) : undefined
+          };
+
+          assistantFiles = [...assistantFiles, newItem];
+          if (parentId) {
+            assistantFiles = assistantFiles.map(f => f.id === parentId ? { ...f, isOpen: true } : f);
+          }
+          setFiles(assistantFiles);
+
+          if (normalizedType === 'file') {
+            assistantActiveItemId = newItem.id;
+            openEditorTabWithItem(newItem);
+          }
+
+          return {
+            summary: `Created ${normalizedType} \`${getPathFromSnapshot(newItem.id)}\`.`,
+            detail: `Created ${normalizedType} at ${getPathFromSnapshot(newItem.id)}.`
+          };
+        }
+
+        if (call.name === 'deleteItem') {
+          const { pathOrName } = call.args as any;
+          const target = typeof pathOrName === 'string' ? findItemInSnapshot(pathOrName) : undefined;
+          if (!target) {
+            return {
+              summary: `I couldn't find \`${String(pathOrName || '')}\` to delete.`,
+              detail: `Delete failed because ${String(pathOrName || '')} was not found.`
+            };
+          }
+
+          const toDelete = [target.id];
+          const collectChildren = (parentId: string) => {
+            assistantFiles.forEach(file => {
+              if (file.parentId === parentId) {
+                toDelete.push(file.id);
+                if (file.type === 'folder') collectChildren(file.id);
+              }
+            });
+          };
+          collectChildren(target.id);
+
+          for (const deleteId of toDelete) {
+            if (syncHandlesRef.current.has(deleteId)) stopFolderSync(deleteId);
+          }
+
+          assistantFiles = assistantFiles.filter(file => !toDelete.includes(file.id));
+          if (toDelete.includes(assistantActiveItemId)) {
+            assistantActiveItemId = '';
+            setActiveFileId('');
+          }
+          setFiles(assistantFiles);
+
+          return {
+            summary: `Deleted \`${target.name}\`.`,
+            detail: `Deleted ${target.type} ${target.name}${toDelete.length > 1 ? ` and ${toDelete.length - 1} descendant item(s)` : ''}.`
+          };
+        }
+
+        if (call.name === 'moveItem') {
+          const { sourcePathOrName, destinationFolderPathOrName } = call.args as any;
+          const source = typeof sourcePathOrName === 'string' ? findItemInSnapshot(sourcePathOrName) : undefined;
+          const moveToRoot = destinationFolderPathOrName === '/' || destinationFolderPathOrName === '~' || destinationFolderPathOrName === '';
+          const destination = moveToRoot
+            ? null
+            : (typeof destinationFolderPathOrName === 'string' ? findItemInSnapshot(destinationFolderPathOrName) : undefined);
+
+          if (!source) {
+            return {
+              summary: `I couldn't find \`${String(sourcePathOrName || '')}\` to move.`,
+              detail: `Move failed because ${String(sourcePathOrName || '')} was not found.`
+            };
+          }
+          if (!moveToRoot && (!destination || destination.type !== 'folder')) {
+            return {
+              summary: `I couldn't find destination folder \`${String(destinationFolderPathOrName || '')}\`.`,
+              detail: `Move failed because destination folder ${String(destinationFolderPathOrName || '')} was not found.`
+            };
+          }
+          if (destination && source.type === 'folder' && isDescendantInSnapshot(destination.id, source.id)) {
+            return {
+              summary: "I can't move a folder into itself or one of its descendants.",
+              detail: `Move failed because ${getPathFromSnapshot(source.id)} contains ${getPathFromSnapshot(destination.id)}.`
+            };
+          }
+
+          assistantFiles = assistantFiles.map(file => {
+            if (file.id === source.id) {
+              return { ...file, parentId: destination ? destination.id : null };
+            }
+            if (destination && file.id === destination.id) {
+              return { ...file, isOpen: true };
+            }
+            return file;
+          });
+          setFiles(assistantFiles);
+
+          return {
+            summary: `Moved \`${source.name}\` to ${destination ? `\`${getPathFromSnapshot(destination.id)}\`` : '`root`'}.`,
+            detail: `Moved ${source.name} to ${destination ? getPathFromSnapshot(destination.id) : 'root'}.`
+          };
+        }
+
+        if (call.name === 'runTerminalCommand') {
+          const { command } = call.args as any;
+          if (typeof command === 'string' && command.trim()) {
+            selectDockPanel('terminal');
+            await executeTerminalCommand(command, false);
+            return {
+              summary: `Executed terminal command: \`${command}\`.`,
+              detail: `Executed terminal command: ${command}.`
+            };
+          }
+          return {
+            summary: "I couldn't run the terminal command because it was empty.",
+            detail: 'Terminal command execution failed because the command was empty.'
+          };
+        }
+
+        return {
+          summary: `Ignored unsupported tool call \`${String(call.name || 'unknown')}\`.`,
+          detail: `Unsupported tool call encountered: ${String(call.name || 'unknown')}.`
+        };
+      };
+
+      for (let pass = 0; pass < MAX_ASSISTANT_TOOL_PASSES; pass++) {
+        const response = await aiRef.current.models.generateContent({
+          model: "gemini-3-flash-preview",
+          contents: buildAssistantPrompt(),
+          config: {
+            tools: [{
+              functionDeclarations: [proposeEditTool, navigateToTool, moveCursorTool, createItemTool, deleteItemTool, moveItemTool, runTerminalCommandTool]
+            }],
+          }
+        });
+
+        const functionCalls = response.functionCalls ?? [];
+        const assistantText = (response.text || '').trim();
+        if (assistantText) {
+          emitAssistantLiveMessage(assistantText);
+        }
+
+        if (functionCalls.length === 0) {
+          break;
+        }
+
+        const passSummaries: string[] = [];
+        const passDetails: string[] = [];
+        for (const call of functionCalls) {
+          const outcome = await executeAssistantToolCall(call);
+          passSummaries.push(outcome.summary);
+          passDetails.push(outcome.detail);
+        }
+
+        if (passSummaries.length > 0) {
+          emitAssistantLiveMessage(
+            `Step ${pass + 1} completed:\n${passSummaries.map(summary => `- ${summary}`).join('\n')}`
+          );
+        }
+
+        if (passDetails.length === 0) {
+          break;
+        }
+
+        toolProgressNotes.push(passDetails.join(' '));
       }
 
-      if (response.text) {
-        appendAssistantMessage(chatId, { role: 'assistant', content: response.text });
+      if (!emittedAssistantMessage) {
+        appendAssistantMessage(chatId, {
+          role: 'assistant',
+          content: "I couldn't complete the requested action."
+        });
       }
     } catch (error) {
       console.error(error);
@@ -4411,7 +5942,7 @@ json.dumps(sorted(_imports))
           language: pendingNewItem.type === 'file' ? langFromFilename(name) : undefined,
         };
         setFiles(prev => [...prev, finalized]);
-        if (finalized.type === 'file') openEditorTab(finalized.id);
+        if (finalized.type === 'file') openEditorTabWithItem(finalized);
       }
       setPendingNewItem(null);
     } else {
@@ -4470,7 +6001,7 @@ json.dumps(sorted(_imports))
       return updated;
     });
 
-    if (type === 'file') openEditorTab(id);
+    if (type === 'file') openEditorTabWithItem(newItem);
     setNamingState(null);
     setNamingName('');
   };
@@ -5693,6 +7224,7 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
         <div className="h-full w-full flex flex-col bg-[rgb(28,28,28)] text-zinc-300 border-white/10 group relative">
           <button
             onClick={() => {
+              setExecutionStartupStatus('');
               setOutputPreviewHtml(null);
               setOutput('');
             }}
@@ -5700,7 +7232,7 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
           >
             Clear
           </button>
-          <div ref={outputContainerRef} className="flex-1 p-4 font-mono text-sm overflow-y-auto whitespace-pre-wrap text-zinc-400 custom-scrollbar">
+          <div ref={outputContainerRef} className="flex-1 p-4 font-mono text-sm overflow-y-auto custom-scrollbar">
             {outputPreviewHtml ? (
               <iframe
                 title="output-preview"
@@ -5709,7 +7241,144 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
                 sandbox="allow-scripts"
               />
             ) : (
-              output
+              <div className="min-h-full flex flex-col justify-end gap-2">
+                {executionStartupStatus ? (
+                  <div className="whitespace-pre-wrap text-zinc-500">
+                    {executionStartupStatus}
+                  </div>
+                ) : null}
+                <div className="whitespace-pre-wrap text-zinc-400 leading-relaxed">
+                  <span>{output}</span>
+                  {outputInteraction && (
+                    <>
+                      {getVisibleOutputInteractionMessage(outputInteraction) ? (
+                        <span className="text-zinc-300">
+                          {getVisibleOutputInteractionMessage(outputInteraction)}
+                        </span>
+                      ) : null}
+                      {(outputInteraction.kind === 'stdin' || outputInteraction.kind === 'prompt') && (
+                        <input
+                          ref={outputInteractionInputRef}
+                          type="text"
+                          value={outputInteractionInput}
+                          onChange={(e) => setOutputInteractionInput(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Escape') {
+                              resolveOutputPanelInteraction(null);
+                              return;
+                            }
+                            if (e.key !== 'Enter') return;
+                            e.preventDefault();
+                            if (outputInteraction.kind === 'stdin') {
+                              if (outputInteraction.inputMode === 'buffered-lines') {
+                                if (outputInteractionInput === '' && outputInteractionBufferedLines.length > 0) {
+                                  submitOutputPanelStdinInteraction();
+                                  return;
+                                }
+                                queueBufferedOutputInteractionLine();
+                              } else {
+                                submitOutputPanelStdinInteraction();
+                              }
+                              return;
+                            }
+                            commitResolvedOutputInteraction(outputInteraction, outputInteractionInput);
+                            resolveOutputPanelInteraction(outputInteractionInput);
+                          }}
+                          spellCheck={false}
+                          className="inline-block align-baseline bg-transparent border-none outline-none text-white p-0 m-0 font-mono text-sm caret-indigo-400"
+                          style={{
+                            width: `${Math.max(
+                              1,
+                              outputInteractionInput.length + 1,
+                              outputInteraction.defaultValue.length + (outputInteraction.defaultValue ? 1 : 0)
+                            )}ch`,
+                          }}
+                        />
+                      )}
+                    </>
+                  )}
+                </div>
+                {outputInteraction && (
+                  <div className="flex flex-wrap gap-2">
+                    {outputInteraction.kind === 'stdin' && outputInteraction.inputMode === 'buffered-lines' && (
+                      <button
+                        onClick={queueBufferedOutputInteractionLine}
+                        className="px-3 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 text-zinc-200 text-xs transition-colors"
+                      >
+                        Queue Line
+                      </button>
+                    )}
+                    {outputInteraction.kind === 'stdin' && (
+                      <>
+                        <button
+                          onClick={submitOutputPanelStdinInteraction}
+                          className="px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-xs transition-colors"
+                        >
+                          {outputInteraction.submitLabel || 'Send'}
+                        </button>
+                        <button
+                          onClick={() => resolveOutputPanelInteraction(null)}
+                          className="px-3 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 text-zinc-200 text-xs transition-colors"
+                        >
+                          {outputInteraction.cancelLabel || 'Cancel'}
+                        </button>
+                      </>
+                    )}
+                    {outputInteraction.kind === 'alert' && (
+                      <button
+                        onClick={() => {
+                          commitResolvedOutputInteraction(outputInteraction, undefined);
+                          resolveOutputPanelInteraction(undefined);
+                        }}
+                        className="px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-xs transition-colors"
+                      >
+                        Continue
+                      </button>
+                    )}
+                    {outputInteraction.kind === 'confirm' && (
+                      <>
+                        <button
+                          onClick={() => {
+                            commitResolvedOutputInteraction(outputInteraction, true);
+                            resolveOutputPanelInteraction(true);
+                          }}
+                          className="px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-xs transition-colors"
+                        >
+                          OK
+                        </button>
+                        <button
+                          onClick={() => {
+                            commitResolvedOutputInteraction(outputInteraction, false);
+                            resolveOutputPanelInteraction(false);
+                          }}
+                          className="px-3 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 text-zinc-200 text-xs transition-colors"
+                        >
+                          Cancel
+                        </button>
+                      </>
+                    )}
+                    {outputInteraction.kind === 'prompt' && (
+                      <>
+                        <button
+                          onClick={() => {
+                            commitResolvedOutputInteraction(outputInteraction, outputInteractionInput);
+                            resolveOutputPanelInteraction(outputInteractionInput);
+                          }}
+                          className="px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-xs transition-colors"
+                        >
+                          {outputInteraction.submitLabel || 'Submit'}
+                        </button>
+                        <button
+                          onClick={() => resolveOutputPanelInteraction(null)}
+                          className="px-3 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 text-zinc-200 text-xs transition-colors"
+                        >
+                          {outputInteraction.cancelLabel || 'Cancel'}
+                        </button>
+                      </>
+                    )}
+                  </div>
+                )}
+              </div>
             )}
           </div>
         </div>
@@ -6063,7 +7732,7 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
               initial={{ opacity: 0, scale: 0.95 }}
               animate={{ opacity: 1, scale: 1 }}
               exit={{ opacity: 0, scale: 0.95 }}
-              className="w-full max-w-lg bg-[rgb(28,28,28)] border border-white/10 rounded-2xl shadow-2xl overflow-hidden flex flex-col max-h-[80vh]"
+              className="w-full max-w-4xl bg-[rgb(28,28,28)] border border-white/10 rounded-2xl shadow-2xl overflow-hidden flex flex-col max-h-[85vh]"
             >
               <div className="p-6 border-b border-white/5 flex items-center justify-between">
                 <h3 className="text-lg font-semibold text-white flex items-center gap-2">
@@ -6122,6 +7791,224 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
                         </button>
                       </div>
                     )}
+                  </div>
+                </section>
+
+                <section>
+                  <h4 className="text-xs font-bold uppercase tracking-widest text-zinc-500 mb-4">Language Runtimes</h4>
+                  <div className="grid grid-cols-1 xl:grid-cols-3 gap-4">
+                    <div className="rounded-2xl border border-white/10 bg-white/5 p-4 space-y-4">
+                      <div>
+                        <div className="text-sm font-medium text-white">JavaScript</div>
+                        <div className="text-xs text-zinc-500 mt-1">Runs in a dedicated worker so timeout termination can stop long-running scripts. Set timeout to `0` to disable it.</div>
+                      </div>
+
+                      <label className="block space-y-2">
+                        <div className="text-xs font-medium uppercase tracking-wide text-zinc-500">Execution Timeout (ms)</div>
+                        <input
+                          type="number"
+                          min="0"
+                          step="100"
+                          value={settings.javascriptExecutionTimeoutMs}
+                          onChange={(e) => setSettings(s => ({
+                            ...s,
+                            javascriptExecutionTimeoutMs: normalizeExecutionTimeoutMs(Number(e.target.value))
+                          }))}
+                          className="w-full rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-sm text-white outline-none transition-colors focus:border-indigo-500"
+                        />
+                        <div className="text-xs text-zinc-500">Current: {formatExecutionTimeoutLabel(settings.javascriptExecutionTimeoutMs)}</div>
+                      </label>
+
+                      <label className="block space-y-2">
+                        <div className="text-xs font-medium uppercase tracking-wide text-zinc-500">Execution Mode</div>
+                        <select
+                          value={settings.javascriptExecutionMode}
+                          onChange={(e) => setSettings(s => ({
+                            ...s,
+                            javascriptExecutionMode: e.target.value as JavaScriptExecutionMode,
+                          }))}
+                          className="w-full rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-sm text-white outline-none transition-colors focus:border-indigo-500"
+                        >
+                          <option value="classic-function">Classic Function</option>
+                          <option value="async-function">Async Function Wrapper</option>
+                        </select>
+                        <div className="text-xs text-zinc-500">
+                          {settings.javascriptExecutionMode === 'classic-function'
+                            ? 'Evaluates with `new Function(code)`.'
+                            : 'Evaluates with an async function so top-level `await` can be used.'}
+                        </div>
+                      </label>
+
+                      <label className="block space-y-2">
+                        <div className="text-xs font-medium uppercase tracking-wide text-zinc-500">I/O Mode</div>
+                        <select
+                          value={settings.javascriptIOMode}
+                          onChange={(e) => setSettings(s => ({
+                            ...s,
+                            javascriptIOMode: e.target.value as RuntimeIOMode,
+                          }))}
+                          className="w-full rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-sm text-white outline-none transition-colors focus:border-indigo-500"
+                        >
+                          <option value="alert-output">Alert &amp; Output Mode</option>
+                          <option value="interactive-output-panel">Interactive Output Panel Mode</option>
+                        </select>
+                        <div className="text-xs text-zinc-500">
+                          {settings.javascriptIOMode === 'alert-output'
+                            ? 'Uses browser alert, confirm, and prompt dialogs while keeping logs in the Output panel.'
+                            : 'Routes JavaScript alert, confirm, and prompt requests into the Output panel instead of browser dialogs.'}
+                        </div>
+                      </label>
+                    </div>
+
+                    <div className="rounded-2xl border border-white/10 bg-white/5 p-4 space-y-4">
+                      <div>
+                        <div className="text-sm font-medium text-white">Python</div>
+                        <div className="text-xs text-zinc-500 mt-1">Uses a Pyodide execution guard for running Python code and unloads the runtime on timeout. Set timeout to `0` to disable it.</div>
+                      </div>
+
+                      <label className="block space-y-2">
+                        <div className="text-xs font-medium uppercase tracking-wide text-zinc-500">Execution Timeout (ms)</div>
+                        <input
+                          type="number"
+                          min="0"
+                          step="100"
+                          value={settings.pythonExecutionTimeoutMs}
+                          onChange={(e) => setSettings(s => ({
+                            ...s,
+                            pythonExecutionTimeoutMs: normalizeExecutionTimeoutMs(Number(e.target.value))
+                          }))}
+                          className="w-full rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-sm text-white outline-none transition-colors focus:border-indigo-500"
+                        />
+                        <div className="text-xs text-zinc-500">Current: {formatExecutionTimeoutLabel(settings.pythonExecutionTimeoutMs)}</div>
+                      </label>
+
+                      <label className="block space-y-2">
+                        <div className="text-xs font-medium uppercase tracking-wide text-zinc-500">Runtime Lifecycle</div>
+                        <select
+                          value={settings.pythonRuntimeLifecycle}
+                          onChange={(e) => setSettings(s => ({
+                            ...s,
+                            pythonRuntimeLifecycle: e.target.value as PythonRuntimeLifecycle,
+                          }))}
+                          className="w-full rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-sm text-white outline-none transition-colors focus:border-indigo-500"
+                        >
+                          <option value="dispose-after-run">Dispose After Run</option>
+                          <option value="keep-warm">Keep Warm Until Idle Timeout</option>
+                        </select>
+                        <div className="text-xs text-zinc-500">
+                          {settings.pythonRuntimeLifecycle === 'dispose-after-run'
+                            ? 'Matches the current fresh-runtime-per-run behavior.'
+                            : 'Keeps Pyodide loaded between runs until the idle timer unloads it.'}
+                        </div>
+                      </label>
+
+                      <label className="block space-y-2">
+                        <div className="text-xs font-medium uppercase tracking-wide text-zinc-500">I/O Mode</div>
+                        <select
+                          value={settings.pythonIOMode}
+                          onChange={(e) => setSettings(s => ({
+                            ...s,
+                            pythonIOMode: e.target.value as RuntimeIOMode,
+                          }))}
+                          className="w-full rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-sm text-white outline-none transition-colors focus:border-indigo-500"
+                        >
+                          <option value="alert-output">Alert &amp; Output Mode</option>
+                          <option value="interactive-output-panel">Interactive Output Panel Mode</option>
+                        </select>
+                        <div className="text-xs text-zinc-500">
+                          {settings.pythonIOMode === 'alert-output'
+                            ? 'Uses browser prompts for Python input while keeping stdout and stderr in the Output panel.'
+                            : 'Lets you queue Python stdin lines from the Output panel before execution. If the script asks for more lines than you supplied, it falls back to browser prompt.'}
+                        </div>
+                      </label>
+                    </div>
+
+                    <div className="rounded-2xl border border-white/10 bg-white/5 p-4 space-y-4">
+                      <div>
+                        <div className="text-sm font-medium text-white">C#</div>
+                        <div className="text-xs text-zinc-500 mt-1">Timeout is best-effort for the WebAssembly runtime. Set timeout to `0` to disable it.</div>
+                      </div>
+
+                      <label className="block space-y-2">
+                        <div className="text-xs font-medium uppercase tracking-wide text-zinc-500">Execution Timeout (ms)</div>
+                        <input
+                          type="number"
+                          min="0"
+                          step="100"
+                          value={settings.csharpExecutionTimeoutMs}
+                          onChange={(e) => setSettings(s => ({
+                            ...s,
+                            csharpExecutionTimeoutMs: normalizeExecutionTimeoutMs(Number(e.target.value))
+                          }))}
+                          className="w-full rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-sm text-white outline-none transition-colors focus:border-indigo-500"
+                        />
+                        <div className="text-xs text-zinc-500">Current: {formatExecutionTimeoutLabel(settings.csharpExecutionTimeoutMs)}</div>
+                      </label>
+
+                      <label className="block space-y-2">
+                        <div className="text-xs font-medium uppercase tracking-wide text-zinc-500">Execution Mode</div>
+                        <select
+                          value={settings.csharpExecutionMode}
+                          onChange={(e) => setSettings(s => ({
+                            ...s,
+                            csharpExecutionMode: e.target.value as CSharpExecutionMode,
+                          }))}
+                          className="w-full rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-sm text-white outline-none transition-colors focus:border-indigo-500"
+                        >
+                          <option value="regular">Regular Program</option>
+                          <option value="script">Script</option>
+                          <option value="script-context">Script Context</option>
+                        </select>
+                        <div className="text-xs text-zinc-500">
+                          {settings.csharpExecutionMode === 'regular'
+                            ? 'Compiles as a normal console program.'
+                            : settings.csharpExecutionMode === 'script'
+                              ? 'Runs as a Roslyn script without preserving previous state.'
+                              : 'Runs as a Roslyn script and keeps state per file between runs.'}
+                        </div>
+                      </label>
+
+                      <label className="block space-y-2">
+                        <div className="text-xs font-medium uppercase tracking-wide text-zinc-500">I/O Mode</div>
+                        <select
+                          value={settings.csharpIOMode}
+                          onChange={(e) => setSettings(s => ({
+                            ...s,
+                            csharpIOMode: e.target.value as RuntimeIOMode,
+                          }))}
+                          className="w-full rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-sm text-white outline-none transition-colors focus:border-indigo-500"
+                        >
+                          <option value="alert-output">Alert &amp; Output Mode</option>
+                          <option value="interactive-output-panel">Interactive Output Panel Mode</option>
+                        </select>
+                        <div className="text-xs text-zinc-500">
+                          {settings.csharpIOMode === 'alert-output'
+                            ? 'Uses the standard Output panel flow for C# execution results.'
+                            : 'Keeps the Output panel front-and-center for C# runs. The current C# runtime is output-only, so there is no extra prompt handling yet.'}
+                        </div>
+                      </label>
+
+                      <label className="flex items-center justify-between gap-4">
+                        <div>
+                          <div className="text-sm font-medium text-white">Reset Script Context Before Run</div>
+                          <div className="text-xs text-zinc-500">
+                            Only used for `Script Context` mode. Clears the file-specific script state before each run.
+                          </div>
+                        </div>
+                        <button
+                          onClick={() => setSettings(s => ({ ...s, csharpResetScriptContextBeforeRun: !s.csharpResetScriptContextBeforeRun }))}
+                          className={cn(
+                            "w-10 h-5 rounded-full transition-all relative shrink-0",
+                            settings.csharpResetScriptContextBeforeRun ? "bg-indigo-600" : "bg-zinc-700"
+                          )}
+                        >
+                          <div className={cn(
+                            "absolute top-1 w-3 h-3 bg-white rounded-full transition-all",
+                            settings.csharpResetScriptContextBeforeRun ? "right-1" : "left-1"
+                          )} />
+                        </button>
+                      </label>
+                    </div>
                   </div>
                 </section>
 

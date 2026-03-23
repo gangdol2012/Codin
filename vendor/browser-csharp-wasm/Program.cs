@@ -180,7 +180,7 @@ namespace BrowserCSharp
 
 				if (compilationResult.Success)
 				{
-					return await RunRegularProgram(compilationResult.Assembly).ConfigureAwait(false);
+					return await RunRegularProgram(compilationResult.Assembly, compilationResult.Compilation).ConfigureAwait(false);
 				}
 
 				return new ExecutionResult(null, null, String.Join('\n', compilationResult.Errors.Select(x => x.GetMessage())));
@@ -198,7 +198,8 @@ namespace BrowserCSharp
 				return first;
 			}
 
-			return TryCompileRegular(WrapAsConsoleProgram(code), refs);
+			CompilationResult wrapped = TryCompileRegular(WrapAsConsoleProgram(code), refs);
+			return wrapped.Success ? wrapped : first;
 		}
 
 		private static string WrapAsConsoleProgram(string userCode)
@@ -232,7 +233,7 @@ internal static class __CodeCraftEntry
 				Path.GetRandomFileName(),
 				new[] { syntaxTree },
 				refs,
-				new CSharpCompilationOptions(OutputKind.ConsoleApplication)
+				new CSharpCompilationOptions(OutputKind.ConsoleApplication, usings: defaultUsings)
 					.WithPlatform(Platform.AnyCpu)
 					.WithOptimizationLevel(OptimizationLevel.Release));
 
@@ -252,12 +253,18 @@ internal static class __CodeCraftEntry
 			return new CompilationResult(Assembly.Load(ms.ToArray()), compilation);
 		}
 
-		private static async Task<ExecutionResult> RunRegularProgram(Assembly assembly)
+		private static async Task<ExecutionResult> RunRegularProgram(Assembly assembly, Compilation compilation)
 		{
-			MethodInfo entry = assembly.EntryPoint;
-			if (entry == null)
+			IMethodSymbol entrySymbol = compilation.GetEntryPoint(CancellationToken.None);
+			if (entrySymbol == null)
 			{
 				return new ExecutionResult(null, null, "No entry point (Main) found.");
+			}
+
+			MethodInfo entry = ResolveCompiledEntryPoint(assembly, entrySymbol);
+			if (entry == null)
+			{
+				return new ExecutionResult(null, null, $"Unable to resolve compiled entry point `{entrySymbol.MetadataName}`.");
 			}
 
 			TextWriter ogOut = Console.Out;
@@ -265,7 +272,8 @@ internal static class __CodeCraftEntry
 			{
 				using StringWriter sw = new StringWriter();
 				Console.SetOut(sw);
-				object[] mainArgs = new object[] { Array.Empty<string>() };
+				ParameterInfo[] parameters = entry.GetParameters();
+				object[] mainArgs = parameters.Length == 0 ? null : new object[] { Array.Empty<string>() };
 				object invokeResult = entry.Invoke(null, mainArgs);
 				object exitOrResult = null;
 
@@ -302,6 +310,21 @@ internal static class __CodeCraftEntry
 			{
 				Console.SetOut(ogOut);
 			}
+		}
+
+		private static MethodInfo ResolveCompiledEntryPoint(Assembly assembly, IMethodSymbol entryPoint)
+		{
+			string containingNamespace = entryPoint.ContainingNamespace?.IsGlobalNamespace == false
+				? entryPoint.ContainingNamespace.ToDisplayString()
+				: null;
+			string containingTypeName = entryPoint.ContainingType?.MetadataName;
+			int parameterCount = entryPoint.Parameters.Length;
+
+			return assembly
+				.GetTypes()
+				.Where(type => type.Name == containingTypeName && type.Namespace == containingNamespace)
+				.SelectMany(type => type.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.Instance))
+				.FirstOrDefault(method => method.Name == entryPoint.MetadataName && method.GetParameters().Length == parameterCount);
 		}
 
 		private static async Task<CompilationResult> CompileScript(string code, ScriptContext? context = null)

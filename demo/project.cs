@@ -1,112 +1,22 @@
 using System;
-using System.Text;
-using System.Threading;
-using System.Xml;
 
 namespace CodeCraftDemo
 {
     class Program
     {
-        static int width = 10;
-        static int height = 10;
-        static bool[,] grid = new bool[height, width];
-        static Random random = new Random();
-
-        static void Main(string[] args)
+        static void Main()
         {
-            
-            InitGrid();
-
-            // Run for 100 generations autonomously
-            for (int gen = 0; gen < 100; gen++)
+            // Even more lightweight: A simple pattern generator (Sierpinski triangle)
+            int size = 16;
+            for (int y = 0; y < size; y++)
             {
-                // Reset cursor to top-left for a smooth "animation" effect
-                try { Console.SetCursorPosition(0, 0); } catch { }
-
-                PrintUI(gen);
-                UpdateGrid();
-            }
-            Console.WriteLine("\nSimulation finished.");
-        }
-
-        static void InitGrid()
-        {
-            for (int y = 0; y < height; y++)
-            {
-                for (int x = 0; x < width; x++)
+                for (int x = 0; x < size - y; x++) Console.Write(" ");
+                for (int x = 0; x <= y; x++)
                 {
-                    // Randomly populate 15% of the grid
-                    grid[y, x] = random.Next(100) < 15;
+                    Console.Write((x & (y - x)) == 0 ? "* " : "  ");
                 }
+                Console.WriteLine("");
             }
-        }
-
-        static void PrintUI(int gen)
-        {
-            StringBuilder sb = new StringBuilder();
-
-            // Header with box-drawing characters
-            string title = $" CONWAY'S GAME OF LIFE - GEN: {gen:D3} ";
-
-            // The Grid
-            for (int y = 0; y < height; y++)
-            {
-                for (int x = 0; x < width; x++)
-                {
-                    // Using full block for alive, space for dead
-                    sb.Append(grid[y, x] ? "⬛" : "⬜");
-                }
-                sb.AppendLine("");
-            }
-
-            Console.Write(sb.ToString());
-        }
-
-        static void UpdateGrid()
-        {
-            bool[,] nextGrid = new bool[height, width];
-
-            for (int y = 0; y < height; y++)
-            {
-                for (int x = 0; x < width; x++)
-                {
-                    int neighbors = CountNeighbors(x, y);
-
-                    if (grid[y, x])
-                    {
-                        // Any live cell with two or three live neighbours survives.
-                        nextGrid[y, x] = neighbors == 2 || neighbors == 3;
-                    }
-                    else
-                    {
-                        // Any dead cell with exactly three live neighbours becomes a live cell.
-                        nextGrid[y, x] = neighbors == 3;
-                    }
-                }
-            }
-
-            grid = nextGrid;
-        }
-
-        static int CountNeighbors(int x, int y)
-        {
-            int count = 0;
-            for (int i = -1; i <= 1; i++)
-            {
-                for (int j = -1; j <= 1; j++)
-                {
-                    if (i == 0 && j == 0) continue;
-
-                    int ni = y + i;
-                    int nj = x + j;
-
-                    if (ni >= 0 && ni < height && nj >= 0 && nj < width)
-                    {
-                        if (grid[ni, nj]) count++;
-                    }
-                }
-            }
-            return count;
         }
     }
 }
