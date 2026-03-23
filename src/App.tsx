@@ -2712,10 +2712,12 @@ export default function App() {
 
   const resolveOutputPanelInteraction = (value: string | boolean | null | undefined) => {
     const resolver = outputInteractionResolverRef.current;
-    outputInteractionResolverRef.current = null;
-    setOutputInteraction(null);
-    setOutputInteractionInput('');
-    setOutputInteractionBufferedLines([]);
+    flushSync(() => {
+      outputInteractionResolverRef.current = null;
+      setOutputInteraction(null);
+      setOutputInteractionInput('');
+      setOutputInteractionBufferedLines([]);
+    });
     resolver?.(value);
   };
 
@@ -2849,7 +2851,11 @@ export default function App() {
       return;
     }
 
-    commitResolvedOutputInteraction(outputInteraction, outputInteractionInput);
+    flushSync(() => {
+      commitResolvedOutputInteraction(outputInteraction, outputInteractionInput, {
+        appendNewline: true,
+      });
+    });
     resolveOutputPanelInteraction(outputInteractionInput);
   };
 
@@ -2897,28 +2903,34 @@ export default function App() {
     return window.prompt(message, defaultValue) ?? null;
   };
 
+  const requestPythonInteractiveOutputInput = async (promptText = '') => {
+    const normalizedPrompt = typeof promptText === 'string' ? promptText : String(promptText ?? '');
+    const response = await requestOutputPanelInteraction(
+      'python',
+      'stdin',
+      '',
+      '',
+      {
+        transcriptPrompt: normalizedPrompt,
+        inputMode: 'single-line',
+        placeholder: 'Type input and press Enter',
+        submitLabel: 'Send',
+        cancelLabel: 'Cancel',
+      }
+    );
+    if (response === null) {
+      throw new Error('Python input cancelled.');
+    }
+    return String(response ?? '');
+  };
+
   const requestPythonInput = (promptText = '') => {
     const normalizedPrompt = typeof promptText === 'string' ? promptText : String(promptText ?? '');
-
-    if (settings.pythonIOMode === 'interactive-output-panel') {
-      selectDockPanel('output');
-      setOutputPreviewHtml(null);
-      if (normalizedPrompt) {
-        flushSync(() => {
-          setOutput(prev => prev + normalizedPrompt);
-        });
-      }
-    }
-
     const value = window.prompt(normalizedPrompt || 'Python input:', '');
-
-    if (settings.pythonIOMode === 'interactive-output-panel') {
-      flushSync(() => {
-        setOutput(prev => prev + (value ?? '') + '\n');
-      });
+    if (value === null) {
+      throw new Error('Python input cancelled.');
     }
-
-    return value ?? '';
+    return value;
   };
 
   const collectPythonOutputPanelInput = async (pyodide: any, code: string) => {
@@ -4723,7 +4735,7 @@ json.dumps({
           indexURL: runtimeSource.indexURL,
           lockFileURL: runtimeSource.lockFileURL,
           packageBaseUrl: runtimeSource.packageBaseUrl,
-          enableRunUntilComplete: false,
+          enableRunUntilComplete: true,
           fullStdLib: false,
           stdLibURL,
         });
@@ -4998,26 +5010,121 @@ for _name in (
 
   const installPyodideInlineInputOverride = async (
     pyodide: any,
-    requestInput: (prompt: string) => string
+    requestInput: (prompt: string) => Promise<string | null>
   ) => {
     try {
-      pyodide.globals.set('__codecraft_request_python_input', requestInput);
+      pyodide.globals.set('__codecraft_request_python_input_async', requestInput);
       await pyodide.runPythonAsync(`
 import builtins
+import io
+import sys
+from pyodide.ffi import can_run_sync, run_sync
 
 __codecraft_original_input = builtins.input
+__codecraft_original_stdin = sys.stdin
+__codecraft_original___stdin__ = sys.__stdin__
+
+class __CodeCraftInlineStdin(io.TextIOBase):
+    encoding = "utf-8"
+    errors = "strict"
+    newlines = None
+    name = "<stdin>"
+    mode = "r"
+
+    def __init__(self):
+        self._buffer = ""
+
+    def readable(self):
+        return True
+
+    def writable(self):
+        return False
+
+    def seekable(self):
+        return False
+
+    def isatty(self):
+        return True
+
+    @property
+    def closed(self):
+        return False
+
+    def fileno(self):
+        raise OSError("Interactive Output Panel stdin has no file descriptor.")
+
+    def flush(self):
+        return None
+
+    def close(self):
+        self._buffer = ""
+
+    def _request_value(self, prompt=""):
+        _request = globals().get("__codecraft_request_python_input_async")
+        if _request is None:
+            raise RuntimeError("Python input bridge is unavailable.")
+        if not can_run_sync():
+            raise RuntimeError("Python input bridge requires Promise integration.")
+        _value = run_sync(_request("" if prompt is None else str(prompt)))
+        if _value is None:
+            raise EOFError("Python input cancelled.")
+        return str(_value)
+
+    def input(self, prompt=""):
+        self._buffer = ""
+        return self._request_value(prompt)
+
+    def _read_line_from_panel(self):
+        return self._request_value("") + "\\n"
+
+    def readline(self, size=-1):
+        if not self._buffer:
+            self._buffer = self._read_line_from_panel()
+        if size is None or size < 0:
+            data = self._buffer
+            self._buffer = ""
+            return data
+        data = self._buffer[:size]
+        self._buffer = self._buffer[size:]
+        return data
+
+    def read(self, size=-1):
+        if size == 0:
+            return ""
+        if size is None or size < 0:
+            if not self._buffer:
+                self._buffer = self._read_line_from_panel()
+            data = self._buffer
+            self._buffer = ""
+            return data
+        while len(self._buffer) < size:
+            self._buffer += self._read_line_from_panel()
+        data = self._buffer[:size]
+        self._buffer = self._buffer[size:]
+        return data
+
+    def readlines(self, hint=-1):
+        if hint == 0:
+            return []
+        return [self.readline()]
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        line = self.readline()
+        if line == "":
+            raise StopIteration
+        return line
+
+__codecraft_inline_stdin = __CodeCraftInlineStdin()
 
 def __codecraft_inline_input(prompt=""):
-    _request = globals().get("__codecraft_request_python_input")
-    if _request is not None:
-        try:
-            _value = _request("" if prompt is None else str(prompt))
-            return "" if _value is None else str(_value)
-        except Exception:
-            pass
-    return __codecraft_original_input(prompt)
+    return __codecraft_inline_stdin.input(prompt)
 
 builtins.input = __codecraft_inline_input
+sys.stdin = __codecraft_inline_stdin
+sys.__stdin__ = __codecraft_inline_stdin
 `);
     } catch { }
   };
@@ -5026,20 +5133,29 @@ builtins.input = __codecraft_inline_input
     try {
       pyodide.runPython(`
 import builtins
+import sys
 
 if "__codecraft_original_input" in globals():
     builtins.input = __codecraft_original_input
+if "__codecraft_original_stdin" in globals():
+    sys.stdin = __codecraft_original_stdin
+if "__codecraft_original___stdin__" in globals():
+    sys.__stdin__ = __codecraft_original___stdin__
 
 for _name in (
     "__codecraft_inline_input",
+    "__CodeCraftInlineStdin",
+    "__codecraft_inline_stdin",
     "__codecraft_original_input",
-    "__codecraft_request_python_input",
+    "__codecraft_original_stdin",
+    "__codecraft_original___stdin__",
+    "__codecraft_request_python_input_async",
 ):
     globals().pop(_name, None)
 `);
     } catch { }
     try {
-      pyodide.globals.delete('__codecraft_request_python_input');
+      pyodide.globals.delete('__codecraft_request_python_input_async');
     } catch { }
   };
 
@@ -5081,11 +5197,20 @@ for _name in (
       });
       setOutput('');
       console.clear();
-      pyodide.setStdin({
-        stdin: () => requestPythonInput(''),
-        isatty: true
-      });
-      await installPyodideInlineInputOverride(pyodide, requestPythonInput);
+      if (settings.pythonIOMode === 'interactive-output-panel') {
+        pyodide.setStdin({
+          stdin: () => {
+            throw new Error('Python stdin must be read through the interactive Output panel.');
+          },
+          isatty: true,
+        });
+        await installPyodideInlineInputOverride(pyodide, requestPythonInteractiveOutputInput);
+      } else {
+        pyodide.setStdin({
+          stdin: () => requestPythonInput(''),
+          isatty: true
+        });
+      }
 
       installPyodideExecutionTimeoutGuard(pyodide, timeoutMs);
       const result = await withExecutionTimeout(
