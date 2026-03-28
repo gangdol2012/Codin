@@ -47,6 +47,11 @@ export const BrowserCSharp = {
   executeRegular(code: string): Promise<ScriptResult> {
     return invoke<ScriptResult>('ExecuteRegular', code);
   },
+
+  /** Compiles and runs a multi-file C# console project. */
+  executeRegularProject(paths: string[], contents: string[], entryPath: string): Promise<ScriptResult> {
+    return invoke<ScriptResult>('ExecuteRegularProject', paths, contents, entryPath);
+  },
 };
 
 export type { ScriptResult } from 'browser-csharp';

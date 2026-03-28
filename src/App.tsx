@@ -427,6 +427,10 @@ function saveSyncMeta(meta: SyncMeta[]) {
 
 const DEFAULT_ASSISTANT_CHAT_NAME = "AI assistant";
 const MAX_ASSISTANT_TOOL_PASSES = 4;
+const ASSISTANT_MODEL_NAME = "gemini-3-flash-preview";
+const ASSISTANT_INPUT_PRICE_USD_PER_MILLION = 0.5;
+const ASSISTANT_OUTPUT_PRICE_USD_PER_MILLION = 3;
+const DEFAULT_ASSISTANT_ESTIMATED_OUTPUT_TOKENS = 1024;
 const createAssistantChatId = () => `chat_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
 const INITIAL_ASSISTANT_CHAT_ID = createAssistantChatId();
 const DEFAULT_PYI_IMPORT_SIZE_LIMIT_BYTES = 200 * 1024;
@@ -1462,6 +1466,34 @@ interface AssistantChat {
   messages: ChatMessage[];
 }
 
+type AssistantTokenEstimateSource = 'model' | 'approximation';
+type AssistantTurnUsageSource = 'model' | 'mixed' | 'approximation';
+
+interface AssistantTokenEstimate {
+  status: 'loading' | 'ready' | 'error';
+  promptTokenCount: number | null;
+  estimatedOutputTokenCount: number;
+  estimatedTotalTokenCount: number | null;
+  estimatedPaidCostUsd: number | null;
+  source: AssistantTokenEstimateSource;
+  error?: string;
+  updatedAt: number;
+}
+
+interface AssistantTurnUsage {
+  promptTokenCount: number;
+  toolUsePromptTokenCount: number;
+  inputTokenCount: number;
+  candidateTokenCount: number;
+  thoughtsTokenCount: number;
+  outputTokenCount: number;
+  totalTokenCount: number;
+  paidCostUsd: number;
+  passCount: number;
+  source: AssistantTurnUsageSource;
+  updatedAt: number;
+}
+
 interface PendingEdit {
   fileId: string;
   originalContent: string;
@@ -1473,12 +1505,30 @@ interface AssistantToolExecutionResult {
   detail: string;
 }
 
+interface ResolvedProjectRun {
+  mode: ProjectRunMode;
+  language: ProjectRuntimeLanguage | null;
+  selectedFiles: FSItem[];
+  entryFile: FSItem | null;
+  error: string | null;
+}
+
+interface ProjectSourceFile {
+  id: string;
+  name: string;
+  path: string;
+  content: string;
+  language: ProjectRuntimeLanguage;
+}
+
 type JavaScriptExecutionMode = 'classic-function' | 'async-function';
 type RuntimeIOMode = 'alert-output' | 'interactive-output-panel';
 type PythonRuntimeLifecycle = 'dispose-after-run' | 'keep-warm';
 type CSharpExecutionMode = 'regular' | 'script' | 'script-context';
 type RuntimeInteractionKind = 'alert' | 'confirm' | 'prompt' | 'stdin';
 type RuntimeInteractionLanguage = 'javascript' | 'python' | 'csharp';
+type ProjectRuntimeLanguage = 'javascript' | 'python' | 'html' | 'csharp';
+type ProjectRunMode = 'csharp-only' | 'python-only' | 'html-only' | 'javascript-only' | 'custom';
 
 interface OutputPanelInteraction {
   id: number;
@@ -1510,6 +1560,9 @@ interface AppSettings {
   csharpExecutionMode: CSharpExecutionMode;
   csharpResetScriptContextBeforeRun: boolean;
   csharpIOMode: RuntimeIOMode;
+  projectRunMode: ProjectRunMode;
+  projectRunCustomFileIds: string[];
+  projectRunEntryFileId: string | null;
 }
 
 const loadSavedAssistantChats = (): AssistantChat[] => {
@@ -1565,11 +1618,148 @@ const DEFAULT_SETTINGS: AppSettings = {
   csharpExecutionMode: 'regular',
   csharpResetScriptContextBeforeRun: false,
   csharpIOMode: 'alert-output',
+  projectRunMode: 'custom',
+  projectRunCustomFileIds: [],
+  projectRunEntryFileId: null,
 };
+
+const PROJECT_RUN_MODE_OPTIONS: { value: ProjectRunMode; label: string; language: ProjectRuntimeLanguage | null }[] = [
+  { value: 'csharp-only', label: 'C# only', language: 'csharp' },
+  { value: 'python-only', label: 'Python only', language: 'python' },
+  { value: 'html-only', label: 'HTML only', language: 'html' },
+  { value: 'javascript-only', label: 'JS only', language: 'javascript' },
+  { value: 'custom', label: 'Custom', language: null },
+];
+
+function normalizeProjectRuntimeLanguage(language?: string): ProjectRuntimeLanguage | null {
+  switch ((language || '').toLowerCase()) {
+    case 'javascript':
+    case 'js':
+      return 'javascript';
+    case 'python':
+    case 'py':
+      return 'python';
+    case 'html':
+      return 'html';
+    case 'csharp':
+    case 'cs':
+      return 'csharp';
+    default:
+      return null;
+  }
+}
+
+function getProjectRuntimeLanguageLabel(language: ProjectRuntimeLanguage | null) {
+  switch (language) {
+    case 'javascript':
+      return 'JavaScript';
+    case 'python':
+      return 'Python';
+    case 'html':
+      return 'HTML';
+    case 'csharp':
+      return 'C#';
+    default:
+      return 'Unknown';
+  }
+}
+
+function getProjectRunModeLanguage(mode: ProjectRunMode): ProjectRuntimeLanguage | null {
+  return PROJECT_RUN_MODE_OPTIONS.find(option => option.value === mode)?.language ?? null;
+}
+
+function normalizeProjectPath(path: string): string {
+  const normalized = path.replace(/\\/g, '/');
+  const parts = normalized.split('/');
+  const resolved: string[] = [];
+  for (const rawPart of parts) {
+    const part = rawPart.trim();
+    if (!part || part === '.') continue;
+    if (part === '..') {
+      resolved.pop();
+      continue;
+    }
+    resolved.push(part);
+  }
+  return resolved.join('/');
+}
+
+function dirnameProjectPath(path: string): string {
+  const normalized = normalizeProjectPath(path);
+  const index = normalized.lastIndexOf('/');
+  return index >= 0 ? normalized.slice(0, index) : '';
+}
+
+function resolveProjectRelativePath(fromPath: string, specifier: string): string {
+  const normalizedSpecifier = specifier.replace(/\\/g, '/').trim();
+  if (!normalizedSpecifier) {
+    return '';
+  }
+  if (normalizedSpecifier.startsWith('/')) {
+    return normalizeProjectPath(normalizedSpecifier.slice(1));
+  }
+  if (normalizedSpecifier.startsWith('./') || normalizedSpecifier.startsWith('../')) {
+    const baseDir = dirnameProjectPath(fromPath);
+    return normalizeProjectPath(baseDir ? `${baseDir}/${normalizedSpecifier}` : normalizedSpecifier);
+  }
+  return normalizeProjectPath(normalizedSpecifier);
+}
+
+function escapeHtml(value: string) {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function extractJavaScriptModuleSpecifiers(source: string): string[] {
+  const matches = new Set<string>();
+  const patterns = [
+    /\bimport\s+[\s\S]*?\sfrom\s*(['"])([^'"]+)\1/g,
+    /\bexport\s+[\s\S]*?\sfrom\s*(['"])([^'"]+)\1/g,
+    /\bimport\s*\(\s*(['"])([^'"]+)\1\s*\)/g,
+  ];
+
+  for (const pattern of patterns) {
+    for (const match of source.matchAll(pattern)) {
+      const specifier = (match[2] || '').trim();
+      if (specifier) {
+        matches.add(specifier);
+      }
+    }
+  }
+
+  return [...matches];
+}
 
 function normalizeExecutionTimeoutMs(value: number) {
   if (!Number.isFinite(value)) return 0;
   return Math.max(0, Math.floor(value));
+}
+
+function estimateFallbackTokenCount(text: string) {
+  if (!text) return 0;
+  return Math.max(1, Math.ceil(text.length / 4));
+}
+
+function calculateAssistantPaidCostUsd(inputTokenCount: number, outputTokenCount: number) {
+  return (inputTokenCount / 1_000_000) * ASSISTANT_INPUT_PRICE_USD_PER_MILLION
+    + (outputTokenCount / 1_000_000) * ASSISTANT_OUTPUT_PRICE_USD_PER_MILLION;
+}
+
+function formatAssistantTokenCount(value: number | null | undefined) {
+  if (value == null || !Number.isFinite(value)) return '—';
+  return new Intl.NumberFormat().format(Math.max(0, Math.round(value)));
+}
+
+function formatAssistantCostUsd(value: number | null | undefined) {
+  if (value == null || !Number.isFinite(value)) return '—';
+  if (value === 0) return '$0.0000';
+  if (value < 0.001) return `$${value.toFixed(6)}`;
+  if (value < 0.01) return `$${value.toFixed(5)}`;
+  return `$${value.toFixed(4)}`;
 }
 
 function formatExecutionTimeoutLabel(timeoutMs: number) {
@@ -1774,7 +1964,7 @@ export default function App() {
     return parsed.map(f => f.type === 'file' && f.name ? { ...f, language: langFromFilename(f.name) } : f);
   });
   const [activeFileId, setActiveFileId] = useState<string>('');
-  const [output, setOutput] = useState<string>('Click "Run" to see output...');
+  const [output, setOutput] = useState<string>('Click "Run" or "Project Run" to see output...');
   const [executionStartupStatus, setExecutionStartupStatus] = useState('');
   const [outputInteraction, setOutputInteraction] = useState<OutputPanelInteraction | null>(null);
   const [outputInteractionInput, setOutputInteractionInput] = useState('');
@@ -1790,6 +1980,8 @@ export default function App() {
   const [assistantInputs, setAssistantInputs] = useState<Record<string, string>>({
     [INITIAL_ASSISTANT_CHAT_ID]: ''
   });
+  const [assistantTokenEstimates, setAssistantTokenEstimates] = useState<Record<string, AssistantTokenEstimate>>({});
+  const [assistantTurnUsageByChatId, setAssistantTurnUsageByChatId] = useState<Record<string, AssistantTurnUsage>>({});
   const [loadingAssistantChatId, setLoadingAssistantChatId] = useState<string | null>(null);
   const [assistantHistoryOpenByChatId, setAssistantHistoryOpenByChatId] = useState<Record<string, boolean>>({});
   const [outputPreviewHtml, setOutputPreviewHtml] = useState<string | null>(null);
@@ -1812,6 +2004,13 @@ export default function App() {
       javascriptExecutionTimeoutMs: normalizeExecutionTimeoutMs(merged.javascriptExecutionTimeoutMs),
       pythonExecutionTimeoutMs: normalizeExecutionTimeoutMs(merged.pythonExecutionTimeoutMs),
       csharpExecutionTimeoutMs: normalizeExecutionTimeoutMs(merged.csharpExecutionTimeoutMs),
+      projectRunMode: PROJECT_RUN_MODE_OPTIONS.some(option => option.value === merged.projectRunMode)
+        ? merged.projectRunMode
+        : DEFAULT_SETTINGS.projectRunMode,
+      projectRunCustomFileIds: Array.isArray(merged.projectRunCustomFileIds)
+        ? merged.projectRunCustomFileIds.filter((value: unknown): value is string => typeof value === 'string')
+        : [],
+      projectRunEntryFileId: typeof merged.projectRunEntryFileId === 'string' ? merged.projectRunEntryFileId : null,
     };
   });
   const [settingsPipPackages, setSettingsPipPackages] = useState<SavedPipPackage[]>(() => loadSavedPipPackages());
@@ -1847,6 +2046,8 @@ export default function App() {
   const terminalContainerRef = useRef<HTMLDivElement>(null);
   const outputInteractionResolverRef = useRef<((value: string | boolean | null | undefined) => void) | null>(null);
   const outputInteractionIdRef = useRef(0);
+  const outputPreviewUrlsRef = useRef<string[]>([]);
+  const assistantEstimateRequestIdRef = useRef(0);
   const csharpRuntimeReadyRef = useRef<Promise<void> | null>(null);
   const skipEditorSyncRef = useRef(false);
   const pendingSharedEditorTargetRef = useRef<{ tabId: string; itemId: string } | null>(null);
@@ -2168,6 +2369,97 @@ export default function App() {
     if (!item.parentId) return item.name;
     return `${getPath(item.parentId)}/${item.name}`;
   };
+
+  function getProjectRunnableFiles() {
+    return files
+      .filter((item): item is FSItem & { type: 'file' } => (
+        item.type === 'file'
+        && normalizeProjectRuntimeLanguage(item.language) !== null
+      ))
+      .sort((left, right) => getPath(left.id).localeCompare(getPath(right.id)));
+  }
+
+  function getActiveRunnableFile() {
+    if (activeItem?.type !== 'file') return null;
+    return normalizeProjectRuntimeLanguage(activeItem.language) ? activeItem : null;
+  }
+
+  function getResolvedProjectRun(): ResolvedProjectRun {
+    const runnableFiles = getProjectRunnableFiles();
+    const fixedLanguage = getProjectRunModeLanguage(settings.projectRunMode);
+
+    const selectedFiles = settings.projectRunMode === 'custom'
+      ? runnableFiles.filter(file => settings.projectRunCustomFileIds.includes(file.id))
+      : runnableFiles.filter(file => normalizeProjectRuntimeLanguage(file.language) === fixedLanguage);
+
+    if (selectedFiles.length === 0) {
+      return {
+        mode: settings.projectRunMode,
+        language: fixedLanguage,
+        selectedFiles,
+        entryFile: null,
+        error: settings.projectRunMode === 'custom'
+          ? 'Custom project run has no files selected.'
+          : `No ${getProjectRuntimeLanguageLabel(fixedLanguage)} files are available for project run.`,
+      };
+    }
+
+    const selectedLanguageSet = new Set<ProjectRuntimeLanguage>(
+      selectedFiles
+        .map(file => normalizeProjectRuntimeLanguage(file.language))
+        .filter((language): language is ProjectRuntimeLanguage => language !== null)
+    );
+
+    if (selectedLanguageSet.size > 1) {
+      return {
+        mode: settings.projectRunMode,
+        language: null,
+        selectedFiles,
+        entryFile: null,
+        error: 'Project run requires files from a single supported language.',
+      };
+    }
+
+    const resolvedLanguage = fixedLanguage ?? selectedLanguageSet.values().next().value ?? null;
+    const activeRunnableFile = activeFileId
+      ? selectedFiles.find(file => file.id === activeFileId) ?? null
+      : null;
+    const configuredEntry = settings.projectRunEntryFileId
+      ? selectedFiles.find(file => file.id === settings.projectRunEntryFileId) ?? null
+      : null;
+    const entryFile = configuredEntry ?? activeRunnableFile ?? selectedFiles[0] ?? null;
+
+    return {
+      mode: settings.projectRunMode,
+      language: resolvedLanguage,
+      selectedFiles,
+      entryFile,
+      error: entryFile ? null : 'Project run could not determine an entry file.',
+    };
+  }
+
+  const toProjectSourceFiles = (projectFiles: FSItem[]): ProjectSourceFile[] => (
+    projectFiles
+      .map((file) => {
+        const language = normalizeProjectRuntimeLanguage(file.language);
+        if (!language) return null;
+        return {
+          id: file.id,
+          name: file.name,
+          path: normalizeProjectPath(getPath(file.id)),
+          content: file.content || '',
+          language,
+        } satisfies ProjectSourceFile;
+      })
+      .filter((file): file is ProjectSourceFile => file !== null)
+      .sort((left, right) => left.path.localeCompare(right.path))
+  );
+
+  const projectRunnableFiles = getProjectRunnableFiles();
+  const resolvedProjectRun = getResolvedProjectRun();
+  const activeRunnableFile = getActiveRunnableFile();
+  const canRunCurrentFile = !isRunning && activeRunnableFile !== null;
+  const canRunProject = !isRunning && !resolvedProjectRun.error;
 
   // Helper to find item by path or name
   const findItem = (pathOrName: string): FSItem | undefined => {
@@ -2549,6 +2841,42 @@ export default function App() {
   }, [settings]);
 
   useEffect(() => {
+    const nextRunnableFiles = getProjectRunnableFiles();
+    const runnableIds = new Set(nextRunnableFiles.map(file => file.id));
+
+    setSettings(current => {
+      const nextCustomFileIds = current.projectRunCustomFileIds.filter(id => runnableIds.has(id));
+      const modeLanguage = getProjectRunModeLanguage(current.projectRunMode);
+      const selectedIds = current.projectRunMode === 'custom'
+        ? nextCustomFileIds
+        : nextRunnableFiles
+          .filter(file => normalizeProjectRuntimeLanguage(file.language) === modeLanguage)
+          .map(file => file.id);
+
+      const preferredEntryId =
+        current.projectRunEntryFileId && selectedIds.includes(current.projectRunEntryFileId)
+          ? current.projectRunEntryFileId
+          : selectedIds.includes(activeFileId)
+            ? activeFileId
+            : selectedIds[0] ?? null;
+
+      if (
+        nextCustomFileIds.length === current.projectRunCustomFileIds.length
+        && nextCustomFileIds.every((id, index) => id === current.projectRunCustomFileIds[index])
+        && preferredEntryId === current.projectRunEntryFileId
+      ) {
+        return current;
+      }
+
+      return {
+        ...current,
+        projectRunCustomFileIds: nextCustomFileIds,
+        projectRunEntryFileId: preferredEntryId,
+      };
+    });
+  }, [activeFileId, files]);
+
+  useEffect(() => {
     if (isSettingsOpen) {
       setSettingsPipPackages(loadSavedPipPackages());
       setSettingsPipIncludedModules(loadSavedPipIncludedModules());
@@ -2627,6 +2955,14 @@ export default function App() {
   useEffect(() => {
     return () => {
       if (pyodideIdleTimerRef.current) clearTimeout(pyodideIdleTimerRef.current);
+      if (outputPreviewUrlsRef.current.length > 0) {
+        for (const url of outputPreviewUrlsRef.current) {
+          try {
+            URL.revokeObjectURL(url);
+          } catch { }
+        }
+        outputPreviewUrlsRef.current = [];
+      }
     };
   }, []);
 
@@ -2639,6 +2975,115 @@ export default function App() {
       return next;
     });
   }, [assistantChats]);
+
+  useEffect(() => {
+    const draftChats = assistantChats
+      .map(chat => ({
+        chatId: chat.id,
+        chat,
+        draft: (assistantInputs[chat.id] || '').trim(),
+      }))
+      .filter(entry => entry.draft.length > 0);
+
+    const draftChatIds = new Set(draftChats.map(entry => entry.chatId));
+    setAssistantTokenEstimates(prev => {
+      const next: Record<string, AssistantTokenEstimate> = {};
+      for (const [chatId, estimate] of Object.entries(prev)) {
+        if (draftChatIds.has(chatId)) {
+          next[chatId] = estimate;
+        }
+      }
+      return next;
+    });
+
+    if (draftChats.length === 0) {
+      assistantEstimateRequestIdRef.current += 1;
+      return;
+    }
+
+    const requestId = assistantEstimateRequestIdRef.current + 1;
+    assistantEstimateRequestIdRef.current = requestId;
+    const timeoutId = window.setTimeout(() => {
+      const selectionContext = getCurrentAssistantSelectionContext();
+      draftChats.forEach(({ chatId, chat, draft }) => {
+        const projectedOutputTokens = assistantTurnUsageByChatId[chatId]?.outputTokenCount || DEFAULT_ASSISTANT_ESTIMATED_OUTPUT_TOKENS;
+        const assistantFiles = files.map(file => ({ ...file }));
+        const assistantActiveItemId = activeItem?.id || activeFileId || '';
+        const prompt = buildAssistantPromptFromSnapshot({
+          chatId,
+          messages: chat.messages,
+          userContent: draft + selectionContext,
+          assistantFiles,
+          assistantActiveItemId,
+        });
+
+        setAssistantTokenEstimates(prev => ({
+          ...prev,
+          [chatId]: {
+            status: 'loading',
+            promptTokenCount: prev[chatId]?.promptTokenCount ?? null,
+            estimatedOutputTokenCount: projectedOutputTokens,
+            estimatedTotalTokenCount: prev[chatId]?.estimatedTotalTokenCount ?? null,
+            estimatedPaidCostUsd: prev[chatId]?.estimatedPaidCostUsd ?? null,
+            source: prev[chatId]?.source ?? 'approximation',
+            error: prev[chatId]?.error,
+            updatedAt: Date.now(),
+          },
+        }));
+
+        void aiRef.current.models.countTokens({
+          model: ASSISTANT_MODEL_NAME,
+          contents: prompt,
+        }).then((response: any) => {
+          if (assistantEstimateRequestIdRef.current !== requestId) return;
+          const promptTokenCount = typeof response?.totalTokens === 'number'
+            ? response.totalTokens
+            : estimateFallbackTokenCount(prompt);
+          const estimatedTotalTokenCount = promptTokenCount + projectedOutputTokens;
+          setAssistantTokenEstimates(prev => ({
+            ...prev,
+            [chatId]: {
+              status: 'ready',
+              promptTokenCount,
+              estimatedOutputTokenCount: projectedOutputTokens,
+              estimatedTotalTokenCount,
+              estimatedPaidCostUsd: calculateAssistantPaidCostUsd(promptTokenCount, projectedOutputTokens),
+              source: typeof response?.totalTokens === 'number' ? 'model' : 'approximation',
+              updatedAt: Date.now(),
+            },
+          }));
+        }).catch((error) => {
+          if (assistantEstimateRequestIdRef.current !== requestId) return;
+          const promptTokenCount = estimateFallbackTokenCount(prompt);
+          const estimatedTotalTokenCount = promptTokenCount + projectedOutputTokens;
+          setAssistantTokenEstimates(prev => ({
+            ...prev,
+            [chatId]: {
+              status: 'ready',
+              promptTokenCount,
+              estimatedOutputTokenCount: projectedOutputTokens,
+              estimatedTotalTokenCount,
+              estimatedPaidCostUsd: calculateAssistantPaidCostUsd(promptTokenCount, projectedOutputTokens),
+              source: 'approximation',
+              error: error instanceof Error ? error.message : String(error),
+              updatedAt: Date.now(),
+            },
+          }));
+        });
+      });
+    }, 500);
+
+    return () => {
+      clearTimeout(timeoutId);
+    };
+  }, [
+    activeFileId,
+    activeItem,
+    assistantChats,
+    assistantInputs,
+    assistantTurnUsageByChatId,
+    files,
+  ]);
 
   // Auto-scroll output and terminal
   useEffect(() => {
@@ -2710,6 +3155,109 @@ export default function App() {
     setExecutionStartupStatus(prev => prev ? `${prev}\n${message}` : message);
   };
 
+  function getCurrentAssistantSelectionContext() {
+    if (!editorRef.current || !activeItem) {
+      return "";
+    }
+    const selection = editorRef.current.getSelection?.();
+    const model = editorRef.current.getModel?.();
+    if (!selection || !model || selection.isEmpty?.()) {
+      return "";
+    }
+    const selectedText = model.getValueInRange(selection);
+    if (!selectedText) {
+      return "";
+    }
+    return `\n\n[User selected code in ${activeItem.name}]:\n\`\`\`${activeItem.language || 'text'}\n${selectedText}\n\`\`\``;
+  }
+
+  function buildAssistantPromptFromSnapshot(params: {
+    chatId: string;
+    messages: ChatMessage[];
+    userContent: string;
+    assistantFiles: FSItem[];
+    assistantActiveItemId: string;
+    toolProgressNotes?: string[];
+    assistantLiveNotes?: string[];
+  }) {
+    const {
+      chatId,
+      messages,
+      userContent,
+      assistantFiles,
+      assistantActiveItemId,
+      toolProgressNotes = [],
+      assistantLiveNotes = [],
+    } = params;
+
+    const getPathFromSnapshot = (id: string | undefined): string => {
+      if (!id) return '';
+      const item = assistantFiles.find(file => file.id === id);
+      if (!item) return '';
+      if (!item.parentId) return item.name;
+      return `${getPathFromSnapshot(item.parentId)}/${item.name}`;
+    };
+
+    const activeSnapshotItem = assistantActiveItemId
+      ? assistantFiles.find(file => file.id === assistantActiveItemId) || null
+      : null;
+    const history = messages.map(msg => `${msg.role.toUpperCase()}: ${msg.content}`).join('\n');
+    const toolProgress = toolProgressNotes.length > 0
+      ? `\nTurn Progress:\n${toolProgressNotes.map((note, index) => `${index + 1}. ${note}`).join('\n')}\nUse the updated workspace state above when deciding the next action. If the task is complete, respond to the user normally.`
+      : '';
+    const liveAssistantProgress = assistantLiveNotes.length > 0
+      ? `\nAssistant Messages Already Shown This Turn:\n${assistantLiveNotes.map((note, index) => `${index + 1}. ${note}`).join('\n')}\nContinue from there and avoid repeating the same message word-for-word.`
+      : '';
+
+    return `
+        Context: You are an AI coding assistant inside CodeCraft IDE.
+        Internal Chat ID: ${chatId}
+        Keep continuity with the existing chat history for this chat.
+        You have access to tools to propose edits, navigate, move cursor, directly create/delete/move files or folders, and run built-in terminal commands.
+        Do not suggest terminal-style commands for filesystem operations when a tool can be used, unless the user specifically asks for it.
+        When you want to change code, use 'proposeEdit' so the user can review it.
+        You may use multiple tool calls in a single response when the task needs several actions.
+        If you have a plan, progress update, or explanation, include it in the same response as your tool calls. That text is shown to the user immediately.
+        Do not save every explanation for one final summary if the work is happening in multiple steps.
+        If you need the contents of another file before editing it, navigate to it first. On the next tool round in the same turn, the updated active item and its content will be shown to you.
+        If more than one action is needed, emit all needed tool calls in order in the same response instead of stopping after the first action.
+
+        Current File System:
+        ${assistantFiles.map(file => `- Path: ${getPathFromSnapshot(file.id)}, Type: ${file.type}, Language: ${file.language || 'N/A'}`).join('\n')}
+
+        Active Item: ${activeSnapshotItem ? getPathFromSnapshot(activeSnapshotItem.id) : 'None selected'}
+        ${activeSnapshotItem ? (activeSnapshotItem.type === 'file' ? `Content:\n${activeSnapshotItem.content || ''}` : 'This is a folder.') : 'No file is currently active.'}
+
+        Chat History:
+        ${history || '(empty)'}
+        ${toolProgress}
+        ${liveAssistantProgress}
+
+        USER: ${userContent}
+        `;
+  }
+
+  function revokeOutputPreviewUrls() {
+    if (outputPreviewUrlsRef.current.length === 0) return;
+    for (const url of outputPreviewUrlsRef.current) {
+      try {
+        URL.revokeObjectURL(url);
+      } catch { }
+    }
+    outputPreviewUrlsRef.current = [];
+  }
+
+  const showOutputPreview = useCallback((html: string, objectUrls: string[] = []) => {
+    revokeOutputPreviewUrls();
+    outputPreviewUrlsRef.current = objectUrls;
+    setOutputPreviewHtml(html);
+  }, [revokeOutputPreviewUrls]);
+
+  const clearOutputPreview = useCallback(() => {
+    revokeOutputPreviewUrls();
+    setOutputPreviewHtml(null);
+  }, [revokeOutputPreviewUrls]);
+
   const resolveOutputPanelInteraction = (value: string | boolean | null | undefined) => {
     const resolver = outputInteractionResolverRef.current;
     flushSync(() => {
@@ -2741,7 +3289,7 @@ export default function App() {
     }
 
     selectDockPanel('output');
-    setOutputPreviewHtml(null);
+    clearOutputPreview();
     outputInteractionIdRef.current += 1;
     setOutputInteractionInput(defaultValue);
     setOutputInteractionBufferedLines([]);
@@ -3016,6 +3564,184 @@ json.dumps(_result)
     }
 
     return String(response ?? '').replace(/\r\n/g, '\n').split('\n');
+  };
+
+  const buildJavaScriptProjectPreview = (
+    projectFiles: ProjectSourceFile[],
+    entryFile: ProjectSourceFile
+  ) => {
+    const urlByPath = new Map<string, string>();
+
+    for (const file of projectFiles) {
+      urlByPath.set(
+        file.path,
+        `data:text/javascript;charset=utf-8,${encodeURIComponent(file.content)}`
+      );
+    }
+
+    const scopes: Record<string, Record<string, string>> = {};
+    for (const file of projectFiles) {
+      const importerUrl = urlByPath.get(file.path);
+      if (!importerUrl) continue;
+
+      const scopedImports: Record<string, string> = {};
+      for (const specifier of extractJavaScriptModuleSpecifiers(file.content)) {
+        const resolvedPath = resolveProjectRelativePath(file.path, specifier);
+        const resolvedUrl = urlByPath.get(resolvedPath);
+        if (!resolvedUrl) continue;
+        scopedImports[specifier] = resolvedUrl;
+      }
+
+      if (Object.keys(scopedImports).length > 0) {
+        scopes[importerUrl] = scopedImports;
+      }
+    }
+
+    const runnerHtml = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>${escapeHtml(entryFile.name)}</title>
+  <style>
+    html, body {
+      margin: 0;
+      min-height: 100%;
+      background: #0b1120;
+      color: #e5e7eb;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+  </style>
+  <script type="importmap">${JSON.stringify({ imports: {}, scopes })}</script>
+</head>
+<body>
+  <script type="module">
+    const formatValue = (value) => {
+      if (typeof value === 'string') return value;
+      try {
+        return JSON.stringify(value, null, 2);
+      } catch {
+        return String(value);
+      }
+    };
+
+    const host = document.createElement('codecraft-console-host');
+    const shadowRoot = host.attachShadow({ mode: 'open' });
+    shadowRoot.innerHTML = \`
+      <style>
+        :host {
+          all: initial;
+        }
+        .console {
+          position: fixed;
+          left: 12px;
+          right: 12px;
+          bottom: 12px;
+          max-height: 40vh;
+          overflow: auto;
+          box-sizing: border-box;
+          padding: 12px 14px;
+          border-radius: 14px;
+          border: 1px solid rgba(148, 163, 184, 0.25);
+          background: rgba(15, 23, 42, 0.88);
+          color: #cbd5e1;
+          font: 12px/1.5 "JetBrains Mono", "Fira Code", ui-monospace, SFMono-Regular, monospace;
+          backdrop-filter: blur(16px);
+          box-shadow: 0 18px 48px rgba(15, 23, 42, 0.35);
+          z-index: 2147483647;
+          white-space: pre-wrap;
+        }
+        .line + .line {
+          margin-top: 6px;
+        }
+        .line[data-level="warn"] {
+          color: #fbbf24;
+        }
+        .line[data-level="error"] {
+          color: #fca5a5;
+        }
+        .line[data-level="status"] {
+          color: #93c5fd;
+        }
+      </style>
+      <div class="console" part="console"></div>
+    \`;
+
+    const consoleNode = shadowRoot.querySelector('.console');
+    const appendLine = (level, text) => {
+      if (!consoleNode) return;
+      const line = document.createElement('div');
+      line.className = 'line';
+      line.dataset.level = level;
+      line.textContent = String(text);
+      consoleNode.appendChild(line);
+      consoleNode.scrollTop = consoleNode.scrollHeight;
+    };
+
+    document.documentElement.appendChild(host);
+    appendLine('status', 'Running JavaScript project: ${escapeHtml(entryFile.path)}');
+
+    const originalConsole = window.console;
+    window.console = {
+      ...originalConsole,
+      log: (...args) => appendLine('log', args.map(formatValue).join(' ')),
+      warn: (...args) => appendLine('warn', args.map(formatValue).join(' ')),
+      error: (...args) => appendLine('error', args.map(formatValue).join(' ')),
+      clear: () => {
+        if (consoleNode) {
+          consoleNode.textContent = '';
+        }
+      },
+    };
+
+    window.addEventListener('error', (event) => {
+      appendLine('error', event.error?.stack || event.message || 'Unhandled error');
+    });
+
+    window.addEventListener('unhandledrejection', (event) => {
+      const reason = event.reason;
+      appendLine('error', reason?.stack || reason?.message || String(reason));
+    });
+
+    try {
+      await import(${JSON.stringify(urlByPath.get(entryFile.path) || '')});
+      appendLine('status', 'JavaScript project finished.');
+    } catch (error) {
+      appendLine('error', error?.stack || error?.message || String(error));
+    }
+  </script>
+</body>
+</html>`;
+
+    return {
+      html: runnerHtml,
+      objectUrls: [],
+    };
+  };
+
+  const runJavaScriptProject = async (
+    projectFiles: ProjectSourceFile[],
+    entryFile: ProjectSourceFile
+  ) => {
+    setExecutionStartupStatus('');
+    setOutput(`JavaScript project running from ${entryFile.path}. Console output appears in the Output preview.`);
+    selectDockPanel('output');
+    const preview = buildJavaScriptProjectPreview(projectFiles, entryFile);
+    showOutputPreview(preview.html, preview.objectUrls);
+  };
+
+  const runHtmlProject = async (
+    projectFiles: ProjectSourceFile[],
+    entryFile: ProjectSourceFile
+  ) => {
+    setExecutionStartupStatus('');
+    setOutput(
+      projectFiles.length > 1
+        ? `Previewing ${entryFile.path}. ${projectFiles.length - 1} additional HTML file(s) remain available as alternate entry pages.`
+        : `Previewing ${entryFile.path}.`
+    );
+    selectDockPanel('output');
+    showOutputPreview(entryFile.content);
   };
 
   const runJavaScript = async (code: string) => {
@@ -5159,6 +5885,165 @@ for _name in (
     } catch { }
   };
 
+  const removePyodideFsPath = (pyodide: any, targetPath: string) => {
+    try {
+      const stat = pyodide.FS.stat(targetPath);
+      if (pyodide.FS.isDir(stat.mode)) {
+        const entries = pyodide.FS.readdir(targetPath);
+        for (const entry of entries) {
+          if (entry === '.' || entry === '..') continue;
+          removePyodideFsPath(pyodide, `${targetPath}/${entry}`);
+        }
+        pyodide.FS.rmdir(targetPath);
+        return;
+      }
+      if (pyodide.FS.isFile(stat.mode)) {
+        pyodide.FS.unlink(targetPath);
+      }
+    } catch { }
+  };
+
+  const ensurePyodideDirectory = (pyodide: any, targetPath: string) => {
+    const normalized = normalizeProjectPath(targetPath);
+    let current = '';
+    for (const part of normalized.split('/')) {
+      if (!part) continue;
+      current = current ? `${current}/${part}` : `/${part}`;
+      try {
+        pyodide.FS.mkdir(current);
+      } catch { }
+    }
+  };
+
+  const writePythonProjectFiles = (pyodide: any, rootPath: string, projectFiles: ProjectSourceFile[]) => {
+    removePyodideFsPath(pyodide, rootPath);
+    ensurePyodideDirectory(pyodide, rootPath);
+
+    for (const file of projectFiles) {
+      const fullPath = `${rootPath}/${file.path}`;
+      const parentPath = dirnameProjectPath(fullPath);
+      if (parentPath) {
+        ensurePyodideDirectory(pyodide, parentPath);
+      }
+      pyodide.FS.writeFile(fullPath, file.content, { encoding: 'utf8' });
+    }
+  };
+
+  const runPythonProject = async (
+    projectFiles: ProjectSourceFile[],
+    entryFile: ProjectSourceFile
+  ) => {
+    const timeoutMs = normalizeExecutionTimeoutMs(settings.pythonExecutionTimeoutMs);
+    const pythonStdoutDecoder = new TextDecoder();
+    const flushPythonStdout = () => {
+      try {
+        const remaining = pythonStdoutDecoder.decode();
+        if (remaining) {
+          setOutput(prev => prev + remaining);
+        }
+      } catch { }
+    };
+
+    try {
+      if (settings.pythonIOMode === 'interactive-output-panel') {
+        selectDockPanel('output');
+      }
+      await ensurePyodideWithPackages(appendExecutionStartupStatus);
+      setExecutionStartupStatus('');
+      clearPyodideIdleTimer();
+      await ensurePyodideUsesTypeshedSurface(projectFiles.map(file => file.content).join('\n\n'));
+      const pyodide = (window as any).pyodide;
+
+      pyodide.setStdout({
+        write: (buffer: Uint8Array) => {
+          const safeBuffer = buffer.buffer instanceof SharedArrayBuffer ? new Uint8Array(buffer) : buffer;
+          const text = pythonStdoutDecoder.decode(safeBuffer, { stream: true });
+          if (text) {
+            setOutput(prev => prev + text);
+          }
+          return buffer.length;
+        },
+      });
+      pyodide.setStderr({
+        batched: (text: string) => {
+          setOutput(prev => prev + `[STDERR] ${text}`);
+        },
+      });
+      setOutput('');
+      console.clear();
+
+      if (settings.pythonIOMode === 'interactive-output-panel') {
+        pyodide.setStdin({
+          stdin: () => {
+            throw new Error('Python stdin must be read through the interactive Output panel.');
+          },
+          isatty: true,
+        });
+        await installPyodideInlineInputOverride(pyodide, requestPythonInteractiveOutputInput);
+      } else {
+        pyodide.setStdin({
+          stdin: () => requestPythonInput(''),
+          isatty: true
+        });
+      }
+
+      const projectRoot = '/codecraft_project';
+      writePythonProjectFiles(pyodide, projectRoot, projectFiles);
+      appendExecutionStartupStatus(`Loaded ${projectFiles.length} Python project file(s).`);
+
+      const entryPath = `${projectRoot}/${entryFile.path}`;
+      const entryDir = entryPath.includes('/') ? entryPath.slice(0, entryPath.lastIndexOf('/')) || projectRoot : projectRoot;
+      const runner = `
+import os
+import runpy
+import sys
+
+project_root = ${JSON.stringify(projectRoot)}
+entry_path = ${JSON.stringify(entryPath)}
+entry_dir = ${JSON.stringify(entryDir)}
+previous_cwd = os.getcwd()
+
+for candidate in (entry_dir, project_root):
+    if candidate and candidate not in sys.path:
+        sys.path.insert(0, candidate)
+
+try:
+    os.chdir(entry_dir or project_root)
+    runpy.run_path(entry_path, run_name="__main__")
+finally:
+    os.chdir(previous_cwd)
+`;
+
+      installPyodideExecutionTimeoutGuard(pyodide, timeoutMs);
+      await withExecutionTimeout(
+        'Python execution',
+        timeoutMs,
+        () => pyodide.runPythonAsync(runner),
+        async () => {
+          unloadPyodide();
+        }
+      );
+
+      flushPythonStdout();
+    } catch (err) {
+      setExecutionStartupStatus('');
+      flushPythonStdout();
+      const normalizedError = normalizePythonExecutionError(err, timeoutMs);
+      setOutput(prev => prev + (prev ? '\n' : '') + `Python Error: ${normalizedError.message}`);
+    } finally {
+      flushPythonStdout();
+      if ((window as any).pyodide) {
+        clearPyodideInlineInputOverride((window as any).pyodide);
+        clearPyodideExecutionTimeoutGuard((window as any).pyodide);
+      }
+      if (settings.pythonRuntimeLifecycle === 'keep-warm' && (window as any).pyodide) {
+        resetPyodideIdleTimer();
+      } else {
+        unloadPyodide();
+      }
+    }
+  };
+
   const runPython = async (code: string) => {
     const timeoutMs = normalizeExecutionTimeoutMs(settings.pythonExecutionTimeoutMs);
     const pythonStdoutDecoder = new TextDecoder();
@@ -5347,11 +6232,55 @@ for _name in (
     }
   };
 
-  const handleRun = async () => {
-    if (!activeItem) {
-      setOutput('Error: No file selected to run.');
-      return;
+  const runCSharpProject = async (
+    projectFiles: ProjectSourceFile[],
+    entryFile: ProjectSourceFile
+  ) => {
+    try {
+      if (settings.csharpIOMode === 'interactive-output-panel') {
+        selectDockPanel('output');
+      }
+      setOutput('');
+      console.clear();
+      setExecutionStartupStatus(`Compiling C# project (${projectFiles.length} file${projectFiles.length === 1 ? '' : 's'})...`);
+
+      await ensureCSharpRuntime();
+      const { BrowserCSharp } = await getBrowserCSharpModule();
+      const note = settings.csharpExecutionMode === 'regular'
+        ? ''
+        : ' Project run uses regular C# compilation.';
+      setExecutionStartupStatus(`Compiling and executing C# project from ${entryFile.path}.${note}`);
+
+      const result = await withExecutionTimeout(
+        'C# execution',
+        settings.csharpExecutionTimeoutMs,
+        () => BrowserCSharp.executeRegularProject(
+          projectFiles.map(file => file.path),
+          projectFiles.map(file => file.content),
+          entryFile.path
+        )
+      );
+
+      const stdOut = (result.stdOut || '').trim();
+      const stdErr = (result.stdErr || '').trim();
+      const returnValue = result.result;
+
+      const chunks: string[] = [];
+      if (stdErr) chunks.push(stdErr);
+      if (stdOut) chunks.push(stdOut);
+      if (returnValue !== undefined && returnValue !== null && String(returnValue).trim()) {
+        chunks.push(`Return value: ${String(returnValue)}`);
+      }
+
+      setExecutionStartupStatus('');
+      setOutput(chunks.join('\n') || 'C# project executed successfully with no output.');
+    } catch (err) {
+      setExecutionStartupStatus('');
+      setOutput(`C# Error: ${err instanceof Error ? err.message : String(err)}`);
     }
+  };
+
+  const runWithExecutionLifecycle = async (executor: () => Promise<void>) => {
     setIsRunning(true);
 
     setExecutionStartupStatus('');
@@ -5366,46 +6295,115 @@ for _name in (
     }
 
     try {
-      if (activeItem.type === 'file' && (activeItem.language === 'javascript' || activeItem.language === 'js')) {
-        setOutputPreviewHtml(null);
-        await runJavaScript(activeItem.content || '');
-        return;
-      }
-
-      if (activeItem.type === 'file' && (activeItem.language === 'python' || activeItem.language === 'py')) {
-        setOutputPreviewHtml(null);
-        await runPython(activeItem.content || '');
-        return;
-      }
-
-      if (activeItem.type === 'file' && activeItem.language === 'html') {
-        setExecutionStartupStatus('');
-        setOutputPreviewHtml(activeItem.content || '');
-        selectDockPanel('output');
-        setOutput('Preview rendered in Output panel.');
-        return;
-      }
-
-      if (activeItem.type === 'file' && (activeItem.language === 'cs' || activeItem.language === 'csharp')) {
-        setOutputPreviewHtml(null);
-        await runCSharp(activeItem.content || '', activeItem.id);
-        return;
-      }
-
-      // Fallback for unsupported languages
-      if (activeItem.type === 'file') {
-        setExecutionStartupStatus('');
-        setOutput(`Error: No local runtime available for ${activeItem.language}. Supported: HTML, JavaScript, Python, and C#.`);
-      } else {
-        setExecutionStartupStatus('');
-        setOutput('Error: Cannot run a folder.');
-      }
+      await executor();
     } catch (error) {
       setExecutionStartupStatus('');
       setOutput(`Error: ${error instanceof Error ? error.message : 'Execution failed'}`);
     } finally {
       setIsRunning(false);
     }
+  };
+
+  const handleRun = async () => {
+    const currentFile = activeRunnableFile;
+    if (!currentFile) {
+      clearOutputPreview();
+      setExecutionStartupStatus('');
+      setOutput('Error: Select a runnable C#, Python, HTML, or JavaScript file first.');
+      return;
+    }
+
+    await runWithExecutionLifecycle(async () => {
+      const runtimeLanguage = normalizeProjectRuntimeLanguage(currentFile.language);
+      const projectFiles = toProjectSourceFiles([currentFile]);
+      const entryFile = projectFiles[0] ?? null;
+
+      if (!runtimeLanguage || !entryFile) {
+        clearOutputPreview();
+        setExecutionStartupStatus('');
+        setOutput('Error: The current file could not be prepared for execution.');
+        return;
+      }
+
+      if (runtimeLanguage === 'javascript') {
+        clearOutputPreview();
+        await runJavaScript(entryFile.content);
+        return;
+      }
+
+      if (runtimeLanguage === 'python') {
+        clearOutputPreview();
+        await runPython(entryFile.content);
+        return;
+      }
+
+      if (runtimeLanguage === 'html') {
+        await runHtmlProject(projectFiles, entryFile);
+        return;
+      }
+
+      if (runtimeLanguage === 'csharp') {
+        clearOutputPreview();
+        await runCSharp(entryFile.content, entryFile.id);
+        return;
+      }
+
+      clearOutputPreview();
+      setExecutionStartupStatus('');
+      setOutput(`Error: No local runtime available for ${runtimeLanguage}. Supported: HTML, JavaScript, Python, and C#.`);
+    });
+  };
+
+  const handleProjectRun = async () => {
+    const selectedFiles = resolvedProjectRun.selectedFiles;
+    const entryItem = resolvedProjectRun.entryFile;
+    const runtimeLanguage = resolvedProjectRun.language;
+    const runError = resolvedProjectRun.error;
+
+    if (!entryItem || !runtimeLanguage || runError) {
+      clearOutputPreview();
+      setExecutionStartupStatus('');
+      setOutput(`Error: ${runError || 'Project run is not configured yet.'}`);
+      return;
+    }
+
+    await runWithExecutionLifecycle(async () => {
+      const projectFiles = toProjectSourceFiles(selectedFiles);
+      const entryFile = projectFiles.find(file => file.id === entryItem.id) ?? null;
+
+      if (!entryFile) {
+        clearOutputPreview();
+        setExecutionStartupStatus('');
+        setOutput('Error: The configured entry file is no longer part of the selected project run files.');
+        return;
+      }
+
+      if (runtimeLanguage === 'javascript') {
+        await runJavaScriptProject(projectFiles, entryFile);
+        return;
+      }
+
+      if (runtimeLanguage === 'python') {
+        clearOutputPreview();
+        await runPythonProject(projectFiles, entryFile);
+        return;
+      }
+
+      if (runtimeLanguage === 'html') {
+        await runHtmlProject(projectFiles, entryFile);
+        return;
+      }
+
+      if (runtimeLanguage === 'csharp') {
+        clearOutputPreview();
+        await runCSharpProject(projectFiles, entryFile);
+        return;
+      }
+
+      clearOutputPreview();
+      setExecutionStartupStatus('');
+      setOutput(`Error: No local runtime available for ${runtimeLanguage}. Supported: HTML, JavaScript, Python, and C#.`);
+    });
   };
 
   const isDescendant = (descendantId: string, ancestorId: string) => {
@@ -5622,15 +6620,7 @@ for _name in (
       }
     }
 
-    let selectionContext = "";
-    if (editorRef.current && activeItem) {
-      const selection = editorRef.current.getSelection();
-      const model = editorRef.current.getModel();
-      if (selection && model && !selection.isEmpty()) {
-        const selectedText = model.getValueInRange(selection);
-        selectionContext = `\n\n[User selected code in ${activeItem.name}]:\n\`\`\`${activeItem.language || 'text'}\n${selectedText}\n\`\`\``;
-      }
-    }
+    const selectionContext = getCurrentAssistantSelectionContext();
 
     const userMsg: ChatMessage = { role: 'user', content: input + selectionContext };
     appendAssistantMessage(chatId, { role: 'user', content: input });
@@ -5638,12 +6628,18 @@ for _name in (
     setLoadingAssistantChatId(chatId);
 
     try {
-      const history = currentChat.messages.map(msg => `${msg.role.toUpperCase()}: ${msg.content}`).join('\n');
       let assistantFiles = files.map(file => ({ ...file }));
       let assistantActiveItemId = activeItem?.id || activeFileId || '';
       const toolProgressNotes: string[] = [];
       const assistantLiveNotes: string[] = [];
       let emittedAssistantMessage = false;
+      let totalPromptTokenCount = 0;
+      let totalCandidateTokenCount = 0;
+      let totalThoughtsTokenCount = 0;
+      let totalToolUsePromptTokenCount = 0;
+      let totalTokenCount = 0;
+      let modelUsagePassCount = 0;
+      let approximationPassCount = 0;
 
       const getPathFromSnapshot = (id: string | undefined): string => {
         if (!id) return '';
@@ -5669,46 +6665,15 @@ for _name in (
         return false;
       };
 
-      const getActiveSnapshotItem = () => (
-        assistantActiveItemId ? assistantFiles.find(f => f.id === assistantActiveItemId) || null : null
-      );
-
-      const buildAssistantPrompt = () => {
-        const activeSnapshotItem = getActiveSnapshotItem();
-        const toolProgress = toolProgressNotes.length > 0
-          ? `\nTurn Progress:\n${toolProgressNotes.map((note, index) => `${index + 1}. ${note}`).join('\n')}\nUse the updated workspace state above when deciding the next action. If the task is complete, respond to the user normally.`
-          : '';
-        const liveAssistantProgress = assistantLiveNotes.length > 0
-          ? `\nAssistant Messages Already Shown This Turn:\n${assistantLiveNotes.map((note, index) => `${index + 1}. ${note}`).join('\n')}\nContinue from there and avoid repeating the same message word-for-word.`
-          : '';
-
-        return `
-        Context: You are an AI coding assistant inside CodeCraft IDE.
-        Internal Chat ID: ${chatId}
-        Keep continuity with the existing chat history for this chat.
-        You have access to tools to propose edits, navigate, move cursor, directly create/delete/move files or folders, and run built-in terminal commands.
-        Do not suggest terminal-style commands for filesystem operations when a tool can be used, unless the user specifically asks for it.
-        When you want to change code, use 'proposeEdit' so the user can review it.
-        You may use multiple tool calls in a single response when the task needs several actions.
-        If you have a plan, progress update, or explanation, include it in the same response as your tool calls. That text is shown to the user immediately.
-        Do not save every explanation for one final summary if the work is happening in multiple steps.
-        If you need the contents of another file before editing it, navigate to it first. On the next tool round in the same turn, the updated active item and its content will be shown to you.
-        If more than one action is needed, emit all needed tool calls in order in the same response instead of stopping after the first action.
-
-        Current File System:
-        ${assistantFiles.map(f => `- Path: ${getPathFromSnapshot(f.id)}, Type: ${f.type}, Language: ${f.language || 'N/A'}`).join('\n')}
-
-        Active Item: ${activeSnapshotItem ? getPathFromSnapshot(activeSnapshotItem.id) : 'None selected'}
-        ${activeSnapshotItem ? (activeSnapshotItem.type === 'file' ? `Content:\n${activeSnapshotItem.content || ''}` : 'This is a folder.') : 'No file is currently active.'}
-
-        Chat History:
-        ${history || '(empty)'}
-        ${toolProgress}
-        ${liveAssistantProgress}
-
-        USER: ${userMsg.content}
-        `;
-      };
+      const buildAssistantPrompt = () => buildAssistantPromptFromSnapshot({
+        chatId,
+        messages: currentChat.messages,
+        userContent: userMsg.content,
+        assistantFiles,
+        assistantActiveItemId,
+        toolProgressNotes,
+        assistantLiveNotes,
+      });
 
       const emitAssistantLiveMessage = (content: string) => {
         const trimmed = content.trim();
@@ -5937,15 +6902,46 @@ for _name in (
       };
 
       for (let pass = 0; pass < MAX_ASSISTANT_TOOL_PASSES; pass++) {
+        const promptForPass = buildAssistantPrompt();
         const response = await aiRef.current.models.generateContent({
-          model: "gemini-3-flash-preview",
-          contents: buildAssistantPrompt(),
+          model: ASSISTANT_MODEL_NAME,
+          contents: promptForPass,
           config: {
             tools: [{
               functionDeclarations: [proposeEditTool, navigateToTool, moveCursorTool, createItemTool, deleteItemTool, moveItemTool, runTerminalCommandTool]
             }],
           }
         });
+
+        const usageMetadata = response.usageMetadata;
+        if (
+          usageMetadata
+          && (
+            typeof usageMetadata.promptTokenCount === 'number'
+            || typeof usageMetadata.candidatesTokenCount === 'number'
+            || typeof usageMetadata.totalTokenCount === 'number'
+          )
+        ) {
+          modelUsagePassCount += 1;
+          totalPromptTokenCount += usageMetadata.promptTokenCount ?? 0;
+          totalCandidateTokenCount += usageMetadata.candidatesTokenCount ?? 0;
+          totalThoughtsTokenCount += usageMetadata.thoughtsTokenCount ?? 0;
+          totalToolUsePromptTokenCount += usageMetadata.toolUsePromptTokenCount ?? 0;
+          totalTokenCount += usageMetadata.totalTokenCount
+            ?? (
+              (usageMetadata.promptTokenCount ?? 0)
+              + (usageMetadata.candidatesTokenCount ?? 0)
+              + (usageMetadata.thoughtsTokenCount ?? 0)
+              + (usageMetadata.toolUsePromptTokenCount ?? 0)
+            );
+        } else {
+          approximationPassCount += 1;
+          const approximatedPromptTokenCount = estimateFallbackTokenCount(promptForPass);
+          const approximatedOutputTokenCount = estimateFallbackTokenCount((response.text || '').trim());
+          totalPromptTokenCount += approximatedPromptTokenCount;
+          totalCandidateTokenCount += approximatedOutputTokenCount;
+          totalTokenCount += approximatedPromptTokenCount + approximatedOutputTokenCount;
+        }
 
         const functionCalls = response.functionCalls ?? [];
         const assistantText = (response.text || '').trim();
@@ -5984,6 +6980,35 @@ for _name in (
           content: "I couldn't complete the requested action."
         });
       }
+
+      const inputTokenCount = totalPromptTokenCount + totalToolUsePromptTokenCount;
+      const outputTokenCount = totalCandidateTokenCount + totalThoughtsTokenCount;
+      const normalizedTotalTokenCount = totalTokenCount > 0
+        ? totalTokenCount
+        : inputTokenCount + outputTokenCount;
+      const source: AssistantTurnUsageSource =
+        modelUsagePassCount > 0 && approximationPassCount === 0
+          ? 'model'
+          : modelUsagePassCount > 0
+            ? 'mixed'
+            : 'approximation';
+
+      setAssistantTurnUsageByChatId(prev => ({
+        ...prev,
+        [chatId]: {
+          promptTokenCount: totalPromptTokenCount,
+          toolUsePromptTokenCount: totalToolUsePromptTokenCount,
+          inputTokenCount,
+          candidateTokenCount: totalCandidateTokenCount,
+          thoughtsTokenCount: totalThoughtsTokenCount,
+          outputTokenCount,
+          totalTokenCount: normalizedTotalTokenCount,
+          paidCostUsd: calculateAssistantPaidCostUsd(inputTokenCount, outputTokenCount),
+          passCount: modelUsagePassCount + approximationPassCount,
+          source,
+          updatedAt: Date.now(),
+        },
+      }));
     } catch (error) {
       console.error(error);
       appendAssistantMessage(chatId, { role: 'assistant', content: 'Sorry, I encountered an error connecting to the AI.' });
@@ -7351,10 +8376,10 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
     if (component === "output") {
       return (
         <div className="h-full w-full flex flex-col bg-[rgb(28,28,28)] text-zinc-300 border-white/10 group relative">
-          <button
+            <button
             onClick={() => {
               setExecutionStartupStatus('');
-              setOutputPreviewHtml(null);
+              clearOutputPreview();
               setOutput('');
             }}
             className="absolute top-2 right-4 text-[10px] px-2 py-1 rounded bg-white/5 hover:bg-white/10 text-zinc-500 hover:text-white transition-all z-10 opacity-0 group-hover:opacity-100 backdrop-blur-sm cursor-pointer"
@@ -7542,6 +8567,8 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
       const chatInput = assistantInputs[chatId] || '';
       const isChatLoading = loadingAssistantChatId === chatId;
       const isHistoryOpen = !!assistantHistoryOpenByChatId[chatId];
+      const tokenEstimate = assistantTokenEstimates[chatId];
+      const lastTurnUsage = assistantTurnUsageByChatId[chatId];
 
       return (
         <div className="h-full w-full bg-[rgb(28,28,28)] border-white/10 flex flex-col min-h-0 relative">
@@ -7675,6 +8702,81 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
                 <ChevronRight size={20} />
               </button>
             </div>
+            {(chatInput.trim() || lastTurnUsage) && (
+              <div className="mt-3 grid grid-cols-1 gap-2">
+                {chatInput.trim() && tokenEstimate && (
+                  <div className="rounded-xl border border-white/10 bg-white/5 px-3 py-2">
+                    <div className="flex items-center justify-between gap-3">
+                      <div className="text-[11px] font-medium uppercase tracking-wide text-zinc-500">Next Send Estimate</div>
+                      <div className="text-[10px] text-zinc-500">
+                        {ASSISTANT_MODEL_NAME} · {tokenEstimate.source === 'model' ? 'model count' : 'local estimate'}
+                      </div>
+                    </div>
+                    <div className="mt-2 grid grid-cols-2 sm:grid-cols-4 gap-2">
+                      <div>
+                        <div className="text-[10px] uppercase tracking-wide text-zinc-500">Input</div>
+                        <div className="text-sm text-white">
+                          {tokenEstimate.status === 'loading' ? '…' : formatAssistantTokenCount(tokenEstimate.promptTokenCount)}
+                        </div>
+                      </div>
+                      <div>
+                        <div className="text-[10px] uppercase tracking-wide text-zinc-500">Projected Output</div>
+                        <div className="text-sm text-white">{formatAssistantTokenCount(tokenEstimate.estimatedOutputTokenCount)}</div>
+                      </div>
+                      <div>
+                        <div className="text-[10px] uppercase tracking-wide text-zinc-500">Projected Total</div>
+                        <div className="text-sm text-white">
+                          {tokenEstimate.status === 'loading' ? '…' : formatAssistantTokenCount(tokenEstimate.estimatedTotalTokenCount)}
+                        </div>
+                      </div>
+                      <div>
+                        <div className="text-[10px] uppercase tracking-wide text-zinc-500">Paid Cost</div>
+                        <div className="text-sm text-emerald-300">
+                          {tokenEstimate.status === 'loading' ? '…' : formatAssistantCostUsd(tokenEstimate.estimatedPaidCostUsd)}
+                        </div>
+                      </div>
+                    </div>
+                    <div className="mt-2 text-[10px] text-zinc-500">
+                      Paid-tier estimate uses Google Gemini pricing for text input/output. Projected output uses the last actual response size for this chat, or {formatAssistantTokenCount(DEFAULT_ASSISTANT_ESTIMATED_OUTPUT_TOKENS)} tokens by default. Free tier can still be $0 while quota remains.
+                    </div>
+                    {tokenEstimate.error && tokenEstimate.source === 'approximation' && (
+                      <div className="mt-1 text-[10px] text-amber-300">
+                        Fell back to a local approximation because live token counting was unavailable.
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {lastTurnUsage && (
+                  <div className="rounded-xl border border-indigo-500/20 bg-indigo-500/10 px-3 py-2">
+                    <div className="flex items-center justify-between gap-3">
+                      <div className="text-[11px] font-medium uppercase tracking-wide text-indigo-300">Last Actual Usage</div>
+                      <div className="text-[10px] text-indigo-200/80">
+                        {lastTurnUsage.passCount} pass{lastTurnUsage.passCount === 1 ? '' : 'es'} · {lastTurnUsage.source}
+                      </div>
+                    </div>
+                    <div className="mt-2 grid grid-cols-2 sm:grid-cols-4 gap-2">
+                      <div>
+                        <div className="text-[10px] uppercase tracking-wide text-indigo-200/70">Input</div>
+                        <div className="text-sm text-white">{formatAssistantTokenCount(lastTurnUsage.inputTokenCount)}</div>
+                      </div>
+                      <div>
+                        <div className="text-[10px] uppercase tracking-wide text-indigo-200/70">Output</div>
+                        <div className="text-sm text-white">{formatAssistantTokenCount(lastTurnUsage.outputTokenCount)}</div>
+                      </div>
+                      <div>
+                        <div className="text-[10px] uppercase tracking-wide text-indigo-200/70">Total</div>
+                        <div className="text-sm text-white">{formatAssistantTokenCount(lastTurnUsage.totalTokenCount)}</div>
+                      </div>
+                      <div>
+                        <div className="text-[10px] uppercase tracking-wide text-indigo-200/70">Paid Cost</div>
+                        <div className="text-sm text-emerald-300">{formatAssistantCostUsd(lastTurnUsage.paidCostUsd)}</div>
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
           </form>
         </div>
       );
@@ -7741,16 +8843,30 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
           <div className="flex items-center gap-1 shrink-0">
             <button
               onClick={handleRun}
-              disabled={isRunning || !activeItem || activeItem.type === 'folder'}
+              disabled={!canRunCurrentFile}
               className={cn(
                 "inline-flex items-center gap-1.5 h-8 px-3 rounded-md text-xs font-medium transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-emerald-600",
-                (isRunning || !activeItem || activeItem.type === 'folder')
+                !canRunCurrentFile
                   ? "border border-zinc-800 text-zinc-600 cursor-not-allowed"
                   : "bg-emerald-700 hover:bg-emerald-600 text-white border border-emerald-600"
               )}
             >
               {isRunning ? <Cpu className="animate-spin" size={13} /> : <Play size={13} />}
               Run
+            </button>
+
+            <button
+              onClick={handleProjectRun}
+              disabled={!canRunProject}
+              className={cn(
+                "inline-flex items-center gap-1.5 h-8 px-3 rounded-md text-xs font-medium transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-indigo-600",
+                !canRunProject
+                  ? "border border-zinc-800 text-zinc-600 cursor-not-allowed"
+                  : "bg-indigo-700 hover:bg-indigo-600 text-white border border-indigo-600"
+              )}
+            >
+              {isRunning ? <Cpu className="animate-spin" size={13} /> : <Folder size={13} />}
+              Project Run
             </button>
 
             <Separator.Root orientation="vertical" className="h-5 w-px bg-zinc-800 mx-2 shrink-0" />
@@ -7920,6 +9036,168 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
                         </button>
                       </div>
                     )}
+                  </div>
+                </section>
+
+                <section>
+                  <h4 className="text-xs font-bold uppercase tracking-widest text-zinc-500 mb-4">Project Run</h4>
+                  <div className="space-y-4">
+                    <div className="rounded-2xl border border-white/10 bg-white/5 p-4 space-y-4">
+                      <div className="text-xs text-zinc-500">
+                        These settings apply only to the `Project Run` button. The regular `Run` button always executes just the current file.
+                      </div>
+
+                      <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)] gap-4">
+                        <label className="block space-y-2">
+                          <div className="text-xs font-medium uppercase tracking-wide text-zinc-500">Run Scope</div>
+                          <select
+                            value={settings.projectRunMode}
+                            onChange={(e) => {
+                              const nextMode = e.target.value as ProjectRunMode;
+                              setSettings(current => {
+                                const modeLanguage = getProjectRunModeLanguage(nextMode);
+                                const activeRunnableLanguage = activeItem?.type === 'file'
+                                  ? normalizeProjectRuntimeLanguage(activeItem.language)
+                                  : null;
+                                const nextCustomFileIds = nextMode === 'custom'
+                                  ? current.projectRunCustomFileIds.length > 0
+                                    ? current.projectRunCustomFileIds
+                                    : activeItem?.type === 'file' && activeRunnableLanguage
+                                      ? [activeItem.id]
+                                      : []
+                                  : current.projectRunCustomFileIds;
+                                const selectedIds = nextMode === 'custom'
+                                  ? nextCustomFileIds
+                                  : projectRunnableFiles
+                                    .filter(file => normalizeProjectRuntimeLanguage(file.language) === modeLanguage)
+                                    .map(file => file.id);
+                                const nextEntryFileId =
+                                  current.projectRunEntryFileId && selectedIds.includes(current.projectRunEntryFileId)
+                                    ? current.projectRunEntryFileId
+                                    : selectedIds.includes(activeFileId)
+                                      ? activeFileId
+                                      : selectedIds[0] ?? null;
+                                return {
+                                  ...current,
+                                  projectRunMode: nextMode,
+                                  projectRunCustomFileIds: nextCustomFileIds,
+                                  projectRunEntryFileId: nextEntryFileId,
+                                };
+                              });
+                            }}
+                            className="w-full rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-sm text-white outline-none transition-colors focus:border-indigo-500"
+                          >
+                            {PROJECT_RUN_MODE_OPTIONS.map(option => (
+                              <option key={option.value} value={option.value}>{option.label}</option>
+                            ))}
+                          </select>
+                          <div className="text-xs text-zinc-500">
+                            Language-specific modes automatically include every runnable file for that language. `Custom` lets you pick the exact files to include for project execution.
+                          </div>
+                        </label>
+
+                        <label className="block space-y-2">
+                          <div className="text-xs font-medium uppercase tracking-wide text-zinc-500">Entry File</div>
+                          <select
+                            value={resolvedProjectRun.entryFile?.id ?? ''}
+                            onChange={(e) => setSettings(current => ({
+                              ...current,
+                              projectRunEntryFileId: e.target.value || null,
+                            }))}
+                            disabled={resolvedProjectRun.selectedFiles.length === 0}
+                            className="w-full rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-sm text-white outline-none transition-colors focus:border-indigo-500 disabled:opacity-60 disabled:cursor-not-allowed"
+                          >
+                            {resolvedProjectRun.selectedFiles.length === 0 ? (
+                              <option value="">No project files selected</option>
+                            ) : (
+                              resolvedProjectRun.selectedFiles.map(file => (
+                                <option key={file.id} value={file.id}>{getPath(file.id)}</option>
+                              ))
+                            )}
+                          </select>
+                          <div className="text-xs text-zinc-500">
+                            The entry file is the file CodeCraft executes or previews when you press `Project Run`.
+                          </div>
+                        </label>
+                      </div>
+
+                      <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                        <div className="rounded-xl border border-white/10 bg-black/20 px-4 py-3">
+                          <div className="text-[11px] uppercase tracking-wide text-zinc-500">Resolved Language</div>
+                          <div className="mt-1 text-sm text-white">
+                            {resolvedProjectRun.language ? getProjectRuntimeLanguageLabel(resolvedProjectRun.language) : 'Not resolved yet'}
+                          </div>
+                        </div>
+                        <div className="rounded-xl border border-white/10 bg-black/20 px-4 py-3">
+                          <div className="text-[11px] uppercase tracking-wide text-zinc-500">Selected Files</div>
+                          <div className="mt-1 text-sm text-white">{resolvedProjectRun.selectedFiles.length}</div>
+                        </div>
+                        <div className="rounded-xl border border-white/10 bg-black/20 px-4 py-3">
+                          <div className="text-[11px] uppercase tracking-wide text-zinc-500">Current Entry</div>
+                          <div className="mt-1 text-sm text-white truncate">{resolvedProjectRun.entryFile ? getPath(resolvedProjectRun.entryFile.id) : 'None'}</div>
+                        </div>
+                      </div>
+
+                      {resolvedProjectRun.error && (
+                        <div className="rounded-xl border border-amber-500/20 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+                          {resolvedProjectRun.error}
+                        </div>
+                      )}
+
+                      {settings.projectRunMode === 'custom' && (
+                        <div className="space-y-3">
+                          <div>
+                            <div className="text-sm font-medium text-white">Custom File Selection</div>
+                            <div className="text-xs text-zinc-500 mt-1">Select the files to include in the run. Cross-language project execution is intentionally blocked.</div>
+                          </div>
+
+                          {projectRunnableFiles.length === 0 ? (
+                            <div className="rounded-xl border border-white/10 bg-black/20 px-4 py-3 text-sm text-zinc-500">
+                              Add at least one runnable `C#`, `Python`, `HTML`, or `JS` file to configure a project run.
+                            </div>
+                          ) : (
+                            <div className="max-h-64 overflow-y-auto custom-scrollbar rounded-xl border border-white/10 bg-black/20 divide-y divide-white/5">
+                              {projectRunnableFiles.map(file => {
+                                const language = normalizeProjectRuntimeLanguage(file.language);
+                                const isChecked = settings.projectRunCustomFileIds.includes(file.id);
+                                return (
+                                  <label key={file.id} className="flex items-center gap-3 px-4 py-3 cursor-pointer hover:bg-white/5">
+                                    <input
+                                      type="checkbox"
+                                      checked={isChecked}
+                                      onChange={(e) => {
+                                        const checked = e.target.checked;
+                                        setSettings(current => {
+                                          const nextIds = checked
+                                            ? [...current.projectRunCustomFileIds, file.id]
+                                            : current.projectRunCustomFileIds.filter(id => id !== file.id);
+                                          const nextEntryFileId =
+                                            current.projectRunEntryFileId && nextIds.includes(current.projectRunEntryFileId)
+                                              ? current.projectRunEntryFileId
+                                              : nextIds.includes(activeFileId)
+                                                ? activeFileId
+                                                : nextIds[0] ?? null;
+                                          return {
+                                            ...current,
+                                            projectRunCustomFileIds: nextIds,
+                                            projectRunEntryFileId: nextEntryFileId,
+                                          };
+                                        });
+                                      }}
+                                      className="h-4 w-4 rounded border-white/20 bg-black/20 text-indigo-500 focus:ring-indigo-500"
+                                    />
+                                    <div className="min-w-0 flex-1">
+                                      <div className="text-sm text-white truncate">{getPath(file.id)}</div>
+                                      <div className="text-xs text-zinc-500">{getProjectRuntimeLanguageLabel(language)}</div>
+                                    </div>
+                                  </label>
+                                );
+                              })}
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </div>
                   </div>
                 </section>
 

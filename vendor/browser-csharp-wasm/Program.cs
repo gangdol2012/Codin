@@ -10,6 +10,7 @@ using System.Threading.Tasks;
 using Microsoft.AspNetCore.Components.WebAssembly.Hosting;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
+using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Microsoft.CodeAnalysis.Emit;
 using Microsoft.JSInterop;
 
@@ -176,7 +177,10 @@ namespace BrowserCSharp
 		{
 			async Task<ExecutionResult> execute()
 			{
-				CompilationResult compilationResult = await CompileRegularProgram(code).ConfigureAwait(false);
+				CompilationResult compilationResult = await CompileRegularProgram(
+					new[] { new KeyValuePair<string, string>("Program.cs", code ?? String.Empty) },
+					"Program.cs"
+				).ConfigureAwait(false);
 
 				if (compilationResult.Success)
 				{
@@ -189,16 +193,53 @@ namespace BrowserCSharp
 			return Task.Run(execute);
 		}
 
-		private static async Task<CompilationResult> CompileRegularProgram(string code)
+		[JSInvokable]
+		public static Task<ExecutionResult> ExecuteRegularProject(string[] paths, string[] contents, string entryPath)
+		{
+			async Task<ExecutionResult> execute()
+			{
+				if (paths == null || contents == null || paths.Length == 0 || paths.Length != contents.Length)
+				{
+					return new ExecutionResult(null, null, "Invalid C# project payload.");
+				}
+
+				KeyValuePair<string, string>[] sourceFiles = paths
+					.Select((path, index) => new KeyValuePair<string, string>(
+						String.IsNullOrWhiteSpace(path) ? $"File{index + 1}.cs" : path,
+						contents[index] ?? String.Empty
+					))
+					.ToArray();
+
+				CompilationResult compilationResult = await CompileRegularProgram(sourceFiles, entryPath).ConfigureAwait(false);
+
+				if (compilationResult.Success)
+				{
+					return await RunRegularProgram(compilationResult.Assembly, compilationResult.Compilation).ConfigureAwait(false);
+				}
+
+				return new ExecutionResult(null, null, String.Join('\n', compilationResult.Errors.Select(x => x.GetMessage())));
+			}
+
+			return Task.Run(execute);
+		}
+
+		private static async Task<CompilationResult> CompileRegularProgram(IReadOnlyList<KeyValuePair<string, string>> sourceFiles, string entryPath)
 		{
 			PortableExecutableReference[] refs = await loadedReferences.ConfigureAwait(false);
-			CompilationResult first = TryCompileRegular(code, refs);
+			CompilationResult first = TryCompileRegular(sourceFiles, refs, entryPath);
 			if (first.Success && first.Compilation.GetEntryPoint(CancellationToken.None) != null)
 			{
 				return first;
 			}
 
-			CompilationResult wrapped = TryCompileRegular(WrapAsConsoleProgram(code), refs);
+			string targetEntryPath = sourceFiles.FirstOrDefault(file => String.Equals(file.Key, entryPath, StringComparison.Ordinal)).Key
+				?? sourceFiles.FirstOrDefault().Key;
+			KeyValuePair<string, string>[] wrappedSources = sourceFiles
+				.Select(file => String.Equals(file.Key, targetEntryPath, StringComparison.Ordinal)
+					? new KeyValuePair<string, string>(file.Key, WrapAsConsoleProgram(file.Value))
+					: file)
+				.ToArray();
+			CompilationResult wrapped = TryCompileRegular(wrappedSources, refs, targetEntryPath);
 			return wrapped.Success ? wrapped : first;
 		}
 
@@ -223,19 +264,31 @@ internal static class __CodeCraftEntry
 ";
 		}
 
-		private static CompilationResult TryCompileRegular(string code, PortableExecutableReference[] refs)
+		private static CompilationResult TryCompileRegular(
+			IReadOnlyList<KeyValuePair<string, string>> sourceFiles,
+			PortableExecutableReference[] refs,
+			string entryPath
+		)
 		{
 			CSharpParseOptions parseOptions = CSharpParseOptions.Default
 				.WithKind(SourceCodeKind.Regular)
 				.WithLanguageVersion(LanguageVersion.Preview);
-			SyntaxTree syntaxTree = CSharpSyntaxTree.ParseText(code, parseOptions);
+			SyntaxTree[] syntaxTrees = sourceFiles
+				.Select(file => CSharpSyntaxTree.ParseText(file.Value ?? String.Empty, parseOptions, path: file.Key))
+				.ToArray();
+			CSharpCompilationOptions options = new CSharpCompilationOptions(OutputKind.ConsoleApplication, usings: defaultUsings)
+				.WithPlatform(Platform.AnyCpu)
+				.WithOptimizationLevel(OptimizationLevel.Release);
+			string mainTypeName = InferRegularProjectMainTypeName(syntaxTrees, entryPath);
+			if (!String.IsNullOrWhiteSpace(mainTypeName))
+			{
+				options = options.WithMainTypeName(mainTypeName);
+			}
 			CSharpCompilation compilation = CSharpCompilation.Create(
 				Path.GetRandomFileName(),
-				new[] { syntaxTree },
+				syntaxTrees,
 				refs,
-				new CSharpCompilationOptions(OutputKind.ConsoleApplication, usings: defaultUsings)
-					.WithPlatform(Platform.AnyCpu)
-					.WithOptimizationLevel(OptimizationLevel.Release));
+				options);
 
 			IEnumerable<Diagnostic> upfrontErrors = compilation.GetDiagnostics().Where(d => d.Severity == DiagnosticSeverity.Error);
 			if (upfrontErrors.Any())
@@ -251,6 +304,49 @@ internal static class __CodeCraftEntry
 			}
 
 			return new CompilationResult(Assembly.Load(ms.ToArray()), compilation);
+		}
+
+		private static string InferRegularProjectMainTypeName(IEnumerable<SyntaxTree> syntaxTrees, string entryPath)
+		{
+			if (String.IsNullOrWhiteSpace(entryPath))
+			{
+				return null;
+			}
+
+			SyntaxTree entryTree = syntaxTrees.FirstOrDefault(tree =>
+				String.Equals(tree.FilePath, entryPath, StringComparison.Ordinal)
+			);
+			if (entryTree == null)
+			{
+				return null;
+			}
+
+			SyntaxNode root = entryTree.GetRoot();
+			TypeDeclarationSyntax typeNode = root
+				.DescendantNodes()
+				.OfType<TypeDeclarationSyntax>()
+				.FirstOrDefault(typeDeclaration =>
+					typeDeclaration.Members
+						.OfType<MethodDeclarationSyntax>()
+						.Any(method =>
+							method.Identifier.ValueText == "Main"
+							&& method.Modifiers.Any(modifier => modifier.IsKind(SyntaxKind.StaticKeyword))
+						)
+				);
+			if (typeNode == null)
+			{
+				return null;
+			}
+
+			string namespaceName = String.Join(
+				".",
+				typeNode.Ancestors()
+					.OfType<NamespaceDeclarationSyntax>()
+					.Select(namespaceNode => namespaceNode.Name.ToString())
+					.Reverse()
+			);
+			string typeName = typeNode.Identifier.ValueText;
+			return String.IsNullOrWhiteSpace(namespaceName) ? typeName : $"{namespaceName}.{typeName}";
 		}
 
 		private static async Task<ExecutionResult> RunRegularProgram(Assembly assembly, Compilation compilation)
