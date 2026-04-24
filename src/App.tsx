@@ -410,6 +410,34 @@ interface SyncMeta {
   connectedAt: number;
 }
 
+type AssistantProvider = 'gemini' | 'openai' | 'anthropic';
+type AssistantMessageKind = 'message' | 'log';
+type AssistantReasoningControl = 'toggleable' | 'always_on' | 'always_off';
+type AssistantSchemaPrimitive = 'string' | 'number' | 'boolean';
+
+interface AssistantToolPropertyDefinition {
+  type: AssistantSchemaPrimitive;
+  description: string;
+  enum?: string[];
+}
+
+interface AssistantToolDefinition {
+  name: string;
+  description: string;
+  parameters: {
+    type: 'object';
+    description?: string;
+    properties: Record<string, AssistantToolPropertyDefinition>;
+    required?: string[];
+  };
+}
+
+interface AssistantModelPreset {
+  id: string;
+  label: string;
+  reasoningControl: AssistantReasoningControl;
+}
+
 interface SharedEditorTarget {
   tabId: string;
   itemId: string;
@@ -426,15 +454,36 @@ function saveSyncMeta(meta: SyncMeta[]) {
 }
 
 const DEFAULT_ASSISTANT_CHAT_NAME = "AI assistant";
-const MAX_ASSISTANT_TOOL_PASSES = 4;
-const ASSISTANT_MODEL_NAME = "gemini-3-flash-preview";
-const ASSISTANT_INPUT_PRICE_USD_PER_MILLION = 0.5;
-const ASSISTANT_OUTPUT_PRICE_USD_PER_MILLION = 3;
+const DEFAULT_ASSISTANT_TOOL_PASSES = 4;
 const DEFAULT_ASSISTANT_ESTIMATED_OUTPUT_TOKENS = 1024;
 const createAssistantChatId = () => `chat_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
 const INITIAL_ASSISTANT_CHAT_ID = createAssistantChatId();
 const DEFAULT_PYI_IMPORT_SIZE_LIMIT_BYTES = 200 * 1024;
 const ABSOLUTE_PYI_IMPORT_SIZE_LIMIT_BYTES = 2 * 1024 * 1024;
+
+const ASSISTANT_PROVIDER_OPTIONS: { value: AssistantProvider; label: string }[] = [
+  { value: 'gemini', label: 'Google Gemini' },
+  { value: 'openai', label: 'OpenAI' },
+  { value: 'anthropic', label: 'Anthropic' },
+];
+
+const ASSISTANT_MODEL_PRESETS: Record<AssistantProvider, AssistantModelPreset[]> = {
+  gemini: [
+    { id: 'gemini-2.5-flash', label: 'Gemini 2.5 Flash', reasoningControl: 'toggleable' },
+    { id: 'gemini-2.5-flash-lite', label: 'Gemini 2.5 Flash Lite', reasoningControl: 'toggleable' },
+    { id: 'gemini-2.5-pro', label: 'Gemini 2.5 Pro', reasoningControl: 'always_on' },
+  ],
+  openai: [
+    { id: 'gpt-5.1', label: 'GPT-5.1', reasoningControl: 'toggleable' },
+    { id: 'gpt-5.1-mini', label: 'GPT-5.1 mini', reasoningControl: 'toggleable' },
+    { id: 'gpt-5.1-nano', label: 'GPT-5.1 nano', reasoningControl: 'toggleable' },
+  ],
+  anthropic: [
+    { id: 'claude-sonnet-4-20250514', label: 'Claude Sonnet 4', reasoningControl: 'toggleable' },
+    { id: 'claude-opus-4-1-20250805', label: 'Claude Opus 4.1', reasoningControl: 'toggleable' },
+    { id: 'claude-3-7-sonnet-20250219', label: 'Claude 3.7 Sonnet', reasoningControl: 'toggleable' },
+  ],
+};
 const STORAGE_KEYS = {
   files: 'codecraft-files',
   settings: 'codecraft-settings',
@@ -723,18 +772,142 @@ const buildSharedEditorOptions = (fontSize: number) => ({
 });
 
 // Define AI tools
-const proposeEditTool: FunctionDeclaration = {
+function isAssistantProvider(value: unknown): value is AssistantProvider {
+  return value === 'gemini' || value === 'openai' || value === 'anthropic';
+}
+
+function getAssistantDefaultModel(provider: AssistantProvider) {
+  return ASSISTANT_MODEL_PRESETS[provider][0]?.id || '';
+}
+
+function getAssistantProviderLabel(provider: AssistantProvider) {
+  return ASSISTANT_PROVIDER_OPTIONS.find(option => option.value === provider)?.label || provider;
+}
+
+function getAssistantApiKeyLabel(provider: AssistantProvider) {
+  switch (provider) {
+    case 'gemini':
+      return 'Gemini API key';
+    case 'openai':
+      return 'OpenAI API key';
+    case 'anthropic':
+      return 'Anthropic API key';
+    default:
+      return 'API key';
+  }
+}
+
+function getAssistantReasoningControl(provider: AssistantProvider, model: string): AssistantReasoningControl {
+  const trimmed = model.trim();
+  const preset = ASSISTANT_MODEL_PRESETS[provider].find(entry => entry.id === trimmed);
+  if (preset) return preset.reasoningControl;
+
+  if (provider === 'gemini') {
+    if (/^gemini-2\.5-flash(-lite)?/i.test(trimmed)) return 'toggleable';
+    if (/^gemini-2\.5-pro/i.test(trimmed) || /^gemini-3/i.test(trimmed)) return 'always_on';
+    return 'always_off';
+  }
+
+  if (provider === 'openai') {
+    if (/^gpt-5\.1/i.test(trimmed)) return 'toggleable';
+    if (/^(gpt-5|o[134])\b/i.test(trimmed)) return 'always_on';
+    return 'always_off';
+  }
+
+  if (provider === 'anthropic') {
+    if (/^claude-(opus-4|opus-4-1|sonnet-4|3-7-sonnet)/i.test(trimmed)) return 'toggleable';
+    return 'always_off';
+  }
+
+  return 'always_off';
+}
+
+function getAssistantReasoningAvailabilityNote(provider: AssistantProvider, model: string) {
+  switch (getAssistantReasoningControl(provider, model)) {
+    case 'toggleable':
+      return 'This provider/model can switch Chain of Thought on or off.';
+    case 'always_on':
+      return 'This provider/model does not offer a full thinking-off mode, so Chain of Thought stays on.';
+    case 'always_off':
+    default:
+      return 'This provider/model does not expose a Chain of Thought mode in CodeCraft.';
+  }
+}
+
+function calculateAssistantPaidCostUsd(
+  _provider: AssistantProvider,
+  _model: string,
+  _inputTokenCount: number,
+  _outputTokenCount: number
+) {
+  return null;
+}
+
+function toGeminiFunctionDeclaration(tool: AssistantToolDefinition): FunctionDeclaration {
+  const toGeminiType = (value: AssistantSchemaPrimitive) => {
+    switch (value) {
+      case 'string':
+        return Type.STRING;
+      case 'number':
+        return Type.NUMBER;
+      case 'boolean':
+        return Type.BOOLEAN;
+      default:
+        return Type.STRING;
+    }
+  };
+
+  return {
+    name: tool.name,
+    description: tool.description,
+    parameters: {
+      type: Type.OBJECT,
+      description: tool.parameters.description,
+      properties: Object.fromEntries(
+        Object.entries(tool.parameters.properties).map(([key, value]) => [
+          key,
+          {
+            type: toGeminiType(value.type),
+            description: value.description,
+            ...(value.enum ? { enum: value.enum } : {}),
+          },
+        ])
+      ),
+      ...(tool.parameters.required ? { required: tool.parameters.required } : {}),
+    },
+  };
+}
+
+function toOpenAIToolDefinition(tool: AssistantToolDefinition) {
+  return {
+    type: 'function',
+    name: tool.name,
+    description: tool.description,
+    parameters: tool.parameters,
+  };
+}
+
+function toAnthropicToolDefinition(tool: AssistantToolDefinition) {
+  return {
+    name: tool.name,
+    description: tool.description,
+    input_schema: tool.parameters,
+  };
+}
+
+const proposeEditTool: AssistantToolDefinition = {
   name: "proposeEdit",
+  description: "Propose changes to a file for user review.",
   parameters: {
-    type: Type.OBJECT,
+    type: 'object',
     description: "Propose changes to a file for user review.",
     properties: {
       pathOrName: {
-        type: Type.STRING,
+        type: 'string',
         description: "The path or name of the file to edit.",
       },
       newContent: {
-        type: Type.STRING,
+        type: 'string',
         description: "The complete proposed content for the file.",
       },
     },
@@ -742,14 +915,15 @@ const proposeEditTool: FunctionDeclaration = {
   },
 };
 
-const navigateToTool: FunctionDeclaration = {
+const navigateToTool: AssistantToolDefinition = {
   name: "navigateTo",
+  description: "Switch the active file or folder in the editor.",
   parameters: {
-    type: Type.OBJECT,
+    type: 'object',
     description: "Switch the active file or folder in the editor.",
     properties: {
       pathOrName: {
-        type: Type.STRING,
+        type: 'string',
         description: "The path or name of the file or folder to navigate to.",
       },
     },
@@ -757,18 +931,19 @@ const navigateToTool: FunctionDeclaration = {
   },
 };
 
-const moveCursorTool: FunctionDeclaration = {
+const moveCursorTool: AssistantToolDefinition = {
   name: "moveCursor",
+  description: "Move the editor cursor to a specific position.",
   parameters: {
-    type: Type.OBJECT,
+    type: 'object',
     description: "Move the editor cursor to a specific position.",
     properties: {
       line: {
-        type: Type.NUMBER,
+        type: 'number',
         description: "The line number (1-indexed).",
       },
       column: {
-        type: Type.NUMBER,
+        type: 'number',
         description: "The column number (1-indexed).",
       },
     },
@@ -776,26 +951,28 @@ const moveCursorTool: FunctionDeclaration = {
   },
 };
 
-const createItemTool: FunctionDeclaration = {
+const createItemTool: AssistantToolDefinition = {
   name: "createItem",
+  description: "Create a file or folder in the workspace.",
   parameters: {
-    type: Type.OBJECT,
+    type: 'object',
     description: "Create a file or folder in the workspace.",
     properties: {
       type: {
-        type: Type.STRING,
+        type: 'string',
         description: "Either 'file' or 'folder'.",
+        enum: ['file', 'folder'],
       },
       name: {
-        type: Type.STRING,
+        type: 'string',
         description: "Name of the new file or folder.",
       },
       parentPathOrName: {
-        type: Type.STRING,
+        type: 'string',
         description: "Optional parent folder path or name. Omit for workspace root.",
       },
       content: {
-        type: Type.STRING,
+        type: 'string',
         description: "Optional file content. Ignored for folders.",
       },
     },
@@ -803,14 +980,15 @@ const createItemTool: FunctionDeclaration = {
   },
 };
 
-const deleteItemTool: FunctionDeclaration = {
+const deleteItemTool: AssistantToolDefinition = {
   name: "deleteItem",
+  description: "Delete a file or folder by path or name.",
   parameters: {
-    type: Type.OBJECT,
+    type: 'object',
     description: "Delete a file or folder by path or name.",
     properties: {
       pathOrName: {
-        type: Type.STRING,
+        type: 'string',
         description: "Path or name of the item to delete.",
       },
     },
@@ -818,18 +996,19 @@ const deleteItemTool: FunctionDeclaration = {
   },
 };
 
-const moveItemTool: FunctionDeclaration = {
+const moveItemTool: AssistantToolDefinition = {
   name: "moveItem",
+  description: "Move a file or folder into another folder.",
   parameters: {
-    type: Type.OBJECT,
+    type: 'object',
     description: "Move a file or folder into another folder.",
     properties: {
       sourcePathOrName: {
-        type: Type.STRING,
+        type: 'string',
         description: "Path or name of the item to move.",
       },
       destinationFolderPathOrName: {
-        type: Type.STRING,
+        type: 'string',
         description: "Destination folder path or name. Use '/' to move to workspace root.",
       },
     },
@@ -837,14 +1016,15 @@ const moveItemTool: FunctionDeclaration = {
   },
 };
 
-const runTerminalCommandTool: FunctionDeclaration = {
+const runTerminalCommandTool: AssistantToolDefinition = {
   name: "runTerminalCommand",
+  description: "Run a command in the built-in terminal emulator.",
   parameters: {
-    type: Type.OBJECT,
+    type: 'object',
     description: "Run a command in the built-in terminal emulator.",
     properties: {
       command: {
-        type: Type.STRING,
+        type: 'string',
         description: "Terminal command text to execute.",
       },
     },
@@ -852,12 +1032,313 @@ const runTerminalCommandTool: FunctionDeclaration = {
   },
 };
 
+const terminalLsTool: AssistantToolDefinition = {
+  name: "terminalLs",
+  description: "List files and folders in the current working directory or in a target folder.",
+  parameters: {
+    type: 'object',
+    properties: {
+      pathOrName: {
+        type: 'string',
+        description: "Optional folder path or folder name. Omit to list the current working directory.",
+      },
+    },
+  },
+};
+
+const terminalPwdTool: AssistantToolDefinition = {
+  name: "terminalPwd",
+  description: "Show the current working directory in the fake terminal.",
+  parameters: {
+    type: 'object',
+    properties: {},
+  },
+};
+
+const terminalCdTool: AssistantToolDefinition = {
+  name: "terminalCd",
+  description: "Change the current working directory in the fake terminal.",
+  parameters: {
+    type: 'object',
+    properties: {
+      target: {
+        type: 'string',
+        description: "Folder name or path. Use '..' for parent, '/' or '~' for workspace root.",
+      },
+    },
+  },
+};
+
+const terminalMkdirTool: AssistantToolDefinition = {
+  name: "terminalMkdir",
+  description: "Create a folder in the current working directory.",
+  parameters: {
+    type: 'object',
+    properties: {
+      name: {
+        type: 'string',
+        description: "Folder name to create.",
+      },
+    },
+    required: ['name'],
+  },
+};
+
+const terminalTouchTool: AssistantToolDefinition = {
+  name: "terminalTouch",
+  description: "Create an empty file in the current working directory.",
+  parameters: {
+    type: 'object',
+    properties: {
+      name: {
+        type: 'string',
+        description: "File name to create.",
+      },
+    },
+    required: ['name'],
+  },
+};
+
+const terminalOpenTool: AssistantToolDefinition = {
+  name: "terminalOpen",
+  description: "Open a file or folder in the editor from the fake terminal.",
+  parameters: {
+    type: 'object',
+    properties: {
+      pathOrName: {
+        type: 'string',
+        description: "Path or name of the file or folder to open.",
+      },
+    },
+    required: ['pathOrName'],
+  },
+};
+
+const terminalCatTool: AssistantToolDefinition = {
+  name: "terminalCat",
+  description: "Read the contents of a file from the fake terminal.",
+  parameters: {
+    type: 'object',
+    properties: {
+      pathOrName: {
+        type: 'string',
+        description: "Path or name of the file to print.",
+      },
+    },
+    required: ['pathOrName'],
+  },
+};
+
+const terminalRmTool: AssistantToolDefinition = {
+  name: "terminalRm",
+  description: "Remove a file or folder from the current working directory or by path.",
+  parameters: {
+    type: 'object',
+    properties: {
+      pathOrName: {
+        type: 'string',
+        description: "Path or name of the item to remove.",
+      },
+    },
+    required: ['pathOrName'],
+  },
+};
+
+const terminalClearTool: AssistantToolDefinition = {
+  name: "terminalClear",
+  description: "Clear the built-in terminal output.",
+  parameters: {
+    type: 'object',
+    properties: {},
+  },
+};
+
+const terminalHelpTool: AssistantToolDefinition = {
+  name: "terminalHelp",
+  description: "Show the list of available fake terminal commands.",
+  parameters: {
+    type: 'object',
+    properties: {},
+  },
+};
+
+const terminalDateTool: AssistantToolDefinition = {
+  name: "terminalDate",
+  description: "Show the current local date and time inside the fake terminal.",
+  parameters: {
+    type: 'object',
+    properties: {},
+  },
+};
+
+const terminalEchoTool: AssistantToolDefinition = {
+  name: "terminalEcho",
+  description: "Echo text in the fake terminal.",
+  parameters: {
+    type: 'object',
+    properties: {
+      text: {
+        type: 'string',
+        description: "Text to echo.",
+      },
+    },
+    required: ['text'],
+  },
+};
+
+const terminalWhoamiTool: AssistantToolDefinition = {
+  name: "terminalWhoami",
+  description: "Show the current fake terminal user.",
+  parameters: {
+    type: 'object',
+    properties: {},
+  },
+};
+
+const pipInstallTool: AssistantToolDefinition = {
+  name: "pipInstall",
+  description: "Install a Python package in the fake terminal.",
+  parameters: {
+    type: 'object',
+    properties: {
+      packageName: {
+        type: 'string',
+        description: "Python package name or URL to install.",
+      },
+      forceBuild: {
+        type: 'boolean',
+        description: "Whether to force the source-build fallback with the equivalent of -force.",
+      },
+    },
+    required: ['packageName'],
+  },
+};
+
+const pipUpgradeTool: AssistantToolDefinition = {
+  name: "pipUpgrade",
+  description: "Upgrade a Python package in the fake terminal.",
+  parameters: {
+    type: 'object',
+    properties: {
+      packageName: {
+        type: 'string',
+        description: "Python package name to upgrade.",
+      },
+      version: {
+        type: 'string',
+        description: "Optional version to upgrade to.",
+      },
+    },
+    required: ['packageName'],
+  },
+};
+
+const pipUninstallTool: AssistantToolDefinition = {
+  name: "pipUninstall",
+  description: "Uninstall a Python package in the fake terminal.",
+  parameters: {
+    type: 'object',
+    properties: {
+      packageName: {
+        type: 'string',
+        description: "Python package name to uninstall.",
+      },
+    },
+    required: ['packageName'],
+  },
+};
+
+const pipIncludeTool: AssistantToolDefinition = {
+  name: "pipInclude",
+  description: "Include a stdlib module in the Pyright type checker from the fake terminal.",
+  parameters: {
+    type: 'object',
+    properties: {
+      moduleName: {
+        type: 'string',
+        description: "Module name to include.",
+      },
+    },
+    required: ['moduleName'],
+  },
+};
+
+const pipListTool: AssistantToolDefinition = {
+  name: "pipList",
+  description: "List installed Python packages in the fake terminal.",
+  parameters: {
+    type: 'object',
+    properties: {},
+  },
+};
+
+const nugetIncludeTool: AssistantToolDefinition = {
+  name: "nugetInclude",
+  description: "Include a C# namespace in the fake terminal.",
+  parameters: {
+    type: 'object',
+    properties: {
+      namespaceName: {
+        type: 'string',
+        description: "C# namespace to include.",
+      },
+    },
+    required: ['namespaceName'],
+  },
+};
+
+const nugetListTool: AssistantToolDefinition = {
+  name: "nugetList",
+  description: "List included C# namespaces in the fake terminal.",
+  parameters: {
+    type: 'object',
+    properties: {},
+  },
+};
+
+const STANDARD_ASSISTANT_TOOLS: AssistantToolDefinition[] = [
+  proposeEditTool,
+  navigateToTool,
+  moveCursorTool,
+  createItemTool,
+  deleteItemTool,
+  moveItemTool,
+  runTerminalCommandTool,
+];
+
+const CHAIN_OF_THOUGHT_ASSISTANT_TOOLS: AssistantToolDefinition[] = [
+  proposeEditTool,
+  navigateToTool,
+  moveCursorTool,
+  createItemTool,
+  deleteItemTool,
+  moveItemTool,
+  terminalLsTool,
+  terminalPwdTool,
+  terminalCdTool,
+  terminalMkdirTool,
+  terminalTouchTool,
+  terminalOpenTool,
+  terminalCatTool,
+  terminalRmTool,
+  terminalClearTool,
+  terminalHelpTool,
+  terminalDateTool,
+  terminalEchoTool,
+  terminalWhoamiTool,
+  pipInstallTool,
+  pipUpgradeTool,
+  pipUninstallTool,
+  pipIncludeTool,
+  pipListTool,
+  nugetIncludeTool,
+  nugetListTool,
+];
+
 // Utility for tailwind classes
 function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
-
-const geminiAi = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || '' });
 
 interface SavedPipPackage { name: string; version: string; }
 interface SavedPyiImportSizeLimitOverride { moduleName: string; maxBytes: number | null; }
@@ -1458,6 +1939,7 @@ interface FSItem {
 interface ChatMessage {
   role: 'user' | 'assistant';
   content: string;
+  kind?: AssistantMessageKind;
 }
 
 interface AssistantChat {
@@ -1488,7 +1970,7 @@ interface AssistantTurnUsage {
   thoughtsTokenCount: number;
   outputTokenCount: number;
   totalTokenCount: number;
-  paidCostUsd: number;
+  paidCostUsd: number | null;
   passCount: number;
   source: AssistantTurnUsageSource;
   updatedAt: number;
@@ -1503,6 +1985,7 @@ interface PendingEdit {
 interface AssistantToolExecutionResult {
   summary: string;
   detail: string;
+  result?: unknown;
 }
 
 interface ResolvedProjectRun {
@@ -1563,6 +2046,12 @@ interface AppSettings {
   projectRunMode: ProjectRunMode;
   projectRunCustomFileIds: string[];
   projectRunEntryFileId: string | null;
+  assistantProvider: AssistantProvider;
+  assistantModel: string;
+  assistantApiKey: string;
+  assistantUseChainOfThought: boolean;
+  assistantShowUsagePopup: boolean;
+  assistantMaxChainOfThoughtDepth: number;
 }
 
 const loadSavedAssistantChats = (): AssistantChat[] => {
@@ -1583,7 +2072,12 @@ const loadSavedAssistantChats = (): AssistantChat[] => {
         message
         && (message.role === 'user' || message.role === 'assistant')
         && typeof message.content === 'string'
-      ))
+        && (message.kind === undefined || message.kind === 'message' || message.kind === 'log')
+      )).map((message: any) => ({
+        role: message.role,
+        content: message.content,
+        ...(message.kind === 'log' ? { kind: 'log' as const } : {}),
+      })),
     }));
     return chats.length > 0 ? chats : [{ id: INITIAL_ASSISTANT_CHAT_ID, name: DEFAULT_ASSISTANT_CHAT_NAME, messages: [] }];
   } catch {
@@ -1621,6 +2115,12 @@ const DEFAULT_SETTINGS: AppSettings = {
   projectRunMode: 'custom',
   projectRunCustomFileIds: [],
   projectRunEntryFileId: null,
+  assistantProvider: 'gemini',
+  assistantModel: getAssistantDefaultModel('gemini'),
+  assistantApiKey: '',
+  assistantUseChainOfThought: false,
+  assistantShowUsagePopup: true,
+  assistantMaxChainOfThoughtDepth: DEFAULT_ASSISTANT_TOOL_PASSES,
 };
 
 const PROJECT_RUN_MODE_OPTIONS: { value: ProjectRunMode; label: string; language: ProjectRuntimeLanguage | null }[] = [
@@ -1739,14 +2239,14 @@ function normalizeExecutionTimeoutMs(value: number) {
   return Math.max(0, Math.floor(value));
 }
 
+function normalizeAssistantMaxChainOfThoughtDepth(value: number) {
+  if (!Number.isFinite(value)) return DEFAULT_ASSISTANT_TOOL_PASSES;
+  return Math.min(12, Math.max(1, Math.floor(value)));
+}
+
 function estimateFallbackTokenCount(text: string) {
   if (!text) return 0;
   return Math.max(1, Math.ceil(text.length / 4));
-}
-
-function calculateAssistantPaidCostUsd(inputTokenCount: number, outputTokenCount: number) {
-  return (inputTokenCount / 1_000_000) * ASSISTANT_INPUT_PRICE_USD_PER_MILLION
-    + (outputTokenCount / 1_000_000) * ASSISTANT_OUTPUT_PRICE_USD_PER_MILLION;
 }
 
 function formatAssistantTokenCount(value: number | null | undefined) {
@@ -1760,6 +2260,16 @@ function formatAssistantCostUsd(value: number | null | undefined) {
   if (value < 0.001) return `$${value.toFixed(6)}`;
   if (value < 0.01) return `$${value.toFixed(5)}`;
   return `$${value.toFixed(4)}`;
+}
+
+function getAssistantErrorMessage(error: unknown) {
+  if (error instanceof Error && error.message.trim()) {
+    return error.message.trim();
+  }
+  if (typeof error === 'string' && error.trim()) {
+    return error.trim();
+  }
+  return 'Unknown error';
 }
 
 function formatExecutionTimeoutLabel(timeoutMs: number) {
@@ -1999,6 +2509,12 @@ export default function App() {
     if (!saved) return DEFAULT_SETTINGS;
     const parsed = JSON.parse(saved);
     const merged = { ...DEFAULT_SETTINGS, ...parsed };
+    const assistantProvider = isAssistantProvider(merged.assistantProvider)
+      ? merged.assistantProvider
+      : DEFAULT_SETTINGS.assistantProvider;
+    const assistantModel = typeof merged.assistantModel === 'string' && merged.assistantModel.trim()
+      ? merged.assistantModel.trim()
+      : getAssistantDefaultModel(assistantProvider);
     return {
       ...merged,
       javascriptExecutionTimeoutMs: normalizeExecutionTimeoutMs(merged.javascriptExecutionTimeoutMs),
@@ -2011,6 +2527,16 @@ export default function App() {
         ? merged.projectRunCustomFileIds.filter((value: unknown): value is string => typeof value === 'string')
         : [],
       projectRunEntryFileId: typeof merged.projectRunEntryFileId === 'string' ? merged.projectRunEntryFileId : null,
+      assistantProvider,
+      assistantModel,
+      assistantApiKey: typeof merged.assistantApiKey === 'string' ? merged.assistantApiKey : '',
+      assistantUseChainOfThought: !!merged.assistantUseChainOfThought,
+      assistantShowUsagePopup: merged.assistantShowUsagePopup !== false,
+      assistantMaxChainOfThoughtDepth: normalizeAssistantMaxChainOfThoughtDepth(
+        typeof merged.assistantMaxChainOfThoughtDepth === 'number'
+          ? merged.assistantMaxChainOfThoughtDepth
+          : DEFAULT_SETTINGS.assistantMaxChainOfThoughtDepth
+      ),
     };
   });
   const [settingsPipPackages, setSettingsPipPackages] = useState<SavedPipPackage[]>(() => loadSavedPipPackages());
@@ -2031,6 +2557,7 @@ export default function App() {
   const [settingsCSharpNamespaceInput, setSettingsCSharpNamespaceInput] = useState('');
   const [settingsCSharpNamespaceBusy, setSettingsCSharpNamespaceBusy] = useState(false);
   const [settingsCSharpNamespaceStatus, setSettingsCSharpNamespaceStatus] = useState('');
+  const [showAssistantApiKey, setShowAssistantApiKey] = useState(false);
   const [syncMeta, setSyncMeta] = useState<SyncMeta[]>(loadSyncMeta);
   const pendingEdit = pendingEdits[0] ?? null;
   const editorRef = useRef<any>(null);
@@ -2048,6 +2575,10 @@ export default function App() {
   const outputInteractionIdRef = useRef(0);
   const outputPreviewUrlsRef = useRef<string[]>([]);
   const assistantEstimateRequestIdRef = useRef(0);
+  const terminalOutputRef = useRef(terminalOutput);
+  terminalOutputRef.current = terminalOutput;
+  const terminalCwdRef = useRef<string | null>(terminalCwd);
+  terminalCwdRef.current = terminalCwd;
   const csharpRuntimeReadyRef = useRef<Promise<void> | null>(null);
   const skipEditorSyncRef = useRef(false);
   const pendingSharedEditorTargetRef = useRef<{ tabId: string; itemId: string } | null>(null);
@@ -2068,6 +2599,15 @@ export default function App() {
   const persistedPythonPackageStubsRestoredRef = useRef(false);
 
   const activeItem = files.find(f => f.id === activeFileId);
+  const assistantReasoningControl = getAssistantReasoningControl(settings.assistantProvider, settings.assistantModel);
+  const effectiveAssistantUseChainOfThought =
+    assistantReasoningControl === 'always_on'
+      ? true
+      : assistantReasoningControl === 'toggleable'
+        ? settings.assistantUseChainOfThought
+        : false;
+  const effectiveAssistantMaxChainOfThoughtDepth = normalizeAssistantMaxChainOfThoughtDepth(settings.assistantMaxChainOfThoughtDepth);
+  const assistantConfiguredApiKey = settings.assistantApiKey.trim();
   const activeEditorTabNode: any = activeEditorTabId ? layoutModel.getNodeById(activeEditorTabId) : null;
   const activeEditorTabItemId =
     activeEditorTabNode?.getComponent?.() === 'editor'
@@ -2608,8 +3148,6 @@ export default function App() {
     openEditorTabWithItem(item);
   };
 
-  const aiRef = useRef(geminiAi);
-
   const readDirRecursive = async (dirHandle: FileSystemDirectoryHandle, parentId: string, existingFiles: FSItem[]): Promise<FSItem[]> => {
     const items: FSItem[] = [];
     for await (const entry of (dirHandle as any).values()) {
@@ -3001,10 +3539,26 @@ export default function App() {
       return;
     }
 
+    if (!settings.assistantShowUsagePopup) {
+      assistantEstimateRequestIdRef.current += 1;
+      setAssistantTokenEstimates({});
+      return;
+    }
+
     const requestId = assistantEstimateRequestIdRef.current + 1;
     assistantEstimateRequestIdRef.current = requestId;
     const timeoutId = window.setTimeout(() => {
       const selectionContext = getCurrentAssistantSelectionContext();
+      const estimateProvider = settings.assistantProvider;
+      const estimateModel = settings.assistantModel.trim();
+      const estimateApiKey = settings.assistantApiKey.trim();
+      const estimateReasoningControl = getAssistantReasoningControl(estimateProvider, estimateModel);
+      const estimateUseChainOfThought =
+        estimateReasoningControl === 'always_on'
+          ? true
+          : estimateReasoningControl === 'toggleable'
+            ? settings.assistantUseChainOfThought
+            : false;
       draftChats.forEach(({ chatId, chat, draft }) => {
         const projectedOutputTokens = assistantTurnUsageByChatId[chatId]?.outputTokenCount || DEFAULT_ASSISTANT_ESTIMATED_OUTPUT_TOKENS;
         const assistantFiles = files.map(file => ({ ...file }));
@@ -3015,6 +3569,9 @@ export default function App() {
           userContent: draft + selectionContext,
           assistantFiles,
           assistantActiveItemId,
+          assistantTerminalCwd: terminalCwd,
+          useChainOfThought: estimateUseChainOfThought,
+          maxChainOfThoughtDepth: effectiveAssistantMaxChainOfThoughtDepth,
         });
 
         setAssistantTokenEstimates(prev => ({
@@ -3031,8 +3588,35 @@ export default function App() {
           },
         }));
 
-        void aiRef.current.models.countTokens({
-          model: ASSISTANT_MODEL_NAME,
+        const finalizeApproximateEstimate = (error?: unknown) => {
+          if (assistantEstimateRequestIdRef.current !== requestId) return;
+          const promptTokenCount = estimateFallbackTokenCount(prompt);
+          const estimatedTotalTokenCount = promptTokenCount + projectedOutputTokens;
+          setAssistantTokenEstimates(prev => ({
+            ...prev,
+            [chatId]: {
+              status: 'ready',
+              promptTokenCount,
+              estimatedOutputTokenCount: projectedOutputTokens,
+              estimatedTotalTokenCount,
+              estimatedPaidCostUsd: calculateAssistantPaidCostUsd(estimateProvider, estimateModel, promptTokenCount, projectedOutputTokens),
+              source: 'approximation',
+              ...(error ? { error: error instanceof Error ? error.message : String(error) } : {}),
+              updatedAt: Date.now(),
+            },
+          }));
+        };
+
+        if (estimateProvider !== 'gemini' || !estimateApiKey || !estimateModel) {
+          finalizeApproximateEstimate(
+            !estimateApiKey ? `Add your ${getAssistantApiKeyLabel(estimateProvider)} to enable live token counting.` : undefined
+          );
+          return;
+        }
+
+        const geminiClient = new GoogleGenAI({ apiKey: estimateApiKey });
+        void geminiClient.models.countTokens({
+          model: estimateModel,
           contents: prompt,
         }).then((response: any) => {
           if (assistantEstimateRequestIdRef.current !== requestId) return;
@@ -3047,28 +3631,13 @@ export default function App() {
               promptTokenCount,
               estimatedOutputTokenCount: projectedOutputTokens,
               estimatedTotalTokenCount,
-              estimatedPaidCostUsd: calculateAssistantPaidCostUsd(promptTokenCount, projectedOutputTokens),
+              estimatedPaidCostUsd: calculateAssistantPaidCostUsd(estimateProvider, estimateModel, promptTokenCount, projectedOutputTokens),
               source: typeof response?.totalTokens === 'number' ? 'model' : 'approximation',
               updatedAt: Date.now(),
             },
           }));
         }).catch((error) => {
-          if (assistantEstimateRequestIdRef.current !== requestId) return;
-          const promptTokenCount = estimateFallbackTokenCount(prompt);
-          const estimatedTotalTokenCount = promptTokenCount + projectedOutputTokens;
-          setAssistantTokenEstimates(prev => ({
-            ...prev,
-            [chatId]: {
-              status: 'ready',
-              promptTokenCount,
-              estimatedOutputTokenCount: projectedOutputTokens,
-              estimatedTotalTokenCount,
-              estimatedPaidCostUsd: calculateAssistantPaidCostUsd(promptTokenCount, projectedOutputTokens),
-              source: 'approximation',
-              error: error instanceof Error ? error.message : String(error),
-              updatedAt: Date.now(),
-            },
-          }));
+          finalizeApproximateEstimate(error);
         });
       });
     }, 500);
@@ -3083,6 +3652,14 @@ export default function App() {
     assistantInputs,
     assistantTurnUsageByChatId,
     files,
+    settings.assistantApiKey,
+    settings.assistantMaxChainOfThoughtDepth,
+    settings.assistantModel,
+    settings.assistantProvider,
+    settings.assistantShowUsagePopup,
+    settings.assistantUseChainOfThought,
+    terminalCwd,
+    effectiveAssistantMaxChainOfThoughtDepth,
   ]);
 
   // Auto-scroll output and terminal
@@ -3177,6 +3754,9 @@ export default function App() {
     userContent: string;
     assistantFiles: FSItem[];
     assistantActiveItemId: string;
+    assistantTerminalCwd?: string | null;
+    useChainOfThought?: boolean;
+    maxChainOfThoughtDepth?: number;
     toolProgressNotes?: string[];
     assistantLiveNotes?: string[];
   }) {
@@ -3186,6 +3766,9 @@ export default function App() {
       userContent,
       assistantFiles,
       assistantActiveItemId,
+      assistantTerminalCwd = null,
+      useChainOfThought = false,
+      maxChainOfThoughtDepth = DEFAULT_ASSISTANT_TOOL_PASSES,
       toolProgressNotes = [],
       assistantLiveNotes = [],
     } = params;
@@ -3208,6 +3791,31 @@ export default function App() {
     const liveAssistantProgress = assistantLiveNotes.length > 0
       ? `\nAssistant Messages Already Shown This Turn:\n${assistantLiveNotes.map((note, index) => `${index + 1}. ${note}`).join('\n')}\nContinue from there and avoid repeating the same message word-for-word.`
       : '';
+
+    if (useChainOfThought) {
+      return `
+        Context: You are an AI coding assistant inside CodeCraft IDE.
+        Internal Chat ID: ${chatId}
+        Keep continuity with the existing chat history for this chat.
+        You are in tool-driven Chain of Thought mode.
+        Use the discrete MCP-style terminal tools to inspect the project one command at a time instead of assuming unseen files or folders.
+        When you want to change code, use 'proposeEdit' so the user can review it.
+        Keep user-facing explanations separate from tool and edit logs.
+        If you need more context, discover it through the available terminal tools.
+        You have at most ${maxChainOfThoughtDepth} tool rounds available for this turn, so prioritize your steps.
+
+        Current terminal working directory: ${assistantTerminalCwd ? `/${getPathFromSnapshot(assistantTerminalCwd)}` : '/'}
+        Active Item: ${activeSnapshotItem ? getPathFromSnapshot(activeSnapshotItem.id) : 'None selected'}
+        ${activeSnapshotItem ? (activeSnapshotItem.type === 'file' ? `Active file content:\n${activeSnapshotItem.content || ''}` : 'The active item is a folder.') : 'No file is currently active.'}
+
+        Chat History:
+        ${history || '(empty)'}
+        ${toolProgress}
+        ${liveAssistantProgress}
+
+        USER: ${userContent}
+      `;
+    }
 
     return `
         Context: You are an AI coding assistant inside CodeCraft IDE.
@@ -6605,6 +7213,99 @@ finally:
     tabNameUpdates.forEach(({ id, name }) => layoutModel.doAction(Actions.updateNodeAttributes(id, { name })));
   }, [files]);
 
+  const buildAssistantToolSet = (useChainOfThought: boolean) => (
+    useChainOfThought ? CHAIN_OF_THOUGHT_ASSISTANT_TOOLS : STANDARD_ASSISTANT_TOOLS
+  );
+
+  const safeJsonParse = (value: string) => {
+    try {
+      return JSON.parse(value);
+    } catch {
+      return {};
+    }
+  };
+
+  const quoteTerminalArg = (value: string) => JSON.stringify(value);
+
+  const extractGeminiVisibleText = (response: any) => {
+    const parts = response?.candidates?.[0]?.content?.parts;
+    if (!Array.isArray(parts)) {
+      return typeof response?.text === 'string' ? response.text.trim() : '';
+    }
+    return parts
+      .filter((part: any) => typeof part?.text === 'string' && !part?.thought)
+      .map((part: any) => String(part.text))
+      .join('\n')
+      .trim();
+  };
+
+  const extractOpenAIVisibleText = (response: any) => {
+    const parts: string[] = [];
+    for (const item of Array.isArray(response?.output) ? response.output : []) {
+      if (item?.type !== 'message' || !Array.isArray(item?.content)) continue;
+      for (const contentItem of item.content) {
+        if ((contentItem?.type === 'output_text' || contentItem?.type === 'text') && typeof contentItem?.text === 'string') {
+          parts.push(contentItem.text);
+        }
+      }
+    }
+    if (parts.length > 0) return parts.join('\n').trim();
+    return typeof response?.output_text === 'string' ? response.output_text.trim() : '';
+  };
+
+  const extractAnthropicVisibleText = (response: any) => (
+    (Array.isArray(response?.content) ? response.content : [])
+      .filter((block: any) => block?.type === 'text' && typeof block?.text === 'string')
+      .map((block: any) => block.text)
+      .join('\n')
+      .trim()
+  );
+
+  const applyAssistantUsage = (
+    accumulator: {
+      totalPromptTokenCount: number;
+      totalCandidateTokenCount: number;
+      totalThoughtsTokenCount: number;
+      totalToolUsePromptTokenCount: number;
+      totalTokenCount: number;
+      modelUsagePassCount: number;
+      approximationPassCount: number;
+    },
+    usage: {
+      promptTokenCount?: number;
+      candidateTokenCount?: number;
+      thoughtsTokenCount?: number;
+      toolUsePromptTokenCount?: number;
+      totalTokenCount?: number;
+      hasModelUsage?: boolean;
+    },
+    promptFallbackText?: string,
+    responseFallbackText?: string,
+  ) => {
+    if (usage.hasModelUsage) {
+      accumulator.modelUsagePassCount += 1;
+      accumulator.totalPromptTokenCount += usage.promptTokenCount ?? 0;
+      accumulator.totalCandidateTokenCount += usage.candidateTokenCount ?? 0;
+      accumulator.totalThoughtsTokenCount += usage.thoughtsTokenCount ?? 0;
+      accumulator.totalToolUsePromptTokenCount += usage.toolUsePromptTokenCount ?? 0;
+      accumulator.totalTokenCount += usage.totalTokenCount
+        ?? (
+          (usage.promptTokenCount ?? 0)
+          + (usage.candidateTokenCount ?? 0)
+          + (usage.thoughtsTokenCount ?? 0)
+          + (usage.toolUsePromptTokenCount ?? 0)
+        );
+      return;
+    }
+
+    accumulator.approximationPassCount += 1;
+    const approximatedPromptTokenCount = estimateFallbackTokenCount(promptFallbackText || '');
+    const approximatedOutputTokenCount = estimateFallbackTokenCount(responseFallbackText || '');
+    accumulator.totalPromptTokenCount += approximatedPromptTokenCount;
+    accumulator.totalCandidateTokenCount += approximatedOutputTokenCount;
+    accumulator.totalTokenCount += approximatedPromptTokenCount + approximatedOutputTokenCount;
+  };
+
   const handleChatSubmit = async (chatId: string, e: React.FormEvent) => {
     e.preventDefault();
     const input = (assistantInputs[chatId] || '').trim();
@@ -6628,18 +7329,37 @@ finally:
     setLoadingAssistantChatId(chatId);
 
     try {
-      let assistantFiles = files.map(file => ({ ...file }));
+      const provider = settings.assistantProvider;
+      const model = settings.assistantModel.trim();
+      const apiKey = assistantConfiguredApiKey;
+      const assistantTools = buildAssistantToolSet(effectiveAssistantUseChainOfThought);
+      const maxAssistantToolPasses = effectiveAssistantUseChainOfThought
+        ? effectiveAssistantMaxChainOfThoughtDepth
+        : DEFAULT_ASSISTANT_TOOL_PASSES;
+      if (!apiKey) {
+        appendAssistantMessage(chatId, {
+          role: 'assistant',
+          content: `Add your ${getAssistantApiKeyLabel(provider)} in Settings before using the assistant.`,
+        });
+        return;
+      }
+
+      let assistantFiles = filesRef.current.map(file => ({ ...file }));
       let assistantActiveItemId = activeItem?.id || activeFileId || '';
+      let assistantTerminalCwd = terminalCwdRef.current;
+      let assistantTerminalOutput = terminalOutputRef.current.slice();
       const toolProgressNotes: string[] = [];
       const assistantLiveNotes: string[] = [];
       let emittedAssistantMessage = false;
-      let totalPromptTokenCount = 0;
-      let totalCandidateTokenCount = 0;
-      let totalThoughtsTokenCount = 0;
-      let totalToolUsePromptTokenCount = 0;
-      let totalTokenCount = 0;
-      let modelUsagePassCount = 0;
-      let approximationPassCount = 0;
+      const usageTotals = {
+        totalPromptTokenCount: 0,
+        totalCandidateTokenCount: 0,
+        totalThoughtsTokenCount: 0,
+        totalToolUsePromptTokenCount: 0,
+        totalTokenCount: 0,
+        modelUsagePassCount: 0,
+        approximationPassCount: 0,
+      };
 
       const getPathFromSnapshot = (id: string | undefined): string => {
         if (!id) return '';
@@ -6653,6 +7373,14 @@ finally:
         const byPath = assistantFiles.find(f => getPathFromSnapshot(f.id) === pathOrName);
         if (byPath) return byPath;
         return assistantFiles.find(f => f.name === pathOrName);
+      };
+
+      const findItemInTerminalContext = (pathOrName: string): FSItem | undefined => {
+        const normalized = pathOrName.startsWith('/') ? pathOrName.slice(1) : pathOrName;
+        const scoped = assistantFiles.find(
+          f => f.name === normalized && f.parentId === assistantTerminalCwd
+        );
+        return scoped || findItemInSnapshot(normalized);
       };
 
       const isDescendantInSnapshot = (descendantId: string, ancestorId: string) => {
@@ -6671,6 +7399,9 @@ finally:
         userContent: userMsg.content,
         assistantFiles,
         assistantActiveItemId,
+        assistantTerminalCwd,
+        useChainOfThought: effectiveAssistantUseChainOfThought,
+        maxChainOfThoughtDepth: maxAssistantToolPasses,
         toolProgressNotes,
         assistantLiveNotes,
       });
@@ -6686,9 +7417,65 @@ finally:
         });
       };
 
-      const executeAssistantToolCall = async (call: any): Promise<AssistantToolExecutionResult> => {
+      const emitAssistantLog = (content: string) => {
+        const trimmed = content.trim();
+        if (!trimmed) return;
+        appendAssistantMessage(chatId, {
+          role: 'assistant',
+          content: trimmed,
+          kind: 'log',
+        });
+      };
+
+      const updateAssistantFiles = (nextFiles: FSItem[]) => {
+        assistantFiles = nextFiles;
+        filesRef.current = nextFiles;
+        setFiles(nextFiles);
+      };
+
+      const updateAssistantTerminalCwd = (nextCwd: string | null) => {
+        assistantTerminalCwd = nextCwd;
+        terminalCwdRef.current = nextCwd;
+        setTerminalCwd(nextCwd);
+      };
+
+      const writeTerminalOutput = (nextOutput: string[]) => {
+        assistantTerminalOutput = nextOutput;
+        terminalOutputRef.current = nextOutput;
+        setTerminalOutput(nextOutput);
+      };
+
+      const appendTerminalCommandResult = (command: string, lines: string[] = []) => {
+        const cwdLabel = assistantTerminalCwd ? getPathFromSnapshot(assistantTerminalCwd) : '~';
+        const nextOutput = [...assistantTerminalOutput, `${cwdLabel} $ ${command}`, ...lines];
+        writeTerminalOutput(nextOutput);
+      };
+
+      const runRawTerminalCommand = async (command: string, summary: string, detail: string) => {
+        const beforeOutputLength = terminalOutputRef.current.length;
+        selectDockPanel('terminal');
+        await executeTerminalCommand(command, false);
+        await new Promise(resolve => window.setTimeout(resolve, 0));
+        assistantFiles = filesRef.current.map(file => ({ ...file }));
+        assistantTerminalCwd = terminalCwdRef.current;
+        assistantTerminalOutput = terminalOutputRef.current.slice();
+        return {
+          summary,
+          detail,
+          result: {
+            ok: true,
+            summary,
+            detail,
+            output: assistantTerminalOutput.slice(beforeOutputLength),
+            currentWorkingDirectory: assistantTerminalCwd ? `/${getPathFromSnapshot(assistantTerminalCwd)}` : '/',
+          },
+        } satisfies AssistantToolExecutionResult;
+      };
+
+      const executeAssistantToolCall = async (call: { name: string; args?: Record<string, any>; callId?: string | null }): Promise<AssistantToolExecutionResult> => {
+        const args = call.args || {};
         if (call.name === 'proposeEdit') {
-          const { pathOrName, newContent } = call.args as any;
+          const { pathOrName, newContent } = args as any;
           const targetFile = typeof pathOrName === 'string' ? findItemInSnapshot(pathOrName) : undefined;
           if (targetFile && targetFile.type === 'file' && typeof newContent === 'string') {
             enqueuePendingEdit({
@@ -6698,57 +7485,70 @@ finally:
             });
             return {
               summary: `Proposed changes to \`${getPathFromSnapshot(targetFile.id)}\`.`,
-              detail: `Proposed reviewed edits for ${getPathFromSnapshot(targetFile.id)}.`
+              detail: `Proposed reviewed edits for ${getPathFromSnapshot(targetFile.id)}.`,
+              result: {
+                ok: true,
+                path: getPathFromSnapshot(targetFile.id),
+                action: 'proposed_edit',
+              },
             };
           }
           return {
             summary: `I couldn't find a file at \`${String(pathOrName || '')}\` to edit.`,
-            detail: `Edit failed because the target file ${String(pathOrName || '')} was not found.`
+            detail: `Edit failed because the target file ${String(pathOrName || '')} was not found.`,
+            result: { ok: false },
           };
         }
 
         if (call.name === 'navigateTo') {
-          const { pathOrName } = call.args as any;
+          const { pathOrName } = args as any;
           const target = typeof pathOrName === 'string' ? findItemInSnapshot(pathOrName) : undefined;
           if (!target) {
             return {
               summary: `I couldn't find \`${String(pathOrName || '')}\`.`,
-              detail: `Navigation failed because ${String(pathOrName || '')} was not found.`
+              detail: `Navigation failed because ${String(pathOrName || '')} was not found.`,
+              result: { ok: false },
             };
           }
 
           assistantActiveItemId = target.id;
           openEditorTabWithItem(target);
           if (target.type === 'folder') {
-            assistantFiles = assistantFiles.map(f => f.id === target.id ? { ...f, isOpen: true } : f);
-            setFiles(assistantFiles);
+            updateAssistantFiles(assistantFiles.map(f => f.id === target.id ? { ...f, isOpen: true } : f));
           }
 
           return {
             summary: `Navigated to \`${getPathFromSnapshot(target.id)}\`.`,
-            detail: `Navigated to ${getPathFromSnapshot(target.id)} (${target.type}).`
+            detail: `Navigated to ${getPathFromSnapshot(target.id)} (${target.type}).`,
+            result: {
+              ok: true,
+              path: getPathFromSnapshot(target.id),
+              type: target.type,
+            },
           };
         }
 
         if (call.name === 'moveCursor') {
-          const { line, column } = call.args as any;
+          const { line, column } = args as any;
           if (typeof line === 'number' && typeof column === 'number' && editorRef.current) {
             editorRef.current.setPosition({ lineNumber: line, column: column });
             editorRef.current.revealPositionInCenter({ lineNumber: line, column: column });
             editorRef.current.focus();
             return {
               summary: `Moved cursor to line ${line}, column ${column}.`,
-              detail: `Moved the editor cursor to line ${line}, column ${column}.`
+              detail: `Moved the editor cursor to line ${line}, column ${column}.`,
+              result: { ok: true, line, column },
             };
           }
           return {
             summary: "I couldn't move the cursor because the editor wasn't ready.",
-            detail: 'Cursor movement failed because there was no mounted editor.'
+            detail: 'Cursor movement failed because there was no mounted editor.',
+            result: { ok: false },
           };
         }
 
         if (call.name === 'createItem') {
-          const { type, name, parentPathOrName, content } = call.args as any;
+          const { type, name, parentPathOrName, content } = args as any;
           const normalizedType = type === 'folder' ? 'folder' : type === 'file' ? 'file' : null;
           const trimmedName = typeof name === 'string' ? name.trim() : '';
           const parent = typeof parentPathOrName === 'string' && parentPathOrName
@@ -6780,11 +7580,11 @@ finally:
             language: normalizedType === 'file' ? langFromFilename(trimmedName) : undefined
           };
 
-          assistantFiles = [...assistantFiles, newItem];
+          let nextFiles = [...assistantFiles, newItem];
           if (parentId) {
-            assistantFiles = assistantFiles.map(f => f.id === parentId ? { ...f, isOpen: true } : f);
+            nextFiles = nextFiles.map(f => f.id === parentId ? { ...f, isOpen: true } : f);
           }
-          setFiles(assistantFiles);
+          updateAssistantFiles(nextFiles);
 
           if (normalizedType === 'file') {
             assistantActiveItemId = newItem.id;
@@ -6793,17 +7593,23 @@ finally:
 
           return {
             summary: `Created ${normalizedType} \`${getPathFromSnapshot(newItem.id)}\`.`,
-            detail: `Created ${normalizedType} at ${getPathFromSnapshot(newItem.id)}.`
+            detail: `Created ${normalizedType} at ${getPathFromSnapshot(newItem.id)}.`,
+            result: {
+              ok: true,
+              path: getPathFromSnapshot(newItem.id),
+              type: normalizedType,
+            },
           };
         }
 
         if (call.name === 'deleteItem') {
-          const { pathOrName } = call.args as any;
+          const { pathOrName } = args as any;
           const target = typeof pathOrName === 'string' ? findItemInSnapshot(pathOrName) : undefined;
           if (!target) {
             return {
               summary: `I couldn't find \`${String(pathOrName || '')}\` to delete.`,
-              detail: `Delete failed because ${String(pathOrName || '')} was not found.`
+              detail: `Delete failed because ${String(pathOrName || '')} was not found.`,
+              result: { ok: false },
             };
           }
 
@@ -6822,21 +7628,22 @@ finally:
             if (syncHandlesRef.current.has(deleteId)) stopFolderSync(deleteId);
           }
 
-          assistantFiles = assistantFiles.filter(file => !toDelete.includes(file.id));
+          const nextFiles = assistantFiles.filter(file => !toDelete.includes(file.id));
           if (toDelete.includes(assistantActiveItemId)) {
             assistantActiveItemId = '';
             setActiveFileId('');
           }
-          setFiles(assistantFiles);
+          updateAssistantFiles(nextFiles);
 
           return {
             summary: `Deleted \`${target.name}\`.`,
-            detail: `Deleted ${target.type} ${target.name}${toDelete.length > 1 ? ` and ${toDelete.length - 1} descendant item(s)` : ''}.`
+            detail: `Deleted ${target.type} ${target.name}${toDelete.length > 1 ? ` and ${toDelete.length - 1} descendant item(s)` : ''}.`,
+            result: { ok: true },
           };
         }
 
         if (call.name === 'moveItem') {
-          const { sourcePathOrName, destinationFolderPathOrName } = call.args as any;
+          const { sourcePathOrName, destinationFolderPathOrName } = args as any;
           const source = typeof sourcePathOrName === 'string' ? findItemInSnapshot(sourcePathOrName) : undefined;
           const moveToRoot = destinationFolderPathOrName === '/' || destinationFolderPathOrName === '~' || destinationFolderPathOrName === '';
           const destination = moveToRoot
@@ -6862,7 +7669,7 @@ finally:
             };
           }
 
-          assistantFiles = assistantFiles.map(file => {
+          updateAssistantFiles(assistantFiles.map(file => {
             if (file.id === source.id) {
               return { ...file, parentId: destination ? destination.id : null };
             }
@@ -6870,108 +7677,558 @@ finally:
               return { ...file, isOpen: true };
             }
             return file;
-          });
-          setFiles(assistantFiles);
+          }));
 
           return {
             summary: `Moved \`${source.name}\` to ${destination ? `\`${getPathFromSnapshot(destination.id)}\`` : '`root`'}.`,
-            detail: `Moved ${source.name} to ${destination ? getPathFromSnapshot(destination.id) : 'root'}.`
+            detail: `Moved ${source.name} to ${destination ? getPathFromSnapshot(destination.id) : 'root'}.`,
+            result: { ok: true },
           };
         }
 
         if (call.name === 'runTerminalCommand') {
-          const { command } = call.args as any;
+          const { command } = args as any;
           if (typeof command === 'string' && command.trim()) {
-            selectDockPanel('terminal');
-            await executeTerminalCommand(command, false);
-            return {
-              summary: `Executed terminal command: \`${command}\`.`,
-              detail: `Executed terminal command: ${command}.`
-            };
+            return runRawTerminalCommand(
+              command,
+              `Executed terminal command: \`${command}\`.`,
+              `Executed terminal command: ${command}.`
+            );
           }
           return {
             summary: "I couldn't run the terminal command because it was empty.",
-            detail: 'Terminal command execution failed because the command was empty.'
+            detail: 'Terminal command execution failed because the command was empty.',
+            result: { ok: false },
           };
+        }
+
+        if (call.name === 'terminalLs') {
+          const target = typeof args.pathOrName === 'string' && args.pathOrName.trim()
+            ? findItemInTerminalContext(args.pathOrName.trim())
+            : undefined;
+          if (args.pathOrName && (!target || target.type !== 'folder')) {
+            const message = `ls: cannot access '${String(args.pathOrName)}': No such directory`;
+            appendTerminalCommandResult(`ls ${String(args.pathOrName)}`, [message]);
+            return { summary: message, detail: message, result: { ok: false } };
+          }
+          const folderId = target?.id ?? assistantTerminalCwd;
+          const items = assistantFiles.filter(file => file.parentId === folderId).map(file => file.name).join('  ');
+          appendTerminalCommandResult(args.pathOrName ? `ls ${String(args.pathOrName)}` : 'ls', [items || '(empty)']);
+          return {
+            summary: `Listed ${target ? getPathFromSnapshot(target.id) : 'the current directory'}.`,
+            detail: items || '(empty)',
+            result: {
+              ok: true,
+              output: items || '(empty)',
+              currentWorkingDirectory: assistantTerminalCwd ? `/${getPathFromSnapshot(assistantTerminalCwd)}` : '/',
+            },
+          };
+        }
+
+        if (call.name === 'terminalPwd') {
+          const pwd = assistantTerminalCwd ? `/${getPathFromSnapshot(assistantTerminalCwd)}` : '/';
+          appendTerminalCommandResult('pwd', [pwd]);
+          return { summary: `Current directory is \`${pwd}\`.`, detail: pwd, result: { ok: true, output: pwd } };
+        }
+
+        if (call.name === 'terminalCd') {
+          const target = typeof args.target === 'string' ? args.target.trim() : '';
+          if (!target || target === '~' || target === '/') {
+            updateAssistantTerminalCwd(null);
+            appendTerminalCommandResult(target ? `cd ${target}` : 'cd');
+            return { summary: 'Changed directory to workspace root.', detail: 'Changed directory to workspace root.', result: { ok: true, currentWorkingDirectory: '/' } };
+          }
+          if (target === '..') {
+            const current = assistantTerminalCwd ? assistantFiles.find(f => f.id === assistantTerminalCwd) : null;
+            updateAssistantTerminalCwd(current?.parentId || null);
+            appendTerminalCommandResult('cd ..');
+            return {
+              summary: `Changed directory to \`${assistantTerminalCwd ? `/${getPathFromSnapshot(assistantTerminalCwd)}` : '/'}\`.`,
+              detail: 'Changed directory to the parent folder.',
+              result: { ok: true, currentWorkingDirectory: assistantTerminalCwd ? `/${getPathFromSnapshot(assistantTerminalCwd)}` : '/' },
+            };
+          }
+          const folder = findItemInTerminalContext(target);
+          if (!folder || folder.type !== 'folder') {
+            const message = `cd: no such directory: ${target}`;
+            appendTerminalCommandResult(`cd ${target}`, [message]);
+            return { summary: message, detail: message, result: { ok: false } };
+          }
+          updateAssistantTerminalCwd(folder.id);
+          appendTerminalCommandResult(`cd ${target}`);
+          return {
+            summary: `Changed directory to \`${getPathFromSnapshot(folder.id)}\`.`,
+            detail: `Changed directory to ${getPathFromSnapshot(folder.id)}.`,
+            result: { ok: true, currentWorkingDirectory: `/${getPathFromSnapshot(folder.id)}` },
+          };
+        }
+
+        if (call.name === 'terminalMkdir') {
+          const name = typeof args.name === 'string' ? args.name.trim() : '';
+          if (!name) {
+            const message = 'mkdir: missing operand';
+            appendTerminalCommandResult('mkdir', [message]);
+            return { summary: message, detail: message, result: { ok: false } };
+          }
+          const id = Math.random().toString(36).substr(2, 9);
+          updateAssistantFiles([...assistantFiles, { id, name, type: 'folder', parentId: assistantTerminalCwd, isOpen: true }]);
+          appendTerminalCommandResult(`mkdir ${name}`);
+          return {
+            summary: `Created folder \`${assistantTerminalCwd ? `${getPathFromSnapshot(assistantTerminalCwd)}/` : ''}${name}\`.`,
+            detail: `Created folder ${name}.`,
+            result: { ok: true },
+          };
+        }
+
+        if (call.name === 'terminalTouch') {
+          const name = typeof args.name === 'string' ? args.name.trim() : '';
+          if (!name) {
+            const message = 'touch: missing operand';
+            appendTerminalCommandResult('touch', [message]);
+            return { summary: message, detail: message, result: { ok: false } };
+          }
+          const id = Math.random().toString(36).substr(2, 9);
+          updateAssistantFiles([...assistantFiles, { id, name, type: 'file', parentId: assistantTerminalCwd, content: '', language: langFromFilename(name) }]);
+          appendTerminalCommandResult(`touch ${name}`);
+          return {
+            summary: `Created file \`${assistantTerminalCwd ? `${getPathFromSnapshot(assistantTerminalCwd)}/` : ''}${name}\`.`,
+            detail: `Created file ${name}.`,
+            result: { ok: true },
+          };
+        }
+
+        if (call.name === 'terminalOpen') {
+          const pathOrName = typeof args.pathOrName === 'string' ? args.pathOrName.trim() : '';
+          const target = pathOrName ? findItemInTerminalContext(pathOrName) : undefined;
+          if (!target) {
+            const message = `open: ${pathOrName}: No such file or directory`;
+            appendTerminalCommandResult(`open ${pathOrName}`, [message]);
+            return { summary: message, detail: message, result: { ok: false } };
+          }
+          if (target.type === 'folder') {
+            updateAssistantFiles(assistantFiles.map(file => file.id === target.id ? { ...file, isOpen: true } : file));
+          }
+          assistantActiveItemId = target.id;
+          openEditorTabWithItem(target);
+          appendTerminalCommandResult(`open ${pathOrName}`);
+          return {
+            summary: `Opened \`${getPathFromSnapshot(target.id)}\`.`,
+            detail: `Opened ${getPathFromSnapshot(target.id)}.`,
+            result: { ok: true, path: getPathFromSnapshot(target.id), type: target.type },
+          };
+        }
+
+        if (call.name === 'terminalCat') {
+          const pathOrName = typeof args.pathOrName === 'string' ? args.pathOrName.trim() : '';
+          const target = pathOrName ? findItemInTerminalContext(pathOrName) : undefined;
+          if (!target || target.type !== 'file') {
+            const message = `cat: ${pathOrName}: No such file`;
+            appendTerminalCommandResult(`cat ${pathOrName}`, [message]);
+            return { summary: message, detail: message, result: { ok: false } };
+          }
+          const content = target.content || '';
+          appendTerminalCommandResult(`cat ${pathOrName}`, [content]);
+          return {
+            summary: `Read \`${getPathFromSnapshot(target.id)}\`.`,
+            detail: `Read ${getPathFromSnapshot(target.id)}.`,
+            result: { ok: true, content },
+          };
+        }
+
+        if (call.name === 'terminalRm') {
+          const pathOrName = typeof args.pathOrName === 'string' ? args.pathOrName.trim() : '';
+          const target = pathOrName ? findItemInTerminalContext(pathOrName) : undefined;
+          if (!target) {
+            const message = `rm: cannot remove '${pathOrName}': No such file or directory`;
+            appendTerminalCommandResult(`rm ${pathOrName}`, [message]);
+            return { summary: message, detail: message, result: { ok: false } };
+          }
+          const toDelete = [target.id];
+          const collectChildren = (parentId: string) => {
+            assistantFiles.forEach(file => {
+              if (file.parentId === parentId) {
+                toDelete.push(file.id);
+                if (file.type === 'folder') collectChildren(file.id);
+              }
+            });
+          };
+          collectChildren(target.id);
+          for (const deleteId of toDelete) {
+            if (syncHandlesRef.current.has(deleteId)) stopFolderSync(deleteId);
+          }
+          if (toDelete.includes(assistantActiveItemId)) {
+            assistantActiveItemId = '';
+            setActiveFileId('');
+          }
+          updateAssistantFiles(assistantFiles.filter(file => !toDelete.includes(file.id)));
+          appendTerminalCommandResult(`rm ${pathOrName}`);
+          return {
+            summary: `Removed \`${getPathFromSnapshot(target.id)}\`.`,
+            detail: `Removed ${getPathFromSnapshot(target.id)}.`,
+            result: { ok: true },
+          };
+        }
+
+        if (call.name === 'terminalClear') {
+          writeTerminalOutput([]);
+          return { summary: 'Cleared the terminal output.', detail: 'Cleared the terminal output.', result: { ok: true } };
+        }
+
+        if (call.name === 'terminalHelp') {
+          const helpLines = [
+            'Standard commands: ls, pwd, cd, mkdir, touch, open, cat, rm, clear, help, date, echo, whoami',
+            'Python: pip install <package> [-force] | pip upgrade <package> [-version <ver>] | pip uninstall <package> | pip include <module> | pip list',
+            'C#: nuget include <namespace> | nuget list',
+          ];
+          appendTerminalCommandResult('help', helpLines);
+          return { summary: 'Displayed terminal help.', detail: helpLines.join(' '), result: { ok: true, output: helpLines } };
+        }
+
+        if (call.name === 'terminalDate') {
+          const value = new Date().toLocaleString();
+          appendTerminalCommandResult('date', [value]);
+          return { summary: `Displayed the current date and time.`, detail: value, result: { ok: true, output: value } };
+        }
+
+        if (call.name === 'terminalEcho') {
+          const text = typeof args.text === 'string' ? args.text : '';
+          appendTerminalCommandResult(`echo ${text}`, [text]);
+          return { summary: 'Echoed text in the terminal.', detail: text, result: { ok: true, output: text } };
+        }
+
+        if (call.name === 'terminalWhoami') {
+          appendTerminalCommandResult('whoami', ['codecraft-user']);
+          return { summary: 'Displayed the current terminal user.', detail: 'codecraft-user', result: { ok: true, output: 'codecraft-user' } };
+        }
+
+        if (call.name === 'pipInstall') {
+          const packageName = typeof args.packageName === 'string' ? args.packageName.trim() : '';
+          if (!packageName) {
+            return { summary: 'pip install needs a package name.', detail: 'pip install needs a package name.', result: { ok: false } };
+          }
+          const command = `pip install ${quoteTerminalArg(packageName)}${args.forceBuild ? ' -force' : ''}`;
+          return runRawTerminalCommand(command, `Executed \`${command}\`.`, `Executed ${command}.`);
+        }
+
+        if (call.name === 'pipUpgrade') {
+          const packageName = typeof args.packageName === 'string' ? args.packageName.trim() : '';
+          if (!packageName) {
+            return { summary: 'pip upgrade needs a package name.', detail: 'pip upgrade needs a package name.', result: { ok: false } };
+          }
+          const versionSegment = typeof args.version === 'string' && args.version.trim()
+            ? ` -version ${quoteTerminalArg(args.version.trim())}`
+            : '';
+          const command = `pip upgrade ${quoteTerminalArg(packageName)}${versionSegment}`;
+          return runRawTerminalCommand(command, `Executed \`${command}\`.`, `Executed ${command}.`);
+        }
+
+        if (call.name === 'pipUninstall') {
+          const packageName = typeof args.packageName === 'string' ? args.packageName.trim() : '';
+          if (!packageName) {
+            return { summary: 'pip uninstall needs a package name.', detail: 'pip uninstall needs a package name.', result: { ok: false } };
+          }
+          const command = `pip uninstall ${quoteTerminalArg(packageName)}`;
+          return runRawTerminalCommand(command, `Executed \`${command}\`.`, `Executed ${command}.`);
+        }
+
+        if (call.name === 'pipInclude') {
+          const moduleName = typeof args.moduleName === 'string' ? args.moduleName.trim() : '';
+          if (!moduleName) {
+            return { summary: 'pip include needs a module name.', detail: 'pip include needs a module name.', result: { ok: false } };
+          }
+          const command = `pip include ${quoteTerminalArg(moduleName)}`;
+          return runRawTerminalCommand(command, `Executed \`${command}\`.`, `Executed ${command}.`);
+        }
+
+        if (call.name === 'pipList') {
+          return runRawTerminalCommand('pip list', 'Listed installed Python packages.', 'Listed installed Python packages.');
+        }
+
+        if (call.name === 'nugetInclude') {
+          const namespaceName = typeof args.namespaceName === 'string' ? args.namespaceName.trim() : '';
+          if (!namespaceName) {
+            return { summary: 'nuget include needs a namespace.', detail: 'nuget include needs a namespace.', result: { ok: false } };
+          }
+          const command = `nuget include ${quoteTerminalArg(namespaceName)}`;
+          return runRawTerminalCommand(command, `Executed \`${command}\`.`, `Executed ${command}.`);
+        }
+
+        if (call.name === 'nugetList') {
+          return runRawTerminalCommand('nuget list', 'Listed included C# namespaces.', 'Listed included C# namespaces.');
         }
 
         return {
           summary: `Ignored unsupported tool call \`${String(call.name || 'unknown')}\`.`,
-          detail: `Unsupported tool call encountered: ${String(call.name || 'unknown')}.`
+          detail: `Unsupported tool call encountered: ${String(call.name || 'unknown')}.`,
+          result: { ok: false },
         };
       };
 
-      for (let pass = 0; pass < MAX_ASSISTANT_TOOL_PASSES; pass++) {
+      const geminiThinkingConfig = (() => {
+        if (!effectiveAssistantUseChainOfThought && getAssistantReasoningControl(provider, model) === 'always_on') {
+          return undefined;
+        }
+        if (/^gemini-2\.5-flash-lite/i.test(model)) {
+          return { thinkingBudget: effectiveAssistantUseChainOfThought ? 512 : 0 };
+        }
+        if (/^gemini-2\.5-flash/i.test(model)) {
+          return { thinkingBudget: effectiveAssistantUseChainOfThought ? -1 : 0 };
+        }
+        if (/^gemini-2\.5-pro/i.test(model) && effectiveAssistantUseChainOfThought) {
+          return { thinkingBudget: -1 };
+        }
+        return undefined;
+      })();
+
+      const runGeminiLoop = async () => {
         const promptForPass = buildAssistantPrompt();
-        const response = await aiRef.current.models.generateContent({
-          model: ASSISTANT_MODEL_NAME,
-          contents: promptForPass,
-          config: {
-            tools: [{
-              functionDeclarations: [proposeEditTool, navigateToTool, moveCursorTool, createItemTool, deleteItemTool, moveItemTool, runTerminalCommandTool]
-            }],
-          }
-        });
+        const ai = new GoogleGenAI({ apiKey });
+        const contents: any[] = [{ role: 'user', parts: [{ text: promptForPass }] }];
 
-        const usageMetadata = response.usageMetadata;
-        if (
-          usageMetadata
-          && (
-            typeof usageMetadata.promptTokenCount === 'number'
-            || typeof usageMetadata.candidatesTokenCount === 'number'
-            || typeof usageMetadata.totalTokenCount === 'number'
-          )
-        ) {
-          modelUsagePassCount += 1;
-          totalPromptTokenCount += usageMetadata.promptTokenCount ?? 0;
-          totalCandidateTokenCount += usageMetadata.candidatesTokenCount ?? 0;
-          totalThoughtsTokenCount += usageMetadata.thoughtsTokenCount ?? 0;
-          totalToolUsePromptTokenCount += usageMetadata.toolUsePromptTokenCount ?? 0;
-          totalTokenCount += usageMetadata.totalTokenCount
-            ?? (
-              (usageMetadata.promptTokenCount ?? 0)
-              + (usageMetadata.candidatesTokenCount ?? 0)
-              + (usageMetadata.thoughtsTokenCount ?? 0)
-              + (usageMetadata.toolUsePromptTokenCount ?? 0)
-            );
-        } else {
-          approximationPassCount += 1;
-          const approximatedPromptTokenCount = estimateFallbackTokenCount(promptForPass);
-          const approximatedOutputTokenCount = estimateFallbackTokenCount((response.text || '').trim());
-          totalPromptTokenCount += approximatedPromptTokenCount;
-          totalCandidateTokenCount += approximatedOutputTokenCount;
-          totalTokenCount += approximatedPromptTokenCount + approximatedOutputTokenCount;
-        }
+        for (let pass = 0; pass < maxAssistantToolPasses; pass++) {
+          const response = await ai.models.generateContent({
+            model,
+            contents,
+            config: {
+              tools: [{ functionDeclarations: assistantTools.map(toGeminiFunctionDeclaration) }],
+              ...(geminiThinkingConfig ? { thinkingConfig: geminiThinkingConfig } : {}),
+            } as any,
+          });
 
-        const functionCalls = response.functionCalls ?? [];
-        const assistantText = (response.text || '').trim();
-        if (assistantText) {
-          emitAssistantLiveMessage(assistantText);
-        }
-
-        if (functionCalls.length === 0) {
-          break;
-        }
-
-        const passSummaries: string[] = [];
-        const passDetails: string[] = [];
-        for (const call of functionCalls) {
-          const outcome = await executeAssistantToolCall(call);
-          passSummaries.push(outcome.summary);
-          passDetails.push(outcome.detail);
-        }
-
-        if (passSummaries.length > 0) {
-          emitAssistantLiveMessage(
-            `Step ${pass + 1} completed:\n${passSummaries.map(summary => `- ${summary}`).join('\n')}`
+          const assistantText = extractGeminiVisibleText(response);
+          applyAssistantUsage(
+            usageTotals,
+            {
+              promptTokenCount: response?.usageMetadata?.promptTokenCount,
+              candidateTokenCount: response?.usageMetadata?.candidatesTokenCount,
+              thoughtsTokenCount: response?.usageMetadata?.thoughtsTokenCount,
+              toolUsePromptTokenCount: response?.usageMetadata?.toolUsePromptTokenCount,
+              totalTokenCount: response?.usageMetadata?.totalTokenCount,
+              hasModelUsage: !!response?.usageMetadata,
+            },
+            pass === 0 ? promptForPass : toolProgressNotes[toolProgressNotes.length - 1],
+            assistantText,
           );
-        }
 
-        if (passDetails.length === 0) {
-          break;
-        }
+          if (assistantText) {
+            emitAssistantLiveMessage(assistantText);
+          }
 
-        toolProgressNotes.push(passDetails.join(' '));
+          const functionCalls = Array.isArray(response?.functionCalls) ? response.functionCalls : [];
+          if (functionCalls.length === 0) break;
+
+          const passSummaries: string[] = [];
+          const passDetails: string[] = [];
+          const functionResponseParts: any[] = [];
+
+          for (const functionCall of functionCalls) {
+            const outcome = await executeAssistantToolCall({
+              name: functionCall.name,
+              args: functionCall.args,
+            });
+            passSummaries.push(outcome.summary);
+            passDetails.push(outcome.detail);
+            functionResponseParts.push({
+              functionResponse: {
+                name: functionCall.name,
+                response: {
+                  result: outcome.result ?? { summary: outcome.summary, detail: outcome.detail },
+                },
+              },
+            });
+          }
+
+          if (passSummaries.length > 0) {
+            emitAssistantLog(`Step ${pass + 1} log:\n${passSummaries.map(summary => `- ${summary}`).join('\n')}`);
+          }
+          if (passDetails.length > 0) {
+            toolProgressNotes.push(passDetails.join(' '));
+          }
+
+          const modelContent = response?.candidates?.[0]?.content;
+          if (modelContent) contents.push(modelContent);
+          contents.push({ role: 'user', parts: functionResponseParts });
+        }
+      };
+
+      const runOpenAILoop = async () => {
+        let previousResponseId: string | undefined;
+        let nextInput: any = [{
+          role: 'user',
+          content: [{ type: 'input_text', text: buildAssistantPrompt() }],
+        }];
+
+        for (let pass = 0; pass < maxAssistantToolPasses; pass++) {
+          const payload: any = {
+            model,
+            input: nextInput,
+            tools: assistantTools.map(toOpenAIToolDefinition),
+          };
+          if (previousResponseId) payload.previous_response_id = previousResponseId;
+          if (getAssistantReasoningControl(provider, model) !== 'always_off') {
+            payload.reasoning = { effort: effectiveAssistantUseChainOfThought ? 'medium' : 'none' };
+          }
+
+          const response = await fetch('https://api.openai.com/v1/responses', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${apiKey}`,
+            },
+            body: JSON.stringify(payload),
+          });
+
+          const responseJson = await response.json();
+          if (!response.ok) {
+            throw new Error(responseJson?.error?.message || 'OpenAI request failed.');
+          }
+
+          const assistantText = extractOpenAIVisibleText(responseJson);
+          const outputTokens = typeof responseJson?.usage?.output_tokens === 'number' ? responseJson.usage.output_tokens : undefined;
+          const reasoningTokens = typeof responseJson?.usage?.output_tokens_details?.reasoning_tokens === 'number'
+            ? responseJson.usage.output_tokens_details.reasoning_tokens
+            : 0;
+          applyAssistantUsage(
+            usageTotals,
+            {
+              promptTokenCount: responseJson?.usage?.input_tokens,
+              candidateTokenCount: typeof outputTokens === 'number' ? Math.max(0, outputTokens - reasoningTokens) : undefined,
+              thoughtsTokenCount: reasoningTokens,
+              totalTokenCount: responseJson?.usage?.total_tokens,
+              hasModelUsage: !!responseJson?.usage,
+            },
+            Array.isArray(nextInput) ? JSON.stringify(nextInput) : String(nextInput || ''),
+            assistantText,
+          );
+
+          if (assistantText) {
+            emitAssistantLiveMessage(assistantText);
+          }
+
+          const functionCalls = (Array.isArray(responseJson?.output) ? responseJson.output : [])
+            .filter((item: any) => item?.type === 'function_call');
+          if (functionCalls.length === 0) break;
+
+          const passSummaries: string[] = [];
+          const passDetails: string[] = [];
+          nextInput = [];
+
+          for (const functionCall of functionCalls) {
+            const outcome = await executeAssistantToolCall({
+              name: functionCall.name,
+              args: safeJsonParse(functionCall.arguments || '{}'),
+              callId: functionCall.call_id,
+            });
+            passSummaries.push(outcome.summary);
+            passDetails.push(outcome.detail);
+            nextInput.push({
+              type: 'function_call_output',
+              call_id: functionCall.call_id,
+              output: JSON.stringify(outcome.result ?? { summary: outcome.summary, detail: outcome.detail }),
+            });
+          }
+
+          if (passSummaries.length > 0) {
+            emitAssistantLog(`Step ${pass + 1} log:\n${passSummaries.map(summary => `- ${summary}`).join('\n')}`);
+          }
+          if (passDetails.length > 0) {
+            toolProgressNotes.push(passDetails.join(' '));
+          }
+
+          previousResponseId = responseJson.id;
+        }
+      };
+
+      const runAnthropicLoop = async () => {
+        const messages: any[] = [{ role: 'user', content: buildAssistantPrompt() }];
+
+        for (let pass = 0; pass < maxAssistantToolPasses; pass++) {
+          const payload: any = {
+            model,
+            max_tokens: effectiveAssistantUseChainOfThought ? 8192 : 4096,
+            messages,
+            tools: assistantTools.map(toAnthropicToolDefinition),
+          };
+          if (effectiveAssistantUseChainOfThought) {
+            payload.thinking = { type: 'enabled', budget_tokens: 2048 };
+          }
+
+          const response = await fetch('https://api.anthropic.com/v1/messages', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'x-api-key': apiKey,
+              'anthropic-version': '2023-06-01',
+            },
+            body: JSON.stringify(payload),
+          });
+
+          const responseJson = await response.json();
+          if (!response.ok) {
+            throw new Error(responseJson?.error?.message || 'Anthropic request failed.');
+          }
+
+          const assistantText = extractAnthropicVisibleText(responseJson);
+          applyAssistantUsage(
+            usageTotals,
+            {
+              promptTokenCount: responseJson?.usage?.input_tokens,
+              candidateTokenCount: responseJson?.usage?.output_tokens,
+              totalTokenCount: (
+                typeof responseJson?.usage?.input_tokens === 'number'
+                && typeof responseJson?.usage?.output_tokens === 'number'
+              ) ? responseJson.usage.input_tokens + responseJson.usage.output_tokens : undefined,
+              hasModelUsage: !!responseJson?.usage,
+            },
+            JSON.stringify(messages),
+            assistantText,
+          );
+
+          if (assistantText) {
+            emitAssistantLiveMessage(assistantText);
+          }
+
+          const toolCalls = (Array.isArray(responseJson?.content) ? responseJson.content : [])
+            .filter((block: any) => block?.type === 'tool_use');
+          if (toolCalls.length === 0) break;
+
+          const passSummaries: string[] = [];
+          const passDetails: string[] = [];
+          const toolResults: any[] = [];
+
+          for (const toolCall of toolCalls) {
+            const outcome = await executeAssistantToolCall({
+              name: toolCall.name,
+              args: toolCall.input,
+              callId: toolCall.id,
+            });
+            passSummaries.push(outcome.summary);
+            passDetails.push(outcome.detail);
+            toolResults.push({
+              type: 'tool_result',
+              tool_use_id: toolCall.id,
+              content: JSON.stringify(outcome.result ?? { summary: outcome.summary, detail: outcome.detail }),
+            });
+          }
+
+          if (passSummaries.length > 0) {
+            emitAssistantLog(`Step ${pass + 1} log:\n${passSummaries.map(summary => `- ${summary}`).join('\n')}`);
+          }
+          if (passDetails.length > 0) {
+            toolProgressNotes.push(passDetails.join(' '));
+          }
+
+          messages.push({ role: 'assistant', content: responseJson.content });
+          messages.push({ role: 'user', content: toolResults });
+        }
+      };
+
+      if (provider === 'gemini') {
+        await runGeminiLoop();
+      } else if (provider === 'openai') {
+        await runOpenAILoop();
+      } else {
+        await runAnthropicLoop();
       }
 
       if (!emittedAssistantMessage) {
@@ -6981,37 +8238,40 @@ finally:
         });
       }
 
-      const inputTokenCount = totalPromptTokenCount + totalToolUsePromptTokenCount;
-      const outputTokenCount = totalCandidateTokenCount + totalThoughtsTokenCount;
-      const normalizedTotalTokenCount = totalTokenCount > 0
-        ? totalTokenCount
+      const inputTokenCount = usageTotals.totalPromptTokenCount + usageTotals.totalToolUsePromptTokenCount;
+      const outputTokenCount = usageTotals.totalCandidateTokenCount + usageTotals.totalThoughtsTokenCount;
+      const normalizedTotalTokenCount = usageTotals.totalTokenCount > 0
+        ? usageTotals.totalTokenCount
         : inputTokenCount + outputTokenCount;
       const source: AssistantTurnUsageSource =
-        modelUsagePassCount > 0 && approximationPassCount === 0
+        usageTotals.modelUsagePassCount > 0 && usageTotals.approximationPassCount === 0
           ? 'model'
-          : modelUsagePassCount > 0
+          : usageTotals.modelUsagePassCount > 0
             ? 'mixed'
             : 'approximation';
 
       setAssistantTurnUsageByChatId(prev => ({
         ...prev,
         [chatId]: {
-          promptTokenCount: totalPromptTokenCount,
-          toolUsePromptTokenCount: totalToolUsePromptTokenCount,
+          promptTokenCount: usageTotals.totalPromptTokenCount,
+          toolUsePromptTokenCount: usageTotals.totalToolUsePromptTokenCount,
           inputTokenCount,
-          candidateTokenCount: totalCandidateTokenCount,
-          thoughtsTokenCount: totalThoughtsTokenCount,
+          candidateTokenCount: usageTotals.totalCandidateTokenCount,
+          thoughtsTokenCount: usageTotals.totalThoughtsTokenCount,
           outputTokenCount,
           totalTokenCount: normalizedTotalTokenCount,
-          paidCostUsd: calculateAssistantPaidCostUsd(inputTokenCount, outputTokenCount),
-          passCount: modelUsagePassCount + approximationPassCount,
+          paidCostUsd: calculateAssistantPaidCostUsd(provider, model, inputTokenCount, outputTokenCount),
+          passCount: usageTotals.modelUsagePassCount + usageTotals.approximationPassCount,
           source,
           updatedAt: Date.now(),
         },
       }));
     } catch (error) {
       console.error(error);
-      appendAssistantMessage(chatId, { role: 'assistant', content: 'Sorry, I encountered an error connecting to the AI.' });
+      appendAssistantMessage(chatId, {
+        role: 'assistant',
+        content: `The assistant request failed.\n\nError: \`${getAssistantErrorMessage(error)}\``,
+      });
     } finally {
       setLoadingAssistantChatId(null);
     }
@@ -8569,6 +9829,7 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
       const isHistoryOpen = !!assistantHistoryOpenByChatId[chatId];
       const tokenEstimate = assistantTokenEstimates[chatId];
       const lastTurnUsage = assistantTurnUsageByChatId[chatId];
+      const assistantStatusLabel = `${getAssistantProviderLabel(settings.assistantProvider)} · ${settings.assistantModel || 'No model selected'}`;
 
       return (
         <div className="h-full w-full bg-[rgb(28,28,28)] border-white/10 flex flex-col min-h-0 relative">
@@ -8618,6 +9879,15 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
             </div>
           )}
           <div className="flex-1 overflow-y-auto p-4 space-y-4 custom-scrollbar">
+            <div className="rounded-xl border border-white/10 bg-white/5 px-3 py-2">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="text-[11px] font-medium uppercase tracking-wide text-zinc-500">Assistant Session</div>
+                <div className="text-[10px] text-zinc-400">{assistantStatusLabel}</div>
+              </div>
+              <div className="mt-1 text-[10px] text-zinc-500">
+                Chain of Thought: {effectiveAssistantUseChainOfThought ? 'On' : 'Off'} · {assistantConfiguredApiKey ? 'API key ready' : `Add your ${getAssistantApiKeyLabel(settings.assistantProvider)} in Settings`}
+              </div>
+            </div>
             {chat.messages.length === 0 && (
               <div className="text-center py-10 space-y-4">
                 <div className="w-12 h-12 bg-indigo-600/20 rounded-full flex items-center justify-center mx-auto text-indigo-400">
@@ -8637,29 +9907,38 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
                   "max-w-[95%] p-3 rounded-2xl text-sm prose prose-invert prose-sm",
                   msg.role === 'user'
                     ? "bg-indigo-600 text-white rounded-tr-none"
-                    : "bg-white/5 text-zinc-300 rounded-tl-none border border-white/5"
+                    : msg.kind === 'log'
+                      ? "bg-black/30 text-zinc-400 rounded-tl-none border border-amber-500/20"
+                      : "bg-white/5 text-zinc-300 rounded-tl-none border border-white/5"
                 )}>
                   {msg.role === 'assistant' ? (
-                    <ReactMarkdown
-                      components={{
-                        code({ node, inline, className, children, ...props }: any) {
-                          return (
-                            <code
-                              className={cn(
-                                "bg-black/40 px-1.5 py-0.5 rounded text-indigo-300 font-mono text-xs",
-                                !inline && "block p-3 my-2 overflow-x-auto border border-white/10",
-                                className
-                              )}
-                              {...props}
-                            >
-                              {children}
-                            </code>
-                          )
-                        }
-                      }}
-                    >
-                      {msg.content}
-                    </ReactMarkdown>
+                    <>
+                      {msg.kind === 'log' && (
+                        <div className="mb-2 text-[10px] font-medium uppercase tracking-wide text-amber-300/80">
+                          Agent Log
+                        </div>
+                      )}
+                      <ReactMarkdown
+                        components={{
+                          code({ node, inline, className, children, ...props }: any) {
+                            return (
+                              <code
+                                className={cn(
+                                  "bg-black/40 px-1.5 py-0.5 rounded text-indigo-300 font-mono text-xs",
+                                  !inline && "block p-3 my-2 overflow-x-auto border border-white/10",
+                                  className
+                                )}
+                                {...props}
+                              >
+                                {children}
+                              </code>
+                            )
+                          }
+                        }}
+                      >
+                        {msg.content}
+                      </ReactMarkdown>
+                    </>
                   ) : (
                     <div className="whitespace-pre-wrap">{msg.content}</div>
                   )}
@@ -8680,6 +9959,11 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
           </div>
 
           <form onSubmit={(e) => handleChatSubmit(chatId, e)} className="p-4 border-t border-white/5 bg-[rgb(28,28,28)]">
+            {!assistantConfiguredApiKey && (
+              <div className="mb-3 rounded-xl border border-amber-500/20 bg-amber-500/10 px-3 py-2 text-[11px] text-amber-200">
+                Add your {getAssistantApiKeyLabel(settings.assistantProvider)} in Settings to send requests.
+              </div>
+            )}
             <div className="relative flex flex-col gap-2">
               <textarea
                 value={chatInput}
@@ -8696,20 +9980,20 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
               />
               <button
                 type="submit"
-                disabled={!chatInput.trim() || isChatLoading}
+                disabled={!chatInput.trim() || isChatLoading || !assistantConfiguredApiKey}
                 className="absolute right-2 bottom-2 p-2 text-indigo-400 hover:text-indigo-300 disabled:text-zinc-600 transition-colors"
               >
                 <ChevronRight size={20} />
               </button>
             </div>
-            {(chatInput.trim() || lastTurnUsage) && (
+            {settings.assistantShowUsagePopup && (chatInput.trim() || lastTurnUsage) && (
               <div className="mt-3 grid grid-cols-1 gap-2">
                 {chatInput.trim() && tokenEstimate && (
                   <div className="rounded-xl border border-white/10 bg-white/5 px-3 py-2">
                     <div className="flex items-center justify-between gap-3">
                       <div className="text-[11px] font-medium uppercase tracking-wide text-zinc-500">Next Send Estimate</div>
                       <div className="text-[10px] text-zinc-500">
-                        {ASSISTANT_MODEL_NAME} · {tokenEstimate.source === 'model' ? 'model count' : 'local estimate'}
+                        {assistantStatusLabel} · {tokenEstimate.source === 'model' ? 'model count' : 'local estimate'}
                       </div>
                     </div>
                     <div className="mt-2 grid grid-cols-2 sm:grid-cols-4 gap-2">
@@ -8737,11 +10021,12 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
                       </div>
                     </div>
                     <div className="mt-2 text-[10px] text-zinc-500">
-                      Paid-tier estimate uses Google Gemini pricing for text input/output. Projected output uses the last actual response size for this chat, or {formatAssistantTokenCount(DEFAULT_ASSISTANT_ESTIMATED_OUTPUT_TOKENS)} tokens by default. Free tier can still be $0 while quota remains.
+                      Projected output uses the last actual response size for this chat, or {formatAssistantTokenCount(DEFAULT_ASSISTANT_ESTIMATED_OUTPUT_TOKENS)} tokens by default. Cost is only shown when pricing data is available for the selected provider/model.
                     </div>
                     {tokenEstimate.error && tokenEstimate.source === 'approximation' && (
                       <div className="mt-1 text-[10px] text-amber-300">
                         Fell back to a local approximation because live token counting was unavailable.
+                        {' '}Error: <span className="font-mono">{tokenEstimate.error}</span>
                       </div>
                     )}
                   </div>
@@ -8993,6 +10278,150 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
               </div>
 
               <div className="flex-1 overflow-y-auto p-6 space-y-8 custom-scrollbar">
+                <section>
+                  <h4 className="text-xs font-bold uppercase tracking-widest text-zinc-500 mb-4">AI Assistant</h4>
+                  <div className="rounded-2xl border border-white/10 bg-white/5 p-4 space-y-4">
+                    <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)] gap-4">
+                      <label className="block space-y-2">
+                        <div className="text-xs font-medium uppercase tracking-wide text-zinc-500">Provider</div>
+                        <select
+                          value={settings.assistantProvider}
+                          onChange={(e) => {
+                            const nextProvider = e.target.value as AssistantProvider;
+                            setSettings(current => ({
+                              ...current,
+                              assistantProvider: nextProvider,
+                              assistantModel: getAssistantDefaultModel(nextProvider),
+                            }));
+                          }}
+                          className="w-full rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-sm text-white outline-none transition-colors focus:border-indigo-500"
+                        >
+                          {ASSISTANT_PROVIDER_OPTIONS.map(option => (
+                            <option key={option.value} value={option.value}>{option.label}</option>
+                          ))}
+                        </select>
+                        <div className="text-xs text-zinc-500">
+                          Choose which API provider CodeCraft should call for the assistant.
+                        </div>
+                      </label>
+
+                      <label className="block space-y-2">
+                        <div className="text-xs font-medium uppercase tracking-wide text-zinc-500">Model</div>
+                        <input
+                          list="assistant-model-options"
+                          value={settings.assistantModel}
+                          onChange={(e) => setSettings(current => ({ ...current, assistantModel: e.target.value }))}
+                          placeholder="Enter or choose a model"
+                          className="w-full rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-sm text-white outline-none transition-colors focus:border-indigo-500"
+                        />
+                        <datalist id="assistant-model-options">
+                          {ASSISTANT_MODEL_PRESETS[settings.assistantProvider].map(option => (
+                            <option key={option.id} value={option.id}>{option.label}</option>
+                          ))}
+                        </datalist>
+                        <div className="text-xs text-zinc-500">
+                          Pick one of the recommended models or type a custom model id.
+                        </div>
+                      </label>
+                    </div>
+
+                    <div className="space-y-2">
+                      <div className="text-xs font-medium uppercase tracking-wide text-zinc-500">
+                        {getAssistantApiKeyLabel(settings.assistantProvider)}
+                      </div>
+                      <div className="flex items-stretch gap-2">
+                        <input
+                          type={showAssistantApiKey ? 'text' : 'password'}
+                          value={settings.assistantApiKey}
+                          onChange={(e) => setSettings(current => ({ ...current, assistantApiKey: e.target.value }))}
+                          placeholder={`Paste your ${getAssistantApiKeyLabel(settings.assistantProvider).toLowerCase()}`}
+                          className="flex-1 rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-sm text-white outline-none transition-colors focus:border-indigo-500"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => setShowAssistantApiKey(value => !value)}
+                          className="px-3 rounded-xl border border-white/10 bg-black/20 text-xs text-zinc-300 hover:bg-white/5 transition-colors"
+                        >
+                          {showAssistantApiKey ? 'Hide' : 'Show'}
+                        </button>
+                      </div>
+                      <div className="text-xs text-zinc-500">
+                        This key is used from the settings input instead of `.env`, and it stays in this browser’s local storage.
+                      </div>
+                    </div>
+
+                    <div className="flex items-center justify-between gap-4 rounded-xl border border-white/10 bg-black/20 px-4 py-3">
+                      <div>
+                        <div className="text-sm font-medium text-white">Chain of Thought</div>
+                        <div className="text-xs text-zinc-500">
+                          {getAssistantReasoningAvailabilityNote(settings.assistantProvider, settings.assistantModel)}
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        disabled={assistantReasoningControl !== 'toggleable'}
+                        onClick={() => setSettings(current => ({
+                          ...current,
+                          assistantUseChainOfThought: !current.assistantUseChainOfThought,
+                        }))}
+                        className={cn(
+                          "w-10 h-5 rounded-full transition-all relative disabled:cursor-not-allowed disabled:opacity-60",
+                          effectiveAssistantUseChainOfThought ? "bg-indigo-600" : "bg-zinc-700"
+                        )}
+                      >
+                        <div className={cn(
+                          "absolute top-1 w-3 h-3 bg-white rounded-full transition-all",
+                          effectiveAssistantUseChainOfThought ? "right-1" : "left-1"
+                        )} />
+                      </button>
+                    </div>
+
+                    <div className="flex items-center justify-between gap-4 rounded-xl border border-white/10 bg-black/20 px-4 py-3">
+                      <div>
+                        <div className="text-sm font-medium text-white">Show Usage Popup</div>
+                        <div className="text-xs text-zinc-500">
+                          Show or hide the assistant usage panel beneath the chat input.
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setSettings(current => ({
+                          ...current,
+                          assistantShowUsagePopup: !current.assistantShowUsagePopup,
+                        }))}
+                        className={cn(
+                          "w-10 h-5 rounded-full transition-all relative",
+                          settings.assistantShowUsagePopup ? "bg-indigo-600" : "bg-zinc-700"
+                        )}
+                      >
+                        <div className={cn(
+                          "absolute top-1 w-3 h-3 bg-white rounded-full transition-all",
+                          settings.assistantShowUsagePopup ? "right-1" : "left-1"
+                        )} />
+                      </button>
+                    </div>
+
+                    <label className="block space-y-2">
+                      <div className="text-xs font-medium uppercase tracking-wide text-zinc-500">Max CoT Depth</div>
+                      <input
+                        type="number"
+                        min={1}
+                        max={12}
+                        step={1}
+                        value={settings.assistantMaxChainOfThoughtDepth}
+                        onChange={(e) => setSettings(current => ({
+                          ...current,
+                          assistantMaxChainOfThoughtDepth: normalizeAssistantMaxChainOfThoughtDepth(Number(e.target.value)),
+                        }))}
+                        className="w-full rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-sm text-white outline-none transition-colors focus:border-indigo-500"
+                      />
+                      <div className="text-xs text-zinc-500">
+                        Limits Chain of Thought tool rounds per assistant turn. Range: 1 to 12. Current effective limit: {effectiveAssistantMaxChainOfThoughtDepth}.
+                      </div>
+                    </label>
+                  </div>
+                </section>
+
                 {/* Execution Settings */}
                 <section>
                   <h4 className="text-xs font-bold uppercase tracking-widest text-zinc-500 mb-4">Execution</h4>
