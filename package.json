@@ -4,9 +4,9 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "prepare": "node scripts/build-minimal-typeshed.mjs && node scripts/sync-browser-csharp-runtime.mjs && node scripts/sync-intellisage-runtime.mjs && node scripts/sync-pyodide-runtime.mjs",
-    "postinstall": "node scripts/sync-browser-csharp-runtime.mjs && node scripts/sync-intellisage-runtime.mjs && node scripts/sync-pyodide-runtime.mjs",
-    "prebuild": "node scripts/build-minimal-typeshed.mjs && node scripts/sync-browser-csharp-runtime.mjs && node scripts/sync-intellisage-runtime.mjs && node scripts/sync-pyodide-runtime.mjs",
+    "prepare": "node scripts/build-minimal-typeshed.mjs && node scripts/sync-browser-csharp-runtime.mjs && node scripts/sync-intellisage-runtime.mjs && node scripts/sync-pyodide-runtime.mjs && node scripts/sync-codex-cli-static.mjs",
+    "postinstall": "node scripts/sync-browser-csharp-runtime.mjs && node scripts/sync-intellisage-runtime.mjs && node scripts/sync-pyodide-runtime.mjs && node scripts/sync-codex-cli-static.mjs",
+    "prebuild": "node scripts/build-minimal-typeshed.mjs && node scripts/sync-browser-csharp-runtime.mjs && node scripts/sync-intellisage-runtime.mjs && node scripts/sync-pyodide-runtime.mjs && node scripts/sync-codex-cli-static.mjs",
     "csharp:intellisage:publish": "dotnet publish vendor/intellisage-wasm/Intellisage.csproj -c Release",
     "dev": "vite",
     "build": "vite build",

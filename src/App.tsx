@@ -33,6 +33,23 @@ import { Layout, Model, TabNode, IJsonModel, Actions, DockLocation } from 'flexl
 import 'flexlayout-react/style/dark.css';
 import * as Tooltip from '@radix-ui/react-tooltip';
 import * as Separator from '@radix-ui/react-separator';
+import {
+  CODEX_CLI_RESPONSES_ENDPOINT,
+  CODEX_CLI_STATIC_REPOSITORY,
+  DEFAULT_CODEX_CLI_OAUTH_SESSION,
+  buildCodexCliPromptPrefix,
+  completeCodexCliBrowserLogin,
+  extractCodexCliVisibleText,
+  formatCodexCliStatusLines,
+  normalizeCodexCliMcpServers,
+  normalizeCodexCliOAuthSession,
+  normalizeCodexCliReasoningEffort,
+  runCodexCliTerminalCommand,
+  type CodexCliMcpServer,
+  type CodexCliOAuthSession,
+  type CodexCliReasoningEffort,
+  type CodexCliRuntimeState,
+} from './codex-cli-static';
 
 type UserFolder = import('./pyright').UserFolder;
 type PyrightModule = typeof import('./pyright');
@@ -410,7 +427,7 @@ interface SyncMeta {
   connectedAt: number;
 }
 
-type AssistantProvider = 'gemini' | 'openai' | 'anthropic';
+type AssistantProvider = 'codex-cli' | 'gemini' | 'openai' | 'anthropic';
 type AssistantMessageKind = 'message' | 'log';
 type AssistantReasoningControl = 'toggleable' | 'always_on' | 'always_off';
 type AssistantSchemaPrimitive = 'string' | 'number' | 'boolean';
@@ -462,12 +479,18 @@ const DEFAULT_PYI_IMPORT_SIZE_LIMIT_BYTES = 200 * 1024;
 const ABSOLUTE_PYI_IMPORT_SIZE_LIMIT_BYTES = 2 * 1024 * 1024;
 
 const ASSISTANT_PROVIDER_OPTIONS: { value: AssistantProvider; label: string }[] = [
+  { value: 'codex-cli', label: 'Codex CLI' },
   { value: 'gemini', label: 'Google Gemini' },
   { value: 'openai', label: 'OpenAI' },
   { value: 'anthropic', label: 'Anthropic' },
 ];
 
 const ASSISTANT_MODEL_PRESETS: Record<AssistantProvider, AssistantModelPreset[]> = {
+  'codex-cli': [
+    { id: 'gpt-5.4', label: 'GPT-5.4', reasoningControl: 'toggleable' },
+    { id: 'gpt-5.3-codex', label: 'GPT-5.3 Codex', reasoningControl: 'toggleable' },
+    { id: 'gpt-5.2', label: 'GPT-5.2', reasoningControl: 'toggleable' },
+  ],
   gemini: [
     { id: 'gemini-2.5-flash', label: 'Gemini 2.5 Flash', reasoningControl: 'toggleable' },
     { id: 'gemini-2.5-flash-lite', label: 'Gemini 2.5 Flash Lite', reasoningControl: 'toggleable' },
@@ -773,7 +796,7 @@ const buildSharedEditorOptions = (fontSize: number) => ({
 
 // Define AI tools
 function isAssistantProvider(value: unknown): value is AssistantProvider {
-  return value === 'gemini' || value === 'openai' || value === 'anthropic';
+  return value === 'codex-cli' || value === 'gemini' || value === 'openai' || value === 'anthropic';
 }
 
 function getAssistantDefaultModel(provider: AssistantProvider) {
@@ -784,23 +807,14 @@ function getAssistantProviderLabel(provider: AssistantProvider) {
   return ASSISTANT_PROVIDER_OPTIONS.find(option => option.value === provider)?.label || provider;
 }
 
-function getAssistantApiKeyLabel(provider: AssistantProvider) {
-  switch (provider) {
-    case 'gemini':
-      return 'Gemini API key';
-    case 'openai':
-      return 'OpenAI API key';
-    case 'anthropic':
-      return 'Anthropic API key';
-    default:
-      return 'API key';
-  }
-}
-
 function getAssistantReasoningControl(provider: AssistantProvider, model: string): AssistantReasoningControl {
   const trimmed = model.trim();
   const preset = ASSISTANT_MODEL_PRESETS[provider].find(entry => entry.id === trimmed);
   if (preset) return preset.reasoningControl;
+
+  if (provider === 'codex-cli') {
+    return 'toggleable';
+  }
 
   if (provider === 'gemini') {
     if (/^gemini-2\.5-flash(-lite)?/i.test(trimmed)) return 'toggleable';
@@ -823,6 +837,10 @@ function getAssistantReasoningControl(provider: AssistantProvider, model: string
 }
 
 function getAssistantReasoningAvailabilityNote(provider: AssistantProvider, model: string) {
+  if (provider === 'codex-cli') {
+    return 'Codex CLI mode sends a reasoning effort control and shows only user-visible summaries.';
+  }
+
   switch (getAssistantReasoningControl(provider, model)) {
     case 'toggleable':
       return 'This provider/model can switch Chain of Thought on or off.';
@@ -1195,6 +1213,53 @@ const terminalWhoamiTool: AssistantToolDefinition = {
   },
 };
 
+const codexMcpListServersTool: AssistantToolDefinition = {
+  name: "codexMcpListServers",
+  description: "List MCP servers configured for Codex CLI mode in CodeCraft.",
+  parameters: {
+    type: 'object',
+    properties: {},
+  },
+};
+
+const codexMcpListToolsTool: AssistantToolDefinition = {
+  name: "codexMcpListTools",
+  description: "List tools exposed by a configured streamable HTTP MCP server.",
+  parameters: {
+    type: 'object',
+    properties: {
+      serverName: {
+        type: 'string',
+        description: "Configured MCP server name.",
+      },
+    },
+    required: ['serverName'],
+  },
+};
+
+const codexMcpCallTool: AssistantToolDefinition = {
+  name: "codexMcpCallTool",
+  description: "Call a tool on a configured streamable HTTP MCP server.",
+  parameters: {
+    type: 'object',
+    properties: {
+      serverName: {
+        type: 'string',
+        description: "Configured MCP server name.",
+      },
+      toolName: {
+        type: 'string',
+        description: "MCP tool name to call.",
+      },
+      argumentsJson: {
+        type: 'string',
+        description: "JSON object string containing the tool arguments.",
+      },
+    },
+    required: ['serverName', 'toolName'],
+  },
+};
+
 const pipInstallTool: AssistantToolDefinition = {
   name: "pipInstall",
   description: "Install a Python package in the fake terminal.",
@@ -1326,6 +1391,9 @@ const CHAIN_OF_THOUGHT_ASSISTANT_TOOLS: AssistantToolDefinition[] = [
   terminalDateTool,
   terminalEchoTool,
   terminalWhoamiTool,
+  codexMcpListServersTool,
+  codexMcpListToolsTool,
+  codexMcpCallTool,
   pipInstallTool,
   pipUpgradeTool,
   pipUninstallTool,
@@ -2049,6 +2117,10 @@ interface AppSettings {
   assistantProvider: AssistantProvider;
   assistantModel: string;
   assistantApiKey: string;
+  assistantOAuthSession: CodexCliOAuthSession;
+  codexCliMcpServers: CodexCliMcpServer[];
+  codexCliReasoningEffort: CodexCliReasoningEffort;
+  codexCliResponsesEndpoint: string;
   assistantUseChainOfThought: boolean;
   assistantShowUsagePopup: boolean;
   assistantMaxChainOfThoughtDepth: number;
@@ -2115,9 +2187,13 @@ const DEFAULT_SETTINGS: AppSettings = {
   projectRunMode: 'custom',
   projectRunCustomFileIds: [],
   projectRunEntryFileId: null,
-  assistantProvider: 'gemini',
-  assistantModel: getAssistantDefaultModel('gemini'),
+  assistantProvider: 'codex-cli',
+  assistantModel: getAssistantDefaultModel('codex-cli'),
   assistantApiKey: '',
+  assistantOAuthSession: DEFAULT_CODEX_CLI_OAUTH_SESSION,
+  codexCliMcpServers: [],
+  codexCliReasoningEffort: 'medium',
+  codexCliResponsesEndpoint: CODEX_CLI_RESPONSES_ENDPOINT,
   assistantUseChainOfThought: false,
   assistantShowUsagePopup: true,
   assistantMaxChainOfThoughtDepth: DEFAULT_ASSISTANT_TOOL_PASSES,
@@ -2530,6 +2606,12 @@ export default function App() {
       assistantProvider,
       assistantModel,
       assistantApiKey: typeof merged.assistantApiKey === 'string' ? merged.assistantApiKey : '',
+      assistantOAuthSession: normalizeCodexCliOAuthSession(merged.assistantOAuthSession),
+      codexCliMcpServers: normalizeCodexCliMcpServers(merged.codexCliMcpServers),
+      codexCliReasoningEffort: normalizeCodexCliReasoningEffort(merged.codexCliReasoningEffort),
+      codexCliResponsesEndpoint: typeof merged.codexCliResponsesEndpoint === 'string' && merged.codexCliResponsesEndpoint.trim()
+        ? merged.codexCliResponsesEndpoint.trim()
+        : CODEX_CLI_RESPONSES_ENDPOINT,
       assistantUseChainOfThought: !!merged.assistantUseChainOfThought,
       assistantShowUsagePopup: merged.assistantShowUsagePopup !== false,
       assistantMaxChainOfThoughtDepth: normalizeAssistantMaxChainOfThoughtDepth(
@@ -2557,7 +2639,6 @@ export default function App() {
   const [settingsCSharpNamespaceInput, setSettingsCSharpNamespaceInput] = useState('');
   const [settingsCSharpNamespaceBusy, setSettingsCSharpNamespaceBusy] = useState(false);
   const [settingsCSharpNamespaceStatus, setSettingsCSharpNamespaceStatus] = useState('');
-  const [showAssistantApiKey, setShowAssistantApiKey] = useState(false);
   const [syncMeta, setSyncMeta] = useState<SyncMeta[]>(loadSyncMeta);
   const pendingEdit = pendingEdits[0] ?? null;
   const editorRef = useRef<any>(null);
@@ -2575,6 +2656,7 @@ export default function App() {
   const outputInteractionIdRef = useRef(0);
   const outputPreviewUrlsRef = useRef<string[]>([]);
   const assistantEstimateRequestIdRef = useRef(0);
+  const codexLoginCallbackHandledRef = useRef(false);
   const terminalOutputRef = useRef(terminalOutput);
   terminalOutputRef.current = terminalOutput;
   const terminalCwdRef = useRef<string | null>(terminalCwd);
@@ -2608,6 +2690,18 @@ export default function App() {
         : false;
   const effectiveAssistantMaxChainOfThoughtDepth = normalizeAssistantMaxChainOfThoughtDepth(settings.assistantMaxChainOfThoughtDepth);
   const assistantConfiguredApiKey = settings.assistantApiKey.trim();
+  const assistantConfiguredOAuth =
+    settings.assistantOAuthSession?.status === 'connected'
+    && !!settings.assistantOAuthSession.accessToken;
+  const assistantAuthReady = settings.assistantProvider === 'codex-cli'
+    ? assistantConfiguredOAuth
+    : !!assistantConfiguredApiKey;
+  const codexCliRuntimeState: CodexCliRuntimeState = {
+    oauth: settings.assistantOAuthSession,
+    mcpServers: settings.codexCliMcpServers,
+    reasoningEffort: settings.codexCliReasoningEffort,
+    responsesEndpoint: settings.codexCliResponsesEndpoint || CODEX_CLI_RESPONSES_ENDPOINT,
+  };
   const activeEditorTabNode: any = activeEditorTabId ? layoutModel.getNodeById(activeEditorTabId) : null;
   const activeEditorTabItemId =
     activeEditorTabNode?.getComponent?.() === 'editor'
@@ -3379,6 +3473,26 @@ export default function App() {
   }, [settings]);
 
   useEffect(() => {
+    if (codexLoginCallbackHandledRef.current || typeof window === 'undefined') return;
+    const callbackUrl = new URL(window.location.href);
+    const hasCodexCallback = callbackUrl.searchParams.has('code') || callbackUrl.searchParams.has('error');
+    if (!hasCodexCallback) return;
+
+    codexLoginCallbackHandledRef.current = true;
+    completeCodexCliBrowserLogin(callbackUrl.toString(), settings.assistantOAuthSession).then(result => {
+      setSettings(current => ({
+        ...current,
+        assistantProvider: 'codex-cli',
+        assistantOAuthSession: result.nextOAuthSession ?? current.assistantOAuthSession,
+      }));
+      setTerminalOutput(prev => [...prev, '~ $ codex login --callback', ...result.lines]);
+      const cleanPath = callbackUrl.pathname.endsWith('/auth/callback') ? '/' : callbackUrl.pathname;
+      window.history.replaceState({}, document.title, `${cleanPath}${callbackUrl.hash || ''}`);
+      selectDockPanel('terminal');
+    });
+  }, [settings.assistantOAuthSession]);
+
+  useEffect(() => {
     const nextRunnableFiles = getProjectRunnableFiles();
     const runnableIds = new Set(nextRunnableFiles.map(file => file.id));
 
@@ -3572,6 +3686,7 @@ export default function App() {
           assistantTerminalCwd: terminalCwd,
           useChainOfThought: estimateUseChainOfThought,
           maxChainOfThoughtDepth: effectiveAssistantMaxChainOfThoughtDepth,
+          codexCliPrefix: estimateProvider === 'codex-cli' ? buildCodexCliPromptPrefix(codexCliRuntimeState) : '',
         });
 
         setAssistantTokenEstimates(prev => ({
@@ -3609,7 +3724,9 @@ export default function App() {
 
         if (estimateProvider !== 'gemini' || !estimateApiKey || !estimateModel) {
           finalizeApproximateEstimate(
-            !estimateApiKey ? `Add your ${getAssistantApiKeyLabel(estimateProvider)} to enable live token counting.` : undefined
+            !estimateApiKey && estimateProvider !== 'codex-cli'
+              ? 'Live token counting is unavailable without a saved legacy credential.'
+              : undefined
           );
           return;
         }
@@ -3759,6 +3876,7 @@ export default function App() {
     maxChainOfThoughtDepth?: number;
     toolProgressNotes?: string[];
     assistantLiveNotes?: string[];
+    codexCliPrefix?: string;
   }) {
     const {
       chatId,
@@ -3771,6 +3889,7 @@ export default function App() {
       maxChainOfThoughtDepth = DEFAULT_ASSISTANT_TOOL_PASSES,
       toolProgressNotes = [],
       assistantLiveNotes = [],
+      codexCliPrefix = '',
     } = params;
 
     const getPathFromSnapshot = (id: string | undefined): string => {
@@ -3795,6 +3914,7 @@ export default function App() {
     if (useChainOfThought) {
       return `
         Context: You are an AI coding assistant inside CodeCraft IDE.
+        ${codexCliPrefix ? `\n${codexCliPrefix}\n` : ''}
         Internal Chat ID: ${chatId}
         Keep continuity with the existing chat history for this chat.
         You are in tool-driven Chain of Thought mode.
@@ -3819,6 +3939,7 @@ export default function App() {
 
     return `
         Context: You are an AI coding assistant inside CodeCraft IDE.
+        ${codexCliPrefix ? `\n${codexCliPrefix}\n` : ''}
         Internal Chat ID: ${chatId}
         Keep continuity with the existing chat history for this chat.
         You have access to tools to propose edits, navigate, move cursor, directly create/delete/move files or folders, and run built-in terminal commands.
@@ -7332,14 +7453,23 @@ finally:
       const provider = settings.assistantProvider;
       const model = settings.assistantModel.trim();
       const apiKey = assistantConfiguredApiKey;
+      const oauthSession = settings.assistantOAuthSession;
       const assistantTools = buildAssistantToolSet(effectiveAssistantUseChainOfThought);
       const maxAssistantToolPasses = effectiveAssistantUseChainOfThought
         ? effectiveAssistantMaxChainOfThoughtDepth
         : DEFAULT_ASSISTANT_TOOL_PASSES;
-      if (!apiKey) {
+      if (provider === 'codex-cli' && (!oauthSession.accessToken || oauthSession.status !== 'connected')) {
         appendAssistantMessage(chatId, {
           role: 'assistant',
-          content: `Add your ${getAssistantApiKeyLabel(provider)} in Settings before using the assistant.`,
+          content: 'Connect Codex OAuth in Settings or run `codex login` in the Terminal before using Codex CLI mode.',
+        });
+        return;
+      }
+
+      if (provider !== 'codex-cli' && !apiKey) {
+        appendAssistantMessage(chatId, {
+          role: 'assistant',
+          content: `This provider still needs a saved credential. Switch to Codex CLI for OAuth-only mode.`,
         });
         return;
       }
@@ -7404,6 +7534,7 @@ finally:
         maxChainOfThoughtDepth: maxAssistantToolPasses,
         toolProgressNotes,
         assistantLiveNotes,
+        codexCliPrefix: provider === 'codex-cli' ? buildCodexCliPromptPrefix(codexCliRuntimeState) : '',
       });
 
       const emitAssistantLiveMessage = (content: string) => {
@@ -7470,6 +7601,35 @@ finally:
             currentWorkingDirectory: assistantTerminalCwd ? `/${getPathFromSnapshot(assistantTerminalCwd)}` : '/',
           },
         } satisfies AssistantToolExecutionResult;
+      };
+
+      const callCodexMcpServer = async (server: CodexCliMcpServer, method: string, params: Record<string, any>) => {
+        const response = await fetch(server.url, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(server.authStatus === 'connected' && settings.assistantOAuthSession.accessToken
+              ? { Authorization: `Bearer ${settings.assistantOAuthSession.accessToken}` }
+              : {}),
+          },
+          body: JSON.stringify({
+            jsonrpc: '2.0',
+            id: `codecraft-${Date.now()}`,
+            method,
+            params,
+          }),
+        });
+        const text = await response.text();
+        let body: any = text;
+        try {
+          body = text ? JSON.parse(text) : null;
+        } catch {
+          // Keep non-JSON MCP gateway responses visible to the model.
+        }
+        if (!response.ok) {
+          throw new Error(typeof body === 'string' ? body : (body?.error?.message || `MCP request failed with ${response.status}`));
+        }
+        return body;
       };
 
       const executeAssistantToolCall = async (call: { name: string; args?: Record<string, any>; callId?: string | null }): Promise<AssistantToolExecutionResult> => {
@@ -7877,6 +8037,7 @@ finally:
         if (call.name === 'terminalHelp') {
           const helpLines = [
             'Standard commands: ls, pwd, cd, mkdir, touch, open, cat, rm, clear, help, date, echo, whoami',
+            'Codex CLI: codex help | codex login | codex status | codex exec <prompt> | codex mcp list',
             'Python: pip install <package> [-force] | pip upgrade <package> [-version <ver>] | pip uninstall <package> | pip include <module> | pip list',
             'C#: nuget include <namespace> | nuget list',
           ];
@@ -7899,6 +8060,78 @@ finally:
         if (call.name === 'terminalWhoami') {
           appendTerminalCommandResult('whoami', ['codecraft-user']);
           return { summary: 'Displayed the current terminal user.', detail: 'codecraft-user', result: { ok: true, output: 'codecraft-user' } };
+        }
+
+        if (call.name === 'codexMcpListServers') {
+          const servers = settings.codexCliMcpServers.filter(server => server.enabled);
+          return {
+            summary: `Listed ${servers.length} Codex MCP server${servers.length === 1 ? '' : 's'}.`,
+            detail: servers.length
+              ? servers.map(server => `${server.name} ${server.url} auth=${server.authStatus}`).join('\n')
+              : 'No Codex MCP servers configured.',
+            result: { ok: true, servers },
+          };
+        }
+
+        if (call.name === 'codexMcpListTools') {
+          const serverName = typeof args.serverName === 'string' ? args.serverName.trim() : '';
+          const server = settings.codexCliMcpServers.find(candidate => candidate.name === serverName && candidate.enabled);
+          if (!server) {
+            return {
+              summary: `MCP server \`${serverName || 'unknown'}\` is not configured.`,
+              detail: `MCP server ${serverName || 'unknown'} is not configured.`,
+              result: { ok: false },
+            };
+          }
+          try {
+            const body = await callCodexMcpServer(server, 'tools/list', {});
+            return {
+              summary: `Listed tools from MCP server \`${server.name}\`.`,
+              detail: JSON.stringify(body),
+              result: { ok: true, server: server.name, response: body },
+            };
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            return {
+              summary: `Could not list MCP tools from \`${server.name}\`: ${message}`,
+              detail: message,
+              result: { ok: false, error: message },
+            };
+          }
+        }
+
+        if (call.name === 'codexMcpCallTool') {
+          const serverName = typeof args.serverName === 'string' ? args.serverName.trim() : '';
+          const toolName = typeof args.toolName === 'string' ? args.toolName.trim() : '';
+          const server = settings.codexCliMcpServers.find(candidate => candidate.name === serverName && candidate.enabled);
+          if (!server || !toolName) {
+            return {
+              summary: 'Could not call MCP tool because the server or tool name was missing.',
+              detail: 'MCP call failed because the server or tool name was missing.',
+              result: { ok: false },
+            };
+          }
+          try {
+            const toolArguments = typeof args.argumentsJson === 'string' && args.argumentsJson.trim()
+              ? safeJsonParse(args.argumentsJson)
+              : {};
+            const body = await callCodexMcpServer(server, 'tools/call', {
+              name: toolName,
+              arguments: toolArguments,
+            });
+            return {
+              summary: `Called MCP tool \`${toolName}\` on \`${server.name}\`.`,
+              detail: JSON.stringify(body),
+              result: { ok: true, server: server.name, tool: toolName, response: body },
+            };
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            return {
+              summary: `MCP tool call failed: ${message}`,
+              detail: message,
+              result: { ok: false, error: message },
+            };
+          }
         }
 
         if (call.name === 'pipInstall') {
@@ -8139,6 +8372,108 @@ finally:
         }
       };
 
+      const runCodexCliLoop = async () => {
+        let previousResponseId: string | undefined;
+        let nextInput: any = [{
+          role: 'user',
+          content: [{ type: 'input_text', text: buildAssistantPrompt() }],
+        }];
+        emitAssistantLog(
+          [
+            `Codex CLI mode: exec --experimental-json --model ${model}`,
+            `Static source: ${CODEX_CLI_STATIC_REPOSITORY.localClonePath} @ ${CODEX_CLI_STATIC_REPOSITORY.commit.slice(0, 7)}`,
+            `Reasoning effort: ${settings.codexCliReasoningEffort}`,
+          ].join('\n')
+        );
+
+        for (let pass = 0; pass < maxAssistantToolPasses; pass++) {
+          const payload: any = {
+            model,
+            input: nextInput,
+            tools: assistantTools.map(toOpenAIToolDefinition),
+            metadata: {
+              client: 'codecraft-codex-cli-static',
+              codex_git_commit: CODEX_CLI_STATIC_REPOSITORY.commit,
+            },
+          };
+          if (previousResponseId) payload.previous_response_id = previousResponseId;
+          if (settings.codexCliReasoningEffort !== 'off') {
+            payload.reasoning = {
+              effort: settings.codexCliReasoningEffort,
+              summary: effectiveAssistantUseChainOfThought ? 'auto' : 'none',
+            };
+          }
+
+          const response = await fetch(settings.codexCliResponsesEndpoint || CODEX_CLI_RESPONSES_ENDPOINT, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${oauthSession.accessToken}`,
+            },
+            body: JSON.stringify(payload),
+          });
+
+          const responseJson = await response.json();
+          if (!response.ok) {
+            throw new Error(responseJson?.error?.message || 'Codex CLI mode request failed.');
+          }
+
+          const assistantText = extractCodexCliVisibleText(responseJson);
+          const outputTokens = typeof responseJson?.usage?.output_tokens === 'number' ? responseJson.usage.output_tokens : undefined;
+          const reasoningTokens = typeof responseJson?.usage?.output_tokens_details?.reasoning_tokens === 'number'
+            ? responseJson.usage.output_tokens_details.reasoning_tokens
+            : 0;
+          applyAssistantUsage(
+            usageTotals,
+            {
+              promptTokenCount: responseJson?.usage?.input_tokens,
+              candidateTokenCount: typeof outputTokens === 'number' ? Math.max(0, outputTokens - reasoningTokens) : undefined,
+              thoughtsTokenCount: reasoningTokens,
+              totalTokenCount: responseJson?.usage?.total_tokens,
+              hasModelUsage: !!responseJson?.usage,
+            },
+            Array.isArray(nextInput) ? JSON.stringify(nextInput) : String(nextInput || ''),
+            assistantText,
+          );
+
+          if (assistantText) {
+            emitAssistantLiveMessage(assistantText);
+          }
+
+          const functionCalls = (Array.isArray(responseJson?.output) ? responseJson.output : [])
+            .filter((item: any) => item?.type === 'function_call');
+          if (functionCalls.length === 0) break;
+
+          const passSummaries: string[] = [];
+          const passDetails: string[] = [];
+          nextInput = [];
+
+          for (const functionCall of functionCalls) {
+            const outcome = await executeAssistantToolCall({
+              name: functionCall.name,
+              args: safeJsonParse(functionCall.arguments || '{}'),
+              callId: functionCall.call_id,
+            });
+            passSummaries.push(outcome.summary);
+            passDetails.push(outcome.detail);
+            nextInput.push({
+              type: 'function_call_output',
+              call_id: functionCall.call_id,
+              output: JSON.stringify(outcome.result ?? { summary: outcome.summary, detail: outcome.detail }),
+            });
+          }
+
+          if (passSummaries.length > 0) {
+            emitAssistantLog(`Codex step ${pass + 1} log:\n${passSummaries.map(summary => `- ${summary}`).join('\n')}`);
+          }
+          if (passDetails.length > 0) {
+            toolProgressNotes.push(passDetails.join(' '));
+          }
+
+          previousResponseId = responseJson.id;
+        }
+      };
+
       const runAnthropicLoop = async () => {
         const messages: any[] = [{ role: 'user', content: buildAssistantPrompt() }];
 
@@ -8223,7 +8558,9 @@ finally:
         }
       };
 
-      if (provider === 'gemini') {
+      if (provider === 'codex-cli') {
+        await runCodexCliLoop();
+      } else if (provider === 'gemini') {
         await runGeminiLoop();
       } else if (provider === 'openai') {
         await runOpenAILoop();
@@ -8527,6 +8864,94 @@ finally:
         setTerminalOutput(newOutput);
       } else {
         setTerminalOutput([...newOutput, `rm: cannot remove '${name}': No such file or directory`]);
+      }
+    } else if (cmd === 'codex') {
+      const pendingAuthWindow = (args[1] || '').toLowerCase() === 'login' && !args[2]
+        ? window.open('about:blank', '_blank')
+        : null;
+      const result = await runCodexCliTerminalCommand(args.slice(1), codexCliRuntimeState, settings.assistantModel);
+      const nextRuntimeState: CodexCliRuntimeState = {
+        ...codexCliRuntimeState,
+        oauth: result.nextOAuthSession ?? codexCliRuntimeState.oauth,
+        mcpServers: result.nextMcpServers ?? codexCliRuntimeState.mcpServers,
+        reasoningEffort: result.nextReasoningEffort ?? codexCliRuntimeState.reasoningEffort,
+      };
+      if (
+        result.nextOAuthSession
+        || result.nextMcpServers
+        || result.nextReasoningEffort
+        || result.nextModel
+      ) {
+        setSettings(current => ({
+          ...current,
+          assistantProvider: 'codex-cli',
+          assistantModel: result.nextModel || current.assistantModel,
+          assistantOAuthSession: result.nextOAuthSession ?? current.assistantOAuthSession,
+          codexCliMcpServers: result.nextMcpServers ?? current.codexCliMcpServers,
+          codexCliReasoningEffort: result.nextReasoningEffort ?? current.codexCliReasoningEffort,
+          assistantUseChainOfThought: result.nextReasoningEffort
+            ? result.nextReasoningEffort !== 'off'
+            : current.assistantUseChainOfThought,
+        }));
+      }
+
+      const terminalLines = [...newOutput, ...result.lines];
+      setTerminalOutput(terminalLines);
+      if (result.openUrl) {
+        if (pendingAuthWindow) {
+          pendingAuthWindow.opener = null;
+          pendingAuthWindow.location.href = result.openUrl;
+        } else {
+          window.open(result.openUrl, '_blank', 'noopener,noreferrer');
+        }
+      } else {
+        pendingAuthWindow?.close();
+      }
+
+      if (result.prompt) {
+        if (nextRuntimeState.oauth.status !== 'connected' || !nextRuntimeState.oauth.accessToken) {
+          setTerminalOutput([...terminalLines, 'codex exec error: OAuth is not connected. Run codex login first.']);
+        } else {
+          setTerminalOutput([...terminalLines, 'Codex CLI adapter: sending prompt...']);
+          try {
+            const activeContext = activeItem?.type === 'file'
+              ? `Active file ${getPath(activeItem.id)}:\n${activeItem.content || ''}`
+              : activeItem
+                ? `Active item ${getPath(activeItem.id)} is a folder.`
+                : 'No active file is selected.';
+            const response = await fetch(nextRuntimeState.responsesEndpoint, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${nextRuntimeState.oauth.accessToken}`,
+              },
+              body: JSON.stringify({
+                model: result.nextModel || settings.assistantModel,
+                input: [{
+                  role: 'user',
+                  content: [{
+                    type: 'input_text',
+                    text: [
+                      buildCodexCliPromptPrefix(nextRuntimeState),
+                      `Current fake terminal cwd: ${terminalCwd ? `/${getPath(terminalCwd)}` : '/'}`,
+                      activeContext,
+                      `USER: ${result.prompt}`,
+                    ].join('\n\n'),
+                  }],
+                }],
+                ...(nextRuntimeState.reasoningEffort !== 'off'
+                  ? { reasoning: { effort: nextRuntimeState.reasoningEffort, summary: 'auto' } }
+                  : {}),
+              }),
+            });
+            const json = await response.json();
+            if (!response.ok) throw new Error(json?.error?.message || `request failed with ${response.status}`);
+            const text = extractCodexCliVisibleText(json) || '(no assistant text returned)';
+            setTerminalOutput(prev => [...prev, text]);
+          } catch (error) {
+            setTerminalOutput(prev => [...prev, `codex exec error: ${error instanceof Error ? error.message : String(error)}`]);
+          }
+        }
       }
     } else if (cmd === 'pip') {
       const subCmd = args[1];
@@ -9234,7 +9659,7 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
         setTerminalOutput([...newOutput, 'Usage: nuget include <namespace> | nuget list']);
       }
     } else if (cmd === 'help') {
-      setTerminalOutput([...newOutput, 'Standard commands: ls, pwd, cd, mkdir, touch, open, cat, rm, clear, help, date, echo', 'Python: pip install <package> [-force] | pip upgrade <package> [-version <ver>] | pip uninstall <package> | pip include <module> | pip list', 'C#: nuget include <namespace> | nuget list']);
+      setTerminalOutput([...newOutput, 'Standard commands: ls, pwd, cd, mkdir, touch, open, cat, rm, clear, help, date, echo', 'Codex CLI: codex help | codex login | codex status | codex exec <prompt> | codex mcp list', 'Python: pip install <package> [-force] | pip upgrade <package> [-version <ver>] | pip uninstall <package> | pip include <module> | pip list', 'C#: nuget include <namespace> | nuget list']);
     } else if (cmd === 'date') {
       setTerminalOutput([...newOutput, new Date().toLocaleString()]);
     } else if (cmd === 'echo') {
@@ -9830,6 +10255,9 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
       const tokenEstimate = assistantTokenEstimates[chatId];
       const lastTurnUsage = assistantTurnUsageByChatId[chatId];
       const assistantStatusLabel = `${getAssistantProviderLabel(settings.assistantProvider)} · ${settings.assistantModel || 'No model selected'}`;
+      const assistantAuthStatusLabel = settings.assistantProvider === 'codex-cli'
+        ? (assistantConfiguredOAuth ? 'OAuth connected' : 'Connect Codex OAuth')
+        : (assistantConfiguredApiKey ? 'Legacy credential ready' : 'Switch to Codex CLI OAuth');
 
       return (
         <div className="h-full w-full bg-[rgb(28,28,28)] border-white/10 flex flex-col min-h-0 relative">
@@ -9885,7 +10313,7 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
                 <div className="text-[10px] text-zinc-400">{assistantStatusLabel}</div>
               </div>
               <div className="mt-1 text-[10px] text-zinc-500">
-                Chain of Thought: {effectiveAssistantUseChainOfThought ? 'On' : 'Off'} · {assistantConfiguredApiKey ? 'API key ready' : `Add your ${getAssistantApiKeyLabel(settings.assistantProvider)} in Settings`}
+                Chain of Thought: {effectiveAssistantUseChainOfThought ? 'On' : 'Off'} · {assistantAuthStatusLabel}
               </div>
             </div>
             {chat.messages.length === 0 && (
@@ -9959,9 +10387,11 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
           </div>
 
           <form onSubmit={(e) => handleChatSubmit(chatId, e)} className="p-4 border-t border-white/5 bg-[rgb(28,28,28)]">
-            {!assistantConfiguredApiKey && (
+            {!assistantAuthReady && (
               <div className="mb-3 rounded-xl border border-amber-500/20 bg-amber-500/10 px-3 py-2 text-[11px] text-amber-200">
-                Add your {getAssistantApiKeyLabel(settings.assistantProvider)} in Settings to send requests.
+                {settings.assistantProvider === 'codex-cli'
+                  ? 'Connect Codex OAuth in Settings or run `codex login` in Terminal.'
+                  : 'OAuth-only mode is available through the Codex CLI provider.'}
               </div>
             )}
             <div className="relative flex flex-col gap-2">
@@ -9980,7 +10410,7 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
               />
               <button
                 type="submit"
-                disabled={!chatInput.trim() || isChatLoading || !assistantConfiguredApiKey}
+                disabled={!chatInput.trim() || isChatLoading || !assistantAuthReady}
                 className="absolute right-2 bottom-2 p-2 text-indigo-400 hover:text-indigo-300 disabled:text-zinc-600 transition-colors"
               >
                 <ChevronRight size={20} />
@@ -10325,30 +10755,121 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
                       </label>
                     </div>
 
-                    <div className="space-y-2">
-                      <div className="text-xs font-medium uppercase tracking-wide text-zinc-500">
-                        {getAssistantApiKeyLabel(settings.assistantProvider)}
+                    <div className="rounded-xl border border-white/10 bg-black/20 px-4 py-3 space-y-3">
+                      <div className="flex flex-wrap items-center justify-between gap-3">
+                        <div>
+                          <div className="text-sm font-medium text-white">OAuth</div>
+                          <div className="text-xs text-zinc-500">
+                            {settings.assistantProvider === 'codex-cli'
+                              ? `Codex CLI OAuth is ${settings.assistantOAuthSession.status.replace('_', ' ')}.`
+                              : 'OAuth-only settings are wired through Codex CLI mode.'}
+                          </div>
+                        </div>
+                        <div className="flex flex-wrap gap-2">
+                          <button
+                            type="button"
+                            onClick={async () => {
+                              const pendingAuthWindow = window.open('about:blank', '_blank');
+                              const result = await runCodexCliTerminalCommand(['login'], codexCliRuntimeState, settings.assistantModel);
+                              setSettings(current => ({
+                                ...current,
+                                assistantProvider: 'codex-cli',
+                                assistantOAuthSession: result.nextOAuthSession ?? current.assistantOAuthSession,
+                              }));
+                              setTerminalOutput(prev => [...prev, '~ $ codex login', ...result.lines]);
+                              if (result.openUrl) {
+                                if (pendingAuthWindow) {
+                                  pendingAuthWindow.opener = null;
+                                  pendingAuthWindow.location.href = result.openUrl;
+                                } else {
+                                  window.open(result.openUrl, '_blank', 'noopener,noreferrer');
+                                }
+                              } else {
+                                pendingAuthWindow?.close();
+                              }
+                              selectDockPanel('terminal');
+                            }}
+                            className="px-3 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-xs text-white transition-colors"
+                          >
+                            Connect
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setSettings(current => ({
+                              ...current,
+                              assistantOAuthSession: DEFAULT_CODEX_CLI_OAUTH_SESSION,
+                            }))}
+                            className="px-3 py-2 rounded-lg border border-white/10 bg-white/5 text-xs text-zinc-200 hover:bg-white/10 transition-colors"
+                          >
+                            Disconnect
+                          </button>
+                        </div>
                       </div>
-                      <div className="flex items-stretch gap-2">
-                        <input
-                          type={showAssistantApiKey ? 'text' : 'password'}
-                          value={settings.assistantApiKey}
-                          onChange={(e) => setSettings(current => ({ ...current, assistantApiKey: e.target.value }))}
-                          placeholder={`Paste your ${getAssistantApiKeyLabel(settings.assistantProvider).toLowerCase()}`}
-                          className="flex-1 rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-sm text-white outline-none transition-colors focus:border-indigo-500"
-                        />
-                        <button
-                          type="button"
-                          onClick={() => setShowAssistantApiKey(value => !value)}
-                          className="px-3 rounded-xl border border-white/10 bg-black/20 text-xs text-zinc-300 hover:bg-white/5 transition-colors"
-                        >
-                          {showAssistantApiKey ? 'Hide' : 'Show'}
-                        </button>
-                      </div>
-                      <div className="text-xs text-zinc-500">
-                        This key is used from the settings input instead of `.env`, and it stays in this browser’s local storage.
-                      </div>
+                      {settings.assistantOAuthSession.login && (
+                        <div className="rounded-lg border border-indigo-500/20 bg-indigo-500/10 px-3 py-2 text-xs text-indigo-100">
+                          <div>Browser login pending</div>
+                          <div className="font-mono text-[10px] mt-1 break-all">{settings.assistantOAuthSession.login.authUrl}</div>
+                        </div>
+                      )}
                     </div>
+
+                    {settings.assistantProvider === 'codex-cli' && (
+                      <div className="rounded-xl border border-white/10 bg-black/20 px-4 py-3 space-y-3">
+                        <div className="flex flex-wrap items-center justify-between gap-3">
+                          <div>
+                            <div className="text-sm font-medium text-white">Codex CLI</div>
+                            <div className="text-xs text-zinc-500">
+                              Static source {CODEX_CLI_STATIC_REPOSITORY.commit.slice(0, 7)} · {settings.codexCliMcpServers.length} MCP server{settings.codexCliMcpServers.length === 1 ? '' : 's'}
+                            </div>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setTerminalOutput(prev => [
+                                ...prev,
+                                '~ $ codex status',
+                                ...formatCodexCliStatusLines(codexCliRuntimeState, settings.assistantModel),
+                              ]);
+                              selectDockPanel('terminal');
+                            }}
+                            className="px-3 py-2 rounded-lg border border-white/10 bg-white/5 text-xs text-zinc-200 hover:bg-white/10 transition-colors"
+                          >
+                            Status
+                          </button>
+                        </div>
+                        <label className="block space-y-2">
+                          <div className="text-xs font-medium uppercase tracking-wide text-zinc-500">Responses Endpoint</div>
+                          <input
+                            value={settings.codexCliResponsesEndpoint}
+                            onChange={(e) => setSettings(current => ({ ...current, codexCliResponsesEndpoint: e.target.value }))}
+                            className="w-full rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-sm text-white outline-none transition-colors focus:border-indigo-500"
+                          />
+                        </label>
+                        <div className="space-y-1">
+                          {settings.codexCliMcpServers.length === 0 ? (
+                            <div className="text-xs text-zinc-500">No MCP servers configured. Add one with `codex mcp add name https://server.example/mcp`.</div>
+                          ) : settings.codexCliMcpServers.map(server => (
+                            <div key={server.name} className="flex items-center justify-between gap-2 rounded-lg border border-white/10 bg-white/5 px-3 py-2">
+                              <div className="min-w-0">
+                                <div className="text-xs text-white truncate">{server.name}</div>
+                                <div className="text-[10px] text-zinc-500 truncate">{server.url} · {server.authStatus}</div>
+                              </div>
+                              <button
+                                type="button"
+                                onClick={() => setSettings(current => ({
+                                  ...current,
+                                  codexCliMcpServers: current.codexCliMcpServers.filter(candidate => candidate.name !== server.name),
+                                }))}
+                                className="p-1.5 rounded-md text-zinc-400 hover:text-white hover:bg-white/10 transition-colors"
+                                title="Remove MCP server"
+                              >
+                                <Unlink size={14} />
+                              </button>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
 
                     <div className="flex items-center justify-between gap-4 rounded-xl border border-white/10 bg-black/20 px-4 py-3">
                       <div>
