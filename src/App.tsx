@@ -410,7 +410,20 @@ interface SyncMeta {
   connectedAt: number;
 }
 
-type AssistantProvider = 'gemini' | 'openai' | 'anthropic';
+type AssistantProvider =
+  | 'gemini'
+  | 'openai'
+  | 'anthropic'
+  | 'openrouter'
+  | 'deepseek'
+  | 'xai'
+  | 'mistral'
+  | 'groq'
+  | 'together'
+  | 'fireworks'
+  | 'cerebras'
+  | 'moonshot'
+  | 'perplexity';
 type AssistantMessageKind = 'message' | 'log';
 type AssistantReasoningControl = 'toggleable' | 'always_on' | 'always_off';
 type AssistantSchemaPrimitive = 'string' | 'number' | 'boolean';
@@ -438,6 +451,23 @@ interface AssistantModelPreset {
   reasoningControl: AssistantReasoningControl;
 }
 
+interface AssistantProviderMetadata {
+  label: string;
+  apiKeyLabel: string;
+}
+
+interface AssistantOpenAIChatProviderConfig {
+  endpoint: string;
+  requestLabel: string;
+  supportsLocalTools: boolean | ((model: string) => boolean);
+  defaultMaxTokens: number;
+}
+
+interface AssistantOpenAIResponsesProviderConfig {
+  endpoint: string;
+  requestLabel: string;
+}
+
 interface SharedEditorTarget {
   tabId: string;
   itemId: string;
@@ -461,11 +491,37 @@ const INITIAL_ASSISTANT_CHAT_ID = createAssistantChatId();
 const DEFAULT_PYI_IMPORT_SIZE_LIMIT_BYTES = 200 * 1024;
 const ABSOLUTE_PYI_IMPORT_SIZE_LIMIT_BYTES = 2 * 1024 * 1024;
 
-const ASSISTANT_PROVIDER_OPTIONS: { value: AssistantProvider; label: string }[] = [
-  { value: 'gemini', label: 'Google Gemini' },
-  { value: 'openai', label: 'OpenAI' },
-  { value: 'anthropic', label: 'Anthropic' },
-];
+const ASSISTANT_PROVIDER_METADATA: Record<AssistantProvider, AssistantProviderMetadata> = {
+  gemini: { label: 'Google Gemini', apiKeyLabel: 'Gemini API key' },
+  openai: { label: 'OpenAI', apiKeyLabel: 'OpenAI API key' },
+  anthropic: { label: 'Anthropic', apiKeyLabel: 'Anthropic API key' },
+  openrouter: { label: 'OpenRouter', apiKeyLabel: 'OpenRouter API key' },
+  deepseek: { label: 'DeepSeek', apiKeyLabel: 'DeepSeek API key' },
+  xai: { label: 'xAI', apiKeyLabel: 'xAI API key' },
+  mistral: { label: 'Mistral AI', apiKeyLabel: 'Mistral API key' },
+  groq: { label: 'Groq', apiKeyLabel: 'Groq API key' },
+  together: { label: 'Together AI', apiKeyLabel: 'Together API key' },
+  fireworks: { label: 'Fireworks AI', apiKeyLabel: 'Fireworks API key' },
+  cerebras: { label: 'Cerebras', apiKeyLabel: 'Cerebras API key' },
+  moonshot: { label: 'Moonshot/Kimi', apiKeyLabel: 'Moonshot API key' },
+  perplexity: { label: 'Perplexity', apiKeyLabel: 'Perplexity API key' },
+};
+
+const ASSISTANT_PROVIDER_OPTIONS: { value: AssistantProvider; label: string }[] = ([
+  'gemini',
+  'openai',
+  'anthropic',
+  'openrouter',
+  'deepseek',
+  'xai',
+  'mistral',
+  'groq',
+  'together',
+  'fireworks',
+  'cerebras',
+  'moonshot',
+  'perplexity',
+] as AssistantProvider[]).map(value => ({ value, label: ASSISTANT_PROVIDER_METADATA[value].label }));
 
 const ASSISTANT_MODEL_PRESETS: Record<AssistantProvider, AssistantModelPreset[]> = {
   gemini: [
@@ -483,6 +539,127 @@ const ASSISTANT_MODEL_PRESETS: Record<AssistantProvider, AssistantModelPreset[]>
     { id: 'claude-opus-4-1-20250805', label: 'Claude Opus 4.1', reasoningControl: 'toggleable' },
     { id: 'claude-3-7-sonnet-20250219', label: 'Claude 3.7 Sonnet', reasoningControl: 'toggleable' },
   ],
+  openrouter: [
+    { id: 'openai/gpt-5', label: 'GPT-5 via OpenRouter', reasoningControl: 'toggleable' },
+    { id: 'anthropic/claude-sonnet-4.5', label: 'Claude Sonnet 4.5 via OpenRouter', reasoningControl: 'toggleable' },
+    { id: 'google/gemini-2.5-pro', label: 'Gemini 2.5 Pro via OpenRouter', reasoningControl: 'always_on' },
+    { id: 'deepseek/deepseek-r1', label: 'DeepSeek R1 via OpenRouter', reasoningControl: 'always_on' },
+    { id: 'qwen/qwen3-coder', label: 'Qwen3 Coder via OpenRouter', reasoningControl: 'toggleable' },
+  ],
+  deepseek: [
+    { id: 'deepseek-chat', label: 'DeepSeek Chat', reasoningControl: 'always_off' },
+    { id: 'deepseek-reasoner', label: 'DeepSeek Reasoner', reasoningControl: 'always_on' },
+  ],
+  xai: [
+    { id: 'grok-4.20-reasoning', label: 'Grok 4.20 Reasoning', reasoningControl: 'always_on' },
+    { id: 'grok-4', label: 'Grok 4', reasoningControl: 'always_on' },
+    { id: 'grok-3-mini', label: 'Grok 3 Mini', reasoningControl: 'always_on' },
+  ],
+  mistral: [
+    { id: 'mistral-large-latest', label: 'Mistral Large', reasoningControl: 'always_off' },
+    { id: 'mistral-small-latest', label: 'Mistral Small', reasoningControl: 'toggleable' },
+    { id: 'magistral-medium-latest', label: 'Magistral Medium', reasoningControl: 'always_on' },
+    { id: 'magistral-small-latest', label: 'Magistral Small', reasoningControl: 'always_on' },
+    { id: 'devstral-latest', label: 'Devstral', reasoningControl: 'always_off' },
+  ],
+  groq: [
+    { id: 'openai/gpt-oss-120b', label: 'GPT-OSS 120B', reasoningControl: 'always_on' },
+    { id: 'openai/gpt-oss-20b', label: 'GPT-OSS 20B', reasoningControl: 'always_on' },
+    { id: 'qwen/qwen3-32b', label: 'Qwen3 32B', reasoningControl: 'toggleable' },
+    { id: 'llama-3.1-8b-instant', label: 'Llama 3.1 8B Instant', reasoningControl: 'always_off' },
+  ],
+  together: [
+    { id: 'zai-org/GLM-5', label: 'GLM-5', reasoningControl: 'always_off' },
+    { id: 'Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8', label: 'Qwen3 Coder 480B', reasoningControl: 'always_off' },
+    { id: 'deepseek-ai/DeepSeek-V3', label: 'DeepSeek V3', reasoningControl: 'always_off' },
+    { id: 'meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8', label: 'Llama 4 Maverick', reasoningControl: 'always_off' },
+  ],
+  fireworks: [
+    { id: 'accounts/fireworks/models/deepseek-v3p1', label: 'DeepSeek V3.1', reasoningControl: 'always_off' },
+    { id: 'accounts/fireworks/models/kimi-k2-instruct', label: 'Kimi K2 Instruct', reasoningControl: 'always_off' },
+    { id: 'accounts/fireworks/models/qwen3-coder-480b-a35b-instruct', label: 'Qwen3 Coder 480B', reasoningControl: 'always_off' },
+    { id: 'accounts/fireworks/models/deepseek-r1', label: 'DeepSeek R1', reasoningControl: 'always_on' },
+  ],
+  cerebras: [
+    { id: 'gpt-oss-120b', label: 'GPT-OSS 120B', reasoningControl: 'always_on' },
+    { id: 'zai-glm-4.7', label: 'Z.ai GLM 4.7', reasoningControl: 'toggleable' },
+    { id: 'qwen-3-235b-a22b-instruct-2507', label: 'Qwen3 235B Instruct', reasoningControl: 'always_off' },
+    { id: 'llama3.1-8b', label: 'Llama 3.1 8B', reasoningControl: 'always_off' },
+  ],
+  moonshot: [
+    { id: 'kimi-k2-0711-preview', label: 'Kimi K2', reasoningControl: 'always_off' },
+    { id: 'moonshot-v1-128k', label: 'Moonshot v1 128K', reasoningControl: 'always_off' },
+    { id: 'moonshot-v1-32k', label: 'Moonshot v1 32K', reasoningControl: 'always_off' },
+  ],
+  perplexity: [
+    { id: 'sonar-pro', label: 'Sonar Pro', reasoningControl: 'always_off' },
+    { id: 'sonar', label: 'Sonar', reasoningControl: 'always_off' },
+    { id: 'sonar-reasoning-pro', label: 'Sonar Reasoning Pro', reasoningControl: 'always_on' },
+  ],
+};
+
+const OPENAI_CHAT_PROVIDER_CONFIGS: Partial<Record<AssistantProvider, AssistantOpenAIChatProviderConfig>> = {
+  openrouter: {
+    endpoint: 'https://openrouter.ai/api/v1/chat/completions',
+    requestLabel: 'OpenRouter request failed.',
+    supportsLocalTools: true,
+    defaultMaxTokens: 8192,
+  },
+  deepseek: {
+    endpoint: 'https://api.deepseek.com/chat/completions',
+    requestLabel: 'DeepSeek request failed.',
+    supportsLocalTools: model => !/^deepseek-reasoner$/i.test(model.trim()),
+    defaultMaxTokens: 8192,
+  },
+  mistral: {
+    endpoint: 'https://api.mistral.ai/v1/chat/completions',
+    requestLabel: 'Mistral request failed.',
+    supportsLocalTools: true,
+    defaultMaxTokens: 8192,
+  },
+  groq: {
+    endpoint: 'https://api.groq.com/openai/v1/chat/completions',
+    requestLabel: 'Groq request failed.',
+    supportsLocalTools: true,
+    defaultMaxTokens: 8192,
+  },
+  together: {
+    endpoint: 'https://api.together.xyz/v1/chat/completions',
+    requestLabel: 'Together AI request failed.',
+    supportsLocalTools: true,
+    defaultMaxTokens: 8192,
+  },
+  fireworks: {
+    endpoint: 'https://api.fireworks.ai/inference/v1/chat/completions',
+    requestLabel: 'Fireworks request failed.',
+    supportsLocalTools: true,
+    defaultMaxTokens: 8192,
+  },
+  cerebras: {
+    endpoint: 'https://api.cerebras.ai/v1/chat/completions',
+    requestLabel: 'Cerebras request failed.',
+    supportsLocalTools: true,
+    defaultMaxTokens: 8192,
+  },
+  moonshot: {
+    endpoint: 'https://api.moonshot.ai/v1/chat/completions',
+    requestLabel: 'Moonshot request failed.',
+    supportsLocalTools: true,
+    defaultMaxTokens: 8192,
+  },
+  perplexity: {
+    endpoint: 'https://api.perplexity.ai/chat/completions',
+    requestLabel: 'Perplexity request failed.',
+    supportsLocalTools: false,
+    defaultMaxTokens: 8192,
+  },
+};
+
+const OPENAI_RESPONSES_PROVIDER_CONFIGS: Partial<Record<AssistantProvider, AssistantOpenAIResponsesProviderConfig>> = {
+  xai: {
+    endpoint: 'https://api.x.ai/v1/responses',
+    requestLabel: 'xAI request failed.',
+  },
 };
 const STORAGE_KEYS = {
   files: 'codecraft-files',
@@ -773,7 +950,7 @@ const buildSharedEditorOptions = (fontSize: number) => ({
 
 // Define AI tools
 function isAssistantProvider(value: unknown): value is AssistantProvider {
-  return value === 'gemini' || value === 'openai' || value === 'anthropic';
+  return typeof value === 'string' && value in ASSISTANT_PROVIDER_METADATA;
 }
 
 function getAssistantDefaultModel(provider: AssistantProvider) {
@@ -781,20 +958,34 @@ function getAssistantDefaultModel(provider: AssistantProvider) {
 }
 
 function getAssistantProviderLabel(provider: AssistantProvider) {
-  return ASSISTANT_PROVIDER_OPTIONS.find(option => option.value === provider)?.label || provider;
+  return ASSISTANT_PROVIDER_METADATA[provider]?.label || provider;
 }
 
 function getAssistantApiKeyLabel(provider: AssistantProvider) {
-  switch (provider) {
-    case 'gemini':
-      return 'Gemini API key';
-    case 'openai':
-      return 'OpenAI API key';
-    case 'anthropic':
-      return 'Anthropic API key';
-    default:
-      return 'API key';
+  return ASSISTANT_PROVIDER_METADATA[provider]?.apiKeyLabel || 'API key';
+}
+
+function getOpenAIChatProviderConfig(provider: AssistantProvider) {
+  return OPENAI_CHAT_PROVIDER_CONFIGS[provider] || null;
+}
+
+function getOpenAIResponsesProviderConfig(provider: AssistantProvider) {
+  return OPENAI_RESPONSES_PROVIDER_CONFIGS[provider] || null;
+}
+
+function getAssistantSupportsRemoteMcp(provider: AssistantProvider) {
+  return provider === 'openai' || provider === 'xai';
+}
+
+function getAssistantSupportsLocalTools(provider: AssistantProvider, model: string) {
+  if (provider === 'gemini' || provider === 'openai' || provider === 'anthropic' || provider === 'xai') {
+    return true;
   }
+  const config = getOpenAIChatProviderConfig(provider);
+  if (!config) return false;
+  return typeof config.supportsLocalTools === 'function'
+    ? config.supportsLocalTools(model)
+    : config.supportsLocalTools;
 }
 
 function getAssistantReasoningControl(provider: AssistantProvider, model: string): AssistantReasoningControl {
@@ -816,6 +1007,49 @@ function getAssistantReasoningControl(provider: AssistantProvider, model: string
 
   if (provider === 'anthropic') {
     if (/^claude-(opus-4|opus-4-1|sonnet-4|3-7-sonnet)/i.test(trimmed)) return 'toggleable';
+    return 'always_off';
+  }
+
+  if (provider === 'openrouter') {
+    if (/(gpt-5|o[134]|grok|deepseek-r1|qwen3|qwen-3|gemini-2\.5|gemini-3|claude|magistral)/i.test(trimmed)) return 'toggleable';
+    return 'always_off';
+  }
+
+  if (provider === 'deepseek') {
+    if (/^deepseek-reasoner$/i.test(trimmed)) return 'always_on';
+    return 'always_off';
+  }
+
+  if (provider === 'xai') {
+    if (/grok.*(reasoning|mini|4|3)/i.test(trimmed)) return 'always_on';
+    return 'always_off';
+  }
+
+  if (provider === 'mistral') {
+    if (/^mistral-small-latest$/i.test(trimmed)) return 'toggleable';
+    if (/^magistral-/i.test(trimmed)) return 'always_on';
+    return 'always_off';
+  }
+
+  if (provider === 'groq') {
+    if (/^openai\/gpt-oss/i.test(trimmed)) return 'always_on';
+    if (/^qwen\/qwen3-32b/i.test(trimmed)) return 'toggleable';
+    return 'always_off';
+  }
+
+  if (provider === 'cerebras') {
+    if (/^zai-glm-4\.7/i.test(trimmed)) return 'toggleable';
+    if (/^gpt-oss/i.test(trimmed)) return 'always_on';
+    return 'always_off';
+  }
+
+  if (provider === 'fireworks') {
+    if (/deepseek-r1/i.test(trimmed)) return 'always_on';
+    return 'always_off';
+  }
+
+  if (provider === 'perplexity') {
+    if (/reasoning/i.test(trimmed)) return 'always_on';
     return 'always_off';
   }
 
@@ -887,12 +1121,112 @@ function toOpenAIToolDefinition(tool: AssistantToolDefinition) {
   };
 }
 
+function toOpenAIChatToolDefinition(tool: AssistantToolDefinition) {
+  return {
+    type: 'function',
+    function: {
+      name: tool.name,
+      description: tool.description,
+      parameters: tool.parameters,
+    },
+  };
+}
+
 function toAnthropicToolDefinition(tool: AssistantToolDefinition) {
   return {
     name: tool.name,
     description: tool.description,
     input_schema: tool.parameters,
   };
+}
+
+function parseAssistantCommaList(value: string) {
+  return value
+    .split(',')
+    .map(part => part.trim())
+    .filter(Boolean);
+}
+
+function sanitizeAssistantMcpServerLabel(value: string) {
+  const sanitized = value.trim().replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 64);
+  return sanitized || DEFAULT_SETTINGS.assistantMcpServerLabel;
+}
+
+function buildAssistantRemoteMcpTool(provider: AssistantProvider, settings: AppSettings) {
+  const serverUrl = settings.assistantMcpServerUrl.trim();
+  if (!serverUrl || !getAssistantSupportsRemoteMcp(provider)) return null;
+
+  const allowedTools = parseAssistantCommaList(settings.assistantMcpAllowedTools);
+  const tool: any = {
+    type: 'mcp',
+    server_url: serverUrl,
+    server_label: sanitizeAssistantMcpServerLabel(settings.assistantMcpServerLabel),
+    ...(settings.assistantMcpServerDescription.trim()
+      ? { server_description: settings.assistantMcpServerDescription.trim() }
+      : {}),
+    ...(allowedTools.length > 0 ? { allowed_tools: allowedTools } : {}),
+    ...(settings.assistantMcpAuthorization.trim()
+      ? { authorization: settings.assistantMcpAuthorization.trim() }
+      : {}),
+  };
+
+  if (provider === 'openai') {
+    tool.require_approval = 'never';
+  }
+
+  return tool;
+}
+
+function getOpenAIChatReasoningRequestOptions(
+  provider: AssistantProvider,
+  model: string,
+  useChainOfThought: boolean,
+) {
+  const control = getAssistantReasoningControl(provider, model);
+  if (control === 'always_off') return {};
+  const reasoningEnabled = control === 'always_on' || useChainOfThought;
+
+  if (provider === 'openrouter') {
+    return {
+      reasoning: reasoningEnabled
+        ? { effort: 'medium', exclude: true }
+        : { effort: 'none', exclude: true },
+    };
+  }
+
+  if (provider === 'mistral') {
+    if (/^mistral-small-latest$/i.test(model)) {
+      return { reasoning_effort: reasoningEnabled ? 'high' : 'none' };
+    }
+    return {};
+  }
+
+  if (provider === 'groq') {
+    if (/^qwen\/qwen3-32b/i.test(model)) {
+      return {
+        reasoning_effort: reasoningEnabled ? 'default' : 'none',
+        reasoning_format: 'hidden',
+      };
+    }
+    if (/^openai\/gpt-oss/i.test(model)) {
+      return {
+        reasoning_effort: 'medium',
+        reasoning_format: 'hidden',
+      };
+    }
+    return {};
+  }
+
+  if (provider === 'cerebras') {
+    if (/^zai-glm-4\.7/i.test(model)) {
+      return { reasoning_effort: reasoningEnabled ? 'high' : 'none' };
+    }
+    if (/^gpt-oss/i.test(model)) {
+      return { reasoning_effort: 'medium' };
+    }
+  }
+
+  return {};
 }
 
 const proposeEditTool: AssistantToolDefinition = {
@@ -1032,11 +1366,12 @@ const runTerminalCommandTool: AssistantToolDefinition = {
   },
 };
 
-const terminalLsTool: AssistantToolDefinition = {
-  name: "terminalLs",
+const lsTool: AssistantToolDefinition = {
+  name: "ls",
   description: "List files and folders in the current working directory or in a target folder.",
   parameters: {
     type: 'object',
+    description: "List files and folders in the fake terminal.",
     properties: {
       pathOrName: {
         type: 'string',
@@ -1303,6 +1638,7 @@ const STANDARD_ASSISTANT_TOOLS: AssistantToolDefinition[] = [
   createItemTool,
   deleteItemTool,
   moveItemTool,
+  lsTool,
   runTerminalCommandTool,
 ];
 
@@ -1313,7 +1649,7 @@ const CHAIN_OF_THOUGHT_ASSISTANT_TOOLS: AssistantToolDefinition[] = [
   createItemTool,
   deleteItemTool,
   moveItemTool,
-  terminalLsTool,
+  lsTool,
   terminalPwdTool,
   terminalCdTool,
   terminalMkdirTool,
@@ -1992,6 +2328,7 @@ interface ResolvedProjectRun {
   mode: ProjectRunMode;
   language: ProjectRuntimeLanguage | null;
   selectedFiles: FSItem[];
+  entryCandidates: FSItem[];
   entryFile: FSItem | null;
   error: string | null;
 }
@@ -2001,7 +2338,7 @@ interface ProjectSourceFile {
   name: string;
   path: string;
   content: string;
-  language: ProjectRuntimeLanguage;
+  language: ProjectFileLanguage;
 }
 
 type JavaScriptExecutionMode = 'classic-function' | 'async-function';
@@ -2011,6 +2348,7 @@ type CSharpExecutionMode = 'regular' | 'script' | 'script-context';
 type RuntimeInteractionKind = 'alert' | 'confirm' | 'prompt' | 'stdin';
 type RuntimeInteractionLanguage = 'javascript' | 'python' | 'csharp';
 type ProjectRuntimeLanguage = 'javascript' | 'python' | 'html' | 'csharp';
+type ProjectFileLanguage = ProjectRuntimeLanguage | 'css';
 type ProjectRunMode = 'csharp-only' | 'python-only' | 'html-only' | 'javascript-only' | 'custom';
 
 interface OutputPanelInteraction {
@@ -2052,6 +2390,11 @@ interface AppSettings {
   assistantUseChainOfThought: boolean;
   assistantShowUsagePopup: boolean;
   assistantMaxChainOfThoughtDepth: number;
+  assistantMcpServerUrl: string;
+  assistantMcpServerLabel: string;
+  assistantMcpServerDescription: string;
+  assistantMcpAllowedTools: string;
+  assistantMcpAuthorization: string;
 }
 
 const loadSavedAssistantChats = (): AssistantChat[] => {
@@ -2121,6 +2464,11 @@ const DEFAULT_SETTINGS: AppSettings = {
   assistantUseChainOfThought: false,
   assistantShowUsagePopup: true,
   assistantMaxChainOfThoughtDepth: DEFAULT_ASSISTANT_TOOL_PASSES,
+  assistantMcpServerUrl: '',
+  assistantMcpServerLabel: 'remote',
+  assistantMcpServerDescription: '',
+  assistantMcpAllowedTools: '',
+  assistantMcpAuthorization: '',
 };
 
 const PROJECT_RUN_MODE_OPTIONS: { value: ProjectRunMode; label: string; language: ProjectRuntimeLanguage | null }[] = [
@@ -2131,7 +2479,7 @@ const PROJECT_RUN_MODE_OPTIONS: { value: ProjectRunMode; label: string; language
   { value: 'custom', label: 'Custom', language: null },
 ];
 
-function normalizeProjectRuntimeLanguage(language?: string): ProjectRuntimeLanguage | null {
+function normalizeProjectFileLanguage(language?: string): ProjectFileLanguage | null {
   switch ((language || '').toLowerCase()) {
     case 'javascript':
     case 'js':
@@ -2141,6 +2489,8 @@ function normalizeProjectRuntimeLanguage(language?: string): ProjectRuntimeLangu
       return 'python';
     case 'html':
       return 'html';
+    case 'css':
+      return 'css';
     case 'csharp':
     case 'cs':
       return 'csharp';
@@ -2149,7 +2499,12 @@ function normalizeProjectRuntimeLanguage(language?: string): ProjectRuntimeLangu
   }
 }
 
-function getProjectRuntimeLanguageLabel(language: ProjectRuntimeLanguage | null) {
+function normalizeProjectRuntimeLanguage(language?: string): ProjectRuntimeLanguage | null {
+  const normalized = normalizeProjectFileLanguage(language);
+  return normalized && normalized !== 'css' ? normalized : null;
+}
+
+function getProjectRuntimeLanguageLabel(language: ProjectFileLanguage | null) {
   switch (language) {
     case 'javascript':
       return 'JavaScript';
@@ -2157,6 +2512,8 @@ function getProjectRuntimeLanguageLabel(language: ProjectRuntimeLanguage | null)
       return 'Python';
     case 'html':
       return 'HTML';
+    case 'css':
+      return 'CSS';
     case 'csharp':
       return 'C#';
     default:
@@ -2205,6 +2562,16 @@ function resolveProjectRelativePath(fromPath: string, specifier: string): string
   return normalizeProjectPath(normalizedSpecifier);
 }
 
+function isExternalProjectResourceSpecifier(specifier: string): boolean {
+  const trimmed = specifier.trim();
+  return /^(?:[a-z][a-z0-9+.-]*:|\/\/|#)/i.test(trimmed);
+}
+
+function stripProjectResourceSuffix(specifier: string): string {
+  const suffixIndex = specifier.search(/[?#]/);
+  return suffixIndex >= 0 ? specifier.slice(0, suffixIndex) : specifier;
+}
+
 function escapeHtml(value: string) {
   return value
     .replace(/&/g, '&amp;')
@@ -2232,6 +2599,13 @@ function extractJavaScriptModuleSpecifiers(source: string): string[] {
   }
 
   return [...matches];
+}
+
+function containsJavaScriptModuleSyntax(source: string): boolean {
+  return (
+    /\bimport\s+(?:[\s\S]*?\sfrom\s*['"]|['"][^'"]+['"])/m.test(source)
+    || /\bexport\s+(?:\{|default\b|const\b|let\b|var\b|function\b|class\b|\*)/m.test(source)
+  );
 }
 
 function normalizeExecutionTimeoutMs(value: number) {
@@ -2537,6 +2911,13 @@ export default function App() {
           ? merged.assistantMaxChainOfThoughtDepth
           : DEFAULT_SETTINGS.assistantMaxChainOfThoughtDepth
       ),
+      assistantMcpServerUrl: typeof merged.assistantMcpServerUrl === 'string' ? merged.assistantMcpServerUrl : '',
+      assistantMcpServerLabel: typeof merged.assistantMcpServerLabel === 'string' && merged.assistantMcpServerLabel.trim()
+        ? merged.assistantMcpServerLabel.trim()
+        : DEFAULT_SETTINGS.assistantMcpServerLabel,
+      assistantMcpServerDescription: typeof merged.assistantMcpServerDescription === 'string' ? merged.assistantMcpServerDescription : '',
+      assistantMcpAllowedTools: typeof merged.assistantMcpAllowedTools === 'string' ? merged.assistantMcpAllowedTools : '',
+      assistantMcpAuthorization: typeof merged.assistantMcpAuthorization === 'string' ? merged.assistantMcpAuthorization : '',
     };
   });
   const [settingsPipPackages, setSettingsPipPackages] = useState<SavedPipPackage[]>(() => loadSavedPipPackages());
@@ -2608,6 +2989,7 @@ export default function App() {
         : false;
   const effectiveAssistantMaxChainOfThoughtDepth = normalizeAssistantMaxChainOfThoughtDepth(settings.assistantMaxChainOfThoughtDepth);
   const assistantConfiguredApiKey = settings.assistantApiKey.trim();
+  const assistantProviderSupportsRemoteMcp = getAssistantSupportsRemoteMcp(settings.assistantProvider);
   const activeEditorTabNode: any = activeEditorTabId ? layoutModel.getNodeById(activeEditorTabId) : null;
   const activeEditorTabItemId =
     activeEditorTabNode?.getComponent?.() === 'editor'
@@ -2914,7 +3296,7 @@ export default function App() {
     return files
       .filter((item): item is FSItem & { type: 'file' } => (
         item.type === 'file'
-        && normalizeProjectRuntimeLanguage(item.language) !== null
+        && normalizeProjectFileLanguage(item.language) !== null
       ))
       .sort((left, right) => getPath(left.id).localeCompare(getPath(right.id)));
   }
@@ -2937,6 +3319,7 @@ export default function App() {
         mode: settings.projectRunMode,
         language: fixedLanguage,
         selectedFiles,
+        entryCandidates: [],
         entryFile: null,
         error: settings.projectRunMode === 'custom'
           ? 'Custom project run has no files selected.'
@@ -2944,35 +3327,84 @@ export default function App() {
       };
     }
 
-    const selectedLanguageSet = new Set<ProjectRuntimeLanguage>(
+    const selectedLanguageSet = new Set<ProjectFileLanguage>(
       selectedFiles
-        .map(file => normalizeProjectRuntimeLanguage(file.language))
-        .filter((language): language is ProjectRuntimeLanguage => language !== null)
+        .map(file => normalizeProjectFileLanguage(file.language))
+        .filter((language): language is ProjectFileLanguage => language !== null)
     );
 
-    if (selectedLanguageSet.size > 1) {
+    let resolvedLanguage: ProjectRuntimeLanguage | null = fixedLanguage;
+    if (!resolvedLanguage) {
+      const hasHtml = selectedLanguageSet.has('html');
+      const runtimeLanguages = [...selectedLanguageSet]
+        .filter((language): language is ProjectRuntimeLanguage => language !== 'css');
+
+      if (hasHtml) {
+        const unsupportedRuntimeLanguages = runtimeLanguages.filter(language => language !== 'html' && language !== 'javascript');
+        if (unsupportedRuntimeLanguages.length === 0) {
+          resolvedLanguage = 'html';
+        } else {
+          return {
+            mode: settings.projectRunMode,
+            language: null,
+            selectedFiles,
+            entryCandidates: [],
+            entryFile: null,
+            error: 'HTML custom project runs can only be combined with selected JavaScript and CSS files.',
+          };
+        }
+      } else if (selectedLanguageSet.has('css')) {
+        if (runtimeLanguages.length === 0) {
+          return {
+            mode: settings.projectRunMode,
+            language: null,
+            selectedFiles,
+            entryCandidates: [],
+            entryFile: null,
+            error: 'Custom project run with CSS needs an HTML entry file.',
+          };
+        }
+        return {
+          mode: settings.projectRunMode,
+          language: null,
+          selectedFiles,
+          entryCandidates: [],
+          entryFile: null,
+          error: 'CSS files can only be combined with HTML in a custom project run.',
+        };
+      } else if (runtimeLanguages.length === 1) {
+        resolvedLanguage = runtimeLanguages[0];
+      }
+    }
+
+    const isHtmlAssetRun =
+      resolvedLanguage === 'html'
+      && [...selectedLanguageSet].every(language => language === 'html' || language === 'javascript' || language === 'css');
+    if (!resolvedLanguage || selectedLanguageSet.size > 1 && !isHtmlAssetRun) {
       return {
         mode: settings.projectRunMode,
         language: null,
         selectedFiles,
+        entryCandidates: [],
         entryFile: null,
         error: 'Project run requires files from a single supported language.',
       };
     }
 
-    const resolvedLanguage = fixedLanguage ?? selectedLanguageSet.values().next().value ?? null;
+    const entryCandidates = selectedFiles.filter(file => normalizeProjectRuntimeLanguage(file.language) === resolvedLanguage);
     const activeRunnableFile = activeFileId
-      ? selectedFiles.find(file => file.id === activeFileId) ?? null
+      ? entryCandidates.find(file => file.id === activeFileId) ?? null
       : null;
     const configuredEntry = settings.projectRunEntryFileId
-      ? selectedFiles.find(file => file.id === settings.projectRunEntryFileId) ?? null
+      ? entryCandidates.find(file => file.id === settings.projectRunEntryFileId) ?? null
       : null;
-    const entryFile = configuredEntry ?? activeRunnableFile ?? selectedFiles[0] ?? null;
+    const entryFile = configuredEntry ?? activeRunnableFile ?? entryCandidates[0] ?? null;
 
     return {
       mode: settings.projectRunMode,
       language: resolvedLanguage,
       selectedFiles,
+      entryCandidates,
       entryFile,
       error: entryFile ? null : 'Project run could not determine an entry file.',
     };
@@ -2981,7 +3413,7 @@ export default function App() {
   const toProjectSourceFiles = (projectFiles: FSItem[]): ProjectSourceFile[] => (
     projectFiles
       .map((file) => {
-        const language = normalizeProjectRuntimeLanguage(file.language);
+        const language = normalizeProjectFileLanguage(file.language);
         if (!language) return null;
         return {
           id: file.id,
@@ -3390,13 +3822,25 @@ export default function App() {
         : nextRunnableFiles
           .filter(file => normalizeProjectRuntimeLanguage(file.language) === modeLanguage)
           .map(file => file.id);
+      const selectedEntryIds = current.projectRunMode === 'custom'
+        ? (() => {
+          const selectedCustomFiles = nextRunnableFiles.filter(file => selectedIds.includes(file.id));
+          const hasHtml = selectedCustomFiles.some(file => normalizeProjectRuntimeLanguage(file.language) === 'html');
+          return selectedCustomFiles
+            .filter(file => {
+              const language = normalizeProjectRuntimeLanguage(file.language);
+              return hasHtml ? language === 'html' : language !== null;
+            })
+            .map(file => file.id);
+        })()
+        : selectedIds;
 
       const preferredEntryId =
-        current.projectRunEntryFileId && selectedIds.includes(current.projectRunEntryFileId)
+        current.projectRunEntryFileId && selectedEntryIds.includes(current.projectRunEntryFileId)
           ? current.projectRunEntryFileId
-          : selectedIds.includes(activeFileId)
+          : selectedEntryIds.includes(activeFileId)
             ? activeFileId
-            : selectedIds[0] ?? null;
+            : selectedEntryIds[0] ?? null;
 
       if (
         nextCustomFileIds.length === current.projectRunCustomFileIds.length
@@ -3559,6 +4003,7 @@ export default function App() {
           : estimateReasoningControl === 'toggleable'
             ? settings.assistantUseChainOfThought
             : false;
+      const estimateHasAssistantTools = getAssistantSupportsLocalTools(estimateProvider, estimateModel);
       draftChats.forEach(({ chatId, chat, draft }) => {
         const projectedOutputTokens = assistantTurnUsageByChatId[chatId]?.outputTokenCount || DEFAULT_ASSISTANT_ESTIMATED_OUTPUT_TOKENS;
         const assistantFiles = files.map(file => ({ ...file }));
@@ -3572,6 +4017,7 @@ export default function App() {
           assistantTerminalCwd: terminalCwd,
           useChainOfThought: estimateUseChainOfThought,
           maxChainOfThoughtDepth: effectiveAssistantMaxChainOfThoughtDepth,
+          hasAssistantTools: estimateHasAssistantTools,
         });
 
         setAssistantTokenEstimates(prev => ({
@@ -3757,6 +4203,7 @@ export default function App() {
     assistantTerminalCwd?: string | null;
     useChainOfThought?: boolean;
     maxChainOfThoughtDepth?: number;
+    hasAssistantTools?: boolean;
     toolProgressNotes?: string[];
     assistantLiveNotes?: string[];
   }) {
@@ -3769,6 +4216,7 @@ export default function App() {
       assistantTerminalCwd = null,
       useChainOfThought = false,
       maxChainOfThoughtDepth = DEFAULT_ASSISTANT_TOOL_PASSES,
+      hasAssistantTools = true,
       toolProgressNotes = [],
       assistantLiveNotes = [],
     } = params;
@@ -3792,7 +4240,7 @@ export default function App() {
       ? `\nAssistant Messages Already Shown This Turn:\n${assistantLiveNotes.map((note, index) => `${index + 1}. ${note}`).join('\n')}\nContinue from there and avoid repeating the same message word-for-word.`
       : '';
 
-    if (useChainOfThought) {
+    if (useChainOfThought && hasAssistantTools) {
       return `
         Context: You are an AI coding assistant inside CodeCraft IDE.
         Internal Chat ID: ${chatId}
@@ -3803,6 +4251,27 @@ export default function App() {
         Keep user-facing explanations separate from tool and edit logs.
         If you need more context, discover it through the available terminal tools.
         You have at most ${maxChainOfThoughtDepth} tool rounds available for this turn, so prioritize your steps.
+
+        Current terminal working directory: ${assistantTerminalCwd ? `/${getPathFromSnapshot(assistantTerminalCwd)}` : '/'}
+        Active Item: ${activeSnapshotItem ? getPathFromSnapshot(activeSnapshotItem.id) : 'None selected'}
+        ${activeSnapshotItem ? (activeSnapshotItem.type === 'file' ? `Active file content:\n${activeSnapshotItem.content || ''}` : 'The active item is a folder.') : 'No file is currently active.'}
+
+        Chat History:
+        ${history || '(empty)'}
+        ${toolProgress}
+        ${liveAssistantProgress}
+
+        USER: ${userContent}
+      `;
+    }
+
+    if (useChainOfThought) {
+      return `
+        Context: You are an AI coding assistant inside CodeCraft IDE.
+        Internal Chat ID: ${chatId}
+        Keep continuity with the existing chat history for this chat.
+        The selected provider/model supports reasoning, but CodeCraft cannot expose its local MCP-style tools through this provider/model.
+        Reason carefully, keep conclusions user-facing, and avoid claiming you changed files unless a tool is available to do it.
 
         Current terminal working directory: ${assistantTerminalCwd ? `/${getPathFromSnapshot(assistantTerminalCwd)}` : '/'}
         Active Item: ${activeSnapshotItem ? getPathFromSnapshot(activeSnapshotItem.id) : 'None selected'}
@@ -4174,13 +4643,11 @@ json.dumps(_result)
     return String(response ?? '').replace(/\r\n/g, '\n').split('\n');
   };
 
-  const buildJavaScriptProjectPreview = (
-    projectFiles: ProjectSourceFile[],
-    entryFile: ProjectSourceFile
-  ) => {
+  const buildJavaScriptProjectUrlMap = (projectFiles: ProjectSourceFile[]) => {
+    const javascriptFiles = projectFiles.filter(file => file.language === 'javascript');
     const urlByPath = new Map<string, string>();
 
-    for (const file of projectFiles) {
+    for (const file of javascriptFiles) {
       urlByPath.set(
         file.path,
         `data:text/javascript;charset=utf-8,${encodeURIComponent(file.content)}`
@@ -4188,13 +4655,14 @@ json.dumps(_result)
     }
 
     const scopes: Record<string, Record<string, string>> = {};
-    for (const file of projectFiles) {
+    for (const file of javascriptFiles) {
       const importerUrl = urlByPath.get(file.path);
       if (!importerUrl) continue;
 
       const scopedImports: Record<string, string> = {};
       for (const specifier of extractJavaScriptModuleSpecifiers(file.content)) {
-        const resolvedPath = resolveProjectRelativePath(file.path, specifier);
+        if (isExternalProjectResourceSpecifier(specifier)) continue;
+        const resolvedPath = resolveProjectRelativePath(file.path, stripProjectResourceSuffix(specifier));
         const resolvedUrl = urlByPath.get(resolvedPath);
         if (!resolvedUrl) continue;
         scopedImports[specifier] = resolvedUrl;
@@ -4204,6 +4672,15 @@ json.dumps(_result)
         scopes[importerUrl] = scopedImports;
       }
     }
+
+    return { urlByPath, scopes };
+  };
+
+  const buildJavaScriptProjectPreview = (
+    projectFiles: ProjectSourceFile[],
+    entryFile: ProjectSourceFile
+  ) => {
+    const { urlByPath, scopes } = buildJavaScriptProjectUrlMap(projectFiles);
 
     const runnerHtml = `<!DOCTYPE html>
 <html lang="en">
@@ -4342,14 +4819,133 @@ json.dumps(_result)
     projectFiles: ProjectSourceFile[],
     entryFile: ProjectSourceFile
   ) => {
+    const buildHtmlProjectPreview = () => {
+      const cssFiles = projectFiles.filter(file => file.language === 'css');
+      const javascriptFiles = projectFiles.filter(file => file.language === 'javascript');
+      if (cssFiles.length === 0 && javascriptFiles.length === 0) {
+        return { html: entryFile.content, objectUrls: [] };
+      }
+
+      const cssByPath = new Map(cssFiles.map(file => [file.path, file]));
+      const javascriptByPath = new Map(javascriptFiles.map(file => [file.path, file]));
+      const { urlByPath: javascriptUrlByPath, scopes: javascriptScopes } = buildJavaScriptProjectUrlMap(javascriptFiles);
+      const appliedCssPaths = new Set<string>();
+      const appliedJavaScriptPaths = new Set<string>();
+      const parser = new DOMParser();
+      const document = parser.parseFromString(entryFile.content, 'text/html');
+
+      const createStyleElement = (file: ProjectSourceFile, source: string) => {
+        const style = document.createElement('style');
+        style.setAttribute('data-codecraft-css', file.path);
+        style.setAttribute('data-codecraft-source', source);
+        style.textContent = `\n/* ${file.path} */\n${file.content}\n`;
+        return style;
+      };
+
+      const createScriptElement = (file: ProjectSourceFile, source: string) => {
+        const script = document.createElement('script');
+        const scriptUrl = javascriptUrlByPath.get(file.path);
+        script.setAttribute('data-codecraft-js', file.path);
+        script.setAttribute('data-codecraft-source', source);
+        if (containsJavaScriptModuleSyntax(file.content)) {
+          script.type = 'module';
+        }
+        if (scriptUrl) {
+          script.src = scriptUrl;
+        }
+        return script;
+      };
+
+      for (const link of Array.from(document.querySelectorAll('link[href]'))) {
+        const rel = link.getAttribute('rel') || '';
+        const href = link.getAttribute('href') || '';
+        if (!/\bstylesheet\b/i.test(rel) || isExternalProjectResourceSpecifier(href)) continue;
+
+        const resolvedPath = resolveProjectRelativePath(entryFile.path, stripProjectResourceSuffix(href));
+        const cssFile = cssByPath.get(resolvedPath);
+        if (!cssFile) {
+          link.remove();
+          continue;
+        }
+
+        const style = createStyleElement(cssFile, 'link');
+        const media = link.getAttribute('media');
+        if (media) style.setAttribute('media', media);
+        link.replaceWith(style);
+        appliedCssPaths.add(cssFile.path);
+      }
+
+      const javascriptScopeKeys = Object.keys(javascriptScopes);
+      if (javascriptScopeKeys.length > 0) {
+        const importMap = document.createElement('script');
+        importMap.type = 'importmap';
+        importMap.textContent = JSON.stringify({ imports: {}, scopes: javascriptScopes });
+        document.head.prepend(importMap);
+      }
+
+      for (const script of Array.from(document.querySelectorAll('script[src]'))) {
+        const src = script.getAttribute('src') || '';
+        if (isExternalProjectResourceSpecifier(src)) continue;
+
+        const resolvedPath = resolveProjectRelativePath(entryFile.path, stripProjectResourceSuffix(src));
+        const javascriptFile = javascriptByPath.get(resolvedPath);
+        const scriptUrl = javascriptFile ? javascriptUrlByPath.get(javascriptFile.path) : '';
+        if (!javascriptFile || !scriptUrl) {
+          script.remove();
+          continue;
+        }
+
+        script.setAttribute('src', scriptUrl);
+        if (!script.getAttribute('type') && containsJavaScriptModuleSyntax(javascriptFile.content)) {
+          script.setAttribute('type', 'module');
+        }
+        script.setAttribute('data-codecraft-js', javascriptFile.path);
+        script.setAttribute('data-codecraft-source', 'script');
+        script.removeAttribute('integrity');
+        script.removeAttribute('crossorigin');
+        appliedJavaScriptPaths.add(javascriptFile.path);
+      }
+
+      for (const cssFile of cssFiles) {
+        if (appliedCssPaths.has(cssFile.path)) continue;
+        document.head.appendChild(createStyleElement(cssFile, 'selection'));
+      }
+
+      for (const javascriptFile of javascriptFiles) {
+        if (appliedJavaScriptPaths.has(javascriptFile.path)) continue;
+        document.body.appendChild(createScriptElement(javascriptFile, 'selection'));
+      }
+
+      return {
+        html: `<!DOCTYPE html>\n${document.documentElement.outerHTML}`,
+        objectUrls: [],
+      };
+    };
+
+    const htmlFiles = projectFiles.filter(file => file.language === 'html');
+    const cssFiles = projectFiles.filter(file => file.language === 'css');
+    const javascriptFiles = projectFiles.filter(file => file.language === 'javascript');
+    const details = [
+      htmlFiles.length > 1
+        ? `${htmlFiles.length - 1} additional HTML file(s) remain available as alternate entry pages`
+        : '',
+      cssFiles.length > 0
+        ? `${cssFiles.length} selected CSS file(s) applied`
+        : '',
+      javascriptFiles.length > 0
+        ? `${javascriptFiles.length} selected JavaScript file(s) available to the page`
+        : '',
+    ].filter(Boolean);
+
     setExecutionStartupStatus('');
     setOutput(
-      projectFiles.length > 1
-        ? `Previewing ${entryFile.path}. ${projectFiles.length - 1} additional HTML file(s) remain available as alternate entry pages.`
+      details.length > 0
+        ? `Previewing ${entryFile.path}. ${details.join('. ')}.`
         : `Previewing ${entryFile.path}.`
     );
     selectDockPanel('output');
-    showOutputPreview(entryFile.content);
+    const preview = buildHtmlProjectPreview();
+    showOutputPreview(preview.html, preview.objectUrls);
   };
 
   const runJavaScript = async (code: string) => {
@@ -7261,6 +7857,47 @@ finally:
       .trim()
   );
 
+  const extractOpenAIChatContentText = (content: any): string => {
+    if (typeof content === 'string') return content;
+    if (!Array.isArray(content)) return '';
+    return content
+      .flatMap((part: any) => {
+        if (!part || part.type === 'thinking') return [];
+        if (typeof part.text === 'string') return [part.text];
+        if (typeof part.content === 'string') return [part.content];
+        if (Array.isArray(part.thinking)) return [];
+        return [];
+      })
+      .join('\n');
+  };
+
+  const extractOpenAIChatVisibleText = (response: any) => {
+    const message = response?.choices?.[0]?.message;
+    return extractOpenAIChatContentText(message?.content).trim();
+  };
+
+  const getOpenAIChatReasoningTokenCount = (response: any) => (
+    typeof response?.usage?.completion_tokens_details?.reasoning_tokens === 'number'
+      ? response.usage.completion_tokens_details.reasoning_tokens
+      : 0
+  );
+
+  const normalizeOpenAIChatAssistantMessage = (provider: AssistantProvider, message: any) => {
+    const normalized: any = {
+      role: 'assistant',
+      content: provider === 'mistral' && Array.isArray(message?.content)
+        ? message.content
+        : (extractOpenAIChatContentText(message?.content) || null),
+    };
+    if (Array.isArray(message?.tool_calls) && message.tool_calls.length > 0) {
+      normalized.tool_calls = message.tool_calls;
+    }
+    if (provider === 'cerebras' && typeof message?.reasoning === 'string') {
+      normalized.reasoning = message.reasoning;
+    }
+    return normalized;
+  };
+
   const applyAssistantUsage = (
     accumulator: {
       totalPromptTokenCount: number;
@@ -7332,7 +7969,10 @@ finally:
       const provider = settings.assistantProvider;
       const model = settings.assistantModel.trim();
       const apiKey = assistantConfiguredApiKey;
-      const assistantTools = buildAssistantToolSet(effectiveAssistantUseChainOfThought);
+      const assistantSupportsLocalTools = getAssistantSupportsLocalTools(provider, model);
+      const assistantTools = assistantSupportsLocalTools
+        ? buildAssistantToolSet(effectiveAssistantUseChainOfThought)
+        : [];
       const maxAssistantToolPasses = effectiveAssistantUseChainOfThought
         ? effectiveAssistantMaxChainOfThoughtDepth
         : DEFAULT_ASSISTANT_TOOL_PASSES;
@@ -7402,6 +8042,7 @@ finally:
         assistantTerminalCwd,
         useChainOfThought: effectiveAssistantUseChainOfThought,
         maxChainOfThoughtDepth: maxAssistantToolPasses,
+        hasAssistantTools: assistantSupportsLocalTools,
         toolProgressNotes,
         assistantLiveNotes,
       });
@@ -7702,20 +8343,25 @@ finally:
           };
         }
 
-        if (call.name === 'terminalLs') {
-          const target = typeof args.pathOrName === 'string' && args.pathOrName.trim()
-            ? findItemInTerminalContext(args.pathOrName.trim())
+        if (call.name === 'ls' || call.name === 'terminalLs') {
+          const rawPathArg = [args.pathOrName, args.path, args.directory, args.target]
+            .find(value => typeof value === 'string' && value.trim());
+          const requestedPath = typeof rawPathArg === 'string' ? rawPathArg.trim() : '';
+          const listsCurrentDirectory = !requestedPath || requestedPath === '.';
+          const listsRootDirectory = requestedPath === '/' || requestedPath === '~';
+          const target = requestedPath && !listsCurrentDirectory && !listsRootDirectory
+            ? findItemInTerminalContext(requestedPath)
             : undefined;
-          if (args.pathOrName && (!target || target.type !== 'folder')) {
-            const message = `ls: cannot access '${String(args.pathOrName)}': No such directory`;
-            appendTerminalCommandResult(`ls ${String(args.pathOrName)}`, [message]);
+          if (!listsCurrentDirectory && !listsRootDirectory && (!target || target.type !== 'folder')) {
+            const message = `ls: cannot access '${requestedPath}': No such directory`;
+            appendTerminalCommandResult(`ls ${requestedPath}`, [message]);
             return { summary: message, detail: message, result: { ok: false } };
           }
-          const folderId = target?.id ?? assistantTerminalCwd;
+          const folderId = listsRootDirectory ? null : target?.id ?? assistantTerminalCwd;
           const items = assistantFiles.filter(file => file.parentId === folderId).map(file => file.name).join('  ');
-          appendTerminalCommandResult(args.pathOrName ? `ls ${String(args.pathOrName)}` : 'ls', [items || '(empty)']);
+          appendTerminalCommandResult(requestedPath ? `ls ${requestedPath}` : 'ls', [items || '(empty)']);
           return {
-            summary: `Listed ${target ? getPathFromSnapshot(target.id) : 'the current directory'}.`,
+            summary: `Listed ${target ? getPathFromSnapshot(target.id) : listsRootDirectory ? 'workspace root' : 'the current directory'}.`,
             detail: items || '(empty)',
             result: {
               ok: true,
@@ -7964,6 +8610,8 @@ finally:
         };
       };
 
+      const assistantRemoteMcpTool = buildAssistantRemoteMcpTool(provider, settings);
+
       const geminiThinkingConfig = (() => {
         if (!effectiveAssistantUseChainOfThought && getAssistantReasoningControl(provider, model) === 'always_on') {
           return undefined;
@@ -8062,7 +8710,10 @@ finally:
           const payload: any = {
             model,
             input: nextInput,
-            tools: assistantTools.map(toOpenAIToolDefinition),
+            tools: [
+              ...assistantTools.map(toOpenAIToolDefinition),
+              ...(assistantRemoteMcpTool ? [assistantRemoteMcpTool] : []),
+            ],
           };
           if (previousResponseId) payload.previous_response_id = previousResponseId;
           if (getAssistantReasoningControl(provider, model) !== 'always_off') {
@@ -8136,6 +8787,182 @@ finally:
           }
 
           previousResponseId = responseJson.id;
+        }
+      };
+
+      const runOpenAIResponsesCompatibleLoop = async (config: AssistantOpenAIResponsesProviderConfig) => {
+        let previousResponseId: string | undefined;
+        let nextInput: any = [{
+          role: 'user',
+          content: [{ type: 'input_text', text: buildAssistantPrompt() }],
+        }];
+
+        for (let pass = 0; pass < maxAssistantToolPasses; pass++) {
+          const payload: any = {
+            model,
+            input: nextInput,
+            tools: [
+              ...assistantTools.map(toOpenAIToolDefinition),
+              ...(assistantRemoteMcpTool ? [assistantRemoteMcpTool] : []),
+            ],
+          };
+          if (previousResponseId) payload.previous_response_id = previousResponseId;
+
+          const response = await fetch(config.endpoint, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${apiKey}`,
+            },
+            body: JSON.stringify(payload),
+          });
+
+          const responseJson = await response.json();
+          if (!response.ok) {
+            throw new Error(responseJson?.error?.message || config.requestLabel);
+          }
+
+          const assistantText = extractOpenAIVisibleText(responseJson);
+          const outputTokens = typeof responseJson?.usage?.output_tokens === 'number' ? responseJson.usage.output_tokens : undefined;
+          const reasoningTokens = typeof responseJson?.usage?.output_tokens_details?.reasoning_tokens === 'number'
+            ? responseJson.usage.output_tokens_details.reasoning_tokens
+            : 0;
+          applyAssistantUsage(
+            usageTotals,
+            {
+              promptTokenCount: responseJson?.usage?.input_tokens,
+              candidateTokenCount: typeof outputTokens === 'number' ? Math.max(0, outputTokens - reasoningTokens) : undefined,
+              thoughtsTokenCount: reasoningTokens,
+              totalTokenCount: responseJson?.usage?.total_tokens,
+              hasModelUsage: !!responseJson?.usage,
+            },
+            Array.isArray(nextInput) ? JSON.stringify(nextInput) : String(nextInput || ''),
+            assistantText,
+          );
+
+          if (assistantText) {
+            emitAssistantLiveMessage(assistantText);
+          }
+
+          const functionCalls = (Array.isArray(responseJson?.output) ? responseJson.output : [])
+            .filter((item: any) => item?.type === 'function_call');
+          if (functionCalls.length === 0) break;
+
+          const passSummaries: string[] = [];
+          const passDetails: string[] = [];
+          nextInput = [];
+
+          for (const functionCall of functionCalls) {
+            const outcome = await executeAssistantToolCall({
+              name: functionCall.name,
+              args: safeJsonParse(functionCall.arguments || '{}'),
+              callId: functionCall.call_id,
+            });
+            passSummaries.push(outcome.summary);
+            passDetails.push(outcome.detail);
+            nextInput.push({
+              type: 'function_call_output',
+              call_id: functionCall.call_id,
+              output: JSON.stringify(outcome.result ?? { summary: outcome.summary, detail: outcome.detail }),
+            });
+          }
+
+          if (passSummaries.length > 0) {
+            emitAssistantLog(`Step ${pass + 1} log:\n${passSummaries.map(summary => `- ${summary}`).join('\n')}`);
+          }
+          if (passDetails.length > 0) {
+            toolProgressNotes.push(passDetails.join(' '));
+          }
+
+          previousResponseId = responseJson.id;
+        }
+      };
+
+      const runOpenAIChatCompatibleLoop = async (config: AssistantOpenAIChatProviderConfig) => {
+        const messages: any[] = [{ role: 'user', content: buildAssistantPrompt() }];
+        const maxTokenKey = provider === 'cerebras' || provider === 'groq'
+          ? 'max_completion_tokens'
+          : 'max_tokens';
+
+        for (let pass = 0; pass < maxAssistantToolPasses; pass++) {
+          const payload: any = {
+            model,
+            messages,
+            [maxTokenKey]: config.defaultMaxTokens,
+            ...getOpenAIChatReasoningRequestOptions(provider, model, effectiveAssistantUseChainOfThought),
+          };
+          if (assistantTools.length > 0) {
+            payload.tools = assistantTools.map(toOpenAIChatToolDefinition);
+            payload.tool_choice = 'auto';
+          }
+
+          const response = await fetch(config.endpoint, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${apiKey}`,
+            },
+            body: JSON.stringify(payload),
+          });
+
+          const responseJson = await response.json();
+          if (!response.ok) {
+            throw new Error(responseJson?.error?.message || config.requestLabel);
+          }
+
+          const assistantText = extractOpenAIChatVisibleText(responseJson);
+          const outputTokens = typeof responseJson?.usage?.completion_tokens === 'number'
+            ? responseJson.usage.completion_tokens
+            : undefined;
+          const reasoningTokens = getOpenAIChatReasoningTokenCount(responseJson);
+          applyAssistantUsage(
+            usageTotals,
+            {
+              promptTokenCount: responseJson?.usage?.prompt_tokens,
+              candidateTokenCount: typeof outputTokens === 'number' ? Math.max(0, outputTokens - reasoningTokens) : undefined,
+              thoughtsTokenCount: reasoningTokens,
+              totalTokenCount: responseJson?.usage?.total_tokens,
+              hasModelUsage: !!responseJson?.usage,
+            },
+            JSON.stringify(messages),
+            assistantText,
+          );
+
+          if (assistantText) {
+            emitAssistantLiveMessage(assistantText);
+          }
+
+          const responseMessage = responseJson?.choices?.[0]?.message || {};
+          const toolCalls = Array.isArray(responseMessage?.tool_calls)
+            ? responseMessage.tool_calls
+            : [];
+          if (toolCalls.length === 0) break;
+
+          const passSummaries: string[] = [];
+          const passDetails: string[] = [];
+          messages.push(normalizeOpenAIChatAssistantMessage(provider, responseMessage));
+
+          for (const toolCall of toolCalls) {
+            const outcome = await executeAssistantToolCall({
+              name: toolCall?.function?.name,
+              args: safeJsonParse(toolCall?.function?.arguments || '{}'),
+              callId: toolCall?.id,
+            });
+            passSummaries.push(outcome.summary);
+            passDetails.push(outcome.detail);
+            messages.push({
+              role: 'tool',
+              tool_call_id: toolCall.id,
+              content: JSON.stringify(outcome.result ?? { summary: outcome.summary, detail: outcome.detail }),
+            });
+          }
+
+          if (passSummaries.length > 0) {
+            emitAssistantLog(`Step ${pass + 1} log:\n${passSummaries.map(summary => `- ${summary}`).join('\n')}`);
+          }
+          if (passDetails.length > 0) {
+            toolProgressNotes.push(passDetails.join(' '));
+          }
         }
       };
 
@@ -8227,8 +9054,18 @@ finally:
         await runGeminiLoop();
       } else if (provider === 'openai') {
         await runOpenAILoop();
-      } else {
+      } else if (provider === 'anthropic') {
         await runAnthropicLoop();
+      } else {
+        const responsesConfig = getOpenAIResponsesProviderConfig(provider);
+        const chatConfig = getOpenAIChatProviderConfig(provider);
+        if (responsesConfig) {
+          await runOpenAIResponsesCompatibleLoop(responsesConfig);
+        } else if (chatConfig) {
+          await runOpenAIChatCompatibleLoop(chatConfig);
+        } else {
+          throw new Error(`${getAssistantProviderLabel(provider)} is not wired yet.`);
+        }
       }
 
       if (!emittedAssistantMessage) {
@@ -10376,6 +11213,67 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
                       </button>
                     </div>
 
+                    {assistantProviderSupportsRemoteMcp && (
+                      <div className="rounded-xl border border-white/10 bg-black/20 p-4 space-y-3">
+                        <div>
+                          <div className="text-sm font-medium text-white">Remote MCP Server</div>
+                          <div className="text-xs text-zinc-500">
+                            Optional server-side MCP tools for {getAssistantProviderLabel(settings.assistantProvider)} Responses API requests.
+                          </div>
+                        </div>
+                        <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,2fr)_minmax(0,1fr)] gap-3">
+                          <label className="block space-y-2">
+                            <div className="text-xs font-medium uppercase tracking-wide text-zinc-500">Server URL</div>
+                            <input
+                              value={settings.assistantMcpServerUrl}
+                              onChange={(e) => setSettings(current => ({ ...current, assistantMcpServerUrl: e.target.value }))}
+                              placeholder="https://example.com/mcp"
+                              className="w-full rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-sm text-white outline-none transition-colors focus:border-indigo-500"
+                            />
+                          </label>
+                          <label className="block space-y-2">
+                            <div className="text-xs font-medium uppercase tracking-wide text-zinc-500">Label</div>
+                            <input
+                              value={settings.assistantMcpServerLabel}
+                              onChange={(e) => setSettings(current => ({ ...current, assistantMcpServerLabel: e.target.value }))}
+                              placeholder="workspace"
+                              className="w-full rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-sm text-white outline-none transition-colors focus:border-indigo-500"
+                            />
+                          </label>
+                        </div>
+                        <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)] gap-3">
+                          <label className="block space-y-2">
+                            <div className="text-xs font-medium uppercase tracking-wide text-zinc-500">Allowed Tools</div>
+                            <input
+                              value={settings.assistantMcpAllowedTools}
+                              onChange={(e) => setSettings(current => ({ ...current, assistantMcpAllowedTools: e.target.value }))}
+                              placeholder="search, fetch"
+                              className="w-full rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-sm text-white outline-none transition-colors focus:border-indigo-500"
+                            />
+                          </label>
+                          <label className="block space-y-2">
+                            <div className="text-xs font-medium uppercase tracking-wide text-zinc-500">Authorization</div>
+                            <input
+                              type="password"
+                              value={settings.assistantMcpAuthorization}
+                              onChange={(e) => setSettings(current => ({ ...current, assistantMcpAuthorization: e.target.value }))}
+                              placeholder="Bearer token or OAuth token"
+                              className="w-full rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-sm text-white outline-none transition-colors focus:border-indigo-500"
+                            />
+                          </label>
+                        </div>
+                        <label className="block space-y-2">
+                          <div className="text-xs font-medium uppercase tracking-wide text-zinc-500">Description</div>
+                          <input
+                            value={settings.assistantMcpServerDescription}
+                            onChange={(e) => setSettings(current => ({ ...current, assistantMcpServerDescription: e.target.value }))}
+                            placeholder="What this server provides"
+                            className="w-full rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-sm text-white outline-none transition-colors focus:border-indigo-500"
+                          />
+                        </label>
+                      </div>
+                    )}
+
                     <div className="flex items-center justify-between gap-4 rounded-xl border border-white/10 bg-black/20 px-4 py-3">
                       <div>
                         <div className="text-sm font-medium text-white">Show Usage Popup</div>
@@ -10500,12 +11398,24 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
                                   : projectRunnableFiles
                                     .filter(file => normalizeProjectRuntimeLanguage(file.language) === modeLanguage)
                                     .map(file => file.id);
+                                const selectedEntryIds = nextMode === 'custom'
+                                  ? (() => {
+                                    const selectedCustomFiles = projectRunnableFiles.filter(file => selectedIds.includes(file.id));
+                                    const hasHtml = selectedCustomFiles.some(file => normalizeProjectRuntimeLanguage(file.language) === 'html');
+                                    return selectedCustomFiles
+                                      .filter(file => {
+                                        const language = normalizeProjectRuntimeLanguage(file.language);
+                                        return hasHtml ? language === 'html' : language !== null;
+                                      })
+                                      .map(file => file.id);
+                                  })()
+                                  : selectedIds;
                                 const nextEntryFileId =
-                                  current.projectRunEntryFileId && selectedIds.includes(current.projectRunEntryFileId)
+                                  current.projectRunEntryFileId && selectedEntryIds.includes(current.projectRunEntryFileId)
                                     ? current.projectRunEntryFileId
-                                    : selectedIds.includes(activeFileId)
+                                    : selectedEntryIds.includes(activeFileId)
                                       ? activeFileId
-                                      : selectedIds[0] ?? null;
+                                      : selectedEntryIds[0] ?? null;
                                 return {
                                   ...current,
                                   projectRunMode: nextMode,
@@ -10533,13 +11443,13 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
                               ...current,
                               projectRunEntryFileId: e.target.value || null,
                             }))}
-                            disabled={resolvedProjectRun.selectedFiles.length === 0}
+                            disabled={resolvedProjectRun.entryCandidates.length === 0}
                             className="w-full rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-sm text-white outline-none transition-colors focus:border-indigo-500 disabled:opacity-60 disabled:cursor-not-allowed"
                           >
-                            {resolvedProjectRun.selectedFiles.length === 0 ? (
-                              <option value="">No project files selected</option>
+                            {resolvedProjectRun.entryCandidates.length === 0 ? (
+                              <option value="">No entry files available</option>
                             ) : (
-                              resolvedProjectRun.selectedFiles.map(file => (
+                              resolvedProjectRun.entryCandidates.map(file => (
                                 <option key={file.id} value={file.id}>{getPath(file.id)}</option>
                               ))
                             )}
@@ -10577,17 +11487,17 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
                         <div className="space-y-3">
                           <div>
                             <div className="text-sm font-medium text-white">Custom File Selection</div>
-                            <div className="text-xs text-zinc-500 mt-1">Select the files to include in the run. Cross-language project execution is intentionally blocked.</div>
+                            <div className="text-xs text-zinc-500 mt-1">Select the exact files to include. HTML can be combined with JS and CSS; other project runs stay single-language.</div>
                           </div>
 
                           {projectRunnableFiles.length === 0 ? (
                             <div className="rounded-xl border border-white/10 bg-black/20 px-4 py-3 text-sm text-zinc-500">
-                              Add at least one runnable `C#`, `Python`, `HTML`, or `JS` file to configure a project run.
+                              Add at least one `C#`, `Python`, `HTML`, `JS`, or `CSS` file to configure a project run.
                             </div>
                           ) : (
                             <div className="max-h-64 overflow-y-auto custom-scrollbar rounded-xl border border-white/10 bg-black/20 divide-y divide-white/5">
                               {projectRunnableFiles.map(file => {
-                                const language = normalizeProjectRuntimeLanguage(file.language);
+                                const language = normalizeProjectFileLanguage(file.language);
                                 const isChecked = settings.projectRunCustomFileIds.includes(file.id);
                                 return (
                                   <label key={file.id} className="flex items-center gap-3 px-4 py-3 cursor-pointer hover:bg-white/5">
@@ -10600,12 +11510,20 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
                                           const nextIds = checked
                                             ? [...current.projectRunCustomFileIds, file.id]
                                             : current.projectRunCustomFileIds.filter(id => id !== file.id);
+                                          const selectedCustomFiles = projectRunnableFiles.filter(candidate => nextIds.includes(candidate.id));
+                                          const hasHtml = selectedCustomFiles.some(candidate => normalizeProjectRuntimeLanguage(candidate.language) === 'html');
+                                          const nextEntryIds = selectedCustomFiles
+                                            .filter(candidate => {
+                                              const language = normalizeProjectRuntimeLanguage(candidate.language);
+                                              return hasHtml ? language === 'html' : language !== null;
+                                            })
+                                            .map(candidate => candidate.id);
                                           const nextEntryFileId =
-                                            current.projectRunEntryFileId && nextIds.includes(current.projectRunEntryFileId)
+                                            current.projectRunEntryFileId && nextEntryIds.includes(current.projectRunEntryFileId)
                                               ? current.projectRunEntryFileId
-                                              : nextIds.includes(activeFileId)
+                                              : nextEntryIds.includes(activeFileId)
                                                 ? activeFileId
-                                                : nextIds[0] ?? null;
+                                                : nextEntryIds[0] ?? null;
                                           return {
                                             ...current,
                                             projectRunCustomFileIds: nextIds,
