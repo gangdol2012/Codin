@@ -5,6 +5,7 @@ using System.IO;
 using System.Linq;
 using System.Net.Http;
 using System.Reflection;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Components.WebAssembly.Hosting;
@@ -128,6 +129,26 @@ namespace BrowserCSharp
 		}
 
 		[JSInvokable]
+		public static Task<ExecutionResult> ExecuteScriptInteractive(string code)
+		{
+			async Task<ExecutionResult> execute()
+			{
+				CompilationResult compilationResult = await CompileScript(code).ConfigureAwait(false);
+
+				if (compilationResult.Success)
+				{
+					return await RunScript(compilationResult.Assembly, compilationResult.Compilation, new object[] { null, null }, true).ConfigureAwait(false);
+				}
+				else
+				{
+					return new ExecutionResult(null, null, String.Join('\n', compilationResult.Errors.Select(x => x.GetMessage())));
+				}
+			}
+
+			return Task.Run(execute);
+		}
+
+		[JSInvokable]
 		public static Task<ExecutionResult> ExecuteScriptInContext(string code, string contextId)
 		{
 			async Task<ExecutionResult> execute()
@@ -140,6 +161,29 @@ namespace BrowserCSharp
 					context = context.AddCompilation(compilationResult.Compilation);
 					previousCompilations[contextId] = context;
 					return await RunScript(compilationResult.Assembly, compilationResult.Compilation, context.States).ConfigureAwait(false);
+				}
+				else
+				{
+					return new ExecutionResult(null, null, String.Join('\n', compilationResult.Errors.Select(x => x.GetMessage())));
+				}
+			}
+
+			return Task.Run(execute);
+		}
+
+		[JSInvokable]
+		public static Task<ExecutionResult> ExecuteScriptInContextInteractive(string code, string contextId)
+		{
+			async Task<ExecutionResult> execute()
+			{
+				ScriptContext context = previousCompilations.TryGetValue(contextId, out ScriptContext c) ? c : ScriptContext.Empty;
+				CompilationResult compilationResult = await CompileScript(code, context).ConfigureAwait(false);
+
+				if (compilationResult.Success)
+				{
+					context = context.AddCompilation(compilationResult.Compilation);
+					previousCompilations[contextId] = context;
+					return await RunScript(compilationResult.Assembly, compilationResult.Compilation, context.States, true).ConfigureAwait(false);
 				}
 				else
 				{
@@ -194,6 +238,27 @@ namespace BrowserCSharp
 		}
 
 		[JSInvokable]
+		public static Task<ExecutionResult> ExecuteRegularInteractive(string code)
+		{
+			async Task<ExecutionResult> execute()
+			{
+				CompilationResult compilationResult = await CompileRegularProgram(
+					new[] { new KeyValuePair<string, string>("Program.cs", code ?? String.Empty) },
+					"Program.cs"
+				).ConfigureAwait(false);
+
+				if (compilationResult.Success)
+				{
+					return await RunRegularProgram(compilationResult.Assembly, compilationResult.Compilation, true).ConfigureAwait(false);
+				}
+
+				return new ExecutionResult(null, null, String.Join('\n', compilationResult.Errors.Select(x => x.GetMessage())));
+			}
+
+			return Task.Run(execute);
+		}
+
+		[JSInvokable]
 		public static Task<ExecutionResult> ExecuteRegularProject(string[] paths, string[] contents, string entryPath)
 		{
 			async Task<ExecutionResult> execute()
@@ -215,6 +280,36 @@ namespace BrowserCSharp
 				if (compilationResult.Success)
 				{
 					return await RunRegularProgram(compilationResult.Assembly, compilationResult.Compilation).ConfigureAwait(false);
+				}
+
+				return new ExecutionResult(null, null, String.Join('\n', compilationResult.Errors.Select(x => x.GetMessage())));
+			}
+
+			return Task.Run(execute);
+		}
+
+		[JSInvokable]
+		public static Task<ExecutionResult> ExecuteRegularProjectInteractive(string[] paths, string[] contents, string entryPath)
+		{
+			async Task<ExecutionResult> execute()
+			{
+				if (paths == null || contents == null || paths.Length == 0 || paths.Length != contents.Length)
+				{
+					return new ExecutionResult(null, null, "Invalid C# project payload.");
+				}
+
+				KeyValuePair<string, string>[] sourceFiles = paths
+					.Select((path, index) => new KeyValuePair<string, string>(
+						String.IsNullOrWhiteSpace(path) ? $"File{index + 1}.cs" : path,
+						contents[index] ?? String.Empty
+					))
+					.ToArray();
+
+				CompilationResult compilationResult = await CompileRegularProgram(sourceFiles, entryPath).ConfigureAwait(false);
+
+				if (compilationResult.Success)
+				{
+					return await RunRegularProgram(compilationResult.Assembly, compilationResult.Compilation, true).ConfigureAwait(false);
 				}
 
 				return new ExecutionResult(null, null, String.Join('\n', compilationResult.Errors.Select(x => x.GetMessage())));
@@ -349,7 +444,7 @@ internal static class __CodeCraftEntry
 			return String.IsNullOrWhiteSpace(namespaceName) ? typeName : $"{namespaceName}.{typeName}";
 		}
 
-		private static async Task<ExecutionResult> RunRegularProgram(Assembly assembly, Compilation compilation)
+		private static async Task<ExecutionResult> RunRegularProgram(Assembly assembly, Compilation compilation, bool interactive = false)
 		{
 			IMethodSymbol entrySymbol = compilation.GetEntryPoint(CancellationToken.None);
 			if (entrySymbol == null)
@@ -364,10 +459,21 @@ internal static class __CodeCraftEntry
 			}
 
 			TextWriter ogOut = Console.Out;
+			TextWriter ogError = Console.Error;
+			TextReader ogIn = Console.In;
 			try
 			{
-				using StringWriter sw = new StringWriter();
-				Console.SetOut(sw);
+				StringWriter sw = interactive ? null : new StringWriter();
+				if (interactive)
+				{
+					Console.SetOut(new CodeCraftInteractiveTextWriter("stdout"));
+					Console.SetError(new CodeCraftInteractiveTextWriter("stderr"));
+					Console.SetIn(new CodeCraftInteractiveTextReader());
+				}
+				else
+				{
+					Console.SetOut(sw);
+				}
 				ParameterInfo[] parameters = entry.GetParameters();
 				object[] mainArgs = parameters.Length == 0 ? null : new object[] { Array.Empty<string>() };
 				object invokeResult = entry.Invoke(null, mainArgs);
@@ -388,8 +494,8 @@ internal static class __CodeCraftEntry
 					exitOrResult = invokeResult;
 				}
 
-				string stdOut = sw.ToString();
-				string outStr = stdOut.Length > 0 ? stdOut : null;
+				string stdOut = sw?.ToString();
+				string outStr = !String.IsNullOrEmpty(stdOut) ? stdOut : null;
 				if (exitOrResult != null && !(exitOrResult is Task))
 				{
 					return new ExecutionResult(exitOrResult, outStr, null);
@@ -405,6 +511,8 @@ internal static class __CodeCraftEntry
 			finally
 			{
 				Console.SetOut(ogOut);
+				Console.SetError(ogError);
+				Console.SetIn(ogIn);
 			}
 		}
 
@@ -456,25 +564,36 @@ internal static class __CodeCraftEntry
 
 		private static Task<ExecutionResult> RunScript(Assembly assembly, Compilation compilation)
 		{
-			return RunScript(assembly, compilation, new object[] { null, null });
+			return RunScript(assembly, compilation, new object[] { null, null }, false);
 		}
-		private static async Task<ExecutionResult> RunScript(Assembly assembly, Compilation compilation, object[] states)
+		private static async Task<ExecutionResult> RunScript(Assembly assembly, Compilation compilation, object[] states, bool interactive = false)
 		{
 			IMethodSymbol entryPoint = compilation.GetEntryPoint(CancellationToken.None);
 			Type type = assembly.GetType($"{entryPoint.ContainingNamespace.MetadataName}.{entryPoint.ContainingType.MetadataName}"); ;
 			MethodInfo entryPointMethod = type.GetMethod(entryPoint.MetadataName);
 
 			TextWriter ogOut = Console.Out;
+			TextWriter ogError = Console.Error;
+			TextReader ogIn = Console.In;
 			try
 			{
-				using StringWriter sw = new StringWriter();
-				Console.SetOut(sw);
+				StringWriter sw = interactive ? null : new StringWriter();
+				if (interactive)
+				{
+					Console.SetOut(new CodeCraftInteractiveTextWriter("stdout"));
+					Console.SetError(new CodeCraftInteractiveTextWriter("stderr"));
+					Console.SetIn(new CodeCraftInteractiveTextReader());
+				}
+				else
+				{
+					Console.SetOut(sw);
+				}
 
 				Func<object[], Task<object>> submission = (Func<object[], Task<object>>)entryPointMethod.CreateDelegate(typeof(Func<object[], Task<object>>));
 				object result = await submission.Invoke(states).ConfigureAwait(false);
 
-				string stdOut = sw.ToString();
-				return new ExecutionResult(result, stdOut.Length > 0 ? stdOut : null, null);
+				string stdOut = sw?.ToString();
+				return new ExecutionResult(result, !String.IsNullOrEmpty(stdOut) ? stdOut : null, null);
 			}
 			catch (Exception ex)
 			{
@@ -484,7 +603,92 @@ internal static class __CodeCraftEntry
 			finally
 			{
 				Console.SetOut(ogOut);
+				Console.SetError(ogError);
+				Console.SetIn(ogIn);
 			}
+		}
+
+		private sealed class CodeCraftInteractiveTextWriter : TextWriter
+		{
+			private readonly string stream;
+
+			public CodeCraftInteractiveTextWriter(string stream)
+			{
+				this.stream = stream;
+			}
+
+			public override Encoding Encoding => Encoding.UTF8;
+
+			public override void Write(char value)
+			{
+				Write(value.ToString());
+			}
+
+			public override void Write(string value)
+			{
+				if (String.IsNullOrEmpty(value)) return;
+				jsRuntime.InvokeVoidAsync("CodeCraftCSharp.writeOutput", stream, value);
+			}
+
+			public override void WriteLine(string value)
+			{
+				Write((value ?? String.Empty) + Environment.NewLine);
+			}
+		}
+
+		private sealed class CodeCraftInteractiveTextReader : TextReader
+		{
+			private string buffer = String.Empty;
+
+			public override string ReadLine()
+			{
+				buffer = String.Empty;
+				return RequestConsoleInput(String.Empty);
+			}
+
+			public override int Read()
+			{
+				if (buffer.Length == 0)
+				{
+					buffer = RequestConsoleInput(String.Empty) + Environment.NewLine;
+				}
+
+				char next = buffer[0];
+				buffer = buffer.Substring(1);
+				return next;
+			}
+
+			public override int Read(char[] targetBuffer, int index, int count)
+			{
+				if (targetBuffer == null) throw new ArgumentNullException(nameof(targetBuffer));
+				if (index < 0 || count < 0 || index + count > targetBuffer.Length) throw new ArgumentOutOfRangeException();
+				if (count == 0) return 0;
+
+				int read = 0;
+				while (read < count)
+				{
+					int next = Read();
+					if (next < 0) break;
+					targetBuffer[index + read] = (char)next;
+					read++;
+					if (buffer.Length == 0) break;
+				}
+				return read;
+			}
+		}
+
+		private static string RequestConsoleInput(string prompt)
+		{
+			if (jsRuntime is IJSInProcessRuntime syncRuntime)
+			{
+				return syncRuntime.Invoke<string>("CodeCraftCSharp.requestInput", prompt ?? String.Empty) ?? String.Empty;
+			}
+
+			return jsRuntime
+				.InvokeAsync<string>("CodeCraftCSharp.requestInput", prompt ?? String.Empty)
+				.AsTask()
+				.GetAwaiter()
+				.GetResult() ?? String.Empty;
 		}
 
 		private static string FormatExecutionException(Exception exception)
