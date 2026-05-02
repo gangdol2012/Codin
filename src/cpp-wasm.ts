@@ -58,6 +58,43 @@ interface LoadedClangPackage {
 let wasmerSdkPromise: Promise<any> | null = null;
 let clangPackagePromise: Promise<LoadedClangPackage> | null = null;
 
+function disposeMaybe(value: unknown) {
+  const candidate = value as {
+    dispose?: () => unknown;
+    close?: () => unknown;
+    free?: () => unknown;
+  } | null | undefined;
+  try {
+    if (typeof candidate?.dispose === 'function') {
+      candidate.dispose();
+    } else if (typeof candidate?.close === 'function') {
+      candidate.close();
+    } else if (typeof candidate?.free === 'function') {
+      candidate.free();
+    }
+  } catch {
+    // Runtime packages do not expose a stable disposal API across SDK builds.
+  }
+}
+
+export function disposeCxxRuntime() {
+  const pendingClangPackage = clangPackagePromise;
+  const pendingWasmerSdk = wasmerSdkPromise;
+  clangPackagePromise = null;
+  wasmerSdkPromise = null;
+
+  void pendingClangPackage
+    ?.then(({ sdk, clang }) => {
+      disposeMaybe(clang);
+      disposeMaybe(sdk);
+    })
+    .catch(() => {});
+
+  void pendingWasmerSdk
+    ?.then(sdk => disposeMaybe(sdk))
+    .catch(() => {});
+}
+
 function normalizeProjectPath(path: string) {
   const resolved: string[] = [];
   for (const raw of path.replace(/\\/g, '/').split('/')) {
