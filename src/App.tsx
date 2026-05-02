@@ -38,10 +38,18 @@ type UserFolder = import('./pyright').UserFolder;
 type PyrightModule = typeof import('./pyright');
 type CSharpAuthoringModule = typeof import('./csharp-intellisage');
 type BrowserCSharpModule = typeof import('./browser-csharp-api');
+type CxxAuthoringModule = typeof import('./cpp-authoring');
+type CxxRuntimeModule = typeof import('./cpp-wasm');
+type JavaAuthoringModule = typeof import('./java-authoring');
+type JavaRuntimeModule = typeof import('./java-wasm');
 
 let pyrightModulePromise: Promise<PyrightModule> | null = null;
 let csharpAuthoringModulePromise: Promise<CSharpAuthoringModule> | null = null;
 let browserCSharpModulePromise: Promise<BrowserCSharpModule> | null = null;
+let cxxAuthoringModulePromise: Promise<CxxAuthoringModule> | null = null;
+let cxxRuntimeModulePromise: Promise<CxxRuntimeModule> | null = null;
+let javaAuthoringModulePromise: Promise<JavaAuthoringModule> | null = null;
+let javaRuntimeModulePromise: Promise<JavaRuntimeModule> | null = null;
 
 const loadPyrightModule = () => {
   if (!pyrightModulePromise) pyrightModulePromise = import('./pyright');
@@ -56,6 +64,26 @@ const loadCSharpAuthoringModule = () => {
 const loadBrowserCSharpModule = () => {
   if (!browserCSharpModulePromise) browserCSharpModulePromise = import('./browser-csharp-api');
   return browserCSharpModulePromise;
+};
+
+const loadCxxAuthoringModule = () => {
+  if (!cxxAuthoringModulePromise) cxxAuthoringModulePromise = import('./cpp-authoring');
+  return cxxAuthoringModulePromise;
+};
+
+const loadCxxRuntimeModule = () => {
+  if (!cxxRuntimeModulePromise) cxxRuntimeModulePromise = import('./cpp-wasm');
+  return cxxRuntimeModulePromise;
+};
+
+const loadJavaAuthoringModule = () => {
+  if (!javaAuthoringModulePromise) javaAuthoringModulePromise = import('./java-authoring');
+  return javaAuthoringModulePromise;
+};
+
+const loadJavaRuntimeModule = () => {
+  if (!javaRuntimeModulePromise) javaRuntimeModulePromise = import('./java-wasm');
+  return javaRuntimeModulePromise;
 };
 
 const SYNC_DB_NAME = 'codecraft-sync';
@@ -686,7 +714,7 @@ const EXT_TO_LANGUAGE: Record<string, string> = {
   sh: 'shell', bash: 'shell', zsh: 'shell',
   sql: 'sql',
   c: 'c', h: 'c',
-  cpp: 'cpp', cc: 'cpp', cxx: 'cpp', hpp: 'cpp',
+  cpp: 'cpp', cc: 'cpp', cxx: 'cpp', 'c++': 'cpp', hpp: 'cpp', hh: 'cpp', hxx: 'cpp', ipp: 'cpp', tpp: 'cpp',
   java: 'java',
   go: 'go',
   rs: 'rust',
@@ -2343,13 +2371,17 @@ interface ProjectSourceFile {
 
 type JavaScriptExecutionMode = 'classic-function' | 'async-function';
 type RuntimeIOMode = 'alert-output' | 'interactive-output-panel';
-type PythonRuntimeLifecycle = 'dispose-after-run' | 'keep-warm';
+type RuntimeLifecycle = 'dispose-after-run' | 'keep-warm';
 type CSharpExecutionMode = 'regular' | 'script' | 'script-context';
+type CxxCStandard = 'c11' | 'c17' | 'c23';
+type CxxCppStandard = 'c++17' | 'c++20' | 'c++23';
+type CxxOptimizationLevel = 'O0' | 'O1' | 'O2' | 'O3';
+type JavaRuntimeVersion = 8 | 11 | 17;
 type RuntimeInteractionKind = 'alert' | 'confirm' | 'prompt' | 'stdin';
-type RuntimeInteractionLanguage = 'javascript' | 'python' | 'csharp';
-type ProjectRuntimeLanguage = 'javascript' | 'python' | 'html' | 'csharp';
+type RuntimeInteractionLanguage = 'javascript' | 'python' | 'csharp' | 'c' | 'cpp' | 'java';
+type ProjectRuntimeLanguage = 'javascript' | 'python' | 'html' | 'csharp' | 'c' | 'cpp' | 'java';
 type ProjectFileLanguage = ProjectRuntimeLanguage | 'css';
-type ProjectRunMode = 'csharp-only' | 'python-only' | 'html-only' | 'javascript-only' | 'custom';
+type ProjectRunMode = 'csharp-only' | 'python-only' | 'html-only' | 'javascript-only' | 'c-only' | 'cpp-only' | 'java-only' | 'custom';
 
 interface OutputPanelInteraction {
   id: number;
@@ -2375,12 +2407,22 @@ interface AppSettings {
   javascriptExecutionMode: JavaScriptExecutionMode;
   javascriptIOMode: RuntimeIOMode;
   pythonExecutionTimeoutMs: number;
-  pythonRuntimeLifecycle: PythonRuntimeLifecycle;
+  pythonRuntimeLifecycle: RuntimeLifecycle;
   pythonIOMode: RuntimeIOMode;
   csharpExecutionTimeoutMs: number;
   csharpExecutionMode: CSharpExecutionMode;
   csharpResetScriptContextBeforeRun: boolean;
   csharpIOMode: RuntimeIOMode;
+  cxxExecutionTimeoutMs: number;
+  cxxRuntimeLifecycle: RuntimeLifecycle;
+  cxxIOMode: RuntimeIOMode;
+  cxxCStandard: CxxCStandard;
+  cxxCppStandard: CxxCppStandard;
+  cxxOptimizationLevel: CxxOptimizationLevel;
+  javaExecutionTimeoutMs: number;
+  javaRuntimeLifecycle: RuntimeLifecycle;
+  javaIOMode: RuntimeIOMode;
+  javaRuntimeVersion: JavaRuntimeVersion;
   projectRunMode: ProjectRunMode;
   projectRunCustomFileIds: string[];
   projectRunEntryFileId: string | null;
@@ -2455,6 +2497,16 @@ const DEFAULT_SETTINGS: AppSettings = {
   csharpExecutionMode: 'regular',
   csharpResetScriptContextBeforeRun: false,
   csharpIOMode: 'alert-output',
+  cxxExecutionTimeoutMs: 0,
+  cxxRuntimeLifecycle: 'keep-warm',
+  cxxIOMode: 'alert-output',
+  cxxCStandard: 'c17',
+  cxxCppStandard: 'c++20',
+  cxxOptimizationLevel: 'O2',
+  javaExecutionTimeoutMs: 0,
+  javaRuntimeLifecycle: 'keep-warm',
+  javaIOMode: 'alert-output',
+  javaRuntimeVersion: 17,
   projectRunMode: 'custom',
   projectRunCustomFileIds: [],
   projectRunEntryFileId: null,
@@ -2471,8 +2523,14 @@ const DEFAULT_SETTINGS: AppSettings = {
   assistantMcpAuthorization: '',
 };
 
+const CXX_RUNTIME_IDLE_TIMEOUT = 60_000;
+const JAVA_RUNTIME_IDLE_TIMEOUT = 60_000;
+
 const PROJECT_RUN_MODE_OPTIONS: { value: ProjectRunMode; label: string; language: ProjectRuntimeLanguage | null }[] = [
   { value: 'csharp-only', label: 'C# only', language: 'csharp' },
+  { value: 'c-only', label: 'C only', language: 'c' },
+  { value: 'cpp-only', label: 'C++ only', language: 'cpp' },
+  { value: 'java-only', label: 'Java only', language: 'java' },
   { value: 'python-only', label: 'Python only', language: 'python' },
   { value: 'html-only', label: 'HTML only', language: 'html' },
   { value: 'javascript-only', label: 'JS only', language: 'javascript' },
@@ -2494,6 +2552,13 @@ function normalizeProjectFileLanguage(language?: string): ProjectFileLanguage | 
     case 'csharp':
     case 'cs':
       return 'csharp';
+    case 'java':
+      return 'java';
+    case 'c':
+      return 'c';
+    case 'cpp':
+    case 'c++':
+      return 'cpp';
     default:
       return null;
   }
@@ -2516,6 +2581,12 @@ function getProjectRuntimeLanguageLabel(language: ProjectFileLanguage | null) {
       return 'CSS';
     case 'csharp':
       return 'C#';
+    case 'c':
+      return 'C';
+    case 'cpp':
+      return 'C++';
+    case 'java':
+      return 'Java';
     default:
       return 'Unknown';
   }
@@ -2523,6 +2594,85 @@ function getProjectRuntimeLanguageLabel(language: ProjectFileLanguage | null) {
 
 function getProjectRunModeLanguage(mode: ProjectRunMode): ProjectRuntimeLanguage | null {
   return PROJECT_RUN_MODE_OPTIONS.find(option => option.value === mode)?.language ?? null;
+}
+
+function isCxxRuntimeLanguage(language: ProjectRuntimeLanguage | ProjectFileLanguage | null | undefined): language is 'c' | 'cpp' {
+  return language === 'c' || language === 'cpp';
+}
+
+function isCSourcePath(path: string) {
+  return /\.c$/i.test(path);
+}
+
+function isCppSourcePath(path: string) {
+  return /\.(?:cpp|cc|cxx|c\+\+)$/i.test(path);
+}
+
+function isCxxSourcePath(path: string) {
+  return isCSourcePath(path) || isCppSourcePath(path);
+}
+
+function isCxxHeaderPath(path: string) {
+  return /\.(?:h|hh|hpp|hxx|ipp|tpp)$/i.test(path);
+}
+
+function isCxxProjectFile(file: FSItem | ProjectSourceFile) {
+  const language = normalizeProjectFileLanguage(file.language);
+  const path = 'path' in file ? file.path : file.name;
+  return isCxxRuntimeLanguage(language) && (isCxxSourcePath(path) || isCxxHeaderPath(path));
+}
+
+function getCxxResolvedRuntimeLanguage(files: FSItem[]) {
+  const hasCpp = files.some(file => {
+    const language = normalizeProjectFileLanguage(file.language);
+    const path = file.name || '';
+    return language === 'cpp' || isCppSourcePath(path);
+  });
+  return hasCpp ? 'cpp' : 'c';
+}
+
+function isProjectRunModeFileMatch(file: FSItem & { type: 'file' }, modeLanguage: ProjectRuntimeLanguage | null) {
+  const language = normalizeProjectFileLanguage(file.language);
+  if (modeLanguage === 'cpp') {
+    return isCxxProjectFile(file);
+  }
+  if (modeLanguage === 'c') {
+    return language === 'c' && isCxxProjectFile(file);
+  }
+  return normalizeProjectRuntimeLanguage(file.language) === modeLanguage;
+}
+
+function isCxxEntryCandidate(file: FSItem, runtimeLanguage: ProjectRuntimeLanguage | null) {
+  if (runtimeLanguage === 'c') {
+    return isCSourcePath(file.name);
+  }
+  if (runtimeLanguage === 'cpp') {
+    return isCxxSourcePath(file.name);
+  }
+  return normalizeProjectRuntimeLanguage(file.language) === runtimeLanguage;
+}
+
+function getProjectEntryCandidateIds(selectedFiles: FSItem[], preferredLanguage: ProjectRuntimeLanguage | null) {
+  if (isCxxRuntimeLanguage(preferredLanguage)) {
+    return selectedFiles
+      .filter(file => isCxxEntryCandidate(file, preferredLanguage))
+      .map(file => file.id);
+  }
+
+  if (!preferredLanguage && selectedFiles.length > 0 && selectedFiles.every(file => isCxxProjectFile(file))) {
+    const cxxLanguage = getCxxResolvedRuntimeLanguage(selectedFiles);
+    return selectedFiles
+      .filter(file => isCxxEntryCandidate(file, cxxLanguage))
+      .map(file => file.id);
+  }
+
+  const hasHtml = selectedFiles.some(file => normalizeProjectRuntimeLanguage(file.language) === 'html');
+  return selectedFiles
+    .filter(file => {
+      const language = normalizeProjectRuntimeLanguage(file.language);
+      return hasHtml ? language === 'html' : language !== null;
+    })
+    .map(file => file.id);
 }
 
 function normalizeProjectPath(path: string): string {
@@ -2613,6 +2763,31 @@ function normalizeExecutionTimeoutMs(value: number) {
   return Math.max(0, Math.floor(value));
 }
 
+function normalizeRuntimeIOMode(value: unknown): RuntimeIOMode {
+  return value === 'interactive-output-panel' ? 'interactive-output-panel' : 'alert-output';
+}
+
+function normalizeRuntimeLifecycle(value: unknown): RuntimeLifecycle {
+  return value === 'keep-warm' ? 'keep-warm' : 'dispose-after-run';
+}
+
+function normalizeCxxCStandard(value: unknown): CxxCStandard {
+  return value === 'c11' || value === 'c23' ? value : 'c17';
+}
+
+function normalizeCxxCppStandard(value: unknown): CxxCppStandard {
+  return value === 'c++17' || value === 'c++23' ? value : 'c++20';
+}
+
+function normalizeCxxOptimizationLevel(value: unknown): CxxOptimizationLevel {
+  return value === 'O0' || value === 'O1' || value === 'O3' ? value : 'O2';
+}
+
+function normalizeJavaRuntimeVersion(value: unknown): JavaRuntimeVersion {
+  const numeric = typeof value === 'number' ? value : Number(value);
+  return numeric === 8 || numeric === 11 ? numeric : 17;
+}
+
 function normalizeAssistantMaxChainOfThoughtDepth(value: number) {
   if (!Number.isFinite(value)) return DEFAULT_ASSISTANT_TOOL_PASSES;
   return Math.min(12, Math.max(1, Math.floor(value)));
@@ -2690,6 +2865,14 @@ const INITIAL_FILES: FSItem[] = [
     language: 'python',
     parentId: 'root',
     content: '# Python running in your browser via Pyodide!\nimport sys\n\nprint("Hello from Python " + sys.version)\n\ndef fib(n):\n    if n <= 1: return n\n    return fib(n-1) + fib(n-2)\n\nprint("Fibonacci(10):", fib(10))\n\n# You can even use standard libraries\nimport math\nprint("Square root of 144 is:", math.sqrt(144))'
+  },
+  {
+    id: '4',
+    name: 'Main.java',
+    type: 'file',
+    language: 'java',
+    parentId: 'root',
+    content: 'import java.util.Scanner;\n\npublic class Main {\n    public static void main(String[] args) {\n        Scanner scanner = new Scanner(System.in);\n        System.out.print("Your name: ");\n        String name = scanner.nextLine();\n        System.out.println("Hello, " + name + " from Java!");\n    }\n}'
   }
 ];
 
@@ -2893,7 +3076,18 @@ export default function App() {
       ...merged,
       javascriptExecutionTimeoutMs: normalizeExecutionTimeoutMs(merged.javascriptExecutionTimeoutMs),
       pythonExecutionTimeoutMs: normalizeExecutionTimeoutMs(merged.pythonExecutionTimeoutMs),
+      pythonRuntimeLifecycle: normalizeRuntimeLifecycle(merged.pythonRuntimeLifecycle),
       csharpExecutionTimeoutMs: normalizeExecutionTimeoutMs(merged.csharpExecutionTimeoutMs),
+      cxxExecutionTimeoutMs: normalizeExecutionTimeoutMs(merged.cxxExecutionTimeoutMs),
+      cxxRuntimeLifecycle: normalizeRuntimeLifecycle(merged.cxxRuntimeLifecycle),
+      cxxIOMode: normalizeRuntimeIOMode(merged.cxxIOMode),
+      cxxCStandard: normalizeCxxCStandard(merged.cxxCStandard),
+      cxxCppStandard: normalizeCxxCppStandard(merged.cxxCppStandard),
+      cxxOptimizationLevel: normalizeCxxOptimizationLevel(merged.cxxOptimizationLevel),
+      javaExecutionTimeoutMs: normalizeExecutionTimeoutMs(merged.javaExecutionTimeoutMs),
+      javaRuntimeLifecycle: normalizeRuntimeLifecycle(merged.javaRuntimeLifecycle),
+      javaIOMode: normalizeRuntimeIOMode(merged.javaIOMode),
+      javaRuntimeVersion: normalizeJavaRuntimeVersion(merged.javaRuntimeVersion),
       projectRunMode: PROJECT_RUN_MODE_OPTIONS.some(option => option.value === merged.projectRunMode)
         ? merged.projectRunMode
         : DEFAULT_SETTINGS.projectRunMode,
@@ -2944,9 +3138,17 @@ export default function App() {
   const editorRef = useRef<any>(null);
   const pythonDiagnosticsEditorRef = useRef<any>(null);
   const csharpDiagnosticsEditorRef = useRef<any>(null);
+  const cxxDiagnosticsEditorRef = useRef<any>(null);
+  const javaDiagnosticsEditorRef = useRef<any>(null);
   const pyrightModuleRef = useRef<PyrightModule | null>(null);
   const csharpAuthoringModuleRef = useRef<CSharpAuthoringModule | null>(null);
   const browserCSharpModuleRef = useRef<BrowserCSharpModule | null>(null);
+  const cxxAuthoringModuleRef = useRef<CxxAuthoringModule | null>(null);
+  const cxxRuntimeModuleRef = useRef<CxxRuntimeModule | null>(null);
+  const javaAuthoringModuleRef = useRef<JavaAuthoringModule | null>(null);
+  const javaRuntimeModuleRef = useRef<JavaRuntimeModule | null>(null);
+  const cxxRuntimeIdleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const javaRuntimeIdleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [activeEditorTabId, setActiveEditorTabId] = useState<string | null>(null);
   const [mountedSharedEditorTarget, setMountedSharedEditorTarget] = useState<SharedEditorTarget | null>(null);
   const outputContainerRef = useRef<HTMLDivElement>(null);
@@ -2961,6 +3163,7 @@ export default function App() {
   const terminalCwdRef = useRef<string | null>(terminalCwd);
   terminalCwdRef.current = terminalCwd;
   const csharpRuntimeReadyRef = useRef<Promise<void> | null>(null);
+  const csharpInteractiveWorkerRef = useRef<Worker | null>(null);
   const skipEditorSyncRef = useRef(false);
   const pendingSharedEditorTargetRef = useRef<{ tabId: string; itemId: string } | null>(null);
   const sharedEditorVersionRef = useRef(0);
@@ -3028,6 +3231,81 @@ export default function App() {
     return browserCSharpModuleRef.current;
   }, []);
 
+  const getCxxAuthoringModule = useCallback(async () => {
+    if (!cxxAuthoringModuleRef.current) {
+      cxxAuthoringModuleRef.current = await loadCxxAuthoringModule();
+    }
+    return cxxAuthoringModuleRef.current;
+  }, []);
+
+  const getCxxRuntimeModule = useCallback(async () => {
+    if (cxxRuntimeIdleTimerRef.current) {
+      clearTimeout(cxxRuntimeIdleTimerRef.current);
+      cxxRuntimeIdleTimerRef.current = null;
+    }
+    if (!cxxRuntimeModuleRef.current) {
+      cxxRuntimeModuleRef.current = await loadCxxRuntimeModule();
+    }
+    return cxxRuntimeModuleRef.current;
+  }, []);
+
+  const getJavaAuthoringModule = useCallback(async () => {
+    if (!javaAuthoringModuleRef.current) {
+      javaAuthoringModuleRef.current = await loadJavaAuthoringModule();
+    }
+    return javaAuthoringModuleRef.current;
+  }, []);
+
+  const getJavaRuntimeModule = useCallback(async () => {
+    if (javaRuntimeIdleTimerRef.current) {
+      clearTimeout(javaRuntimeIdleTimerRef.current);
+      javaRuntimeIdleTimerRef.current = null;
+    }
+    if (!javaRuntimeModuleRef.current) {
+      javaRuntimeModuleRef.current = await loadJavaRuntimeModule();
+    }
+    return javaRuntimeModuleRef.current;
+  }, []);
+
+  const disposeCxxRuntime = useCallback(() => {
+    if (cxxRuntimeIdleTimerRef.current) {
+      clearTimeout(cxxRuntimeIdleTimerRef.current);
+      cxxRuntimeIdleTimerRef.current = null;
+    }
+    cxxRuntimeModuleRef.current?.disposeCxxRuntime?.();
+    cxxRuntimeModuleRef.current = null;
+    cxxRuntimeModulePromise = null;
+  }, []);
+
+  const resetCxxRuntimeIdleTimer = useCallback(() => {
+    if (cxxRuntimeIdleTimerRef.current) {
+      clearTimeout(cxxRuntimeIdleTimerRef.current);
+    }
+    cxxRuntimeIdleTimerRef.current = setTimeout(disposeCxxRuntime, CXX_RUNTIME_IDLE_TIMEOUT);
+  }, [disposeCxxRuntime]);
+
+  const disposeJavaRuntime = useCallback(() => {
+    if (javaRuntimeIdleTimerRef.current) {
+      clearTimeout(javaRuntimeIdleTimerRef.current);
+      javaRuntimeIdleTimerRef.current = null;
+    }
+    javaRuntimeModuleRef.current?.disposeJavaRuntime?.();
+    javaRuntimeModuleRef.current = null;
+    javaRuntimeModulePromise = null;
+  }, []);
+
+  const resetJavaRuntimeIdleTimer = useCallback(() => {
+    if (javaRuntimeIdleTimerRef.current) {
+      clearTimeout(javaRuntimeIdleTimerRef.current);
+    }
+    javaRuntimeIdleTimerRef.current = setTimeout(disposeJavaRuntime, JAVA_RUNTIME_IDLE_TIMEOUT);
+  }, [disposeJavaRuntime]);
+
+  useEffect(() => () => {
+    disposeCxxRuntime();
+    disposeJavaRuntime();
+  }, [disposeCxxRuntime, disposeJavaRuntime]);
+
   const clearPyrightEditorBinding = useCallback(() => {
     const provider = pyrightModuleRef.current?.pyrightProvider;
     if (!provider) return;
@@ -3037,6 +3315,14 @@ export default function App() {
 
   const clearCSharpEditorBinding = useCallback(() => {
     csharpAuthoringModuleRef.current?.csharpService.clearEditor();
+  }, []);
+
+  const clearCxxEditorBinding = useCallback(() => {
+    cxxAuthoringModuleRef.current?.cxxService.clearEditor();
+  }, []);
+
+  const clearJavaEditorBinding = useCallback(() => {
+    javaAuthoringModuleRef.current?.javaService.clearEditor();
   }, []);
 
   const resetSharedEditorOptions = useCallback((editor: any) => {
@@ -3197,6 +3483,18 @@ export default function App() {
     return csharpAuthoring;
   }, [getCSharpAuthoringModule]);
 
+  const ensureCxxAuthoringReady = useCallback(async () => {
+    const cxxAuthoring = await getCxxAuthoringModule();
+    await cxxAuthoring.ensureCxxReady();
+    return cxxAuthoring;
+  }, [getCxxAuthoringModule]);
+
+  const ensureJavaAuthoringReady = useCallback(async () => {
+    const javaAuthoring = await getJavaAuthoringModule();
+    await javaAuthoring.ensureJavaReady();
+    return javaAuthoring;
+  }, [getJavaAuthoringModule]);
+
   const refreshPythonDiagnostics = useCallback(async () => {
     const editor = pythonDiagnosticsEditorRef.current;
     if (!editor) return;
@@ -3226,6 +3524,44 @@ export default function App() {
     csharpAuthoring.csharpService.setupEditor(editor);
   }, [ensureCSharpAuthoringReady]);
 
+  const refreshCxxDiagnostics = useCallback(async () => {
+    const editor = cxxDiagnosticsEditorRef.current;
+    if (!editor) return;
+    if (editorRef.current !== editor) return;
+    const languageId = editor.getModel?.()?.getLanguageId?.();
+    if (languageId !== 'c' && languageId !== 'cpp') return;
+
+    const cxxAuthoring = await ensureCxxAuthoringReady();
+    if (cxxDiagnosticsEditorRef.current !== editor) return;
+    if (editorRef.current !== editor) return;
+    const nextLanguageId = editor.getModel?.()?.getLanguageId?.();
+    if (nextLanguageId !== 'c' && nextLanguageId !== 'cpp') return;
+
+    cxxAuthoring.cxxService.setupEditor(editor, () => (
+      toProjectSourceFiles(getProjectRunnableFiles())
+        .filter(file => file.language === 'c' || file.language === 'cpp')
+        .map(file => ({ path: file.path, content: file.content, language: file.language as 'c' | 'cpp' }))
+    ));
+  }, [ensureCxxAuthoringReady]);
+
+  const refreshJavaDiagnostics = useCallback(async () => {
+    const editor = javaDiagnosticsEditorRef.current;
+    if (!editor) return;
+    if (editorRef.current !== editor) return;
+    if (editor.getModel?.()?.getLanguageId?.() !== 'java') return;
+
+    const javaAuthoring = await ensureJavaAuthoringReady();
+    if (javaDiagnosticsEditorRef.current !== editor) return;
+    if (editorRef.current !== editor) return;
+    if (editor.getModel?.()?.getLanguageId?.() !== 'java') return;
+
+    javaAuthoring.javaService.setupEditor(editor, () => (
+      toProjectSourceFiles(getProjectRunnableFiles())
+        .filter(file => file.language === 'java')
+        .map(file => ({ path: file.path, content: file.content, language: 'java' as const }))
+    ));
+  }, [ensureJavaAuthoringReady]);
+
   const bindLanguageServicesToEditor = useCallback((editor: any) => {
     editorRef.current = editor;
     configureMonacoSuggestionAcceptance(editor);
@@ -3247,7 +3583,23 @@ export default function App() {
       clearCSharpEditorBinding();
       csharpDiagnosticsEditorRef.current = null;
     }
-  }, [clearCSharpEditorBinding, clearPyrightEditorBinding, refreshCSharpDiagnostics, refreshPythonDiagnostics, resetSharedEditorOptions]);
+
+    if (languageId === 'c' || languageId === 'cpp') {
+      cxxDiagnosticsEditorRef.current = editor;
+      void refreshCxxDiagnostics();
+    } else if (cxxDiagnosticsEditorRef.current === editor) {
+      clearCxxEditorBinding();
+      cxxDiagnosticsEditorRef.current = null;
+    }
+
+    if (languageId === 'java') {
+      javaDiagnosticsEditorRef.current = editor;
+      void refreshJavaDiagnostics();
+    } else if (javaDiagnosticsEditorRef.current === editor) {
+      clearJavaEditorBinding();
+      javaDiagnosticsEditorRef.current = null;
+    }
+  }, [clearCSharpEditorBinding, clearCxxEditorBinding, clearJavaEditorBinding, clearPyrightEditorBinding, refreshCSharpDiagnostics, refreshCxxDiagnostics, refreshJavaDiagnostics, refreshPythonDiagnostics, resetSharedEditorOptions]);
 
   const handleEditorMount = useCallback((editor: any) => {
     bindLanguageServicesToEditor(editor);
@@ -3262,6 +3614,14 @@ export default function App() {
         clearCSharpEditorBinding();
         csharpDiagnosticsEditorRef.current = null;
       }
+      if (cxxDiagnosticsEditorRef.current === editor) {
+        clearCxxEditorBinding();
+        cxxDiagnosticsEditorRef.current = null;
+      }
+      if (javaDiagnosticsEditorRef.current === editor) {
+        clearJavaEditorBinding();
+        javaDiagnosticsEditorRef.current = null;
+      }
       if (editorRef.current === editor) {
         editorRef.current = null;
       }
@@ -3274,7 +3634,7 @@ export default function App() {
         );
       }
     });
-  }, [bindLanguageServicesToEditor, clearCSharpEditorBinding, clearPyrightEditorBinding, createSharedEditorTarget]);
+  }, [bindLanguageServicesToEditor, clearCSharpEditorBinding, clearCxxEditorBinding, clearJavaEditorBinding, clearPyrightEditorBinding, createSharedEditorTarget]);
 
   const disposeMountedSharedEditor = useCallback(() => {
     const editor = editorRef.current;
@@ -3303,7 +3663,10 @@ export default function App() {
 
   function getActiveRunnableFile() {
     if (activeItem?.type !== 'file') return null;
-    return normalizeProjectRuntimeLanguage(activeItem.language) ? activeItem : null;
+    const runtimeLanguage = normalizeProjectRuntimeLanguage(activeItem.language);
+    if (!runtimeLanguage) return null;
+    if (isCxxRuntimeLanguage(runtimeLanguage) && !isCxxSourcePath(activeItem.name)) return null;
+    return activeItem;
   }
 
   function getResolvedProjectRun(): ResolvedProjectRun {
@@ -3312,7 +3675,7 @@ export default function App() {
 
     const selectedFiles = settings.projectRunMode === 'custom'
       ? runnableFiles.filter(file => settings.projectRunCustomFileIds.includes(file.id))
-      : runnableFiles.filter(file => normalizeProjectRuntimeLanguage(file.language) === fixedLanguage);
+      : runnableFiles.filter(file => isProjectRunModeFileMatch(file, fixedLanguage));
 
     if (selectedFiles.length === 0) {
       return {
@@ -3338,6 +3701,7 @@ export default function App() {
       const hasHtml = selectedLanguageSet.has('html');
       const runtimeLanguages = [...selectedLanguageSet]
         .filter((language): language is ProjectRuntimeLanguage => language !== 'css');
+      const cxxOnly = selectedFiles.every(file => isCxxProjectFile(file));
 
       if (hasHtml) {
         const unsupportedRuntimeLanguages = runtimeLanguages.filter(language => language !== 'html' && language !== 'javascript');
@@ -3372,6 +3736,8 @@ export default function App() {
           entryFile: null,
           error: 'CSS files can only be combined with HTML in a custom project run.',
         };
+      } else if (cxxOnly) {
+        resolvedLanguage = getCxxResolvedRuntimeLanguage(selectedFiles);
       } else if (runtimeLanguages.length === 1) {
         resolvedLanguage = runtimeLanguages[0];
       }
@@ -3380,18 +3746,23 @@ export default function App() {
     const isHtmlAssetRun =
       resolvedLanguage === 'html'
       && [...selectedLanguageSet].every(language => language === 'html' || language === 'javascript' || language === 'css');
-    if (!resolvedLanguage || selectedLanguageSet.size > 1 && !isHtmlAssetRun) {
+    const isCxxAssetRun =
+      isCxxRuntimeLanguage(resolvedLanguage)
+      && selectedFiles.every(file => isCxxProjectFile(file));
+    if (!resolvedLanguage || selectedLanguageSet.size > 1 && !isHtmlAssetRun && !isCxxAssetRun) {
       return {
         mode: settings.projectRunMode,
         language: null,
         selectedFiles,
         entryCandidates: [],
         entryFile: null,
-        error: 'Project run requires files from a single supported language.',
+        error: 'Project run requires files from a single supported language, except HTML with JS/CSS assets or C/C++ source/header sets.',
       };
     }
 
-    const entryCandidates = selectedFiles.filter(file => normalizeProjectRuntimeLanguage(file.language) === resolvedLanguage);
+    const entryCandidates = selectedFiles.filter(file => isCxxRuntimeLanguage(resolvedLanguage)
+      ? isCxxEntryCandidate(file, resolvedLanguage)
+      : normalizeProjectRuntimeLanguage(file.language) === resolvedLanguage);
     const activeRunnableFile = activeFileId
       ? entryCandidates.find(file => file.id === activeFileId) ?? null
       : null;
@@ -3825,15 +4196,9 @@ export default function App() {
       const selectedEntryIds = current.projectRunMode === 'custom'
         ? (() => {
           const selectedCustomFiles = nextRunnableFiles.filter(file => selectedIds.includes(file.id));
-          const hasHtml = selectedCustomFiles.some(file => normalizeProjectRuntimeLanguage(file.language) === 'html');
-          return selectedCustomFiles
-            .filter(file => {
-              const language = normalizeProjectRuntimeLanguage(file.language);
-              return hasHtml ? language === 'html' : language !== null;
-            })
-            .map(file => file.id);
+          return getProjectEntryCandidateIds(selectedCustomFiles, null);
         })()
-        : selectedIds;
+        : getProjectEntryCandidateIds(nextRunnableFiles.filter(file => selectedIds.includes(file.id)), modeLanguage);
 
       const preferredEntryId =
         current.projectRunEntryFileId && selectedEntryIds.includes(current.projectRunEntryFileId)
@@ -4128,6 +4493,8 @@ export default function App() {
     return () => {
       outputInteractionResolverRef.current?.(null);
       outputInteractionResolverRef.current = null;
+      csharpInteractiveWorkerRef.current?.terminate();
+      csharpInteractiveWorkerRef.current = null;
     };
   }, []);
 
@@ -6890,6 +7257,85 @@ json.dumps(sorted(_imports))
 
   const getCSharpScriptContextId = (fileId: string) => `codecraft-csharp-script:${fileId}`;
 
+  const getCSharpInteractiveWorker = () => {
+    if (!csharpInteractiveWorkerRef.current) {
+      csharpInteractiveWorkerRef.current = new Worker(new URL('./csharp-runner.worker.ts', import.meta.url));
+    }
+    return csharpInteractiveWorkerRef.current;
+  };
+
+  const terminateCSharpInteractiveWorker = () => {
+    csharpInteractiveWorkerRef.current?.terminate();
+    csharpInteractiveWorkerRef.current = null;
+  };
+
+  const runCSharpInInteractiveWorker = (payload: {
+    mode: 'regular' | 'script' | 'script-context' | 'project';
+    code?: string;
+    contextId?: string;
+    resetContext?: boolean;
+    paths?: string[];
+    contents?: string[];
+    entryPath?: string;
+  }): Promise<any> => new Promise((resolve, reject) => {
+    const worker = getCSharpInteractiveWorker();
+    let settled = false;
+
+    const finish = (callback: () => void) => {
+      if (settled) return;
+      settled = true;
+      callback();
+    };
+
+    worker.onmessage = (event) => {
+      const message = event.data || {};
+      if ((message.type === 'stdout' || message.type === 'stderr') && typeof message.text === 'string') {
+        setOutput(prev => prev + message.text);
+        return;
+      }
+      if (
+        message.type === 'stdin-request'
+        && message.headerBuffer instanceof SharedArrayBuffer
+        && message.payloadBuffer instanceof SharedArrayBuffer
+      ) {
+        void performRuntimeInteraction(
+          'csharp',
+          settings.csharpIOMode,
+          'stdin',
+          typeof message.prompt === 'string' && message.prompt ? message.prompt : 'C# stdin> ',
+          ''
+        ).then((value) => {
+          completeSharedBufferInteraction(
+            message.headerBuffer,
+            message.payloadBuffer,
+            { value: value ?? '' }
+          );
+        }).catch((error) => {
+          completeSharedBufferInteraction(
+            message.headerBuffer,
+            message.payloadBuffer,
+            { __codecraftError: error instanceof Error ? error.message : String(error) }
+          );
+        });
+        return;
+      }
+      if (message.type === 'done') {
+        finish(() => resolve(message.result));
+        return;
+      }
+      if (message.type === 'error') {
+        finish(() => reject(new Error(typeof message.message === 'string' ? message.message : 'C# worker execution failed.')));
+      }
+    };
+
+    worker.onerror = (event) => {
+      terminateCSharpInteractiveWorker();
+      finish(() => reject(new Error(event.message || 'C# worker execution failed.')));
+    };
+
+    worker.postMessage({ type: 'run', ...payload });
+  });
+
   const installPyodideExecutionTimeoutGuard = (pyodide: any, timeoutMs: number) => {
     const normalizedTimeout = normalizeExecutionTimeoutMs(timeoutMs);
     if (normalizedTimeout <= 0) return;
@@ -7385,11 +7831,33 @@ finally:
             : 'script context';
       setExecutionStartupStatus(`Compiling and executing C# (WebAssembly, ${modeLabel})...`);
 
-      await ensureCSharpRuntime();
-      const { BrowserCSharp } = await getBrowserCSharpModule();
+      const useInteractiveWorker = settings.csharpIOMode === 'interactive-output-panel';
+      const csharpModule = useInteractiveWorker ? null : await getBrowserCSharpModule();
+      if (!useInteractiveWorker) {
+        await ensureCSharpRuntime();
+      }
+      const BrowserCSharp = csharpModule?.BrowserCSharp;
       const contextId = getCSharpScriptContextId(fileId);
 
       const executeCSharp = async () => {
+        if (useInteractiveWorker) {
+          if (settings.csharpExecutionMode === 'script-context') {
+            return runCSharpInInteractiveWorker({
+              mode: 'script-context',
+              code,
+              contextId,
+              resetContext: settings.csharpResetScriptContextBeforeRun,
+            });
+          }
+          if (settings.csharpExecutionMode === 'script') {
+            return runCSharpInInteractiveWorker({ mode: 'script', code });
+          }
+          return runCSharpInInteractiveWorker({ mode: 'regular', code });
+        }
+
+        if (!BrowserCSharp) {
+          throw new Error('C# runtime module is unavailable.');
+        }
         if (settings.csharpExecutionMode === 'script-context') {
           if (settings.csharpResetScriptContextBeforeRun) {
             try {
@@ -7410,9 +7878,13 @@ finally:
         settings.csharpExecutionTimeoutMs,
         executeCSharp,
         async () => {
+          if (useInteractiveWorker) {
+            terminateCSharpInteractiveWorker();
+            return;
+          }
           if (settings.csharpExecutionMode === 'script-context') {
             try {
-              await BrowserCSharp.clearScriptContext(contextId);
+              await BrowserCSharp?.clearScriptContext(contextId);
             } catch { }
           }
         }
@@ -7448,8 +7920,12 @@ finally:
       console.clear();
       setExecutionStartupStatus(`Compiling C# project (${projectFiles.length} file${projectFiles.length === 1 ? '' : 's'})...`);
 
-      await ensureCSharpRuntime();
-      const { BrowserCSharp } = await getBrowserCSharpModule();
+      const useInteractiveWorker = settings.csharpIOMode === 'interactive-output-panel';
+      const csharpModule = useInteractiveWorker ? null : await getBrowserCSharpModule();
+      if (!useInteractiveWorker) {
+        await ensureCSharpRuntime();
+      }
+      const BrowserCSharp = csharpModule?.BrowserCSharp;
       const note = settings.csharpExecutionMode === 'regular'
         ? ''
         : ' Project run uses regular C# compilation.';
@@ -7458,11 +7934,23 @@ finally:
       const result = await withExecutionTimeout(
         'C# execution',
         settings.csharpExecutionTimeoutMs,
-        () => BrowserCSharp.executeRegularProject(
-          projectFiles.map(file => file.path),
-          projectFiles.map(file => file.content),
-          entryFile.path
-        )
+        () => useInteractiveWorker
+          ? runCSharpInInteractiveWorker({
+            mode: 'project',
+            paths: projectFiles.map(file => file.path),
+            contents: projectFiles.map(file => file.content),
+            entryPath: entryFile.path,
+          })
+          : BrowserCSharp!.executeRegularProject(
+            projectFiles.map(file => file.path),
+            projectFiles.map(file => file.content),
+            entryFile.path
+          ),
+        async () => {
+          if (useInteractiveWorker) {
+            terminateCSharpInteractiveWorker();
+          }
+        }
       );
 
       const stdOut = (result.stdOut || '').trim();
@@ -7481,6 +7969,272 @@ finally:
     } catch (err) {
       setExecutionStartupStatus('');
       setOutput(`C# Error: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  };
+
+  const getCxxRuntimeLabel = (language: ProjectRuntimeLanguage) => (
+    language === 'cpp' ? 'C++' : 'C'
+  );
+
+  const requestCxxRuntimeInput = async (
+    runtimeLanguage: 'c' | 'cpp',
+    promptText = ''
+  ) => {
+    const label = getCxxRuntimeLabel(runtimeLanguage);
+    if (settings.cxxIOMode === 'interactive-output-panel') {
+      selectDockPanel('output');
+      const response = await requestOutputPanelInteraction(
+        runtimeLanguage,
+        'stdin',
+        '',
+        '',
+        {
+          transcriptPrompt: promptText || `${label} stdin> `,
+          inputMode: 'single-line',
+          placeholder: 'Type input and press Enter',
+          submitLabel: 'Send',
+          cancelLabel: 'Cancel',
+        }
+      );
+      if (response === null) {
+        throw new Error(`${label} input cancelled.`);
+      }
+      return String(response ?? '');
+    }
+
+    const value = window.prompt(promptText || `${label} stdin:`, '');
+    if (value === null) {
+      throw new Error(`${label} input cancelled.`);
+    }
+    return value;
+  };
+
+  const formatCxxExecutionOutput = (
+    result: Awaited<ReturnType<CxxRuntimeModule['compileAndRunCxxProject']>>,
+    runtimeLanguage: 'c' | 'cpp',
+    options?: { runtimeOutputStreamed?: boolean }
+  ) => {
+    const chunks: string[] = [];
+    const compilerDiagnostics = [result.compile.stderr.trim(), result.compile.stdout.trim()]
+      .filter(Boolean)
+      .join('\n')
+      .trim();
+    if (compilerDiagnostics) {
+      chunks.push(`Compiler diagnostics:\n${compilerDiagnostics}`);
+    }
+
+    if (!options?.runtimeOutputStreamed) {
+      const stderr = result.run.stderr.trim();
+      const stdout = result.run.stdout.trim();
+      if (stderr) chunks.push(stderr);
+      if (stdout) chunks.push(stdout);
+    }
+    if (!result.run.ok) {
+      chunks.push(`Program exited with code ${result.run.code}.`);
+    }
+
+    return chunks.join('\n') || (options?.runtimeOutputStreamed
+      ? ''
+      : `${getCxxRuntimeLabel(runtimeLanguage)} executed successfully with no output.`);
+  };
+
+  const formatCxxRuntimeError = (err: unknown) => {
+    const baseMessage = err instanceof Error ? err.message : String(err);
+    const compile = (err as any)?.compile;
+    const run = (err as any)?.run;
+    const details = [
+      compile?.stderr?.trim?.(),
+      compile?.stdout?.trim?.(),
+      run?.stderr?.trim?.(),
+      run?.stdout?.trim?.(),
+    ].filter(Boolean);
+    return details.length > 0 ? `${baseMessage}\n${details.join('\n')}` : baseMessage;
+  };
+
+  const runCxxProject = async (
+    projectFiles: ProjectSourceFile[],
+    entryFile: ProjectSourceFile,
+    runtimeLanguage: 'c' | 'cpp'
+  ) => {
+    const runtimeLabel = getCxxRuntimeLabel(runtimeLanguage);
+    try {
+      if (settings.cxxIOMode === 'interactive-output-panel') {
+        selectDockPanel('output');
+      }
+      setOutput('');
+      console.clear();
+
+      const cxxProjectFiles = projectFiles
+        .filter(file => file.language === 'c' || file.language === 'cpp')
+        .map(file => ({
+          path: file.path,
+          content: file.content,
+          language: file.language as 'c' | 'cpp',
+        }));
+
+      setExecutionStartupStatus(`Preparing ${runtimeLabel} project from ${entryFile.path}...`);
+
+      const cxxRuntime = await getCxxRuntimeModule();
+      const streamRuntimeOutput = settings.cxxIOMode === 'interactive-output-panel';
+      const result = await withExecutionTimeout(
+        `${runtimeLabel} execution`,
+        settings.cxxExecutionTimeoutMs,
+        () => cxxRuntime.compileAndRunCxxProject({
+          files: cxxProjectFiles,
+          entryPath: entryFile.path,
+          language: runtimeLanguage,
+          cStandard: settings.cxxCStandard,
+          cppStandard: settings.cxxCppStandard,
+          optimization: settings.cxxOptimizationLevel,
+          requestStdin: (prompt) => requestCxxRuntimeInput(runtimeLanguage, prompt),
+          onStdout: streamRuntimeOutput ? (chunk) => setOutput(prev => prev + chunk) : undefined,
+          onStderr: streamRuntimeOutput ? (chunk) => setOutput(prev => prev + chunk) : undefined,
+          onStatus: appendExecutionStartupStatus,
+        })
+      );
+
+      setExecutionStartupStatus('');
+      const formattedOutput = formatCxxExecutionOutput(result, runtimeLanguage, {
+        runtimeOutputStreamed: streamRuntimeOutput,
+      });
+      if (formattedOutput) {
+        setOutput(prev => [prev.trimEnd(), formattedOutput].filter(Boolean).join('\n'));
+      }
+    } catch (err) {
+      setExecutionStartupStatus('');
+      setOutput(prev => [prev.trimEnd(), `${runtimeLabel} Error: ${formatCxxRuntimeError(err)}`].filter(Boolean).join('\n'));
+    } finally {
+      if (settings.cxxRuntimeLifecycle === 'keep-warm') {
+        resetCxxRuntimeIdleTimer();
+      } else {
+        disposeCxxRuntime();
+      }
+    }
+  };
+
+  const requestJavaRuntimeInput = async (promptText = '') => {
+    if (settings.javaIOMode === 'interactive-output-panel') {
+      selectDockPanel('output');
+      const response = await requestOutputPanelInteraction(
+        'java',
+        'stdin',
+        '',
+        '',
+        {
+          transcriptPrompt: promptText,
+          inputMode: 'single-line',
+          placeholder: 'Type input and press Enter',
+          submitLabel: 'Send',
+          cancelLabel: 'Cancel',
+        }
+      );
+      if (response === null) {
+        throw new Error('Java input cancelled.');
+      }
+      return String(response ?? '');
+    }
+
+    const value = window.prompt(promptText || 'Java stdin:', '');
+    if (value === null) {
+      throw new Error('Java input cancelled.');
+    }
+    return value;
+  };
+
+  const formatJavaExecutionOutput = (
+    result: Awaited<ReturnType<JavaRuntimeModule['compileAndRunJavaProject']>>,
+    options?: { runtimeOutputStreamed?: boolean }
+  ) => {
+    const chunks: string[] = [];
+    const compilerDiagnostics = [result.compile.stderr.trim(), result.compile.stdout.trim()]
+      .filter(Boolean)
+      .join('\n')
+      .trim();
+    if (compilerDiagnostics) {
+      chunks.push(`Compiler diagnostics:\n${compilerDiagnostics}`);
+    }
+
+    if (!options?.runtimeOutputStreamed) {
+      const stderr = result.run.stderr.trim();
+      const stdout = result.run.stdout.trim();
+      if (stderr) chunks.push(stderr);
+      if (stdout) chunks.push(stdout);
+    }
+    if (!result.run.ok) {
+      chunks.push(`Program exited with code ${result.run.code}.`);
+    }
+
+    return chunks.join('\n') || (options?.runtimeOutputStreamed
+      ? ''
+      : 'Java executed successfully with no output.');
+  };
+
+  const formatJavaRuntimeError = (err: unknown) => {
+    const baseMessage = err instanceof Error ? err.message : String(err);
+    if ((err as any)?.name === 'JavaRuntimeError') {
+      return baseMessage;
+    }
+    const compile = (err as any)?.compile;
+    const run = (err as any)?.run;
+    const details = [
+      compile?.stderr?.trim?.(),
+      compile?.stdout?.trim?.(),
+      run?.stderr?.trim?.(),
+      run?.stdout?.trim?.(),
+    ].filter(Boolean);
+    return details.length > 0 ? `${baseMessage}\n${details.join('\n')}` : baseMessage;
+  };
+
+  const runJavaProject = async (
+    projectFiles: ProjectSourceFile[],
+    entryFile: ProjectSourceFile
+  ) => {
+    try {
+      if (settings.javaIOMode === 'interactive-output-panel') {
+        selectDockPanel('output');
+      }
+      setOutput('');
+      console.clear();
+
+      const javaProjectFiles = projectFiles
+        .filter(file => file.language === 'java')
+        .map(file => ({
+          path: file.path,
+          content: file.content,
+          language: 'java' as const,
+        }));
+
+      setExecutionStartupStatus(`Preparing Java project from ${entryFile.path}...`);
+
+      const javaRuntime = await getJavaRuntimeModule();
+      const streamRuntimeOutput = settings.javaIOMode === 'interactive-output-panel';
+      const result = await javaRuntime.compileAndRunJavaProject({
+        files: javaProjectFiles,
+        entryPath: entryFile.path,
+        javaVersion: settings.javaRuntimeVersion,
+        timeoutMs: normalizeExecutionTimeoutMs(settings.javaExecutionTimeoutMs),
+        requestStdin: requestJavaRuntimeInput,
+        onStdout: streamRuntimeOutput ? (chunk) => setOutput(prev => prev + chunk) : undefined,
+        onStderr: streamRuntimeOutput ? (chunk) => setOutput(prev => prev + chunk) : undefined,
+        onStatus: appendExecutionStartupStatus,
+      });
+
+      setExecutionStartupStatus('');
+      const formattedOutput = formatJavaExecutionOutput(result, {
+        runtimeOutputStreamed: streamRuntimeOutput,
+      });
+      if (formattedOutput) {
+        setOutput(prev => [prev.trimEnd(), formattedOutput].filter(Boolean).join('\n'));
+      }
+    } catch (err) {
+      setExecutionStartupStatus('');
+      setOutput(prev => [prev.trimEnd(), `Java Error: ${formatJavaRuntimeError(err)}`].filter(Boolean).join('\n'));
+    } finally {
+      if (settings.javaRuntimeLifecycle === 'keep-warm') {
+        resetJavaRuntimeIdleTimer();
+      } else {
+        disposeJavaRuntime();
+      }
     }
   };
 
@@ -7513,7 +8267,7 @@ finally:
     if (!currentFile) {
       clearOutputPreview();
       setExecutionStartupStatus('');
-      setOutput('Error: Select a runnable C#, Python, HTML, or JavaScript file first.');
+      setOutput('Error: Select a runnable Java, C, C++, C#, Python, HTML, or JavaScript source file first.');
       return;
     }
 
@@ -7552,9 +8306,21 @@ finally:
         return;
       }
 
+      if (runtimeLanguage === 'c' || runtimeLanguage === 'cpp') {
+        clearOutputPreview();
+        await runCxxProject(projectFiles, entryFile, runtimeLanguage);
+        return;
+      }
+
+      if (runtimeLanguage === 'java') {
+        clearOutputPreview();
+        await runJavaProject(projectFiles, entryFile);
+        return;
+      }
+
       clearOutputPreview();
       setExecutionStartupStatus('');
-      setOutput(`Error: No local runtime available for ${runtimeLanguage}. Supported: HTML, JavaScript, Python, and C#.`);
+      setOutput(`Error: No local runtime available for ${runtimeLanguage}. Supported: HTML, JavaScript, Python, C#, C, C++, and Java.`);
     });
   };
 
@@ -7604,9 +8370,21 @@ finally:
         return;
       }
 
+      if (runtimeLanguage === 'c' || runtimeLanguage === 'cpp') {
+        clearOutputPreview();
+        await runCxxProject(projectFiles, entryFile, runtimeLanguage);
+        return;
+      }
+
+      if (runtimeLanguage === 'java') {
+        clearOutputPreview();
+        await runJavaProject(projectFiles, entryFile);
+        return;
+      }
+
       clearOutputPreview();
       setExecutionStartupStatus('');
-      setOutput(`Error: No local runtime available for ${runtimeLanguage}. Supported: HTML, JavaScript, Python, and C#.`);
+      setOutput(`Error: No local runtime available for ${runtimeLanguage}. Supported: HTML, JavaScript, Python, C#, C, C++, and Java.`);
     });
   };
 
@@ -8525,6 +9303,8 @@ finally:
             'Standard commands: ls, pwd, cd, mkdir, touch, open, cat, rm, clear, help, date, echo, whoami',
             'Python: pip install <package> [-force] | pip upgrade <package> [-version <ver>] | pip uninstall <package> | pip include <module> | pip list',
             'C#: nuget include <namespace> | nuget list',
+            'C/C++: use Run or Project Run on .c, .cpp, .cc, .cxx, and matching header files',
+            'Java: use Run or Project Run on .java files',
           ];
           appendTerminalCommandResult('help', helpLines);
           return { summary: 'Displayed terminal help.', detail: helpLines.join(' '), result: { ok: true, output: helpLines } };
@@ -10071,7 +10851,7 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
         setTerminalOutput([...newOutput, 'Usage: nuget include <namespace> | nuget list']);
       }
     } else if (cmd === 'help') {
-      setTerminalOutput([...newOutput, 'Standard commands: ls, pwd, cd, mkdir, touch, open, cat, rm, clear, help, date, echo', 'Python: pip install <package> [-force] | pip upgrade <package> [-version <ver>] | pip uninstall <package> | pip include <module> | pip list', 'C#: nuget include <namespace> | nuget list']);
+      setTerminalOutput([...newOutput, 'Standard commands: ls, pwd, cd, mkdir, touch, open, cat, rm, clear, help, date, echo', 'Python: pip install <package> [-force] | pip upgrade <package> [-version <ver>] | pip uninstall <package> | pip include <module> | pip list', 'C#: nuget include <namespace> | nuget list', 'C/C++: use Run or Project Run on .c, .cpp, .cc, .cxx, and matching header files', 'Java: use Run or Project Run on .java files']);
     } else if (cmd === 'date') {
       setTerminalOutput([...newOutput, new Date().toLocaleString()]);
     } else if (cmd === 'echo') {
@@ -11401,15 +12181,9 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
                                 const selectedEntryIds = nextMode === 'custom'
                                   ? (() => {
                                     const selectedCustomFiles = projectRunnableFiles.filter(file => selectedIds.includes(file.id));
-                                    const hasHtml = selectedCustomFiles.some(file => normalizeProjectRuntimeLanguage(file.language) === 'html');
-                                    return selectedCustomFiles
-                                      .filter(file => {
-                                        const language = normalizeProjectRuntimeLanguage(file.language);
-                                        return hasHtml ? language === 'html' : language !== null;
-                                      })
-                                      .map(file => file.id);
+                                    return getProjectEntryCandidateIds(selectedCustomFiles, null);
                                   })()
-                                  : selectedIds;
+                                  : getProjectEntryCandidateIds(projectRunnableFiles.filter(file => selectedIds.includes(file.id)), modeLanguage);
                                 const nextEntryFileId =
                                   current.projectRunEntryFileId && selectedEntryIds.includes(current.projectRunEntryFileId)
                                     ? current.projectRunEntryFileId
@@ -11487,12 +12261,12 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
                         <div className="space-y-3">
                           <div>
                             <div className="text-sm font-medium text-white">Custom File Selection</div>
-                            <div className="text-xs text-zinc-500 mt-1">Select the exact files to include. HTML can be combined with JS and CSS; other project runs stay single-language.</div>
+                            <div className="text-xs text-zinc-500 mt-1">Select the exact files to include. HTML can be combined with JS and CSS; C/C++ runs can include matching source and header files.</div>
                           </div>
 
                           {projectRunnableFiles.length === 0 ? (
                             <div className="rounded-xl border border-white/10 bg-black/20 px-4 py-3 text-sm text-zinc-500">
-                              Add at least one `C#`, `Python`, `HTML`, `JS`, or `CSS` file to configure a project run.
+                              Add at least one `Java`, `C`, `C++`, `C#`, `Python`, `HTML`, `JS`, or `CSS` file to configure a project run.
                             </div>
                           ) : (
                             <div className="max-h-64 overflow-y-auto custom-scrollbar rounded-xl border border-white/10 bg-black/20 divide-y divide-white/5">
@@ -11511,13 +12285,7 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
                                             ? [...current.projectRunCustomFileIds, file.id]
                                             : current.projectRunCustomFileIds.filter(id => id !== file.id);
                                           const selectedCustomFiles = projectRunnableFiles.filter(candidate => nextIds.includes(candidate.id));
-                                          const hasHtml = selectedCustomFiles.some(candidate => normalizeProjectRuntimeLanguage(candidate.language) === 'html');
-                                          const nextEntryIds = selectedCustomFiles
-                                            .filter(candidate => {
-                                              const language = normalizeProjectRuntimeLanguage(candidate.language);
-                                              return hasHtml ? language === 'html' : language !== null;
-                                            })
-                                            .map(candidate => candidate.id);
+                                          const nextEntryIds = getProjectEntryCandidateIds(selectedCustomFiles, null);
                                           const nextEntryFileId =
                                             current.projectRunEntryFileId && nextEntryIds.includes(current.projectRunEntryFileId)
                                               ? current.projectRunEntryFileId
@@ -11550,7 +12318,7 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
 
                 <section>
                   <h4 className="text-xs font-bold uppercase tracking-widest text-zinc-500 mb-4">Language Runtimes</h4>
-                  <div className="grid grid-cols-1 xl:grid-cols-3 gap-4">
+                  <div className="grid grid-cols-1 xl:grid-cols-5 gap-4">
                     <div className="rounded-2xl border border-white/10 bg-white/5 p-4 space-y-4">
                       <div>
                         <div className="text-sm font-medium text-white">JavaScript</div>
@@ -11642,7 +12410,7 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
                           value={settings.pythonRuntimeLifecycle}
                           onChange={(e) => setSettings(s => ({
                             ...s,
-                            pythonRuntimeLifecycle: e.target.value as PythonRuntimeLifecycle,
+                            pythonRuntimeLifecycle: e.target.value as RuntimeLifecycle,
                           }))}
                           className="w-full rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-sm text-white outline-none transition-colors focus:border-indigo-500"
                         >
@@ -11672,7 +12440,7 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
                         <div className="text-xs text-zinc-500">
                           {settings.pythonIOMode === 'alert-output'
                             ? 'Uses browser prompts for Python input while keeping stdout and stderr in the Output panel.'
-                            : 'Lets you queue Python stdin lines from the Output panel before execution. If the script asks for more lines than you supplied, it falls back to browser prompt.'}
+                            : 'Routes Python stdin requests to the Output panel as the program asks for input.'}
                         </div>
                       </label>
                     </div>
@@ -11738,7 +12506,7 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
                         <div className="text-xs text-zinc-500">
                           {settings.csharpIOMode === 'alert-output'
                             ? 'Uses the standard Output panel flow for C# execution results.'
-                            : 'Keeps the Output panel front-and-center for C# runs. The current C# runtime is output-only, so there is no extra prompt handling yet.'}
+                            : 'Runs C# in a worker and routes Console input/output through the Output panel as the program runs.'}
                         </div>
                       </label>
 
@@ -11761,6 +12529,201 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
                             settings.csharpResetScriptContextBeforeRun ? "right-1" : "left-1"
                           )} />
                         </button>
+                      </label>
+                    </div>
+
+                    <div className="rounded-2xl border border-white/10 bg-white/5 p-4 space-y-4">
+                      <div>
+                        <div className="text-sm font-medium text-white">Java</div>
+                        <div className="text-xs text-zinc-500 mt-1">Compiles with javac in a CheerpJ worker, then runs the selected main class with live stdin/stdout.</div>
+                      </div>
+
+                      <label className="block space-y-2">
+                        <div className="text-xs font-medium uppercase tracking-wide text-zinc-500">Execution Timeout (ms)</div>
+                        <input
+                          type="number"
+                          min="0"
+                          step="100"
+                          value={settings.javaExecutionTimeoutMs}
+                          onChange={(e) => setSettings(s => ({
+                            ...s,
+                            javaExecutionTimeoutMs: normalizeExecutionTimeoutMs(Number(e.target.value))
+                          }))}
+                          className="w-full rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-sm text-white outline-none transition-colors focus:border-indigo-500"
+                        />
+                        <div className="text-xs text-zinc-500">Current: {formatExecutionTimeoutLabel(settings.javaExecutionTimeoutMs)}</div>
+                      </label>
+
+                      <label className="block space-y-2">
+                        <div className="text-xs font-medium uppercase tracking-wide text-zinc-500">Runtime Version</div>
+                        <select
+                          value={settings.javaRuntimeVersion}
+                          onChange={(e) => setSettings(s => ({
+                            ...s,
+                            javaRuntimeVersion: normalizeJavaRuntimeVersion(e.target.value),
+                          }))}
+                          className="w-full rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-sm text-white outline-none transition-colors focus:border-indigo-500"
+                        >
+                          <option value={17}>Java 17</option>
+                          <option value={11}>Java 11</option>
+                          <option value={8}>Java 8</option>
+                        </select>
+                        <div className="text-xs text-zinc-500">Java 17 is the default for current language features.</div>
+                      </label>
+
+                      <label className="block space-y-2">
+                        <div className="text-xs font-medium uppercase tracking-wide text-zinc-500">Runtime Lifecycle</div>
+                        <select
+                          value={settings.javaRuntimeLifecycle}
+                          onChange={(e) => setSettings(s => ({
+                            ...s,
+                            javaRuntimeLifecycle: e.target.value as RuntimeLifecycle,
+                          }))}
+                          className="w-full rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-sm text-white outline-none transition-colors focus:border-indigo-500"
+                        >
+                          <option value="dispose-after-run">Dispose After Run</option>
+                          <option value="keep-warm">Keep Warm Until Idle Timeout</option>
+                        </select>
+                        <div className="text-xs text-zinc-500">
+                          {settings.javaRuntimeLifecycle === 'dispose-after-run'
+                            ? 'Disposes Java runtime state as soon as the run finishes.'
+                            : 'Starts the Java idle timer after each run and disposes when it expires.'}
+                        </div>
+                      </label>
+
+                      <label className="block space-y-2">
+                        <div className="text-xs font-medium uppercase tracking-wide text-zinc-500">I/O Mode</div>
+                        <select
+                          value={settings.javaIOMode}
+                          onChange={(e) => setSettings(s => ({
+                            ...s,
+                            javaIOMode: e.target.value as RuntimeIOMode,
+                          }))}
+                          className="w-full rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-sm text-white outline-none transition-colors focus:border-indigo-500"
+                        >
+                          <option value="alert-output">Alert &amp; Output Mode</option>
+                          <option value="interactive-output-panel">Interactive Output Panel Mode</option>
+                        </select>
+                        <div className="text-xs text-zinc-500">
+                          {settings.javaIOMode === 'alert-output'
+                            ? 'Uses browser prompts when Java reads from System.in.'
+                            : 'Routes Java System.in requests to the Output panel exactly when the program reads input.'}
+                        </div>
+                      </label>
+                    </div>
+
+                    <div className="rounded-2xl border border-white/10 bg-white/5 p-4 space-y-4">
+                      <div>
+                        <div className="text-sm font-medium text-white">C/C++</div>
+                        <div className="text-xs text-zinc-500 mt-1">Compiles with Clang through Wasmer, then runs the produced WebAssembly program. The first run may download the compiler package.</div>
+                      </div>
+
+                      <label className="block space-y-2">
+                        <div className="text-xs font-medium uppercase tracking-wide text-zinc-500">Execution Timeout (ms)</div>
+                        <input
+                          type="number"
+                          min="0"
+                          step="100"
+                          value={settings.cxxExecutionTimeoutMs}
+                          onChange={(e) => setSettings(s => ({
+                            ...s,
+                            cxxExecutionTimeoutMs: normalizeExecutionTimeoutMs(Number(e.target.value))
+                          }))}
+                          className="w-full rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-sm text-white outline-none transition-colors focus:border-indigo-500"
+                        />
+                        <div className="text-xs text-zinc-500">Current: {formatExecutionTimeoutLabel(settings.cxxExecutionTimeoutMs)}</div>
+                      </label>
+
+                      <label className="block space-y-2">
+                        <div className="text-xs font-medium uppercase tracking-wide text-zinc-500">Runtime Lifecycle</div>
+                        <select
+                          value={settings.cxxRuntimeLifecycle}
+                          onChange={(e) => setSettings(s => ({
+                            ...s,
+                            cxxRuntimeLifecycle: e.target.value as RuntimeLifecycle,
+                          }))}
+                          className="w-full rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-sm text-white outline-none transition-colors focus:border-indigo-500"
+                        >
+                          <option value="dispose-after-run">Dispose After Run</option>
+                          <option value="keep-warm">Keep Warm Until Idle Timeout</option>
+                        </select>
+                        <div className="text-xs text-zinc-500">
+                          {settings.cxxRuntimeLifecycle === 'dispose-after-run'
+                            ? 'Disposes the C/C++ compiler runtime as soon as the run finishes.'
+                            : 'Starts the C/C++ idle timer after each run and disposes when it expires.'}
+                        </div>
+                      </label>
+
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                        <label className="block space-y-2">
+                          <div className="text-xs font-medium uppercase tracking-wide text-zinc-500">C Standard</div>
+                          <select
+                            value={settings.cxxCStandard}
+                            onChange={(e) => setSettings(s => ({
+                              ...s,
+                              cxxCStandard: normalizeCxxCStandard(e.target.value),
+                            }))}
+                            className="w-full rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-sm text-white outline-none transition-colors focus:border-indigo-500"
+                          >
+                            <option value="c11">C11</option>
+                            <option value="c17">C17</option>
+                            <option value="c23">C23</option>
+                          </select>
+                        </label>
+
+                        <label className="block space-y-2">
+                          <div className="text-xs font-medium uppercase tracking-wide text-zinc-500">C++ Standard</div>
+                          <select
+                            value={settings.cxxCppStandard}
+                            onChange={(e) => setSettings(s => ({
+                              ...s,
+                              cxxCppStandard: normalizeCxxCppStandard(e.target.value),
+                            }))}
+                            className="w-full rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-sm text-white outline-none transition-colors focus:border-indigo-500"
+                          >
+                            <option value="c++17">C++17</option>
+                            <option value="c++20">C++20</option>
+                            <option value="c++23">C++23</option>
+                          </select>
+                        </label>
+                      </div>
+
+                      <label className="block space-y-2">
+                        <div className="text-xs font-medium uppercase tracking-wide text-zinc-500">Optimization</div>
+                        <select
+                          value={settings.cxxOptimizationLevel}
+                          onChange={(e) => setSettings(s => ({
+                            ...s,
+                            cxxOptimizationLevel: normalizeCxxOptimizationLevel(e.target.value),
+                          }))}
+                          className="w-full rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-sm text-white outline-none transition-colors focus:border-indigo-500"
+                        >
+                          <option value="O0">O0</option>
+                          <option value="O1">O1</option>
+                          <option value="O2">O2</option>
+                          <option value="O3">O3</option>
+                        </select>
+                        <div className="text-xs text-zinc-500">Applies to both C and C++ compiler invocations.</div>
+                      </label>
+
+                      <label className="block space-y-2">
+                        <div className="text-xs font-medium uppercase tracking-wide text-zinc-500">I/O Mode</div>
+                        <select
+                          value={settings.cxxIOMode}
+                          onChange={(e) => setSettings(s => ({
+                            ...s,
+                            cxxIOMode: e.target.value as RuntimeIOMode,
+                          }))}
+                          className="w-full rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-sm text-white outline-none transition-colors focus:border-indigo-500"
+                        >
+                          <option value="alert-output">Alert &amp; Output Mode</option>
+                          <option value="interactive-output-panel">Interactive Output Panel Mode</option>
+                        </select>
+                        <div className="text-xs text-zinc-500">
+                          {settings.cxxIOMode === 'alert-output'
+                            ? 'Uses browser prompts when the compiled program reads from stdin.'
+                            : 'Runs the compiled program in a worker and routes stdin/stdout/stderr through the Output panel as it runs.'}
+                        </div>
                       </label>
                     </div>
                   </div>

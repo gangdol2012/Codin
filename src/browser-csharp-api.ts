@@ -30,6 +30,14 @@ export const BrowserCSharp = {
     return BrowserCSharpBase.ExecuteScript(code, contextId);
   },
 
+  executeScriptInteractive(code: string): Promise<ScriptResult> {
+    return invoke<ScriptResult>('ExecuteScriptInteractive', code);
+  },
+
+  executeScriptInContextInteractive(code: string, contextId: string): Promise<ScriptResult> {
+    return invoke<ScriptResult>('ExecuteScriptInContextInteractive', code, contextId);
+  },
+
   /** Forget accumulated compilations for a REPL `contextId` (see `executeScriptInContext`). */
   clearScriptContext(contextId: string): Promise<boolean> {
     return invoke<boolean>('ClearScriptContext', contextId);
@@ -48,9 +56,17 @@ export const BrowserCSharp = {
     return invoke<ScriptResult>('ExecuteRegular', code);
   },
 
+  executeRegularInteractive(code: string): Promise<ScriptResult> {
+    return invoke<ScriptResult>('ExecuteRegularInteractive', code);
+  },
+
   /** Compiles and runs a multi-file C# console project. */
   executeRegularProject(paths: string[], contents: string[], entryPath: string): Promise<ScriptResult> {
     return invoke<ScriptResult>('ExecuteRegularProject', paths, contents, entryPath);
+  },
+
+  executeRegularProjectInteractive(paths: string[], contents: string[], entryPath: string): Promise<ScriptResult> {
+    return invoke<ScriptResult>('ExecuteRegularProjectInteractive', paths, contents, entryPath);
   },
 };
 
