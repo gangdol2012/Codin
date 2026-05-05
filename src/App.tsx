@@ -23,6 +23,7 @@ import {
 } from 'lucide-react';
 import Editor, { DiffEditor } from '@monaco-editor/react';
 import { configureMonacoSuggestionAcceptance } from './monaco-suggest';
+import { CODECRAFT_MONACO_THEME } from './python-coloring';
 import { motion, AnimatePresence } from 'motion/react';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
@@ -856,6 +857,7 @@ const buildSharedEditorOptions = (fontSize: number) => ({
   lineNumbersMinChars: 5,
   renderLineHighlight: 'all' as const,
   renderValidationDecorations: 'editable' as const,
+  'semanticHighlighting.enabled': true as const,
   selectionHighlight: true,
   occurrencesHighlight: 'singleFile' as const,
   emptySelectionClipboard: true,
@@ -11147,7 +11149,7 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
                 </div>
               </div>
               <div className="flex-1 overflow-hidden">
-                <DiffEditor height="100%" original={pendingEdit.originalContent} modified={pendingEdit.proposedContent} language={files.find(f => f.id === pendingEdit.fileId)?.language} theme="vs-dark" options={{ fontSize: 14, fontFamily: '"JetBrains Mono", "Fira Code", monospace', minimap: { enabled: false }, scrollBeyondLastLine: false, automaticLayout: true, renderSideBySide: true, readOnly: true }} />
+                <DiffEditor height="100%" original={pendingEdit.originalContent} modified={pendingEdit.proposedContent} language={files.find(f => f.id === pendingEdit.fileId)?.language} theme={CODECRAFT_MONACO_THEME} options={{ fontSize: 14, fontFamily: '"JetBrains Mono", "Fira Code", monospace', minimap: { enabled: false }, scrollBeyondLastLine: false, automaticLayout: true, renderSideBySide: true, readOnly: true, 'semanticHighlighting.enabled': true } as any} />
               </div>
             </div>
           ) : !tabItem ? (
@@ -11215,7 +11217,7 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
                   height="100%"
                   defaultLanguage={tabItem.language}
                   language={tabItem.language}
-                  theme="vs-dark"
+                  theme={CODECRAFT_MONACO_THEME}
                   value={tabItem.content}
                   onMount={handleEditorMount}
                   onChange={(value) => {
