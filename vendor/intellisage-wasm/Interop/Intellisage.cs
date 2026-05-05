@@ -9,19 +9,46 @@ using System.Text;
 public class MonacoServiceWrapper {
     [JSInvokable]
     public async Task<byte[]?> RunAsync(string name, string[] args) {
+        var worker = Intellisage.MonacoWorkerWrapper
+            ?? throw new InvalidOperationException("The C# Monaco worker has not been initialized.");
+
         switch (name) {
             case "GetCompletionAsync":
-                return await Intellisage.MonacoWorkerWrapper.RunAsync(a => a.GetCompletionAsync(args[0], args[1]));
+                return await worker.RunAsync(a => a.GetCompletionAsync(args[0], args[1]));
             case "GetCompletionResolveAsync":
-                return await Intellisage.MonacoWorkerWrapper.RunAsync(a => a.GetCompletionResolveAsync(args[0]));
+                return await worker.RunAsync(a => a.GetCompletionResolveAsync(args[0]));
             case "GetSignatureHelpAsync":
-                return await Intellisage.MonacoWorkerWrapper.RunAsync(a => a.GetSignatureHelpAsync(args[0], args[1]));
+                return await worker.RunAsync(a => a.GetSignatureHelpAsync(args[0], args[1]));
             case "GetQuickInfoAsync":
-                return await Intellisage.MonacoWorkerWrapper.RunAsync(a => a.GetQuickInfoAsync(args[0]));
+                return args.Length > 1
+                    ? await worker.RunAsync(a => a.GetQuickInfoAsync(args[0], args[1]))
+                    : await worker.RunAsync(a => a.GetQuickInfoAsync(args[0]));
             case "GetDiagnosticsAsync":
-                return await Intellisage.MonacoWorkerWrapper.RunAsync(a => a.GetDiagnosticsAsync(args[0]));
+                return await worker.RunAsync(a => a.GetDiagnosticsAsync(args[0]));
+            case "GetSemanticTokensAsync":
+                return await worker.RunAsync(a => a.GetSemanticTokensAsync(args[0]));
+            case "GetDefinitionAsync":
+                return await worker.RunAsync(a => a.GetDefinitionAsync(args[0], args[1]));
+            case "GetReferencesAsync":
+                return await worker.RunAsync(a => a.GetReferencesAsync(args[0], args[1], args[2]));
+            case "GetRenameInfoAsync":
+                return await worker.RunAsync(a => a.GetRenameInfoAsync(args[0], args[1]));
+            case "GetRenameEditsAsync":
+                return await worker.RunAsync(a => a.GetRenameEditsAsync(args[0], args[1], args[2]));
+            case "GetDocumentSymbolsAsync":
+                return await worker.RunAsync(a => a.GetDocumentSymbolsAsync(args[0]));
+            case "GetFormattingAsync":
+                return await worker.RunAsync(a => a.GetFormattingAsync(args[0]));
+            case "GetRangeFormattingAsync":
+                return await worker.RunAsync(a => a.GetRangeFormattingAsync(args[0], args[1]));
+            case "GetCodeActionsAsync":
+                return await worker.RunAsync(a => a.GetCodeActionsAsync(args[0], args[1]));
+            case "GetInlayHintsAsync":
+                return await worker.RunAsync(a => a.GetInlayHintsAsync(args[0], args[1]));
+            case "GetFoldingRangesAsync":
+                return await worker.RunAsync(a => a.GetFoldingRangesAsync(args[0]));
             case "IncludeNamespaceAsync":
-                return await Intellisage.MonacoWorkerWrapper.RunAsync(a => a.IncludeNamespaceAsync(args[0]));
+                return await worker.RunAsync(a => a.IncludeNamespaceAsync(args[0]));
         }
        return Encoding.UTF8.GetBytes("{}");
     }

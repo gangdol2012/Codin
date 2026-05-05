@@ -31,6 +31,8 @@
 
   <ItemGroup>
     <Compile Remove="Example/**/*.cs" />
+    <Content Remove="publish/**" />
+    <None Remove="publish/**" />
   </ItemGroup>
 
 </Project>
