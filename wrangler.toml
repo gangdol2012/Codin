@@ -1,0 +1,4 @@
+name = "codecraft-delegate"
+main = "workers/delegate-worker.mjs"
+compatibility_date = "2025-11-01"
+workers_dev = true

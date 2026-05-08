@@ -319,6 +319,10 @@ function resolveIncludePath(fromPath: string, includePath: string) {
 
 function currentModelPath(model: monaco.editor.ITextModel) {
   const uriPath = decodeURIComponent(model.uri.path || '');
+  const projectMarker = '/codecraft-project/';
+  const projectIndex = uriPath.indexOf(projectMarker);
+  if (projectIndex >= 0) return uriPath.slice(projectIndex + projectMarker.length);
+
   const marker = '/codecraft-model/';
   const index = uriPath.indexOf(marker);
   if (index < 0) return model.uri.path.replace(/^\//, '');

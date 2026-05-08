@@ -193,6 +193,9 @@ function stripCommentsAndStrings(source: string) {
 
 function currentModelPath(model: monaco.editor.ITextModel) {
   const rawPath = model.uri.path || model.uri.toString();
+  const projectMatch = rawPath.match(/codecraft-project\/(.+)$/);
+  if (projectMatch) return decodeURIComponent(projectMatch[1]);
+
   const match = rawPath.match(/codecraft-model\/[^/]+\/(.+)$/);
   if (!match) return decodeURIComponent(rawPath.split('/').pop() || '');
   return decodeURIComponent(match[1]);
@@ -317,6 +320,21 @@ class JavaLanguageService {
     }));
   }
 
+  private getProjectTypeNames(): string[] {
+    const files = this.projectFilesProvider?.() || [];
+    const names = new Set<string>();
+    const typePattern = /^\s*(?:public\s+|protected\s+|private\s+)?(?:abstract\s+|final\s+|sealed\s+|non-sealed\s+|strictfp\s+)*?(?:class|interface|enum|record)\s+([A-Za-z_$][\w$]*)/gm;
+
+    for (const file of files) {
+      const clean = stripCommentsAndStrings(file.content || '');
+      for (const match of clean.matchAll(typePattern)) {
+        if (match[1]) names.add(match[1]);
+      }
+    }
+
+    return [...names].sort((left, right) => left.localeCompare(right));
+  }
+
   private provideCompletionItems(model: monaco.editor.ITextModel, position: monaco.Position): monaco.languages.CompletionList {
     const word = model.getWordUntilPosition(position);
     const range = new monaco.Range(position.lineNumber, word.startColumn, position.lineNumber, word.endColumn);
@@ -362,6 +380,10 @@ class JavaLanguageService {
     }
     for (const typeName of COMMON_TYPES) {
       suggestions.push(completion(typeName, monaco.languages.CompletionItemKind.Class, range));
+    }
+    for (const typeName of this.getProjectTypeNames()) {
+      if (COMMON_TYPES.includes(typeName)) continue;
+      suggestions.push(completion(typeName, monaco.languages.CompletionItemKind.Class, range, 'Project type'));
     }
     suggestions.push({
       label: 'main',

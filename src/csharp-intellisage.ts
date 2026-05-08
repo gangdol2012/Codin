@@ -4,6 +4,14 @@ const iframeId = `intellisage-${Math.random().toString(36).slice(2)}`;
 
 type IntellisageCall = (method: string, ...args: unknown[]) => Promise<any>;
 
+export interface CSharpProjectFileSnapshot {
+  path: string;
+  content: string;
+  language: 'csharp';
+}
+
+type CSharpProjectFilesProvider = () => CSharpProjectFileSnapshot[];
+
 interface RoslynPositionDto {
   line: number;
   character: number;
@@ -148,10 +156,42 @@ function isRecord(value: string, obj: unknown): obj is Record<string, unknown> {
   return typeof obj === 'object' && obj !== null && value in obj;
 }
 
+function normalizeProjectPath(path: string): string {
+  const resolved: string[] = [];
+  for (const rawPart of path.replace(/\\/g, '/').split('/')) {
+    const part = rawPart.trim();
+    if (!part || part === '.') continue;
+    if (part === '..') {
+      resolved.pop();
+      continue;
+    }
+    resolved.push(part);
+  }
+  return resolved.join('/');
+}
+
+function currentModelPath(model: monaco.editor.ITextModel) {
+  const uriPath = decodeURIComponent(model.uri.path || '');
+  const projectMarker = '/codecraft-project/';
+  const projectIndex = uriPath.indexOf(projectMarker);
+  if (projectIndex >= 0) return normalizeProjectPath(uriPath.slice(projectIndex + projectMarker.length));
+
+  const modelMarker = '/codecraft-model/';
+  const modelIndex = uriPath.indexOf(modelMarker);
+  if (modelIndex >= 0) {
+    const withoutPrefix = uriPath.slice(modelIndex + modelMarker.length);
+    const slash = withoutPrefix.indexOf('/');
+    return normalizeProjectPath(slash >= 0 ? withoutPrefix.slice(slash + 1) : withoutPrefix);
+  }
+
+  return normalizeProjectPath(uriPath.replace(/^\//, '') || model.uri.toString());
+}
+
 class CSharpLanguageService {
   private intellisage: IntellisageCall | null = null;
   private lastCompletions = new Map<monaco.languages.CompletionItem, any>();
   private model: monaco.editor.ITextModel | null = null;
+  private projectFilesProvider: CSharpProjectFilesProvider = () => [];
   private initialized = false;
   private providerDisposables: monaco.IDisposable[] = [];
   private semanticCache = new WeakMap<monaco.editor.ITextModel, { versionId: number; index: CSharpSemanticIndex }>();
@@ -295,7 +335,10 @@ class CSharpLanguageService {
   private editorChangeListener: monaco.IDisposable | null = null;
   private modelChangeListener: monaco.IDisposable | null = null;
 
-  setupEditor(editor: monaco.editor.IStandaloneCodeEditor) {
+  setupEditor(editor: monaco.editor.IStandaloneCodeEditor, projectFilesProvider?: CSharpProjectFilesProvider) {
+    if (projectFilesProvider) {
+      this.projectFilesProvider = projectFilesProvider;
+    }
     this.setupDiagnostics(editor);
   }
 
@@ -426,7 +469,18 @@ class CSharpLanguageService {
       for (let i = 0; i < mapped.length; i++) {
         this.lastCompletions.set(mapped[i], validItems[i]);
       }
-      return { suggestions: mapped.length ? mapped : this.provideLocalCompletionItems(model, position).suggestions };
+      const localSuggestions = this.provideLocalCompletionItems(model, position).suggestions;
+      const seen = new Set(mapped.map(item => completionItemKey(item)));
+      const merged = [
+        ...mapped,
+        ...localSuggestions.filter(item => {
+          const key = completionItemKey(item);
+          if (seen.has(key)) return false;
+          seen.add(key);
+          return true;
+        }),
+      ];
+      return { suggestions: merged.length ? merged : localSuggestions };
     } catch {
       return this.provideLocalCompletionItems(model, position);
     }
@@ -504,9 +558,10 @@ class CSharpLanguageService {
 
     const symbol = this.getSemanticIndex(model).symbolAt(position);
     if (!symbol) return undefined;
+    const declaration = this.findProjectDeclaration(model, symbol);
     return {
       range: symbol.token.range,
-      contents: [{ value: buildSymbolMarkdown(symbol.declaration ?? symbol) }],
+      contents: [{ value: buildSymbolMarkdown(declaration?.declaration ?? symbol.declaration ?? symbol) }],
     };
   }
 
@@ -544,9 +599,11 @@ class CSharpLanguageService {
     }
 
     const symbol = this.getSemanticIndex(model).symbolAt(position);
-    const declaration = symbol?.declaration ?? symbol;
-    if (!declaration) return undefined;
-    return [{ uri: model.uri, range: declaration.token.range }];
+    if (!symbol) return undefined;
+    const declaration = this.findProjectDeclaration(model, symbol);
+    return declaration
+      ? [{ uri: declaration.model.uri, range: declaration.declaration.token.range }]
+      : [{ uri: model.uri, range: symbol.token.range }];
   }
 
   private async provideReferences(
@@ -554,11 +611,11 @@ class CSharpLanguageService {
     position: monaco.Position,
     context: monaco.languages.ReferenceContext
   ): Promise<monaco.languages.Location[] | undefined> {
+    let roslynLocations: monaco.languages.Location[] = [];
     if (this.intellisage) {
       try {
         const response = await this.intellisage('GetReferencesAsync', model.getValue(), this.positionRequest(position), String(context.includeDeclaration));
-        const locations = this.convertLocations(model, response);
-        if (locations.length) return locations;
+        roslynLocations = this.convertLocations(model, response);
       } catch {
         // Fall through to the browser-side semantic index.
       }
@@ -566,9 +623,10 @@ class CSharpLanguageService {
 
     const index = this.getSemanticIndex(model);
     const symbol = index.symbolAt(position);
-    if (!symbol) return undefined;
-    const refs = index.referencesFor(symbol, context.includeDeclaration);
-    return refs.map(ref => ({ uri: model.uri, range: ref.token.range }));
+    if (!symbol) return roslynLocations.length ? roslynLocations : undefined;
+    const refs = this.projectReferencesFor(model, symbol, context.includeDeclaration);
+    const fallbackRefs = refs.length ? refs : index.referencesFor(symbol, context.includeDeclaration).map(ref => ({ uri: model.uri, range: ref.token.range }));
+    return mergeLocations([...roslynLocations, ...fallbackRefs]);
   }
 
   private provideDocumentHighlights(
@@ -639,14 +697,14 @@ class CSharpLanguageService {
       return { edits: [], rejectReason: 'Enter a valid C# identifier.' };
     }
 
+    let roslynEdits: monaco.languages.IWorkspaceTextEdit[] = [];
+    let roslynRejectReason: string | undefined;
     if (this.intellisage) {
       try {
         const response = await this.intellisage('GetRenameEditsAsync', model.getValue(), this.positionRequest(position), newName) as RoslynRenameEditsDto | false;
         if (response && Array.isArray(response.edits)) {
-          return {
-            edits: response.edits.flatMap(edit => this.convertWorkspaceEdit(model, edit)),
-            rejectReason: response.rejectReason ?? undefined,
-          };
+          roslynEdits = response.edits.flatMap(edit => this.convertWorkspaceEdit(model, edit));
+          roslynRejectReason = response.rejectReason ?? undefined;
         }
       } catch {
         // Fall through to the browser-side semantic index.
@@ -656,15 +714,19 @@ class CSharpLanguageService {
     const index = this.getSemanticIndex(model);
     const symbol = index.symbolAt(position);
     if (!symbol || !isRenameableSymbol(symbol)) {
+      if (roslynEdits.length) {
+        return { edits: roslynEdits, rejectReason: roslynRejectReason };
+      }
       return { edits: [], rejectReason: 'This C# token cannot be renamed.' };
     }
 
-    const edits = index.referencesFor(symbol, true).map(ref => ({
-      resource: model.uri,
-      textEdit: { range: ref.token.range, text: newName },
-      versionId: model.getVersionId(),
+    const projectRefs = this.projectReferencesFor(model, symbol, true);
+    const edits = (projectRefs.length ? projectRefs : index.referencesFor(symbol, true).map(ref => ({ uri: model.uri, range: ref.token.range }))).map(ref => ({
+      resource: ref.uri,
+      textEdit: { range: ref.range, text: newName },
+      versionId: monaco.editor.getModel(ref.uri)?.getVersionId(),
     }));
-    return { edits };
+    return { edits: mergeWorkspaceTextEdits([...roslynEdits, ...edits]), rejectReason: roslynRejectReason };
   }
 
   private async provideCodeActions(
@@ -839,24 +901,42 @@ class CSharpLanguageService {
     model: monaco.editor.ITextModel,
     position: monaco.Position
   ): monaco.languages.CompletionList {
-    const index = this.getSemanticIndex(model);
+    const projectEntries = this.getProjectSemanticEntries(model);
     const word = model.getWordUntilPosition(position);
     const range = new monaco.Range(position.lineNumber, word.startColumn, position.lineNumber, word.endColumn);
     const before = model.getValueInRange(new monaco.Range(position.lineNumber, 1, position.lineNumber, position.column));
     const suggestions: monaco.languages.CompletionItem[] = [];
+    const seenDeclarations = new Set<string>();
 
     const add = (label: string, kind: monaco.languages.CompletionItemKind, detail?: string, insertText = label) => {
       suggestions.push({ label, kind, detail, insertText, range });
     };
+    const addDeclaration = (declaration: CSharpDeclaration, sourceModel: monaco.editor.ITextModel) => {
+      const key = `${declaration.kind}:${declaration.name}`;
+      if (seenDeclarations.has(key)) return;
+      seenDeclarations.add(key);
+      const sourcePath = sourceModel === model ? '' : currentModelPath(sourceModel);
+      add(
+        declaration.name,
+        completionKindForSymbolKind(declaration.kind),
+        sourcePath ? `${declaration.detail} - ${sourcePath}` : declaration.detail
+      );
+    };
 
     if (/\.\s*@?[_\p{L}\p{N}]*$/u.test(before)) {
-      for (const member of index.memberCompletions()) {
-        add(member.name, completionKindForSymbolKind(member.kind), member.detail);
+      for (const entry of projectEntries) {
+        for (const member of entry.index.memberCompletions()) {
+          if (!this.isProjectVisibleDeclaration(member, entry.model === model)) continue;
+          addDeclaration(member, entry.model);
+        }
       }
     } else {
       for (const keyword of CSHARP_COMPLETION_KEYWORDS) add(keyword, monaco.languages.CompletionItemKind.Keyword);
-      for (const symbol of index.globalCompletions()) {
-        add(symbol.name, completionKindForSymbolKind(symbol.kind), symbol.detail);
+      for (const entry of projectEntries) {
+        for (const symbol of entry.index.globalCompletions()) {
+          if (!this.isProjectVisibleDeclaration(symbol, entry.model === model)) continue;
+          addDeclaration(symbol, entry.model);
+        }
       }
       for (const type of DEFAULT_CSHARP_TYPES) {
         add(type, monaco.languages.CompletionItemKind.Class, 'System type');
@@ -884,6 +964,82 @@ class CSharpLanguageService {
       },
       dispose() {},
     };
+  }
+
+  private getProjectSemanticEntries(model: monaco.editor.ITextModel): { model: monaco.editor.ITextModel; index: CSharpSemanticIndex }[] {
+    const projectPaths = new Set(
+      this.projectFilesProvider()
+        .map(file => normalizeProjectPath(file.path))
+        .filter(Boolean)
+    );
+    const candidates = monaco.editor.getModels()
+      .filter(candidate => candidate.getLanguageId() === 'csharp')
+      .filter(candidate => projectPaths.size === 0 || projectPaths.has(currentModelPath(candidate)));
+    if (!candidates.includes(model)) {
+      candidates.push(model);
+    }
+
+    const seen = new Set<string>();
+    return candidates.flatMap(candidate => {
+      const key = candidate.uri.toString();
+      if (seen.has(key)) return [];
+      seen.add(key);
+      return [{ model: candidate, index: this.getSemanticIndex(candidate) }];
+    });
+  }
+
+  private isProjectVisibleDeclaration(declaration: CSharpDeclaration, isActiveModel: boolean) {
+    return isActiveModel || !['local', 'parameter', 'label'].includes(declaration.kind);
+  }
+
+  private findProjectDeclaration(
+    model: monaco.editor.ITextModel,
+    symbol: CSharpSemanticOccurrence
+  ): { model: monaco.editor.ITextModel; index: CSharpSemanticIndex; declaration: CSharpDeclaration } | undefined {
+    const entries = this.getProjectSemanticEntries(model);
+    const activeEntry = entries.find(entry => entry.model === model);
+    const localDeclaration = symbol.declaration ?? activeEntry?.index.declarations.find(declaration => declaration.token.index === symbol.token.index);
+    if (localDeclaration && this.isProjectVisibleDeclaration(localDeclaration, true)) {
+      return { model, index: activeEntry?.index ?? this.getSemanticIndex(model), declaration: localDeclaration };
+    }
+
+    const visibleDeclarations = entries.flatMap(entry => (
+      entry.index.declarations
+        .filter(declaration => declaration.name === symbol.name)
+        .filter(declaration => this.isProjectVisibleDeclaration(declaration, entry.model === model))
+        .map(declaration => ({ ...entry, declaration }))
+    ));
+
+    return visibleDeclarations.find(entry => entry.declaration.kind === symbol.kind)
+      ?? visibleDeclarations.find(entry => areReferenceKindsCompatible(symbol.kind, entry.declaration.kind))
+      ?? visibleDeclarations[0];
+  }
+
+  private projectReferencesFor(
+    model: monaco.editor.ITextModel,
+    symbol: CSharpSemanticOccurrence,
+    includeDeclaration: boolean
+  ): monaco.languages.Location[] {
+    const declaration = this.findProjectDeclaration(model, symbol);
+    const target = declaration?.declaration ?? symbol;
+    const locations: monaco.languages.Location[] = [];
+    const seen = new Set<string>();
+    const entries = ['local', 'parameter', 'label'].includes(target.kind)
+      ? this.getProjectSemanticEntries(model).filter(entry => entry.model === model)
+      : this.getProjectSemanticEntries(model);
+
+    for (const entry of entries) {
+      for (const reference of entry.index.referencesFor(target, includeDeclaration)) {
+        if (entry.index.tokens[reference.token.index] !== reference.token) continue;
+        const range = reference.token.range;
+        const key = `${entry.model.uri.toString()}:${range.startLineNumber}:${range.startColumn}:${range.endLineNumber}:${range.endColumn}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        locations.push({ uri: entry.model.uri, range });
+      }
+    }
+
+    return locations;
   }
 
   private getSemanticIndex(model: monaco.editor.ITextModel): CSharpSemanticIndex {
@@ -2027,6 +2183,33 @@ function completionKindForSymbolKind(kind: CSharpSymbolKind) {
     case 'parameter': return monaco.languages.CompletionItemKind.Variable;
     default: return monaco.languages.CompletionItemKind.Variable;
   }
+}
+
+function completionItemKey(item: monaco.languages.CompletionItem) {
+  const label = typeof item.label === 'string' ? item.label : item.label.label;
+  return `${label}:${item.kind ?? ''}`;
+}
+
+function mergeLocations(locations: monaco.languages.Location[]) {
+  const seen = new Set<string>();
+  return locations.filter(location => {
+    const range = location.range;
+    const key = `${location.uri.toString()}:${range.startLineNumber}:${range.startColumn}:${range.endLineNumber}:${range.endColumn}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function mergeWorkspaceTextEdits(edits: monaco.languages.IWorkspaceTextEdit[]) {
+  const seen = new Set<string>();
+  return edits.filter(edit => {
+    const range = edit.textEdit.range;
+    const key = `${edit.resource.toString()}:${range.startLineNumber}:${range.startColumn}:${range.endLineNumber}:${range.endColumn}:${edit.textEdit.text}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 function dedupeCodeActions(actions: monaco.languages.CodeAction[]) {

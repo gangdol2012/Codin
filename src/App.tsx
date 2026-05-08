@@ -19,7 +19,13 @@ import {
   FolderPlus,
   FilePlus,
   FolderSync,
-  Unlink
+  Unlink,
+  Download,
+  Upload,
+  Copy,
+  CopyPlus,
+  ClipboardPaste,
+  Pencil
 } from 'lucide-react';
 import Editor, { DiffEditor } from '@monaco-editor/react';
 import { configureMonacoSuggestionAcceptance } from './monaco-suggest';
@@ -31,9 +37,11 @@ import { GoogleGenAI, Type, type FunctionDeclaration } from "@google/genai";
 import ReactMarkdown from 'react-markdown';
 import { flushSync } from 'react-dom';
 import { Layout, Model, TabNode, IJsonModel, Actions, DockLocation } from 'flexlayout-react';
+import * as monaco from 'monaco-editor';
 import 'flexlayout-react/style/dark.css';
 import * as Tooltip from '@radix-ui/react-tooltip';
 import * as Separator from '@radix-ui/react-separator';
+import type * as TypeScript from 'typescript';
 
 type UserFolder = import('./pyright').UserFolder;
 type PyrightModule = typeof import('./pyright');
@@ -43,6 +51,7 @@ type CxxAuthoringModule = typeof import('./cpp-authoring');
 type CxxRuntimeModule = typeof import('./cpp-wasm');
 type JavaAuthoringModule = typeof import('./java-authoring');
 type JavaRuntimeModule = typeof import('./java-wasm');
+type TypeScriptModule = typeof TypeScript;
 
 let pyrightModulePromise: Promise<PyrightModule> | null = null;
 let csharpAuthoringModulePromise: Promise<CSharpAuthoringModule> | null = null;
@@ -51,6 +60,7 @@ let cxxAuthoringModulePromise: Promise<CxxAuthoringModule> | null = null;
 let cxxRuntimeModulePromise: Promise<CxxRuntimeModule> | null = null;
 let javaAuthoringModulePromise: Promise<JavaAuthoringModule> | null = null;
 let javaRuntimeModulePromise: Promise<JavaRuntimeModule> | null = null;
+let typescriptModulePromise: Promise<TypeScriptModule> | null = null;
 
 const loadPyrightModule = () => {
   if (!pyrightModulePromise) pyrightModulePromise = import('./pyright');
@@ -87,13 +97,160 @@ const loadJavaRuntimeModule = () => {
   return javaRuntimeModulePromise;
 };
 
+const loadTypeScriptModule = () => {
+  if (!typescriptModulePromise) typescriptModulePromise = import('typescript');
+  return typescriptModulePromise;
+};
+
 const SYNC_DB_NAME = 'codecraft-sync';
 const SYNC_STORE_NAME = 'handles';
 const SYNC_META_KEY = 'codecraft-sync-meta';
+const PROJECTS_STORAGE_KEY = 'codecraft-projects';
+const ACTIVE_PROJECT_STORAGE_KEY = 'codecraft-active-project-id';
+const PROJECT_STORAGE_PREFIX = 'codecraft-project';
+const DEFAULT_PROJECT_ID = 'default';
 const PYTHON_CACHE_DB_NAME = 'codecraft-python-cache';
 const PYTHON_CACHE_STORE_NAME = 'pyodide-package-meta';
 const PYTHON_CACHE_PACKAGE_META_KEY = 'packages';
 const PYTHON_CACHE_PACKAGE_SNAPSHOT_KEY = 'snapshot';
+const NPM_PACKAGE_DB_NAME = 'codecraft-npm-packages';
+const NPM_PACKAGE_STORE_NAME = 'packages';
+const MAX_NPM_INSTALL_PACKAGE_COUNT = 4096;
+const NPM_INSTALL_BROWSER_YIELD_EVERY = 8;
+const NPM_INSTALL_PROGRESS_DETAIL_LIMIT = 120;
+const MAX_NPM_PACKAGE_TEXT_FILE_BYTES = 5 * 1024 * 1024;
+const MAX_NPM_PACKAGE_TOTAL_TEXT_BYTES = 40 * 1024 * 1024;
+const NPM_INCLUDE_FETCH_TIMEOUT_MS = 12000;
+
+interface CodeCraftProjectMeta {
+  id: string;
+  name: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+function createProjectId() {
+  return `project_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function createDefaultProjectMeta(): CodeCraftProjectMeta {
+  const now = Date.now();
+  return {
+    id: DEFAULT_PROJECT_ID,
+    name: 'Default Project',
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
+function normalizeProjectMeta(value: unknown): CodeCraftProjectMeta | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const raw = value as Partial<CodeCraftProjectMeta>;
+  if (typeof raw.id !== 'string' || !raw.id.trim()) return null;
+  return {
+    id: raw.id.trim(),
+    name: typeof raw.name === 'string' && raw.name.trim() ? raw.name.trim() : 'Untitled Project',
+    createdAt: Number.isFinite(raw.createdAt) ? raw.createdAt! : Date.now(),
+    updatedAt: Number.isFinite(raw.updatedAt) ? raw.updatedAt! : Date.now(),
+  };
+}
+
+function loadProjectRegistry(): CodeCraftProjectMeta[] {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(PROJECTS_STORAGE_KEY) || '[]');
+    const projects = Array.isArray(parsed)
+      ? parsed.map(normalizeProjectMeta).filter((project): project is CodeCraftProjectMeta => project !== null)
+      : [];
+    return projects.length > 0 ? projects : [createDefaultProjectMeta()];
+  } catch {
+    return [createDefaultProjectMeta()];
+  }
+}
+
+function saveProjectRegistry(projects: CodeCraftProjectMeta[]) {
+  const deduped = new Map<string, CodeCraftProjectMeta>();
+  for (const project of projects) {
+    const normalized = normalizeProjectMeta(project);
+    if (normalized) deduped.set(normalized.id, normalized);
+  }
+  const next = [...deduped.values()].sort((left, right) => right.updatedAt - left.updatedAt);
+  localStorage.setItem(PROJECTS_STORAGE_KEY, JSON.stringify(next.length > 0 ? next : [createDefaultProjectMeta()]));
+}
+
+function getUniqueProjectName(baseName: string, projects: CodeCraftProjectMeta[]) {
+  const trimmedBase = baseName.trim() || 'Untitled Project';
+  const existingNames = new Set(projects.map(project => project.name));
+  if (!existingNames.has(trimmedBase)) return trimmedBase;
+
+  let index = 2;
+  while (existingNames.has(`${trimmedBase} ${index}`)) index += 1;
+  return `${trimmedBase} ${index}`;
+}
+
+function getProjectNameFromDataFileName(fileName: string) {
+  const withoutExtension = fileName.replace(/\.[^.]+$/, '');
+  const cleaned = withoutExtension
+    .replace(/^codecraft-user-data[-_ ]*/i, '')
+    .replace(/[-_]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return cleaned || 'Imported Project';
+}
+
+function touchProjectUpdatedAt(projectId = getActiveProjectId(), timestamp = Date.now()) {
+  const projects = loadProjectRegistry();
+  const nextProjects = projects.map(project => (
+    project.id === projectId
+      ? { ...project, updatedAt: timestamp }
+      : project
+  ));
+  if (!nextProjects.some(project => project.id === projectId)) {
+    nextProjects.push({
+      id: projectId,
+      name: projectId === DEFAULT_PROJECT_ID ? 'Default Project' : 'Untitled Project',
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    });
+  }
+  saveProjectRegistry(nextProjects);
+  return loadProjectRegistry();
+}
+
+function getActiveProjectId() {
+  const projects = loadProjectRegistry();
+  const activeId = localStorage.getItem(ACTIVE_PROJECT_STORAGE_KEY) || DEFAULT_PROJECT_ID;
+  const resolved = projects.some(project => project.id === activeId)
+    ? activeId
+    : projects[0]?.id || DEFAULT_PROJECT_ID;
+  if (resolved !== activeId) {
+    localStorage.setItem(ACTIVE_PROJECT_STORAGE_KEY, resolved);
+  }
+  return resolved;
+}
+
+function setActiveProjectId(projectId: string) {
+  const projects = loadProjectRegistry();
+  if (!projects.some(project => project.id === projectId)) return false;
+  localStorage.setItem(ACTIVE_PROJECT_STORAGE_KEY, projectId);
+  return true;
+}
+
+function getProjectStorageKey(baseKey: string, projectId = getActiveProjectId()) {
+  return `${PROJECT_STORAGE_PREFIX}:${projectId}:${baseKey}`;
+}
+
+function getProjectDbKey(baseKey: string, projectId = getActiveProjectId()) {
+  return `${projectId}::${baseKey}`;
+}
+
+function isProjectDbKeyForCurrentProject(key: IDBValidKey, projectId = getActiveProjectId()) {
+  return typeof key === 'string' && key.startsWith(`${projectId}::`);
+}
+
+function unscopedProjectDbKey(key: string, projectId = getActiveProjectId()) {
+  const prefix = `${projectId}::`;
+  return key.startsWith(prefix) ? key.slice(prefix.length) : key;
+}
 
 function openSyncDB(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
@@ -108,7 +265,7 @@ async function saveSyncHandle(folderId: string, handle: FileSystemDirectoryHandl
   const db = await openSyncDB();
   return new Promise<void>((resolve, reject) => {
     const tx = db.transaction(SYNC_STORE_NAME, 'readwrite');
-    tx.objectStore(SYNC_STORE_NAME).put(handle, folderId);
+    tx.objectStore(SYNC_STORE_NAME).put(handle, getProjectDbKey(folderId));
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
   });
@@ -118,7 +275,9 @@ async function removeSyncHandle(folderId: string) {
   const db = await openSyncDB();
   return new Promise<void>((resolve, reject) => {
     const tx = db.transaction(SYNC_STORE_NAME, 'readwrite');
-    tx.objectStore(SYNC_STORE_NAME).delete(folderId);
+    const store = tx.objectStore(SYNC_STORE_NAME);
+    store.delete(getProjectDbKey(folderId));
+    if (getActiveProjectId() === DEFAULT_PROJECT_ID) store.delete(folderId);
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
   });
@@ -134,7 +293,12 @@ async function loadAllSyncHandles(): Promise<Map<string, FileSystemDirectoryHand
     req.onsuccess = () => {
       const cursor = req.result;
       if (cursor) {
-        map.set(cursor.key as string, cursor.value as FileSystemDirectoryHandle);
+        const key = cursor.key;
+        if (isProjectDbKeyForCurrentProject(key)) {
+          map.set(unscopedProjectDbKey(key as string), cursor.value as FileSystemDirectoryHandle);
+        } else if (getActiveProjectId() === DEFAULT_PROJECT_ID && typeof key === 'string' && !key.includes('::')) {
+          map.set(key, cursor.value as FileSystemDirectoryHandle);
+        }
         cursor.continue();
       } else {
         resolve(map);
@@ -150,6 +314,19 @@ function openPythonCacheDB(): Promise<IDBDatabase> {
     req.onupgradeneeded = () => {
       if (!req.result.objectStoreNames.contains(PYTHON_CACHE_STORE_NAME)) {
         req.result.createObjectStore(PYTHON_CACHE_STORE_NAME);
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+function openNpmPackageDB(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(NPM_PACKAGE_DB_NAME, 1);
+    req.onupgradeneeded = () => {
+      if (!req.result.objectStoreNames.contains(NPM_PACKAGE_STORE_NAME)) {
+        req.result.createObjectStore(NPM_PACKAGE_STORE_NAME);
       }
     };
     req.onsuccess = () => resolve(req.result);
@@ -216,29 +393,16 @@ async function readZipEntryData(data: Uint8Array, entry: ZipArchiveEntry): Promi
   const raw = readZipEntryRaw(data, entry);
   if (entry.method === 0) return raw;
   if (entry.method === 8) {
-    const ds = new DecompressionStream('deflate-raw');
-    const writer = ds.writable.getWriter();
-    writer.write(raw as unknown as BufferSource);
-    writer.close();
-
-    const chunks: Uint8Array[] = [];
-    const reader = ds.readable.getReader();
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      chunks.push(value);
-    }
-
-    const total = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
-    const out = new Uint8Array(total);
-    let off = 0;
-    for (const chunk of chunks) {
-      out.set(chunk, off);
-      off += chunk.length;
-    }
-    return out;
+    return decompressBytes(raw, 'deflate-raw');
   }
   throw new Error(`Unsupported ZIP method: ${entry.method}`);
+}
+
+async function decompressBytes(data: Uint8Array, format: CompressionFormat) {
+  const stream = new Blob([data as unknown as BlobPart])
+    .stream()
+    .pipeThrough(new DecompressionStream(format));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
 }
 
 function crc32(data: Uint8Array): number {
@@ -452,7 +616,8 @@ type AssistantProvider =
   | 'fireworks'
   | 'cerebras'
   | 'moonshot'
-  | 'perplexity';
+  | 'perplexity'
+  | 'cursor';
 type AssistantMessageKind = 'message' | 'log';
 type AssistantReasoningControl = 'toggleable' | 'always_on' | 'always_off';
 type AssistantSchemaPrimitive = 'string' | 'number' | 'boolean';
@@ -497,6 +662,27 @@ interface AssistantOpenAIResponsesProviderConfig {
   requestLabel: string;
 }
 
+interface CursorServerSentEvent {
+  id?: string;
+  event?: string;
+  data: string;
+}
+
+interface CursorTextBuffer {
+  value: string;
+}
+
+interface CursorLocalToolBridgeCall {
+  name: string;
+  args?: Record<string, any>;
+}
+
+interface CursorLocalToolBridgeResponse {
+  message: string;
+  toolCalls: CursorLocalToolBridgeCall[];
+  consumedEntireResponse: boolean;
+}
+
 interface SharedEditorTarget {
   tabId: string;
   itemId: string;
@@ -504,17 +690,25 @@ interface SharedEditorTarget {
 }
 
 function loadSyncMeta(): SyncMeta[] {
-  try { return JSON.parse(localStorage.getItem(SYNC_META_KEY) || '[]'); }
+  try { return JSON.parse(localStorage.getItem(getProjectStorageKey(SYNC_META_KEY)) || '[]'); }
   catch { return []; }
 }
 
 function saveSyncMeta(meta: SyncMeta[]) {
-  localStorage.setItem(SYNC_META_KEY, JSON.stringify(meta));
+  localStorage.setItem(getProjectStorageKey(SYNC_META_KEY), JSON.stringify(meta));
 }
 
 const DEFAULT_ASSISTANT_CHAT_NAME = "AI assistant";
 const DEFAULT_ASSISTANT_TOOL_PASSES = 4;
+const MAX_ASSISTANT_CHAIN_OF_THOUGHT_DEPTH = 64;
+const DEFAULT_ASSISTANT_REQUEST_RATE_LIMIT_PER_MINUTE = 0;
+const MAX_ASSISTANT_REQUEST_RATE_LIMIT_PER_MINUTE = 120;
 const DEFAULT_ASSISTANT_ESTIMATED_OUTPUT_TOKENS = 1024;
+const CURSOR_AGENTS_API_BASE_URL = 'https://api.cursor.com';
+const CURSOR_AGENTS_GITHUB_REPOSITORY_URL = 'https://github.com/gangdol2012/repository';
+const CODECRAFT_DELEGATE_SERVER_URL = 'https://codecraft-delegate.codecraftide.workers.dev/delegate';
+const CURSOR_AGENT_STATUS_POLL_INTERVAL_MS = 2500;
+const CURSOR_AGENT_STATUS_TIMEOUT_MS = 10 * 60 * 1000;
 const createAssistantChatId = () => `chat_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
 const INITIAL_ASSISTANT_CHAT_ID = createAssistantChatId();
 const DEFAULT_PYI_IMPORT_SIZE_LIMIT_BYTES = 200 * 1024;
@@ -534,6 +728,7 @@ const ASSISTANT_PROVIDER_METADATA: Record<AssistantProvider, AssistantProviderMe
   cerebras: { label: 'Cerebras', apiKeyLabel: 'Cerebras API key' },
   moonshot: { label: 'Moonshot/Kimi', apiKeyLabel: 'Moonshot API key' },
   perplexity: { label: 'Perplexity', apiKeyLabel: 'Perplexity API key' },
+  cursor: { label: 'Cursor Agents', apiKeyLabel: 'Cursor API key' },
 };
 
 const ASSISTANT_PROVIDER_OPTIONS: { value: AssistantProvider; label: string }[] = ([
@@ -550,6 +745,7 @@ const ASSISTANT_PROVIDER_OPTIONS: { value: AssistantProvider; label: string }[] 
   'cerebras',
   'moonshot',
   'perplexity',
+  'cursor',
 ] as AssistantProvider[]).map(value => ({ value, label: ASSISTANT_PROVIDER_METADATA[value].label }));
 
 const ASSISTANT_MODEL_PRESETS: Record<AssistantProvider, AssistantModelPreset[]> = {
@@ -625,6 +821,11 @@ const ASSISTANT_MODEL_PRESETS: Record<AssistantProvider, AssistantModelPreset[]>
     { id: 'sonar', label: 'Sonar', reasoningControl: 'always_off' },
     { id: 'sonar-reasoning-pro', label: 'Sonar Reasoning Pro', reasoningControl: 'always_on' },
   ],
+  cursor: [
+    { id: 'composer-2', label: 'Composer 2', reasoningControl: 'toggleable' },
+    { id: 'gpt-5.5', label: 'GPT-5.5', reasoningControl: 'toggleable' },
+    { id: 'claude-4-sonnet-thinking', label: 'Claude 4 Sonnet Thinking', reasoningControl: 'always_on' },
+  ],
 };
 
 const OPENAI_CHAT_PROVIDER_CONFIGS: Partial<Record<AssistantProvider, AssistantOpenAIChatProviderConfig>> = {
@@ -697,9 +898,43 @@ const STORAGE_KEYS = {
   layout: 'codecraft-layout',
   pipPackages: 'codecraft-pip-packages',
   pipIncludedModules: 'codecraft-pip-included-modules',
+  npmPackages: 'codecraft-npm-packages',
+  javascriptIncludedModules: 'codecraft-javascript-included-modules',
   csharpNamespaces: 'codecraft-csharp-namespaces',
   pyiImportSizeLimits: 'codecraft-pyi-import-size-limits'
 };
+
+const PROJECT_LOCAL_STORAGE_KEYS = [
+  ...Object.values(STORAGE_KEYS),
+  SYNC_META_KEY,
+];
+
+function migrateLegacyDefaultProjectStorage() {
+  const hasProjectRegistry = localStorage.getItem(PROJECTS_STORAGE_KEY) != null;
+  const projects = loadProjectRegistry();
+  if (!hasProjectRegistry) {
+    saveProjectRegistry(projects);
+  }
+
+  const resolvedProjects = loadProjectRegistry();
+  const activeProjectId = localStorage.getItem(ACTIVE_PROJECT_STORAGE_KEY);
+  if (!activeProjectId || !resolvedProjects.some(project => project.id === activeProjectId)) {
+    localStorage.setItem(ACTIVE_PROJECT_STORAGE_KEY, resolvedProjects[0]?.id || DEFAULT_PROJECT_ID);
+  }
+
+  if (hasProjectRegistry) return;
+
+  for (const baseKey of PROJECT_LOCAL_STORAGE_KEYS) {
+    const projectKey = getProjectStorageKey(baseKey, DEFAULT_PROJECT_ID);
+    if (localStorage.getItem(projectKey) != null) continue;
+    const legacyValue = localStorage.getItem(baseKey);
+    if (legacyValue != null) {
+      localStorage.setItem(projectKey, legacyValue);
+    }
+  }
+}
+
+migrateLegacyDefaultProjectStorage();
 
 const EXT_TO_LANGUAGE: Record<string, string> = {
   js: 'javascript', jsx: 'javascript', mjs: 'javascript', cjs: 'javascript',
@@ -1003,12 +1238,8 @@ function getOpenAIResponsesProviderConfig(provider: AssistantProvider) {
   return OPENAI_RESPONSES_PROVIDER_CONFIGS[provider] || null;
 }
 
-function getAssistantSupportsRemoteMcp(provider: AssistantProvider) {
-  return provider === 'openai' || provider === 'xai';
-}
-
 function getAssistantSupportsLocalTools(provider: AssistantProvider, model: string) {
-  if (provider === 'gemini' || provider === 'openai' || provider === 'anthropic' || provider === 'xai') {
+  if (provider === 'gemini' || provider === 'openai' || provider === 'anthropic' || provider === 'xai' || provider === 'cursor') {
     return true;
   }
   const config = getOpenAIChatProviderConfig(provider);
@@ -1083,6 +1314,11 @@ function getAssistantReasoningControl(provider: AssistantProvider, model: string
     return 'always_off';
   }
 
+  if (provider === 'cursor') {
+    if (/(thinking|reasoning|gpt-5|claude|composer)/i.test(trimmed)) return 'toggleable';
+    return 'toggleable';
+  }
+
   return 'always_off';
 }
 
@@ -1096,6 +1332,319 @@ function getAssistantReasoningAvailabilityNote(provider: AssistantProvider, mode
     default:
       return 'This provider/model does not expose a Chain of Thought mode in CodeCraft.';
   }
+}
+
+function parseCursorServerSentEventFrame(frame: string): CursorServerSentEvent | null {
+  const lines = frame.split('\n');
+  let id: string | undefined;
+  let event: string | undefined;
+  const data: string[] = [];
+
+  for (const rawLine of lines) {
+    const line = rawLine.trimEnd();
+    if (!line || line.startsWith(':')) continue;
+    if (line.startsWith('id:')) {
+      id = line.slice(3).trim();
+    } else if (line.startsWith('event:')) {
+      event = line.slice(6).trim();
+    } else if (line.startsWith('data:')) {
+      data.push(line.slice(5).trimStart());
+    }
+  }
+
+  if (!id && !event && data.length === 0) return null;
+  return {
+    ...(id ? { id } : {}),
+    ...(event ? { event } : {}),
+    data: data.join('\n'),
+  };
+}
+
+async function readCursorServerSentEvents(
+  response: Response,
+  onEvent: (event: CursorServerSentEvent) => Promise<boolean | void> | boolean | void
+) {
+  const reader = response.body?.getReader();
+  if (!reader) return;
+
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  const drainFrame = async (frame: string) => {
+    const parsed = parseCursorServerSentEventFrame(frame);
+    if (!parsed) return true;
+    const shouldContinue = await onEvent(parsed);
+    return shouldContinue !== false;
+  };
+
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
+      let separatorIndex = buffer.indexOf('\n\n');
+      while (separatorIndex !== -1) {
+        const frame = buffer.slice(0, separatorIndex);
+        buffer = buffer.slice(separatorIndex + 2);
+        if (!await drainFrame(frame)) {
+          await reader.cancel();
+          return;
+        }
+        separatorIndex = buffer.indexOf('\n\n');
+      }
+    }
+
+    buffer += decoder.decode().replace(/\r\n/g, '\n');
+    if (buffer.trim()) {
+      await drainFrame(buffer);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+function buildDelegatedRequestUrl(targetUrl: string) {
+  const delegateUrl = new URL(CODECRAFT_DELEGATE_SERVER_URL);
+  delegateUrl.searchParams.set('url', targetUrl);
+  return delegateUrl.toString();
+}
+
+function appendCursorText(buffer: CursorTextBuffer, text: string) {
+  if (!text) return;
+  if (!buffer.value || text === buffer.value || text.startsWith(buffer.value)) {
+    buffer.value = text;
+    return;
+  }
+  buffer.value += text;
+}
+
+function chooseCursorStreamText(preferred: CursorTextBuffer, fallback: CursorTextBuffer) {
+  const preferredText = preferred.value.trim();
+  const fallbackText = fallback.value.trim();
+  if (!preferredText) return fallbackText;
+  if (!fallbackText) return preferredText;
+  if (preferredText.includes(fallbackText)) return preferredText;
+  if (fallbackText.includes(preferredText)) return fallbackText;
+  return preferredText;
+}
+
+function stripAssistantJsonFence(value: string) {
+  const trimmed = value.trim();
+  const match = trimmed.match(/^```(?:json|codecraft-tools)?\s*([\s\S]*?)\s*```$/i);
+  return match ? match[1].trim() : trimmed;
+}
+
+function parseAssistantJsonCandidate(value: string) {
+  try {
+    return JSON.parse(stripAssistantJsonFence(value));
+  } catch {
+    return null;
+  }
+}
+
+function normalizeCursorLocalToolName(value: unknown) {
+  const rawName = typeof value === 'string' ? value.trim() : '';
+  const normalized = rawName.replace(/[\s_-]+/g, '').toLowerCase();
+  switch (normalized) {
+    case 'edit':
+    case 'editfile':
+    case 'write':
+    case 'writefile':
+    case 'replacefile':
+    case 'replacefilecontent':
+    case 'updatefile':
+      return 'proposeEdit';
+    case 'read':
+    case 'readfile':
+    case 'cat':
+      return 'terminalCat';
+    case 'list':
+    case 'listdirectory':
+    case 'listfiles':
+    case 'ls':
+      return 'ls';
+    case 'pwd':
+      return 'terminalPwd';
+    case 'cd':
+      return 'terminalCd';
+    case 'mkdir':
+      return 'terminalMkdir';
+    case 'touch':
+      return 'terminalTouch';
+    case 'open':
+    case 'openfile':
+      return 'terminalOpen';
+    case 'rm':
+    case 'remove':
+    case 'removefile':
+    case 'delete':
+    case 'deletefile':
+      return 'terminalRm';
+    case 'clear':
+      return 'terminalClear';
+    case 'date':
+      return 'terminalDate';
+    case 'echo':
+      return 'terminalEcho';
+    default:
+      return rawName;
+  }
+}
+
+function normalizeCursorLocalToolArgs(toolName: string, value: unknown): Record<string, any> {
+  const source = value && typeof value === 'object' && !Array.isArray(value)
+    ? { ...(value as Record<string, any>) }
+    : {};
+
+  const firstString = (...keys: string[]) => (
+    keys.map(key => source[key]).find(entry => typeof entry === 'string')
+  );
+
+  if (toolName === 'proposeEdit') {
+    return {
+      ...source,
+      pathOrName: source.pathOrName ?? firstString('path', 'filePath', 'filepath', 'file', 'filename', 'name'),
+      newContent: source.newContent ?? source.content ?? source.text ?? source.replacement,
+    };
+  }
+
+  if (
+    toolName === 'navigateTo'
+    || toolName === 'terminalOpen'
+    || toolName === 'terminalCat'
+    || toolName === 'terminalRm'
+    || toolName === 'ls'
+  ) {
+    return {
+      ...source,
+      pathOrName: source.pathOrName ?? firstString('path', 'filePath', 'filepath', 'file', 'directory', 'dir', 'target', 'name'),
+    };
+  }
+
+  if (toolName === 'terminalCd') {
+    return {
+      ...source,
+      target: source.target ?? firstString('path', 'directory', 'dir', 'pathOrName', 'name'),
+    };
+  }
+
+  if (toolName === 'terminalMkdir' || toolName === 'terminalTouch') {
+    return {
+      ...source,
+      name: source.name ?? firstString('path', 'pathOrName', 'file', 'directory'),
+    };
+  }
+
+  if (toolName === 'terminalEcho') {
+    return {
+      ...source,
+      text: source.text ?? source.message ?? '',
+    };
+  }
+
+  return source;
+}
+
+function normalizeCursorLocalToolCall(value: unknown): CursorLocalToolBridgeCall | null {
+  if (!value || typeof value !== 'object') return null;
+  const record = value as Record<string, any>;
+  const name = normalizeCursorLocalToolName(record.name ?? record.tool ?? record.type);
+  if (!name) return null;
+  const rawArgs = record.args ?? record.arguments ?? record.input ?? {};
+  return {
+    name,
+    args: normalizeCursorLocalToolArgs(name, rawArgs),
+  };
+}
+
+function normalizeCursorLocalToolBridgePayload(value: unknown, consumedEntireResponse: boolean): CursorLocalToolBridgeResponse | null {
+  if (!value || typeof value !== 'object') return null;
+  const record = value as Record<string, any>;
+  const rawToolCalls = Array.isArray(record.toolCalls)
+    ? record.toolCalls
+    : Array.isArray(record.tool_calls)
+      ? record.tool_calls
+      : Array.isArray(record.calls)
+        ? record.calls
+        : null;
+  if (!rawToolCalls) return null;
+  const toolCalls = rawToolCalls
+    .map(normalizeCursorLocalToolCall)
+    .filter((call): call is CursorLocalToolBridgeCall => call !== null);
+  if (toolCalls.length === 0) return null;
+  const rawMessage = [record.message, record.content, record.response, record.summary]
+    .find(entry => typeof entry === 'string');
+  return {
+    message: typeof rawMessage === 'string' ? rawMessage.trim() : '',
+    toolCalls,
+    consumedEntireResponse,
+  };
+}
+
+function parseCursorLocalToolBridgeResponse(text: string): CursorLocalToolBridgeResponse | null {
+  const toolCalls: CursorLocalToolBridgeCall[] = [];
+  const messages: string[] = [];
+  let consumedEntireResponse = false;
+
+  const absorbPayload = (value: unknown, consumed: boolean) => {
+    const payload = normalizeCursorLocalToolBridgePayload(value, consumed);
+    if (!payload) return false;
+    toolCalls.push(...payload.toolCalls);
+    if (payload.message) messages.push(payload.message);
+    consumedEntireResponse = consumedEntireResponse || payload.consumedEntireResponse;
+    return true;
+  };
+
+  const taggedBlockPattern = /<codecraft-tools>([\s\S]*?)<\/codecraft-tools>/gi;
+  for (const match of text.matchAll(taggedBlockPattern)) {
+    absorbPayload(parseAssistantJsonCandidate(match[1] || ''), false);
+  }
+
+  const fencedBlockPattern = /```(?:json|codecraft-tools)\s*([\s\S]*?)```/gi;
+  for (const match of text.matchAll(fencedBlockPattern)) {
+    absorbPayload(parseAssistantJsonCandidate(match[1] || ''), false);
+  }
+
+  if (toolCalls.length === 0) {
+    const parsedEntireResponse = parseAssistantJsonCandidate(text);
+    consumedEntireResponse = absorbPayload(parsedEntireResponse, true);
+  }
+
+  if (toolCalls.length === 0) return null;
+  return {
+    message: messages.filter(Boolean).join('\n\n').trim(),
+    toolCalls,
+    consumedEntireResponse,
+  };
+}
+
+function stripCursorLocalToolBridgeBlocks(text: string) {
+  return text
+    .replace(/<codecraft-tools>[\s\S]*?<\/codecraft-tools>/gi, '')
+    .replace(/```(?:json|codecraft-tools)\s*[\s\S]*?```/gi, '')
+    .trim();
+}
+
+function buildCursorLocalToolBridgeInstruction(tools: AssistantToolDefinition[]) {
+  const toolSchemas = tools.map(tool => ({
+    name: tool.name,
+    description: tool.description,
+    parameters: tool.parameters,
+  }));
+
+  return `
+    Cursor Cloud Agents are remote and repository-backed, but this CodeCraft integration must edit only the local IDE workspace.
+    Do not use Cursor/provider-native shell, filesystem, source-control, repository, PR, branch, git, GitHub, or edit tools.
+    To inspect or modify CodeCraft's local IDE, ask CodeCraft to run local tools by emitting one JSON object inside a <codecraft-tools> block.
+    Use this exact shape:
+    <codecraft-tools>
+    {"message":"optional short user-facing progress note","toolCalls":[{"name":"toolName","args":{"argumentName":"value"}}]}
+    </codecraft-tools>
+    If you need to edit code, use proposeEdit with the complete new file content. CodeCraft will apply that request inside the IDE review flow.
+    If the task is complete and no local tool is needed, respond normally without a <codecraft-tools> block.
+    Allowed CodeCraft local tools:
+    ${JSON.stringify(toolSchemas, null, 2)}
+  `;
 }
 
 function calculateAssistantPaidCostUsd(
@@ -1168,43 +1717,6 @@ function toAnthropicToolDefinition(tool: AssistantToolDefinition) {
     description: tool.description,
     input_schema: tool.parameters,
   };
-}
-
-function parseAssistantCommaList(value: string) {
-  return value
-    .split(',')
-    .map(part => part.trim())
-    .filter(Boolean);
-}
-
-function sanitizeAssistantMcpServerLabel(value: string) {
-  const sanitized = value.trim().replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 64);
-  return sanitized || DEFAULT_SETTINGS.assistantMcpServerLabel;
-}
-
-function buildAssistantRemoteMcpTool(provider: AssistantProvider, settings: AppSettings) {
-  const serverUrl = settings.assistantMcpServerUrl.trim();
-  if (!serverUrl || !getAssistantSupportsRemoteMcp(provider)) return null;
-
-  const allowedTools = parseAssistantCommaList(settings.assistantMcpAllowedTools);
-  const tool: any = {
-    type: 'mcp',
-    server_url: serverUrl,
-    server_label: sanitizeAssistantMcpServerLabel(settings.assistantMcpServerLabel),
-    ...(settings.assistantMcpServerDescription.trim()
-      ? { server_description: settings.assistantMcpServerDescription.trim() }
-      : {}),
-    ...(allowedTools.length > 0 ? { allowed_tools: allowedTools } : {}),
-    ...(settings.assistantMcpAuthorization.trim()
-      ? { authorization: settings.assistantMcpAuthorization.trim() }
-      : {}),
-  };
-
-  if (provider === 'openai') {
-    tool.require_approval = 'never';
-  }
-
-  return tool;
 }
 
 function getOpenAIChatReasoningRequestOptions(
@@ -1637,6 +2149,64 @@ const pipListTool: AssistantToolDefinition = {
   },
 };
 
+const npmIncludeTool: AssistantToolDefinition = {
+  name: "npmInclude",
+  description: "Include an exact JavaScript/TypeScript module specifier in the fake terminal.",
+  parameters: {
+    type: 'object',
+    properties: {
+      moduleName: {
+        type: 'string',
+        description: "JavaScript module specifier to include.",
+      },
+      url: {
+        type: 'string',
+        description: "Optional module URL. If omitted, CodeCraft checks cdnjs, jsDelivr, Google Hosted Libraries, unpkg, then esm.sh.",
+      },
+    },
+    required: ['moduleName'],
+  },
+};
+
+const npmInstallTool: AssistantToolDefinition = {
+  name: "npmInstall",
+  description: "Install one or more JavaScript/TypeScript npm packages from the npm registry in the fake terminal.",
+  parameters: {
+    type: 'object',
+    properties: {
+      packageName: {
+        type: 'string',
+        description: "One or more npm package specifiers to install, separated by spaces.",
+      },
+    },
+    required: ['packageName'],
+  },
+};
+
+const npmUninstallTool: AssistantToolDefinition = {
+  name: "npmUninstall",
+  description: "Uninstall a JavaScript/TypeScript npm package from the fake terminal.",
+  parameters: {
+    type: 'object',
+    properties: {
+      packageName: {
+        type: 'string',
+        description: "One or more npm package specifiers to uninstall, separated by spaces.",
+      },
+    },
+    required: ['packageName'],
+  },
+};
+
+const npmListTool: AssistantToolDefinition = {
+  name: "npmList",
+  description: "List installed JavaScript/TypeScript modules in the fake terminal.",
+  parameters: {
+    type: 'object',
+    properties: {},
+  },
+};
+
 const nugetIncludeTool: AssistantToolDefinition = {
   name: "nugetInclude",
   description: "Include a C# namespace in the fake terminal.",
@@ -1697,6 +2267,10 @@ const CHAIN_OF_THOUGHT_ASSISTANT_TOOLS: AssistantToolDefinition[] = [
   pipUninstallTool,
   pipIncludeTool,
   pipListTool,
+  npmInstallTool,
+  npmIncludeTool,
+  npmUninstallTool,
+  npmListTool,
   nugetIncludeTool,
   nugetListTool,
 ];
@@ -1707,6 +2281,40 @@ function cn(...inputs: ClassValue[]) {
 }
 
 interface SavedPipPackage { name: string; version: string; }
+interface SavedJavaScriptModule { name: string; url: string; }
+interface JavaScriptModuleIncludeResolution {
+  name: string;
+  url: string;
+  provider: string;
+}
+interface JavaScriptModuleIncludeProvider {
+  id: string;
+  label: string;
+  resolve: (moduleName: string) => Promise<string | null>;
+}
+interface SavedNpmInstalledPackage {
+  name: string;
+  version: string;
+  spec: string;
+  entry: string;
+  fileCount: number;
+  dependencyCount: number;
+  installedAt: number;
+}
+interface StoredNpmPackage extends SavedNpmInstalledPackage {
+  packageKey: string;
+  packageJson: Record<string, any>;
+  files: Record<string, string>;
+}
+interface ParsedNpmPackageSpec {
+  name: string;
+  range: string;
+  raw: string;
+}
+interface NpmInstallResult {
+  installed: SavedNpmInstalledPackage[];
+  skipped: string[];
+}
 interface SavedPyiImportSizeLimitOverride { moduleName: string; maxBytes: number | null; }
 type PyodidePackageInstallSource = 'pyodide-prebuilt' | 'micropip' | 'sdist' | 'url';
 
@@ -1725,6 +2333,47 @@ interface CachedPyodideEnvironmentSnapshot {
   signature: string;
   files: CachedPyodideSiteFile[];
   packages: Record<string, CachedPyodidePackageMeta>;
+}
+
+interface SerializedUserFolder {
+  [name: string]: string | SerializedArrayBuffer | SerializedUserFolder;
+}
+
+interface SerializedArrayBuffer {
+  __codecraftType: 'ArrayBuffer';
+  base64: string;
+}
+
+interface SerializedCachedPyodideSiteFile {
+  relativePath: string;
+  dataBase64: string;
+}
+
+interface SerializedCachedPyodidePackageMeta {
+  version: string;
+  source: PyodidePackageInstallSource;
+  stubs: SerializedUserFolder;
+}
+
+interface SerializedCachedPyodideEnvironmentSnapshot {
+  signature: string;
+  files: SerializedCachedPyodideSiteFile[];
+  packages: Record<string, SerializedCachedPyodidePackageMeta>;
+}
+
+interface CodeCraftUserDataExport {
+  format: 'codecraft-user-data';
+  version: 1;
+  exportedAt: string;
+  localStorage: Record<string, string>;
+  indexedDB: {
+    npmPackages: StoredNpmPackage[];
+    pyodidePackageMeta: Record<string, SerializedCachedPyodidePackageMeta>;
+    pyodidePackageSnapshot: SerializedCachedPyodideEnvironmentSnapshot | null;
+  };
+  browserBoundData: {
+    fileSystemSyncHandlesExported: false;
+  };
 }
 
 interface PyodideStubExtractionSummary {
@@ -1767,7 +2416,7 @@ function sortSavedPipPackages(pkgs: SavedPipPackage[]) {
 
 function loadSavedPipPackages(): SavedPipPackage[] {
   try {
-    const raw = JSON.parse(localStorage.getItem(STORAGE_KEYS.pipPackages) || '[]');
+    const raw = JSON.parse(localStorage.getItem(getProjectStorageKey(STORAGE_KEYS.pipPackages)) || '[]');
     if (Array.isArray(raw) && raw.length > 0 && typeof raw[0] === 'string') {
       return sortSavedPipPackages(raw.map((s: string) => ({ name: normalizeSavedPipPackageName(s), version: '' })));
     }
@@ -1788,7 +2437,7 @@ function loadSavedPipPackages(): SavedPipPackage[] {
 }
 
 function savePipPackages(pkgs: SavedPipPackage[]) {
-  localStorage.setItem(STORAGE_KEYS.pipPackages, JSON.stringify(sortSavedPipPackages(pkgs)));
+  localStorage.setItem(getProjectStorageKey(STORAGE_KEYS.pipPackages), JSON.stringify(sortSavedPipPackages(pkgs)));
 }
 
 function addSavedPipPackage(pkg: string, version: string) {
@@ -1852,14 +2501,159 @@ function cloneCachedPyodideEnvironmentSnapshot(
   };
 }
 
-async function loadPersistedPyodidePackageMetaCache(): Promise<Record<string, CachedPyodidePackageMeta>> {
+function bytesToBase64(bytes: Uint8Array) {
+  let binary = '';
+  const chunkSize = 0x8000;
+  for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+    const chunk = bytes.subarray(offset, offset + chunkSize);
+    binary += String.fromCharCode(...chunk);
+  }
+  return btoa(binary);
+}
+
+function base64ToBytes(base64: string) {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return bytes;
+}
+
+function serializeUserFolder(folder: UserFolder): SerializedUserFolder {
+  const serialized: SerializedUserFolder = {};
+  for (const [name, value] of Object.entries(folder)) {
+    if (typeof value === 'string') {
+      serialized[name] = value;
+      continue;
+    }
+    if (value instanceof ArrayBuffer) {
+      serialized[name] = {
+        __codecraftType: 'ArrayBuffer',
+        base64: bytesToBase64(new Uint8Array(value)),
+      };
+      continue;
+    }
+    serialized[name] = serializeUserFolder(value);
+  }
+  return serialized;
+}
+
+function deserializeUserFolder(folder: unknown): UserFolder {
+  if (!folder || typeof folder !== 'object' || Array.isArray(folder)) return {};
+
+  const restored: UserFolder = {};
+  for (const [name, value] of Object.entries(folder as Record<string, unknown>)) {
+    if (typeof value === 'string') {
+      restored[name] = value;
+      continue;
+    }
+    if (
+      value
+      && typeof value === 'object'
+      && !Array.isArray(value)
+      && (value as SerializedArrayBuffer).__codecraftType === 'ArrayBuffer'
+      && typeof (value as SerializedArrayBuffer).base64 === 'string'
+    ) {
+      const bytes = base64ToBytes((value as SerializedArrayBuffer).base64);
+      restored[name] = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+      continue;
+    }
+    restored[name] = deserializeUserFolder(value);
+  }
+  return restored;
+}
+
+function serializeCachedPyodidePackageMetaRecord(
+  cache: Record<string, CachedPyodidePackageMeta>
+): Record<string, SerializedCachedPyodidePackageMeta> {
+  const serialized: Record<string, SerializedCachedPyodidePackageMeta> = {};
+  for (const [pkgName, meta] of Object.entries(cache)) {
+    serialized[pkgName] = {
+      version: meta.version,
+      source: meta.source,
+      stubs: serializeUserFolder(meta.stubs),
+    };
+  }
+  return serialized;
+}
+
+function deserializeCachedPyodidePackageMetaRecord(
+  cache: unknown
+): Record<string, CachedPyodidePackageMeta> {
+  if (!cache || typeof cache !== 'object' || Array.isArray(cache)) return {};
+
+  const restored: Record<string, CachedPyodidePackageMeta> = {};
+  for (const [pkgName, value] of Object.entries(cache as Record<string, unknown>)) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) continue;
+    const meta = value as Partial<SerializedCachedPyodidePackageMeta>;
+    if (typeof meta.version !== 'string' || typeof meta.source !== 'string') continue;
+    restored[pkgName] = {
+      version: meta.version,
+      source: meta.source as PyodidePackageInstallSource,
+      stubs: deserializeUserFolder(meta.stubs),
+    };
+  }
+  return restored;
+}
+
+function serializeCachedPyodideEnvironmentSnapshot(
+  snapshot: CachedPyodideEnvironmentSnapshot | null
+): SerializedCachedPyodideEnvironmentSnapshot | null {
+  if (!snapshot) return null;
+  return {
+    signature: snapshot.signature,
+    files: snapshot.files.map(file => ({
+      relativePath: file.relativePath,
+      dataBase64: bytesToBase64(file.data),
+    })),
+    packages: serializeCachedPyodidePackageMetaRecord(snapshot.packages),
+  };
+}
+
+function deserializeCachedPyodideEnvironmentSnapshot(
+  snapshot: unknown
+): CachedPyodideEnvironmentSnapshot | null {
+  if (!snapshot || typeof snapshot !== 'object' || Array.isArray(snapshot)) return null;
+  const raw = snapshot as Partial<SerializedCachedPyodideEnvironmentSnapshot>;
+  if (typeof raw.signature !== 'string' || !Array.isArray(raw.files)) return null;
+
+  const files = raw.files
+    .filter((file): file is SerializedCachedPyodideSiteFile => (
+      !!file
+      && typeof file.relativePath === 'string'
+      && typeof file.dataBase64 === 'string'
+    ))
+    .map(file => ({
+      relativePath: file.relativePath,
+      data: base64ToBytes(file.dataBase64),
+    }));
+
+  return {
+    signature: raw.signature,
+    files,
+    packages: deserializeCachedPyodidePackageMetaRecord(raw.packages),
+  };
+}
+
+function getPyodidePackageMetaKey(projectId = getActiveProjectId()) {
+  return getProjectDbKey(PYTHON_CACHE_PACKAGE_META_KEY, projectId);
+}
+
+function getPyodidePackageSnapshotKey(projectId = getActiveProjectId()) {
+  return getProjectDbKey(PYTHON_CACHE_PACKAGE_SNAPSHOT_KEY, projectId);
+}
+
+async function loadPersistedPyodidePackageMetaCache(projectId = getActiveProjectId()): Promise<Record<string, CachedPyodidePackageMeta>> {
   try {
     const db = await openPythonCacheDB();
     return await new Promise((resolve, reject) => {
       const tx = db.transaction(PYTHON_CACHE_STORE_NAME, 'readonly');
-      const req = tx.objectStore(PYTHON_CACHE_STORE_NAME).get(PYTHON_CACHE_PACKAGE_META_KEY);
+      const store = tx.objectStore(PYTHON_CACHE_STORE_NAME);
+      const req = store.get(getPyodidePackageMetaKey(projectId));
+      const fallbackReq = projectId === DEFAULT_PROJECT_ID ? store.get(PYTHON_CACHE_PACKAGE_META_KEY) : null;
       tx.oncomplete = () => {
-        const raw = req.result;
+        const raw = req.result || fallbackReq?.result;
         if (!raw || typeof raw !== 'object') {
           resolve({});
           return;
@@ -1883,31 +2677,34 @@ async function loadPersistedPyodidePackageMetaCache(): Promise<Record<string, Ca
       };
       tx.onerror = () => reject(tx.error);
       req.onerror = () => reject(req.error);
+      if (fallbackReq) fallbackReq.onerror = () => reject(fallbackReq.error);
     });
   } catch {
     return {};
   }
 }
 
-async function savePersistedPyodidePackageMetaCache(cache: Record<string, CachedPyodidePackageMeta>) {
+async function savePersistedPyodidePackageMetaCache(cache: Record<string, CachedPyodidePackageMeta>, projectId = getActiveProjectId()) {
   const db = await openPythonCacheDB();
   const snapshot = cloneCachedPyodidePackageMetaRecord(cache);
   return new Promise<void>((resolve, reject) => {
     const tx = db.transaction(PYTHON_CACHE_STORE_NAME, 'readwrite');
-    tx.objectStore(PYTHON_CACHE_STORE_NAME).put(snapshot, PYTHON_CACHE_PACKAGE_META_KEY);
+    tx.objectStore(PYTHON_CACHE_STORE_NAME).put(snapshot, getPyodidePackageMetaKey(projectId));
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
   });
 }
 
-async function loadPersistedPyodidePackageSnapshot(): Promise<CachedPyodideEnvironmentSnapshot | null> {
+async function loadPersistedPyodidePackageSnapshot(projectId = getActiveProjectId()): Promise<CachedPyodideEnvironmentSnapshot | null> {
   try {
     const db = await openPythonCacheDB();
     return await new Promise((resolve, reject) => {
       const tx = db.transaction(PYTHON_CACHE_STORE_NAME, 'readonly');
-      const req = tx.objectStore(PYTHON_CACHE_STORE_NAME).get(PYTHON_CACHE_PACKAGE_SNAPSHOT_KEY);
+      const store = tx.objectStore(PYTHON_CACHE_STORE_NAME);
+      const req = store.get(getPyodidePackageSnapshotKey(projectId));
+      const fallbackReq = projectId === DEFAULT_PROJECT_ID ? store.get(PYTHON_CACHE_PACKAGE_SNAPSHOT_KEY) : null;
       tx.oncomplete = () => {
-        const raw = req.result;
+        const raw = req.result || fallbackReq?.result;
         if (!raw || typeof raw !== 'object' || typeof raw.signature !== 'string' || !Array.isArray(raw.files)) {
           resolve(null);
           return;
@@ -1933,22 +2730,23 @@ async function loadPersistedPyodidePackageSnapshot(): Promise<CachedPyodideEnvir
       };
       tx.onerror = () => reject(tx.error);
       req.onerror = () => reject(req.error);
+      if (fallbackReq) fallbackReq.onerror = () => reject(fallbackReq.error);
     });
   } catch {
     return null;
   }
 }
 
-async function savePersistedPyodidePackageSnapshot(snapshot: CachedPyodideEnvironmentSnapshot | null) {
+async function savePersistedPyodidePackageSnapshot(snapshot: CachedPyodideEnvironmentSnapshot | null, projectId = getActiveProjectId()) {
   const db = await openPythonCacheDB();
   const clonedSnapshot = cloneCachedPyodideEnvironmentSnapshot(snapshot);
   return new Promise<void>((resolve, reject) => {
     const tx = db.transaction(PYTHON_CACHE_STORE_NAME, 'readwrite');
     const store = tx.objectStore(PYTHON_CACHE_STORE_NAME);
     if (clonedSnapshot) {
-      store.put(clonedSnapshot, PYTHON_CACHE_PACKAGE_SNAPSHOT_KEY);
+      store.put(clonedSnapshot, getPyodidePackageSnapshotKey(projectId));
     } else {
-      store.delete(PYTHON_CACHE_PACKAGE_SNAPSHOT_KEY);
+      store.delete(getPyodidePackageSnapshotKey(projectId));
     }
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
@@ -2157,7 +2955,7 @@ function writePyodideFsTree(pyodide: any, rootPath: string, files: CachedPyodide
 
 function loadSavedPipIncludedModules(): string[] {
   try {
-    const raw = JSON.parse(localStorage.getItem(STORAGE_KEYS.pipIncludedModules) || '[]');
+    const raw = JSON.parse(localStorage.getItem(getProjectStorageKey(STORAGE_KEYS.pipIncludedModules)) || '[]');
     return Array.isArray(raw)
       ? [...new Set(
         raw
@@ -2172,7 +2970,7 @@ function loadSavedPipIncludedModules(): string[] {
 }
 
 function savePipIncludedModules(modules: string[]) {
-  localStorage.setItem(STORAGE_KEYS.pipIncludedModules, JSON.stringify(
+  localStorage.setItem(getProjectStorageKey(STORAGE_KEYS.pipIncludedModules), JSON.stringify(
     [...new Set(modules.map(value => value.trim()).filter(Boolean))].sort((a, b) => a.localeCompare(b))
   ));
 }
@@ -2187,6 +2985,1257 @@ function addSavedPipIncludedModule(moduleName: string) {
   }
 }
 
+function normalizeJavaScriptModuleName(moduleName: string) {
+  return moduleName.trim();
+}
+
+function isValidJavaScriptModuleName(moduleName: string) {
+  const normalized = normalizeJavaScriptModuleName(moduleName);
+  return (
+    normalized.length > 0
+    && !normalized.startsWith('.')
+    && !normalized.startsWith('/')
+    && !isExternalProjectResourceSpecifier(normalized)
+  );
+}
+
+const GOOGLE_HOSTED_LIBRARY_CANDIDATES: Record<string, Array<{ library: string; version: string; file: string }>> = {
+  angular: [{ library: 'angularjs', version: '1.8.3', file: 'angular.min.js' }],
+  angularjs: [{ library: 'angularjs', version: '1.8.3', file: 'angular.min.js' }],
+  dojo: [{ library: 'dojo', version: '1.13.0', file: 'dojo/dojo.js' }],
+  extcore: [{ library: 'ext-core', version: '3.1.0', file: 'ext-core.js' }],
+  'ext-core': [{ library: 'ext-core', version: '3.1.0', file: 'ext-core.js' }],
+  jquery: [{ library: 'jquery', version: '3.7.1', file: 'jquery.min.js' }],
+  jqueryui: [{ library: 'jqueryui', version: '1.13.3', file: 'jquery-ui.min.js' }],
+  'jquery-ui': [{ library: 'jqueryui', version: '1.13.3', file: 'jquery-ui.min.js' }],
+  mootools: [{ library: 'mootools', version: '1.6.0', file: 'mootools.min.js' }],
+  prototype: [{ library: 'prototype', version: '1.7.3.0', file: 'prototype.js' }],
+  scriptaculous: [{ library: 'scriptaculous', version: '1.9.0', file: 'scriptaculous.js' }],
+  swfobject: [{ library: 'swfobject', version: '2.2', file: 'swfobject.js' }],
+  webfont: [{ library: 'webfont', version: '1.6.26', file: 'webfont.js' }],
+};
+
+const JAVASCRIPT_MODULE_INCLUDE_PROVIDERS: JavaScriptModuleIncludeProvider[] = [
+  { id: 'cdnjs', label: 'cdnjs', resolve: resolveCdnjsModuleUrl },
+  { id: 'jsdelivr', label: 'jsDelivr', resolve: resolveJsDelivrModuleUrl },
+  { id: 'google-hosted-libraries', label: 'Google Hosted Libraries', resolve: resolveGoogleHostedLibraryUrl },
+  { id: 'unpkg', label: 'unpkg', resolve: resolveUnpkgModuleUrl },
+  { id: 'esm.sh', label: 'esm.sh', resolve: resolveEsmShModuleUrl },
+];
+
+function getDefaultJavaScriptModuleUrl(moduleName: string) {
+  const encodedName = normalizeJavaScriptModuleName(moduleName)
+    .split('/')
+    .map(part => encodeURIComponent(part))
+    .join('/');
+  return `https://esm.sh/${encodedName}`;
+}
+
+function normalizeJavaScriptModuleUrl(moduleName: string, url?: string) {
+  const rawUrl = (url || '').trim();
+  return rawUrl || getDefaultJavaScriptModuleUrl(moduleName);
+}
+
+function encodeJavaScriptModuleSpecifierForCdn(moduleName: string) {
+  return normalizeJavaScriptModuleName(moduleName)
+    .split('/')
+    .map(part => encodeURIComponent(part))
+    .join('/');
+}
+
+function getCdnjsLibraryUrl(libraryName: string, version: string, filename: string) {
+  const encodedLibrary = encodeURIComponent(libraryName);
+  const encodedVersion = encodeURIComponent(version);
+  const encodedFile = filename.split('/').map(part => encodeURIComponent(part)).join('/');
+  return `https://cdnjs.cloudflare.com/ajax/libs/${encodedLibrary}/${encodedVersion}/${encodedFile}`;
+}
+
+function isCdnjsEsmFile(filename: string) {
+  const normalized = filename.toLowerCase();
+  return (
+    normalized.endsWith('.mjs')
+    || normalized.endsWith('.esm.js')
+    || normalized.endsWith('.esm.min.js')
+    || normalized.endsWith('.es.js')
+    || normalized.endsWith('.es.min.js')
+    || normalized.endsWith('.module.js')
+    || normalized.endsWith('.module.min.js')
+    || normalized.endsWith('.legacy-esm.js')
+    || normalized.endsWith('.legacy-esm.min.js')
+  );
+}
+
+function getCdnjsPreferredEsmFile(libraryInfo: any) {
+  const assets = Array.isArray(libraryInfo?.assets) ? libraryInfo.assets : [];
+  const latestAsset = assets.find((asset: any) => asset?.version === libraryInfo?.version) || assets[0];
+  const files = Array.isArray(latestAsset?.files)
+    ? latestAsset.files.filter((file: unknown): file is string => typeof file === 'string')
+    : [];
+  if (typeof libraryInfo?.filename === 'string' && isCdnjsEsmFile(libraryInfo.filename)) {
+    return libraryInfo.filename;
+  }
+  return files.find(isCdnjsEsmFile) || null;
+}
+
+async function fetchWithNpmIncludeTimeout(url: string, init: RequestInit = {}) {
+  const controller = new AbortController();
+  const timeoutId = window.setTimeout(() => controller.abort(), NPM_INCLUDE_FETCH_TIMEOUT_MS);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } finally {
+    window.clearTimeout(timeoutId);
+  }
+}
+
+async function isReachableJavaScriptModuleUrl(url: string) {
+  try {
+    const headResponse = await fetchWithNpmIncludeTimeout(url, { method: 'HEAD', cache: 'no-store' });
+    if (headResponse.ok) return true;
+    if (headResponse.status !== 403 && headResponse.status !== 405) return false;
+  } catch {
+    // Some CDNs do not allow HEAD from every edge. Fall through to GET.
+  }
+
+  try {
+    const getResponse = await fetchWithNpmIncludeTimeout(url, { method: 'GET', cache: 'no-store' });
+    return getResponse.ok;
+  } catch {
+    return false;
+  }
+}
+
+async function fetchCdnjsLibraryInfo(libraryName: string) {
+  const response = await fetchWithNpmIncludeTimeout(
+    `https://api.cdnjs.com/libraries/${encodeURIComponent(libraryName)}?fields=name,filename,version,assets`,
+    { cache: 'no-store' }
+  );
+  if (!response.ok) return null;
+  const data = await response.json();
+  return data?.error ? null : data;
+}
+
+async function findCdnjsLibraryName(moduleName: string) {
+  const exact = await fetchCdnjsLibraryInfo(moduleName);
+  if (exact?.name) return exact.name;
+
+  const response = await fetchWithNpmIncludeTimeout(
+    `https://api.cdnjs.com/libraries?search=${encodeURIComponent(moduleName)}&fields=name,filename,version`,
+    { cache: 'no-store' }
+  );
+  if (!response.ok) return null;
+  const data = await response.json();
+  const results = Array.isArray(data?.results) ? data.results : [];
+  const exactResult = results.find((result: any) => (
+    typeof result?.name === 'string'
+    && (result.name === moduleName || result.name === `${moduleName}.js`)
+  ));
+  return exactResult?.name || null;
+}
+
+async function resolveCdnjsModuleUrl(moduleName: string) {
+  if (moduleName.includes('/')) return null;
+
+  const libraryName = await findCdnjsLibraryName(moduleName);
+  if (!libraryName) return null;
+
+  const libraryInfo = await fetchCdnjsLibraryInfo(libraryName);
+  const version = typeof libraryInfo?.version === 'string' ? libraryInfo.version : '';
+  const filename = getCdnjsPreferredEsmFile(libraryInfo);
+  if (!version || !filename) return null;
+
+  const url = getCdnjsLibraryUrl(libraryName, version, filename);
+  return await isReachableJavaScriptModuleUrl(url) ? url : null;
+}
+
+async function resolveJsDelivrModuleUrl(moduleName: string) {
+  const url = `https://cdn.jsdelivr.net/npm/${encodeJavaScriptModuleSpecifierForCdn(moduleName)}/+esm`;
+  return await isReachableJavaScriptModuleUrl(url) ? url : null;
+}
+
+async function resolveGoogleHostedLibraryUrl(moduleName: string) {
+  const normalized = moduleName.toLowerCase();
+  if (normalized.includes('/')) return null;
+
+  const candidates = GOOGLE_HOSTED_LIBRARY_CANDIDATES[normalized] || [];
+  for (const candidate of candidates) {
+    const url = `https://ajax.googleapis.com/ajax/libs/${candidate.library}/${candidate.version}/${candidate.file}`;
+    if (await isReachableJavaScriptModuleUrl(url)) return url;
+  }
+  return null;
+}
+
+async function resolveUnpkgModuleUrl(moduleName: string) {
+  const url = `https://unpkg.com/${encodeJavaScriptModuleSpecifierForCdn(moduleName)}?module`;
+  return await isReachableJavaScriptModuleUrl(url) ? url : null;
+}
+
+async function resolveEsmShModuleUrl(moduleName: string) {
+  const url = `https://esm.sh/${encodeJavaScriptModuleSpecifierForCdn(moduleName)}`;
+  return await isReachableJavaScriptModuleUrl(url) ? url : null;
+}
+
+function getJavaScriptModuleNameFromNpmInstallSpec(packageSpec: string) {
+  const normalized = normalizeJavaScriptModuleName(packageSpec);
+  if (!normalized) return '';
+
+  if (normalized.startsWith('@')) {
+    const scopeSlashIndex = normalized.indexOf('/');
+    if (scopeSlashIndex <= 1 || scopeSlashIndex === normalized.length - 1) {
+      return normalized;
+    }
+    const versionAtIndex = normalized.indexOf('@', scopeSlashIndex + 1);
+    return versionAtIndex === -1 ? normalized : normalized.slice(0, versionAtIndex);
+  }
+
+  const versionAtIndex = normalized.indexOf('@');
+  return versionAtIndex === -1 ? normalized : normalized.slice(0, versionAtIndex);
+}
+
+function isValidNpmPackageInstallSpec(packageSpec: string) {
+  const normalized = normalizeJavaScriptModuleName(packageSpec);
+  if (
+    !normalized
+    || normalized.startsWith('.')
+    || normalized.startsWith('/')
+    || isExternalProjectResourceSpecifier(normalized)
+    || /\s/.test(normalized)
+  ) {
+    return false;
+  }
+
+  const scopeSlashIndex = normalized.startsWith('@') ? normalized.indexOf('/') : -1;
+  if (normalized.startsWith('@') && (scopeSlashIndex <= 1 || scopeSlashIndex === normalized.length - 1)) {
+    return false;
+  }
+
+  const moduleName = getJavaScriptModuleNameFromNpmInstallSpec(normalized);
+  if (!isValidJavaScriptModuleName(moduleName)) return false;
+  if (!moduleName.startsWith('@') && moduleName.includes('/')) return false;
+  if (moduleName.startsWith('@') && moduleName.slice(1).split('/').length !== 2) return false;
+
+  const versionAtIndex = normalized.startsWith('@')
+    ? normalized.indexOf('@', scopeSlashIndex + 1)
+    : normalized.indexOf('@');
+  return versionAtIndex === -1 || versionAtIndex < normalized.length - 1;
+}
+
+function sortSavedJavaScriptModules(modules: SavedJavaScriptModule[]) {
+  return [...modules].sort((left, right) => left.name.localeCompare(right.name));
+}
+
+function loadSavedJavaScriptIncludedModules(): SavedJavaScriptModule[] {
+  try {
+    const raw = JSON.parse(localStorage.getItem(getProjectStorageKey(STORAGE_KEYS.javascriptIncludedModules)) || '[]');
+    if (!Array.isArray(raw)) return [];
+
+    const deduped = new Map<string, SavedJavaScriptModule>();
+    for (const value of raw) {
+      if (!value) continue;
+
+      if (typeof value === 'string') {
+        const name = normalizeJavaScriptModuleName(value);
+        if (isValidJavaScriptModuleName(name)) {
+          deduped.set(name, { name, url: getDefaultJavaScriptModuleUrl(name) });
+        }
+        continue;
+      }
+
+      if (typeof value.name !== 'string') continue;
+      const name = normalizeJavaScriptModuleName(value.name);
+      if (!isValidJavaScriptModuleName(name)) continue;
+
+      const url = typeof value.url === 'string'
+        ? normalizeJavaScriptModuleUrl(name, value.url)
+        : getDefaultJavaScriptModuleUrl(name);
+      deduped.set(name, { name, url });
+    }
+
+    return sortSavedJavaScriptModules([...deduped.values()]);
+  } catch {
+    return [];
+  }
+}
+
+function saveJavaScriptIncludedModules(modules: SavedJavaScriptModule[]) {
+  localStorage.setItem(getProjectStorageKey(STORAGE_KEYS.javascriptIncludedModules), JSON.stringify(
+    sortSavedJavaScriptModules(
+      modules
+        .map(moduleInfo => {
+          const name = normalizeJavaScriptModuleName(moduleInfo.name);
+          if (!isValidJavaScriptModuleName(name)) return null;
+          return {
+            name,
+            url: normalizeJavaScriptModuleUrl(name, moduleInfo.url),
+          };
+        })
+        .filter((moduleInfo): moduleInfo is SavedJavaScriptModule => moduleInfo !== null)
+    )
+  ));
+}
+
+function addSavedJavaScriptIncludedModule(moduleName: string, url?: string) {
+  const name = normalizeJavaScriptModuleName(moduleName);
+  if (!isValidJavaScriptModuleName(name)) return null;
+
+  const nextModule = {
+    name,
+    url: normalizeJavaScriptModuleUrl(name, url),
+  };
+  const current = loadSavedJavaScriptIncludedModules()
+    .filter(moduleInfo => moduleInfo.name !== name);
+  current.push(nextModule);
+  saveJavaScriptIncludedModules(current);
+  return nextModule;
+}
+
+async function includeJavaScriptModuleFromProviders(
+  moduleName: string,
+  url?: string,
+  onStatus: (message: string) => void = () => { }
+): Promise<JavaScriptModuleIncludeResolution | null> {
+  const name = normalizeJavaScriptModuleName(moduleName);
+  if (!isValidJavaScriptModuleName(name)) return null;
+
+  const explicitUrl = (url || '').trim();
+  if (explicitUrl) {
+    const moduleInfo = addSavedJavaScriptIncludedModule(name, explicitUrl);
+    return moduleInfo ? { ...moduleInfo, provider: 'custom URL' } : null;
+  }
+
+  const triedProviders: string[] = [];
+  for (const provider of JAVASCRIPT_MODULE_INCLUDE_PROVIDERS) {
+    triedProviders.push(provider.label);
+    onStatus(`npm include: checking ${provider.label} for '${name}'...`);
+    try {
+      const resolvedUrl = await provider.resolve(name);
+      if (!resolvedUrl) continue;
+
+      const moduleInfo = addSavedJavaScriptIncludedModule(name, resolvedUrl);
+      if (!moduleInfo) return null;
+      return { ...moduleInfo, provider: provider.label };
+    } catch (err) {
+      onStatus(`npm include: ${provider.label} check failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  onStatus(`npm include: '${name}' was not found on ${triedProviders.join(', ')}.`);
+  return null;
+}
+
+function removeSavedJavaScriptIncludedModule(moduleName: string) {
+  const name = normalizeJavaScriptModuleName(moduleName);
+  const current = loadSavedJavaScriptIncludedModules();
+  const next = current.filter(moduleInfo => moduleInfo.name !== name);
+  saveJavaScriptIncludedModules(next);
+  return next.length !== current.length;
+}
+
+function getStoredNpmPackageKey(name: string, version: string) {
+  return `${name}@${version}`;
+}
+
+function getStoredNpmPackageStorageKey(name: string, version: string, projectId = getActiveProjectId()) {
+  return getProjectDbKey(getStoredNpmPackageKey(name, version), projectId);
+}
+
+function normalizeSavedNpmInstalledPackage(value: any): SavedNpmInstalledPackage | null {
+  if (!value || typeof value.name !== 'string' || typeof value.version !== 'string') return null;
+  const name = getJavaScriptModuleNameFromNpmInstallSpec(value.name);
+  const version = value.version.trim();
+  if (!isValidNpmPackageInstallSpec(name) || !version) return null;
+  return {
+    name,
+    version,
+    spec: typeof value.spec === 'string' && value.spec.trim() ? value.spec.trim() : `${name}@${version}`,
+    entry: typeof value.entry === 'string' && value.entry.trim() ? normalizeProjectPath(value.entry) : 'index.js',
+    fileCount: Number.isFinite(value.fileCount) ? Math.max(0, Math.floor(value.fileCount)) : 0,
+    dependencyCount: Number.isFinite(value.dependencyCount) ? Math.max(0, Math.floor(value.dependencyCount)) : 0,
+    installedAt: Number.isFinite(value.installedAt) ? value.installedAt : Date.now(),
+  };
+}
+
+function sortSavedNpmInstalledPackages(packages: SavedNpmInstalledPackage[]) {
+  return [...packages].sort((left, right) => left.name.localeCompare(right.name));
+}
+
+function loadSavedNpmInstalledPackages(): SavedNpmInstalledPackage[] {
+  try {
+    const raw = JSON.parse(localStorage.getItem(getProjectStorageKey(STORAGE_KEYS.npmPackages)) || '[]');
+    if (!Array.isArray(raw)) return [];
+    const deduped = new Map<string, SavedNpmInstalledPackage>();
+    for (const value of raw) {
+      const normalized = normalizeSavedNpmInstalledPackage(value);
+      if (normalized) deduped.set(normalized.name, normalized);
+    }
+    return sortSavedNpmInstalledPackages([...deduped.values()]);
+  } catch {
+    return [];
+  }
+}
+
+function saveNpmInstalledPackages(packages: SavedNpmInstalledPackage[]) {
+  const deduped = new Map<string, SavedNpmInstalledPackage>();
+  for (const packageInfo of packages) {
+    const normalized = normalizeSavedNpmInstalledPackage(packageInfo);
+    if (normalized) deduped.set(normalized.name, normalized);
+  }
+  localStorage.setItem(getProjectStorageKey(STORAGE_KEYS.npmPackages), JSON.stringify(sortSavedNpmInstalledPackages([...deduped.values()])));
+}
+
+function upsertSavedNpmInstalledPackage(packageInfo: SavedNpmInstalledPackage) {
+  const next = loadSavedNpmInstalledPackages().filter(existing => existing.name !== packageInfo.name);
+  next.push(packageInfo);
+  saveNpmInstalledPackages(next);
+}
+
+function removeSavedNpmInstalledPackage(packageName: string) {
+  const name = getJavaScriptModuleNameFromNpmInstallSpec(packageName);
+  const current = loadSavedNpmInstalledPackages();
+  const removed = current.find(packageInfo => packageInfo.name === name) || null;
+  if (!removed) return null;
+  saveNpmInstalledPackages(current.filter(packageInfo => packageInfo.name !== name));
+  return removed;
+}
+
+async function putStoredNpmPackage(packageInfo: StoredNpmPackage) {
+  const db = await openNpmPackageDB();
+  return new Promise<void>((resolve, reject) => {
+    const tx = db.transaction(NPM_PACKAGE_STORE_NAME, 'readwrite');
+    tx.objectStore(NPM_PACKAGE_STORE_NAME).put(packageInfo, getStoredNpmPackageStorageKey(packageInfo.name, packageInfo.version));
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+async function loadStoredNpmPackage(name: string, version: string): Promise<StoredNpmPackage | null> {
+  const db = await openNpmPackageDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(NPM_PACKAGE_STORE_NAME, 'readonly');
+    const store = tx.objectStore(NPM_PACKAGE_STORE_NAME);
+    const req = store.get(getStoredNpmPackageStorageKey(name, version));
+    const fallbackReq = getActiveProjectId() === DEFAULT_PROJECT_ID ? store.get(getStoredNpmPackageKey(name, version)) : null;
+    tx.oncomplete = () => resolve(normalizeStoredNpmPackage(req.result || fallbackReq?.result));
+    req.onerror = () => reject(req.error);
+    if (fallbackReq) fallbackReq.onerror = () => reject(fallbackReq.error);
+  });
+}
+
+async function deleteStoredNpmPackage(name: string, version: string) {
+  const db = await openNpmPackageDB();
+  return new Promise<void>((resolve, reject) => {
+    const tx = db.transaction(NPM_PACKAGE_STORE_NAME, 'readwrite');
+    const store = tx.objectStore(NPM_PACKAGE_STORE_NAME);
+    store.delete(getStoredNpmPackageStorageKey(name, version));
+    if (getActiveProjectId() === DEFAULT_PROJECT_ID) store.delete(getStoredNpmPackageKey(name, version));
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+function normalizeStoredNpmPackage(value: unknown): StoredNpmPackage | null {
+  const normalized = normalizeSavedNpmInstalledPackage(value);
+  if (!normalized || !value || typeof value !== 'object') return null;
+
+  const raw = value as Partial<StoredNpmPackage>;
+  const files: Record<string, string> = {};
+  if (raw.files && typeof raw.files === 'object' && !Array.isArray(raw.files)) {
+    for (const [path, source] of Object.entries(raw.files)) {
+      if (typeof source === 'string') files[path] = source;
+    }
+  }
+
+  return {
+    ...normalized,
+    packageKey: typeof raw.packageKey === 'string'
+      ? raw.packageKey
+      : getStoredNpmPackageKey(normalized.name, normalized.version),
+    packageJson: raw.packageJson && typeof raw.packageJson === 'object' && !Array.isArray(raw.packageJson)
+      ? raw.packageJson as Record<string, any>
+      : {},
+    files,
+  };
+}
+
+async function loadAllStoredNpmPackages(projectId = getActiveProjectId()): Promise<StoredNpmPackage[]> {
+  const db = await openNpmPackageDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(NPM_PACKAGE_STORE_NAME, 'readonly');
+    const req = tx.objectStore(NPM_PACKAGE_STORE_NAME).openCursor();
+    const packages: StoredNpmPackage[] = [];
+    req.onsuccess = () => {
+      const cursor = req.result;
+      if (!cursor) {
+        resolve(packages);
+        return;
+      }
+      const key = cursor.key;
+      if (isProjectDbKeyForCurrentProject(key, projectId) || projectId === DEFAULT_PROJECT_ID && typeof key === 'string' && !key.includes('::')) {
+        const normalized = normalizeStoredNpmPackage(cursor.value);
+        if (normalized) packages.push(normalized);
+      }
+      cursor.continue();
+    };
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function replaceAllStoredNpmPackages(packages: unknown[], projectId = getActiveProjectId()) {
+  const db = await openNpmPackageDB();
+  const normalizedPackages = packages
+    .map(normalizeStoredNpmPackage)
+    .filter((packageInfo): packageInfo is StoredNpmPackage => packageInfo !== null);
+
+  return new Promise<void>((resolve, reject) => {
+    const tx = db.transaction(NPM_PACKAGE_STORE_NAME, 'readwrite');
+    const store = tx.objectStore(NPM_PACKAGE_STORE_NAME);
+    const req = store.openCursor();
+    req.onsuccess = () => {
+      const cursor = req.result;
+      if (!cursor) {
+        for (const packageInfo of normalizedPackages) {
+          store.put(packageInfo, getStoredNpmPackageStorageKey(packageInfo.name, packageInfo.version, projectId));
+        }
+        return;
+      }
+      const key = cursor.key;
+      if (isProjectDbKeyForCurrentProject(key, projectId) || projectId === DEFAULT_PROJECT_ID && typeof key === 'string' && !key.includes('::')) {
+        cursor.delete();
+      }
+      cursor.continue();
+    };
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+async function clearStoredSyncHandles(projectId = getActiveProjectId()) {
+  const db = await openSyncDB();
+  return new Promise<void>((resolve, reject) => {
+    const tx = db.transaction(SYNC_STORE_NAME, 'readwrite');
+    const store = tx.objectStore(SYNC_STORE_NAME);
+    const req = store.openCursor();
+    req.onsuccess = () => {
+      const cursor = req.result;
+      if (!cursor) return;
+      const key = cursor.key;
+      if (isProjectDbKeyForCurrentProject(key, projectId) || projectId === DEFAULT_PROJECT_ID && typeof key === 'string' && !key.includes('::')) {
+        cursor.delete();
+      }
+      cursor.continue();
+    };
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+function getCodeCraftLocalStorageSnapshot(projectId = getActiveProjectId()) {
+  const snapshot: Record<string, string> = {};
+  for (const baseKey of PROJECT_LOCAL_STORAGE_KEYS) {
+    const value = localStorage.getItem(getProjectStorageKey(baseKey, projectId));
+    if (typeof value === 'string') snapshot[baseKey] = value;
+  }
+  return snapshot;
+}
+
+function replaceCodeCraftLocalStorageSnapshot(snapshot: Record<string, string>, projectId = getActiveProjectId()) {
+  for (const baseKey of PROJECT_LOCAL_STORAGE_KEYS) {
+    localStorage.removeItem(getProjectStorageKey(baseKey, projectId));
+  }
+  for (const [key, value] of Object.entries(snapshot)) {
+    if (!PROJECT_LOCAL_STORAGE_KEYS.includes(key) || typeof value !== 'string') continue;
+    localStorage.setItem(getProjectStorageKey(key, projectId), value);
+  }
+}
+
+async function deleteCodeCraftProjectData(projectId: string) {
+  replaceCodeCraftLocalStorageSnapshot({}, projectId);
+  await Promise.all([
+    replaceAllStoredNpmPackages([], projectId),
+    savePersistedPyodidePackageMetaCache({}, projectId),
+    savePersistedPyodidePackageSnapshot(null, projectId),
+    clearStoredSyncHandles(projectId),
+  ]);
+}
+
+async function createCodeCraftUserDataExport(
+  localStorageOverrides: Record<string, string> = {},
+  projectId = getActiveProjectId()
+): Promise<CodeCraftUserDataExport> {
+  const [
+    npmPackages,
+    pyodidePackageMeta,
+    pyodidePackageSnapshot,
+  ] = await Promise.all([
+    loadAllStoredNpmPackages(projectId).catch(() => []),
+    loadPersistedPyodidePackageMetaCache(projectId).catch(() => ({})),
+    loadPersistedPyodidePackageSnapshot(projectId).catch(() => null),
+  ]);
+
+  return {
+    format: 'codecraft-user-data',
+    version: 1,
+    exportedAt: new Date().toISOString(),
+    localStorage: {
+      ...getCodeCraftLocalStorageSnapshot(projectId),
+      ...localStorageOverrides,
+    },
+    indexedDB: {
+      npmPackages,
+      pyodidePackageMeta: serializeCachedPyodidePackageMetaRecord(pyodidePackageMeta),
+      pyodidePackageSnapshot: serializeCachedPyodideEnvironmentSnapshot(pyodidePackageSnapshot),
+    },
+    browserBoundData: {
+      fileSystemSyncHandlesExported: false,
+    },
+  };
+}
+
+async function restoreCodeCraftUserDataExport(raw: unknown, projectId = getActiveProjectId()) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new Error('Backup file is not a CodeCraft user data export.');
+  }
+
+  const backup = raw as Partial<CodeCraftUserDataExport>;
+  if (backup.format !== 'codecraft-user-data' || backup.version !== 1) {
+    throw new Error('Backup file is not a supported CodeCraft user data export.');
+  }
+
+  const localStorageSnapshot: Record<string, string> = {};
+  if (backup.localStorage && typeof backup.localStorage === 'object' && !Array.isArray(backup.localStorage)) {
+    for (const [key, value] of Object.entries(backup.localStorage)) {
+      if (typeof value === 'string') localStorageSnapshot[key] = value;
+    }
+  }
+
+  replaceCodeCraftLocalStorageSnapshot(localStorageSnapshot, projectId);
+
+  const indexedDBSnapshot = backup.indexedDB && typeof backup.indexedDB === 'object'
+    ? backup.indexedDB
+    : null;
+  await replaceAllStoredNpmPackages(Array.isArray(indexedDBSnapshot?.npmPackages) ? indexedDBSnapshot.npmPackages : [], projectId);
+  await savePersistedPyodidePackageMetaCache(deserializeCachedPyodidePackageMetaRecord(indexedDBSnapshot?.pyodidePackageMeta), projectId);
+  await savePersistedPyodidePackageSnapshot(deserializeCachedPyodideEnvironmentSnapshot(indexedDBSnapshot?.pyodidePackageSnapshot), projectId);
+  await clearStoredSyncHandles(projectId);
+}
+
+function parseNpmPackageInstallSpec(packageSpec: string): ParsedNpmPackageSpec | null {
+  const raw = packageSpec.trim();
+  if (!raw || raw.startsWith('.') || raw.startsWith('/') || isExternalProjectResourceSpecifier(raw)) {
+    return null;
+  }
+
+  if (raw.startsWith('@')) {
+    const scopeSlashIndex = raw.indexOf('/');
+    if (scopeSlashIndex <= 1 || scopeSlashIndex === raw.length - 1) return null;
+    const versionAtIndex = raw.indexOf('@', scopeSlashIndex + 1);
+    const name = versionAtIndex === -1 ? raw : raw.slice(0, versionAtIndex);
+    const range = (versionAtIndex === -1 ? 'latest' : raw.slice(versionAtIndex + 1)).trim();
+    return isValidNpmPackageInstallSpec(name) && range ? { name, range, raw } : null;
+  }
+
+  const versionAtIndex = raw.indexOf('@');
+  const name = versionAtIndex === -1 ? raw : raw.slice(0, versionAtIndex);
+  const range = (versionAtIndex === -1 ? 'latest' : raw.slice(versionAtIndex + 1)).trim();
+  return isValidNpmPackageInstallSpec(name) && range ? { name, range, raw } : null;
+}
+
+function getNpmRegistryPackageUrl(packageName: string) {
+  const encoded = packageName.startsWith('@')
+    ? `@${packageName.slice(1).replace('/', '%2F')}`
+    : encodeURIComponent(packageName);
+  return `https://registry.npmjs.org/${encoded}`;
+}
+
+function parsePartialSemver(value: string) {
+  const match = value.trim().match(/^v?(\d+)(?:\.(\d+|x|\*))?(?:\.(\d+|x|\*))?(?:[-+].*)?$/i);
+  if (!match) return null;
+  return {
+    major: Number(match[1]),
+    minor: match[2] == null || /x|\*/i.test(match[2]) ? null : Number(match[2]),
+    patch: match[3] == null || /x|\*/i.test(match[3]) ? null : Number(match[3]),
+  };
+}
+
+function parseFullSemver(value: string) {
+  const parsed = parsePartialSemver(value);
+  if (!parsed || parsed.minor == null || parsed.patch == null) return null;
+  return parsed as { major: number; minor: number; patch: number };
+}
+
+function compareSemver(left: { major: number; minor: number; patch: number }, right: { major: number; minor: number; patch: number }) {
+  return left.major - right.major || left.minor - right.minor || left.patch - right.patch;
+}
+
+function normalizePartialSemver(parsed: { major: number; minor: number | null; patch: number | null }) {
+  return {
+    major: parsed.major,
+    minor: parsed.minor ?? 0,
+    patch: parsed.patch ?? 0,
+  };
+}
+
+function satisfiesNpmComparator(version: { major: number; minor: number; patch: number }, comparator: string) {
+  const trimmed = comparator.trim();
+  if (!trimmed || trimmed === '*' || trimmed.toLowerCase() === 'latest') return true;
+
+  const operatorMatch = trimmed.match(/^(>=|<=|>|<|=)?\s*(.+)$/);
+  if (!operatorMatch) return false;
+  const operator = operatorMatch[1] || '=';
+  const parsed = parsePartialSemver(operatorMatch[2]);
+  if (!parsed) return false;
+  const target = normalizePartialSemver(parsed);
+
+  if (operator === '=') {
+    if (parsed.minor == null) return version.major === target.major;
+    if (parsed.patch == null) return version.major === target.major && version.minor === target.minor;
+  }
+
+  const comparison = compareSemver(version, target);
+  if (operator === '>=') return comparison >= 0;
+  if (operator === '>') return comparison > 0;
+  if (operator === '<=') return comparison <= 0;
+  if (operator === '<') return comparison < 0;
+  return comparison === 0;
+}
+
+function satisfiesNpmCaretRange(version: { major: number; minor: number; patch: number }, range: string) {
+  const parsed = parsePartialSemver(range.slice(1));
+  if (!parsed) return false;
+  const lower = normalizePartialSemver(parsed);
+  let upper = { major: lower.major + 1, minor: 0, patch: 0 };
+  if (lower.major === 0 && parsed.minor != null) {
+    upper = parsed.minor === 0
+      ? { major: 0, minor: 0, patch: lower.patch + 1 }
+      : { major: 0, minor: lower.minor + 1, patch: 0 };
+  }
+  return compareSemver(version, lower) >= 0 && compareSemver(version, upper) < 0;
+}
+
+function satisfiesNpmTildeRange(version: { major: number; minor: number; patch: number }, range: string) {
+  const parsed = parsePartialSemver(range.slice(1));
+  if (!parsed) return false;
+  const lower = normalizePartialSemver(parsed);
+  const upper = parsed.minor == null
+    ? { major: lower.major + 1, minor: 0, patch: 0 }
+    : { major: lower.major, minor: lower.minor + 1, patch: 0 };
+  return compareSemver(version, lower) >= 0 && compareSemver(version, upper) < 0;
+}
+
+function satisfiesNpmRange(versionString: string, range: string) {
+  const version = parseFullSemver(versionString);
+  if (!version) return versionString === range;
+  const trimmed = (range || 'latest').trim();
+  if (!trimmed || trimmed === '*' || trimmed.toLowerCase() === 'latest') return true;
+
+  return trimmed.split('||').some(part => {
+    const clause = part.trim();
+    if (!clause) return false;
+    if (clause.startsWith('^')) return satisfiesNpmCaretRange(version, clause);
+    if (clause.startsWith('~')) return satisfiesNpmTildeRange(version, clause);
+    return clause.split(/\s+/).every(token => satisfiesNpmComparator(version, token));
+  });
+}
+
+function resolveNpmRegistryVersion(metadata: any, range: string) {
+  const versions = metadata?.versions && typeof metadata.versions === 'object' ? metadata.versions : {};
+  const distTags = metadata?.['dist-tags'] && typeof metadata['dist-tags'] === 'object' ? metadata['dist-tags'] : {};
+  const requested = (range || 'latest').trim();
+
+  if (typeof distTags[requested] === 'string' && versions[distTags[requested]]) {
+    return distTags[requested];
+  }
+  if (versions[requested]) return requested;
+
+  const matchingVersions = Object.keys(versions)
+    .map(version => ({ version, parsed: parseFullSemver(version) }))
+    .filter((entry): entry is { version: string; parsed: { major: number; minor: number; patch: number } } => (
+      !!entry.parsed && satisfiesNpmRange(entry.version, requested)
+    ))
+    .sort((left, right) => compareSemver(right.parsed, left.parsed));
+
+  if (matchingVersions[0]) return matchingVersions[0].version;
+  if (typeof distTags.latest === 'string' && versions[distTags.latest]) return distTags.latest;
+  return '';
+}
+
+async function decompressGzipBytes(data: Uint8Array) {
+  return decompressBytes(data, 'gzip');
+}
+
+function readTarString(data: Uint8Array, offset: number, length: number) {
+  let end = offset;
+  const limit = offset + length;
+  while (end < limit && data[end] !== 0) end += 1;
+  return new TextDecoder().decode(data.subarray(offset, end)).trim();
+}
+
+function readTarOctal(data: Uint8Array, offset: number, length: number) {
+  const raw = readTarString(data, offset, length).replace(/\0/g, '').trim();
+  return raw ? parseInt(raw, 8) || 0 : 0;
+}
+
+function shouldStoreNpmPackageTextFile(path: string, size: number) {
+  if (size > MAX_NPM_PACKAGE_TEXT_FILE_BYTES) return false;
+  return (
+    path === 'package.json'
+    || /\.(?:mjs|js|jsx|cjs|ts|tsx|d\.ts|json|css)$/i.test(path)
+  );
+}
+
+function parseNpmPackageTarballFiles(tarData: Uint8Array) {
+  const files: Record<string, string> = {};
+  const decoder = new TextDecoder();
+  let offset = 0;
+  let totalTextBytes = 0;
+
+  while (offset + 512 <= tarData.length) {
+    let empty = true;
+    for (let index = offset; index < offset + 512; index += 1) {
+      if (tarData[index] !== 0) {
+        empty = false;
+        break;
+      }
+    }
+    if (empty) break;
+
+    const name = readTarString(tarData, offset, 100);
+    const size = readTarOctal(tarData, offset + 124, 12);
+    const typeFlag = String.fromCharCode(tarData[offset + 156] || 0);
+    const prefix = readTarString(tarData, offset + 345, 155);
+    const fullName = normalizeProjectPath(prefix ? `${prefix}/${name}` : name);
+    const fileStart = offset + 512;
+    const fileEnd = fileStart + size;
+    const relativePath = fullName.startsWith('package/')
+      ? fullName.slice('package/'.length)
+      : fullName;
+
+    if ((typeFlag === '0' || typeFlag === '\0') && relativePath && shouldStoreNpmPackageTextFile(relativePath, size)) {
+      totalTextBytes += size;
+      if (totalTextBytes > MAX_NPM_PACKAGE_TOTAL_TEXT_BYTES) {
+        throw new Error(`npm package text files exceed ${Math.round(MAX_NPM_PACKAGE_TOTAL_TEXT_BYTES / 1024 / 1024)}MB`);
+      }
+      files[relativePath] = decoder.decode(tarData.subarray(fileStart, fileEnd));
+    }
+
+    offset = fileStart + Math.ceil(size / 512) * 512;
+  }
+
+  return files;
+}
+
+function isJavaScriptLikeNpmPackagePath(path: string) {
+  return !/\.d\.ts$/i.test(path) && /\.(?:mjs|js|jsx|cjs|ts|tsx)$/i.test(path);
+}
+
+function isRuntimeExposedNpmPackagePath(path: string) {
+  return isJavaScriptLikeNpmPackagePath(path) || /\.(?:json|css)$/i.test(path);
+}
+
+function resolveNpmPackageFilePath(files: Record<string, string>, candidate: string) {
+  const normalized = normalizeProjectPath(candidate.replace(/^\.\//, ''));
+  const candidates = /\.[cm]?[jt]sx?$|\.json$|\.css$/i.test(normalized)
+    ? [normalized]
+    : [
+      normalized,
+      `${normalized}.mjs`,
+      `${normalized}.js`,
+      `${normalized}.jsx`,
+      `${normalized}.cjs`,
+      `${normalized}.ts`,
+      `${normalized}.tsx`,
+      `${normalized}.json`,
+      `${normalized}/index.mjs`,
+      `${normalized}/index.js`,
+      `${normalized}/index.jsx`,
+      `${normalized}/index.cjs`,
+      `${normalized}/index.ts`,
+      `${normalized}/index.tsx`,
+    ];
+  return candidates.find(path => Object.prototype.hasOwnProperty.call(files, path)) || '';
+}
+
+function pickNpmExportTarget(value: any): string {
+  if (typeof value === 'string') return value;
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const picked = pickNpmExportTarget(item);
+      if (picked) return picked;
+    }
+    return '';
+  }
+  if (value && typeof value === 'object') {
+    for (const key of ['browser', 'import', 'module', 'default', 'require', 'node']) {
+      const picked = pickNpmExportTarget(value[key]);
+      if (picked) return picked;
+    }
+    for (const item of Object.values(value)) {
+      const picked = pickNpmExportTarget(item);
+      if (picked) return picked;
+    }
+  }
+  return '';
+}
+
+function resolveNpmPackageEntryPath(packageJson: Record<string, any>, files: Record<string, string>) {
+  const exportsValue = packageJson.exports;
+  const exportDot = exportsValue && typeof exportsValue === 'object' && !Array.isArray(exportsValue)
+    ? exportsValue['.']
+    : exportsValue;
+
+  const candidates = [
+    pickNpmExportTarget(exportDot),
+    typeof packageJson.browser === 'string' ? packageJson.browser : '',
+    typeof packageJson.module === 'string' ? packageJson.module : '',
+    typeof packageJson['jsnext:main'] === 'string' ? packageJson['jsnext:main'] : '',
+    typeof packageJson.main === 'string' ? packageJson.main : '',
+    'index.mjs',
+    'index.js',
+    'dist/index.mjs',
+    'dist/index.js',
+  ].filter(Boolean);
+
+  for (const candidate of candidates) {
+    const resolved = resolveNpmPackageFilePath(files, candidate);
+    if (resolved) return resolved;
+  }
+  return Object.keys(files).find(isJavaScriptLikeNpmPackagePath) || 'index.js';
+}
+
+function collectNpmPackageExportAliases(packageInfo: StoredNpmPackage) {
+  const aliases = new Map<string, string>();
+  const { packageJson, files, name } = packageInfo;
+  aliases.set(name, packageInfo.entry);
+
+  const exportsValue = packageJson.exports;
+  if (exportsValue && typeof exportsValue === 'object' && !Array.isArray(exportsValue)) {
+    const hasSubpathExports = Object.keys(exportsValue).some(key => key.startsWith('.'));
+    if (hasSubpathExports) {
+      for (const [key, value] of Object.entries(exportsValue)) {
+        if (!key.startsWith('.')) continue;
+        const target = pickNpmExportTarget(value);
+        if (!target) continue;
+        const resolved = resolveNpmPackageFilePath(files, target);
+        if (!resolved) continue;
+        const specifier = key === '.'
+          ? name
+          : `${name}/${key.replace(/^\.\//, '')}`;
+        aliases.set(specifier, resolved);
+      }
+    }
+  }
+
+  for (const path of Object.keys(files)) {
+    if (!isRuntimeExposedNpmPackagePath(path)) continue;
+    const withoutExtension = path.replace(/\.(?:mjs|js|jsx|cjs|ts|tsx|json|css)$/i, '');
+    aliases.set(`${name}/${path}`, path);
+    aliases.set(`${name}/${withoutExtension}`, path);
+    if (/\/index\.(?:mjs|js|jsx|cjs|ts|tsx|json|css)$/i.test(path)) {
+      aliases.set(`${name}/${path.replace(/\/index\.(?:mjs|js|jsx|cjs|ts|tsx|json|css)$/i, '')}`, path);
+    }
+  }
+
+  return aliases;
+}
+
+function getNpmPackageInternalSpecifier(packageInfo: Pick<StoredNpmPackage, 'packageKey'>, path: string) {
+  return `codecraft-npm/${encodeURIComponent(packageInfo.packageKey)}/${normalizeProjectPath(path)}`;
+}
+
+function resolveNpmPackageRelativeSpecifier(packageInfo: StoredNpmPackage, importerPath: string, specifier: string) {
+  const basePath = specifier.startsWith('/')
+    ? specifier.slice(1)
+    : normalizeProjectPath(`${dirnameProjectPath(importerPath)}/${specifier}`);
+  const resolved = resolveNpmPackageFilePath(packageInfo.files, stripProjectResourceSuffix(basePath));
+  return resolved ? getNpmPackageInternalSpecifier(packageInfo, resolved) : specifier;
+}
+
+function rewriteNpmPackageModuleSpecifiers(source: string, packageInfo: StoredNpmPackage, importerPath: string) {
+  const rewriteSpecifier = (specifier: string) => {
+    if (isExternalProjectResourceSpecifier(specifier)) return specifier;
+    if (specifier.startsWith('.') || specifier.startsWith('/')) {
+      return resolveNpmPackageRelativeSpecifier(packageInfo, importerPath, specifier);
+    }
+    if (specifier === packageInfo.name) {
+      return getNpmPackageInternalSpecifier(packageInfo, packageInfo.entry);
+    }
+    if (specifier.startsWith(`${packageInfo.name}/`)) {
+      const subpath = specifier.slice(packageInfo.name.length + 1);
+      const resolved = resolveNpmPackageFilePath(packageInfo.files, subpath);
+      return resolved ? getNpmPackageInternalSpecifier(packageInfo, resolved) : specifier;
+    }
+    return specifier;
+  };
+
+  const rewriteImportDeclaration = (fullMatch: string, quote: string, specifier: string) => (
+    fullMatch.replace(`${quote}${specifier}${quote}`, `${quote}${rewriteSpecifier(specifier)}${quote}`)
+  );
+
+  return source
+    .replace(
+      /\bimport\s*(['"])([^'"]+)\1/g,
+      (fullMatch, quote: string, specifier: string) => rewriteImportDeclaration(fullMatch, quote, specifier)
+    )
+    .replace(
+      /\bimport\s*(?:type\s*)?(?:[\w$]+\s*,\s*)?(?:\{[^}]*\}|\*\s*as\s*[\w$]+|[\w$]+)\s*from\s*(['"])([^'"]+)\1/g,
+      (fullMatch, quote: string, specifier: string) => rewriteImportDeclaration(fullMatch, quote, specifier)
+    )
+    .replace(
+      /\bexport\s*(?:type\s*)?(?:\{[^}]*\}|\*)\s*(?:as\s+[\w$]+\s*)?from\s*(['"])([^'"]+)\1/g,
+      (fullMatch, quote: string, specifier: string) => rewriteImportDeclaration(fullMatch, quote, specifier)
+    )
+    .replace(
+      /\bimport\s*\(\s*(['"])([^'"]+)\1\s*\)/g,
+      (fullMatch, quote: string, specifier: string) => rewriteImportDeclaration(fullMatch, quote, specifier)
+    );
+}
+
+function collectNpmPackageCommonJsRequireSpecifiers(source: string) {
+  const specifiers = new Set<string>();
+  source.replace(
+    /\brequire\s*\(\s*(['"])([^'"]+)\1\s*\)/g,
+    (_fullMatch, _quote: string, specifier: string) => {
+      specifiers.add(specifier);
+      return '';
+    }
+  );
+  return [...specifiers];
+}
+
+function collectNpmPackageCommonJsNamedExports(source: string) {
+  const names = new Set<string>();
+  const addName = (name: string) => {
+    if (/^[A-Za-z_$][\w$]*$/.test(name) && name !== 'default') {
+      names.add(name);
+    }
+  };
+
+  source.replace(/\b(?:module\s*\.\s*)?exports\s*\.\s*([A-Za-z_$][\w$]*)\s*=/g, (_fullMatch, name: string) => {
+    addName(name);
+    return '';
+  });
+  source.replace(/\bObject\.defineProperty\s*\(\s*(?:module\s*\.\s*)?exports\s*,\s*(['"])([A-Za-z_$][\w$]*)\1/g, (_fullMatch, _quote: string, name: string) => {
+    addName(name);
+    return '';
+  });
+
+  return [...names].sort((left, right) => left.localeCompare(right));
+}
+
+function createNpmPackageCommonJsRuntimeModuleSource(packageInfo: StoredNpmPackage, path: string) {
+  const source = packageInfo.files[path] ?? '';
+  const requireSpecifiers = collectNpmPackageCommonJsRequireSpecifiers(source);
+  const importLines: string[] = [];
+  const requireEntries: string[] = [];
+
+  requireSpecifiers.forEach((specifier, index) => {
+    const resolvedSpecifier = (() => {
+      if (isExternalProjectResourceSpecifier(specifier)) return specifier;
+      if (specifier.startsWith('.') || specifier.startsWith('/')) {
+        return resolveNpmPackageRelativeSpecifier(packageInfo, path, specifier);
+      }
+      if (specifier === packageInfo.name) {
+        return getNpmPackageInternalSpecifier(packageInfo, packageInfo.entry);
+      }
+      if (specifier.startsWith(`${packageInfo.name}/`)) {
+        const subpath = specifier.slice(packageInfo.name.length + 1);
+        const resolved = resolveNpmPackageFilePath(packageInfo.files, subpath);
+        return resolved ? getNpmPackageInternalSpecifier(packageInfo, resolved) : specifier;
+      }
+      return specifier;
+    })();
+    const bindingName = `__codecraftCjsRequire${index}`;
+    importLines.push(`import * as ${bindingName} from ${JSON.stringify(resolvedSpecifier)};`);
+    requireEntries.push(`${JSON.stringify(specifier)}: ${bindingName}`);
+  });
+
+  const namedExportLines = collectNpmPackageCommonJsNamedExports(source)
+    .map(name => `export const ${name} = __codecraftCjsExports?.[${JSON.stringify(name)}];`);
+
+  return `${importLines.join('\n')}
+const __codecraftCjsRequireModules = { ${requireEntries.join(', ')} };
+const __codecraftCjsInterop = (moduleValue) => (
+  moduleValue
+  && typeof moduleValue === 'object'
+  && 'default' in moduleValue
+  && Object.keys(moduleValue).every((key) => key === 'default' || key === '__esModule')
+    ? moduleValue.default
+    : moduleValue
+);
+const module = { exports: {} };
+let exports = module.exports;
+const __filename = ${JSON.stringify(`/codecraft-npm/${packageInfo.packageKey}/${path}`)};
+const __dirname = ${JSON.stringify(`/codecraft-npm/${packageInfo.packageKey}/${dirnameProjectPath(path)}`)};
+const require = (specifier) => {
+  if (Object.prototype.hasOwnProperty.call(__codecraftCjsRequireModules, specifier)) {
+    return __codecraftCjsInterop(__codecraftCjsRequireModules[specifier]);
+  }
+  throw new Error('CodeCraft npm CommonJS module could not require "' + specifier + '" from ${packageInfo.name}/${path}.');
+};
+require.cache = {};
+require.extensions = {};
+require.main = null;
+require.resolve = (specifier) => specifier;
+(0, Function)('exports', 'require', 'module', '__filename', '__dirname', ${JSON.stringify(`${source}\n//# sourceURL=codecraft-npm://${packageInfo.packageKey}/${path}`)})(exports, require, module, __filename, __dirname);
+const __codecraftCjsExports = module.exports;
+export default __codecraftCjsExports;
+export const moduleExports = __codecraftCjsExports;
+${namedExportLines.join('\n')}
+//# sourceURL=codecraft-npm://${packageInfo.packageKey}/${path}.mjs`;
+}
+
+function createNpmPackageRuntimeModuleSource(packageInfo: StoredNpmPackage, path: string) {
+  const source = packageInfo.files[path] ?? '';
+  if (/\.json$/i.test(path)) {
+    return `export default ${source.trim() || 'null'};\n//# sourceURL=codecraft-npm://${packageInfo.packageKey}/${path}`;
+  }
+  if (/\.css$/i.test(path)) {
+    return `const css = ${JSON.stringify(source)};\nconst style = document.createElement('style');\nstyle.setAttribute('data-codecraft-npm-css', ${JSON.stringify(`${packageInfo.name}/${path}`)});\nstyle.textContent = css;\ndocument.head.appendChild(style);\nexport default css;\n//# sourceURL=codecraft-npm://${packageInfo.packageKey}/${path}`;
+  }
+  if (/\.cjs$/i.test(path)) {
+    return createNpmPackageCommonJsRuntimeModuleSource(packageInfo, path);
+  }
+  return `${rewriteNpmPackageModuleSpecifiers(source, packageInfo, path)}\n//# sourceURL=codecraft-npm://${packageInfo.packageKey}/${path}`;
+}
+
+async function fetchNpmRegistryMetadata(packageName: string) {
+  const response = await fetch(getNpmRegistryPackageUrl(packageName));
+  if (!response.ok) {
+    throw new Error(`Package "${packageName}" not found on the npm registry`);
+  }
+  return response.json();
+}
+
+function yieldToBrowser() {
+  return new Promise<void>(resolve => window.setTimeout(resolve, 0));
+}
+
+function formatNpmPackageListForStatus(packages: string[]) {
+  if (packages.length <= 8) return packages.join(', ');
+  return `${packages.slice(0, 8).join(', ')}, and ${packages.length - 8} more`;
+}
+
+async function installNpmPackagesFromRegistry(
+  packageSpecs: string[],
+  onStatus: (message: string) => void = () => { }
+): Promise<NpmInstallResult> {
+  const queue: Array<{ name?: string; range?: string; raw: string; requestedBy?: string }> = packageSpecs.map(raw => ({ raw }));
+  const visited = new Set<string>();
+  const installed: SavedNpmInstalledPackage[] = [];
+  const skipped: string[] = [];
+
+  while (queue.length > 0) {
+    if (visited.size >= MAX_NPM_INSTALL_PACKAGE_COUNT) {
+      throw new Error(`npm install stopped after resolving ${MAX_NPM_INSTALL_PACKAGE_COUNT} packages. Install fewer packages at once, or uninstall unused packages and try again.`);
+    }
+
+    const item = queue.shift()!;
+    const parsed = item.name
+      ? { name: item.name, range: item.range || 'latest', raw: item.raw }
+      : parseNpmPackageInstallSpec(item.raw);
+    if (!parsed) {
+      throw new Error(`Invalid npm package specifier: ${item.raw}`);
+    }
+
+    const visitKey = `${parsed.name}@${parsed.range}`;
+    if (visited.has(visitKey)) continue;
+    visited.add(visitKey);
+    if (visited.size % NPM_INSTALL_BROWSER_YIELD_EVERY === 0) {
+      await yieldToBrowser();
+    }
+
+    const metadata = await fetchNpmRegistryMetadata(parsed.name);
+    const version = resolveNpmRegistryVersion(metadata, parsed.range);
+    if (!version || !metadata.versions?.[version]) {
+      throw new Error(`Could not resolve ${parsed.name}@${parsed.range} from the npm registry`);
+    }
+
+    const packageKey = getStoredNpmPackageKey(parsed.name, version);
+    if (installed.some(packageInfo => packageInfo.name === parsed.name && packageInfo.version === version)) {
+      continue;
+    }
+
+    const versionMeta = metadata.versions[version];
+    const tarballUrl = versionMeta?.dist?.tarball;
+    if (typeof tarballUrl !== 'string' || !tarballUrl) {
+      throw new Error(`Package ${packageKey} does not expose a registry tarball`);
+    }
+
+    onStatus(`Fetching ${packageKey} from npm registry... (${visited.size} resolved, ${queue.length} queued)`);
+    const tarballResponse = await fetch(tarballUrl);
+    if (!tarballResponse.ok) {
+      throw new Error(`Failed to download ${packageKey} tarball`);
+    }
+
+    const gzipBytes = new Uint8Array(await tarballResponse.arrayBuffer());
+    const tarBytes = await decompressGzipBytes(gzipBytes);
+    const files = parseNpmPackageTarballFiles(tarBytes);
+    if (!files['package.json']) {
+      files['package.json'] = JSON.stringify(versionMeta, null, 2);
+    }
+
+    let packageJson: Record<string, any> = {};
+    try {
+      packageJson = JSON.parse(files['package.json']);
+    } catch {
+      packageJson = {};
+    }
+    packageJson.name = typeof packageJson.name === 'string' ? packageJson.name : parsed.name;
+    packageJson.version = typeof packageJson.version === 'string' ? packageJson.version : version;
+
+    const dependencies = versionMeta.dependencies && typeof versionMeta.dependencies === 'object'
+      ? versionMeta.dependencies as Record<string, string>
+      : {};
+    const entry = resolveNpmPackageEntryPath(packageJson, files);
+    const savedPackage: SavedNpmInstalledPackage = {
+      name: parsed.name,
+      version,
+      spec: parsed.raw,
+      entry,
+      fileCount: Object.keys(files).length,
+      dependencyCount: Object.keys(dependencies).length,
+      installedAt: Date.now(),
+    };
+    const storedPackage: StoredNpmPackage = {
+      ...savedPackage,
+      packageKey,
+      packageJson,
+      files,
+    };
+
+    const previous = loadSavedNpmInstalledPackages().find(packageInfo => packageInfo.name === parsed.name);
+    await putStoredNpmPackage(storedPackage);
+    upsertSavedNpmInstalledPackage(savedPackage);
+    if (previous && previous.version !== version) {
+      try {
+        await deleteStoredNpmPackage(previous.name, previous.version);
+      } catch { }
+    }
+
+    installed.push(savedPackage);
+    onStatus(`Installed ${packageKey} (${installed.length} installed, ${savedPackage.fileCount} file${savedPackage.fileCount === 1 ? '' : 's'}).`);
+
+    for (const [dependencyName, dependencyRange] of Object.entries(dependencies)) {
+      const dependencyKey = `${dependencyName}@${dependencyRange}`;
+      if (visited.has(dependencyKey)) continue;
+      queue.push({
+        name: dependencyName,
+        range: dependencyRange,
+        raw: dependencyKey,
+        requestedBy: parsed.name,
+      });
+    }
+
+    const peerDependencies = versionMeta.peerDependencies && typeof versionMeta.peerDependencies === 'object'
+      ? Object.keys(versionMeta.peerDependencies)
+      : [];
+    if (peerDependencies.length > 0) {
+      skipped.push(`${packageKey} peer dependencies: ${peerDependencies.join(', ')}`);
+    }
+  }
+
+  return { installed, skipped };
+}
+
 function normalizePyiImportSizeLimitModuleName(moduleName: string) {
   return moduleName.trim().toLowerCase();
 }
@@ -2197,7 +4246,7 @@ function sortSavedPyiImportSizeLimitOverrides(overrides: SavedPyiImportSizeLimit
 
 function loadSavedPyiImportSizeLimitOverrides(): SavedPyiImportSizeLimitOverride[] {
   try {
-    const raw = JSON.parse(localStorage.getItem(STORAGE_KEYS.pyiImportSizeLimits) || '[]');
+    const raw = JSON.parse(localStorage.getItem(getProjectStorageKey(STORAGE_KEYS.pyiImportSizeLimits)) || '[]');
     if (!Array.isArray(raw)) return [];
 
     const deduped = new Map<string, SavedPyiImportSizeLimitOverride>();
@@ -2224,7 +4273,7 @@ function loadSavedPyiImportSizeLimitOverrides(): SavedPyiImportSizeLimitOverride
 
 function saveSavedPyiImportSizeLimitOverrides(overrides: SavedPyiImportSizeLimitOverride[]) {
   localStorage.setItem(
-    STORAGE_KEYS.pyiImportSizeLimits,
+    getProjectStorageKey(STORAGE_KEYS.pyiImportSizeLimits),
     JSON.stringify(sortSavedPyiImportSizeLimitOverrides(
       overrides.map(override => ({
         moduleName: normalizePyiImportSizeLimitModuleName(override.moduleName),
@@ -2251,7 +4300,7 @@ function resolveSavedPyiImportSizeLimit(moduleName: string): number {
 
 function loadSavedCSharpNamespaces(): string[] {
   try {
-    const raw = JSON.parse(localStorage.getItem(STORAGE_KEYS.csharpNamespaces) || '[]');
+    const raw = JSON.parse(localStorage.getItem(getProjectStorageKey(STORAGE_KEYS.csharpNamespaces)) || '[]');
     return Array.isArray(raw)
       ? raw.filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
       : [];
@@ -2261,7 +4310,7 @@ function loadSavedCSharpNamespaces(): string[] {
 }
 
 function saveCSharpNamespaces(namespaces: string[]) {
-  localStorage.setItem(STORAGE_KEYS.csharpNamespaces, JSON.stringify(namespaces));
+  localStorage.setItem(getProjectStorageKey(STORAGE_KEYS.csharpNamespaces), JSON.stringify(namespaces));
 }
 
 function addSavedCSharpNamespace(namespaceName: string) {
@@ -2300,6 +4349,311 @@ interface FSItem {
   content?: string;
   parentId: string | null;
   isOpen?: boolean;
+}
+
+interface UploadedProjectFile {
+  path: string;
+  content: string;
+}
+
+interface AssistantAttachmentFile extends UploadedProjectFile {
+  id: string;
+  source: 'workspace' | 'upload';
+}
+
+interface PackageJsonDependencyIssue {
+  path: string;
+  message: string;
+}
+
+interface PackageJsonDependencyConflict {
+  packageName: string;
+  ranges: string[];
+  sources: string[];
+}
+
+interface PackageJsonDependencyRequirement {
+  name: string;
+  range: string;
+  spec: string;
+  sources: string[];
+}
+
+interface PackageJsonDependencySyncPlan {
+  signature: string;
+  packageJsonCount: number;
+  requirements: PackageJsonDependencyRequirement[];
+  conflicts: PackageJsonDependencyConflict[];
+  invalidFiles: PackageJsonDependencyIssue[];
+  unsupportedDependencies: PackageJsonDependencyIssue[];
+}
+
+const PACKAGE_JSON_DEPENDENCY_FIELDS = [
+  'dependencies',
+  'devDependencies',
+  'optionalDependencies',
+  'peerDependencies',
+] as const;
+
+function createFsItemId() {
+  return Math.random().toString(36).slice(2, 11);
+}
+
+function getFsItemPath(items: FSItem[], id: string | undefined): string {
+  if (!id) return '';
+  const item = items.find(candidate => candidate.id === id);
+  if (!item) return '';
+  if (!item.parentId) return item.name;
+  const parentPath = getFsItemPath(items, item.parentId);
+  return parentPath ? `${parentPath}/${item.name}` : item.name;
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function sanitizeUploadedProjectPath(path: string) {
+  return path
+    .replace(/\\/g, '/')
+    .split('/')
+    .map(part => part.trim())
+    .filter(part => part && part !== '.' && part !== '..');
+}
+
+function hasFileDataTransferPayload(dataTransfer: DataTransfer | null) {
+  if (!dataTransfer) return false;
+  if (dataTransfer.files && dataTransfer.files.length > 0) return true;
+  return Array.from(dataTransfer.items || []).some(item => item.kind === 'file');
+}
+
+function normalizeAssistantAttachmentPath(path: string) {
+  return sanitizeUploadedProjectPath(path).join('/');
+}
+
+function formatAssistantAttachmentSummary(files: AssistantAttachmentFile[]) {
+  if (files.length === 0) return '';
+  return `\n\nAttached files:\n${files.map(file => `- ${file.path}`).join('\n')}`;
+}
+
+function formatAssistantAttachmentPromptSection(files: AssistantAttachmentFile[]) {
+  if (files.length === 0) return '';
+  return `\n\nAttached files for this user message. Each file name below is its path:\n${files.map(file => (
+    `\n<attached_file path="${file.path.replace(/"/g, '&quot;')}">\n${file.content || ''}\n</attached_file>`
+  )).join('\n')}`;
+}
+
+function readDataTransferDirectoryEntries(reader: any): Promise<any[]> {
+  return new Promise((resolve, reject) => {
+    const entries: any[] = [];
+    const readBatch = () => {
+      reader.readEntries(
+        (batch: any[]) => {
+          if (!batch.length) {
+            resolve(entries);
+            return;
+          }
+          entries.push(...batch);
+          readBatch();
+        },
+        reject
+      );
+    };
+    readBatch();
+  });
+}
+
+function getFileFromDataTransferEntry(entry: any): Promise<File> {
+  return new Promise((resolve, reject) => {
+    entry.file(resolve, reject);
+  });
+}
+
+async function readUploadedFilesFromFileSystemHandle(handle: FileSystemHandle, parentPath = ''): Promise<UploadedProjectFile[]> {
+  if (handle.kind === 'file') {
+    const file = await (handle as FileSystemFileHandle).getFile();
+    return [{
+      path: `${parentPath}${file.name}`,
+      content: await file.text(),
+    }];
+  }
+
+  const directoryHandle = handle as FileSystemDirectoryHandle;
+  const nestedFiles: UploadedProjectFile[] = [];
+  for await (const childHandle of (directoryHandle as any).values()) {
+    nestedFiles.push(...await readUploadedFilesFromFileSystemHandle(childHandle, `${parentPath}${directoryHandle.name}/`));
+  }
+  return nestedFiles;
+}
+
+async function getFileSystemHandleFromDataTransferItem(item: DataTransferItem): Promise<FileSystemHandle | null> {
+  const getAsFileSystemHandle = (item as any).getAsFileSystemHandle;
+  if (typeof getAsFileSystemHandle !== 'function') return null;
+  try {
+    return await getAsFileSystemHandle.call(item);
+  } catch {
+    return null;
+  }
+}
+
+async function readUploadedFilesFromEntry(entry: any, parentPath = ''): Promise<UploadedProjectFile[]> {
+  if (!entry) return [];
+  if (entry.isFile) {
+    const file = await getFileFromDataTransferEntry(entry);
+    return [{
+      path: `${parentPath}${file.name}`,
+      content: await file.text(),
+    }];
+  }
+
+  if (!entry.isDirectory) return [];
+  const reader = entry.createReader();
+  const entries = await readDataTransferDirectoryEntries(reader);
+  const nextParentPath = `${parentPath}${entry.name}/`;
+  const nestedFiles = await Promise.all(entries.map(child => readUploadedFilesFromEntry(child, nextParentPath)));
+  return nestedFiles.flat();
+}
+
+async function readUploadedProjectFilesFromDataTransfer(dataTransfer: DataTransfer): Promise<UploadedProjectFile[]> {
+  const items = Array.from(dataTransfer.items || []);
+  const handles = (await Promise.all(items.map(getFileSystemHandleFromDataTransferItem))).filter(Boolean) as FileSystemHandle[];
+
+  if (handles.length > 0) {
+    const files = await Promise.all(handles.map(handle => readUploadedFilesFromFileSystemHandle(handle)));
+    return files.flat().filter(file => file.path.trim());
+  }
+
+  const entries = items
+    .map(item => {
+      const getEntry = (item as any).webkitGetAsEntry;
+      return typeof getEntry === 'function' ? getEntry.call(item) : null;
+    })
+    .filter(Boolean);
+
+  if (entries.length > 0) {
+    const files = await Promise.all(entries.map(entry => readUploadedFilesFromEntry(entry)));
+    return files.flat().filter(file => file.path.trim());
+  }
+
+  return Promise.all(Array.from(dataTransfer.files || []).map(async file => ({
+    path: ((file as any).webkitRelativePath || file.name) as string,
+    content: await file.text(),
+  })));
+}
+
+function isNpmPackageJsonRegistryRange(range: string) {
+  return !/^(?:workspace:|file:|link:|portal:|git\+|https?:|github:|npm:)/i.test(range.trim());
+}
+
+function createPackageJsonDependencySpec(packageName: string, range: string) {
+  const trimmedRange = range.trim() || 'latest';
+  return trimmedRange === 'latest' ? packageName : `${packageName}@${trimmedRange}`;
+}
+
+function collectPackageJsonDependencySyncPlan(items: FSItem[]): PackageJsonDependencySyncPlan {
+  const packageJsonFiles = items
+    .filter((item): item is FSItem & { type: 'file' } => item.type === 'file' && item.name === 'package.json')
+    .sort((left, right) => getFsItemPath(items, left.id).localeCompare(getFsItemPath(items, right.id)));
+  const dependencySources = new Map<string, Map<string, string[]>>();
+  const invalidFiles: PackageJsonDependencyIssue[] = [];
+  const unsupportedDependencies: PackageJsonDependencyIssue[] = [];
+
+  for (const file of packageJsonFiles) {
+    const path = getFsItemPath(items, file.id);
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(file.content || '{}');
+    } catch (error) {
+      invalidFiles.push({
+        path,
+        message: error instanceof Error ? error.message : 'Invalid JSON',
+      });
+      continue;
+    }
+
+    if (!isPlainRecord(parsed)) {
+      invalidFiles.push({ path, message: 'package.json must contain a JSON object.' });
+      continue;
+    }
+
+    for (const field of PACKAGE_JSON_DEPENDENCY_FIELDS) {
+      const dependencies = parsed[field];
+      if (dependencies == null) continue;
+      if (!isPlainRecord(dependencies)) {
+        invalidFiles.push({ path, message: `${field} must be a JSON object.` });
+        continue;
+      }
+
+      for (const [rawPackageName, rawRange] of Object.entries(dependencies)) {
+        if (typeof rawRange !== 'string') {
+          invalidFiles.push({ path, message: `${field}.${rawPackageName} must be a string range.` });
+          continue;
+        }
+
+        const packageName = rawPackageName.trim();
+        const range = rawRange.trim() || 'latest';
+        if (!isValidNpmPackageInstallSpec(packageName)) {
+          invalidFiles.push({ path, message: `${field}.${rawPackageName} is not a valid npm package name.` });
+          continue;
+        }
+
+        const source = `${path}:${field}`;
+        const ranges = dependencySources.get(packageName) || new Map<string, string[]>();
+        ranges.set(range, [...(ranges.get(range) || []), source]);
+        dependencySources.set(packageName, ranges);
+
+        if (!isNpmPackageJsonRegistryRange(range)) {
+          unsupportedDependencies.push({
+            path,
+            message: `${field}.${packageName}@${range} is not supported by the browser npm registry installer.`,
+          });
+        }
+      }
+    }
+  }
+
+  const conflicts: PackageJsonDependencyConflict[] = [];
+  const requirements: PackageJsonDependencyRequirement[] = [];
+  for (const [packageName, ranges] of dependencySources) {
+    if (ranges.size > 1) {
+      conflicts.push({
+        packageName,
+        ranges: [...ranges.keys()].sort(),
+        sources: [...ranges.values()].flat().sort(),
+      });
+      continue;
+    }
+
+    const [[range, sources]] = [...ranges.entries()];
+    if (!isNpmPackageJsonRegistryRange(range)) continue;
+    requirements.push({
+      name: packageName,
+      range,
+      spec: createPackageJsonDependencySpec(packageName, range),
+      sources: sources.sort(),
+    });
+  }
+
+  requirements.sort((left, right) => left.name.localeCompare(right.name));
+  conflicts.sort((left, right) => left.packageName.localeCompare(right.packageName));
+  invalidFiles.sort((left, right) => left.path.localeCompare(right.path));
+  unsupportedDependencies.sort((left, right) => `${left.path}:${left.message}`.localeCompare(`${right.path}:${right.message}`));
+
+  const signature = JSON.stringify({
+    packageJsonFiles: packageJsonFiles.map(file => [getFsItemPath(items, file.id), file.content || '']),
+    requirements: requirements.map(requirement => [requirement.name, requirement.range]),
+    conflicts,
+    invalidFiles,
+    unsupportedDependencies,
+  });
+
+  return {
+    signature,
+    packageJsonCount: packageJsonFiles.length,
+    requirements,
+    conflicts,
+    invalidFiles,
+    unsupportedDependencies,
+  };
 }
 
 interface ChatMessage {
@@ -2355,9 +4709,8 @@ interface AssistantToolExecutionResult {
 }
 
 interface ResolvedProjectRun {
-  mode: ProjectRunMode;
   language: ProjectRuntimeLanguage | null;
-  selectedFiles: FSItem[];
+  includedFiles: FSItem[];
   entryCandidates: FSItem[];
   entryFile: FSItem | null;
   error: string | null;
@@ -2382,8 +4735,8 @@ type JavaRuntimeVersion = 8 | 11 | 17;
 type RuntimeInteractionKind = 'alert' | 'confirm' | 'prompt' | 'stdin';
 type RuntimeInteractionLanguage = 'javascript' | 'python' | 'csharp' | 'c' | 'cpp' | 'java';
 type ProjectRuntimeLanguage = 'javascript' | 'python' | 'html' | 'csharp' | 'c' | 'cpp' | 'java';
-type ProjectFileLanguage = ProjectRuntimeLanguage | 'css';
-type ProjectRunMode = 'csharp-only' | 'python-only' | 'html-only' | 'javascript-only' | 'c-only' | 'cpp-only' | 'java-only' | 'custom';
+type ProjectFileLanguage = ProjectRuntimeLanguage | 'typescript' | 'css';
+type ProjectRunEntryKind = ProjectRuntimeLanguage | 'typescript' | 'tsx' | 'unknown';
 
 interface OutputPanelInteraction {
   id: number;
@@ -2425,8 +4778,6 @@ interface AppSettings {
   javaRuntimeLifecycle: RuntimeLifecycle;
   javaIOMode: RuntimeIOMode;
   javaRuntimeVersion: JavaRuntimeVersion;
-  projectRunMode: ProjectRunMode;
-  projectRunCustomFileIds: string[];
   projectRunEntryFileId: string | null;
   assistantProvider: AssistantProvider;
   assistantModel: string;
@@ -2434,15 +4785,11 @@ interface AppSettings {
   assistantUseChainOfThought: boolean;
   assistantShowUsagePopup: boolean;
   assistantMaxChainOfThoughtDepth: number;
-  assistantMcpServerUrl: string;
-  assistantMcpServerLabel: string;
-  assistantMcpServerDescription: string;
-  assistantMcpAllowedTools: string;
-  assistantMcpAuthorization: string;
+  assistantRequestRateLimitPerMinute: number;
 }
 
 const loadSavedAssistantChats = (): AssistantChat[] => {
-  const saved = localStorage.getItem(STORAGE_KEYS.assistantChats);
+  const saved = localStorage.getItem(getProjectStorageKey(STORAGE_KEYS.assistantChats));
   if (!saved) return [{ id: INITIAL_ASSISTANT_CHAT_ID, name: DEFAULT_ASSISTANT_CHAT_NAME, messages: [] }];
   try {
     const parsed = JSON.parse(saved);
@@ -2473,7 +4820,7 @@ const loadSavedAssistantChats = (): AssistantChat[] => {
 };
 
 const loadSavedLayout = (): IJsonModel => {
-  const saved = localStorage.getItem(STORAGE_KEYS.layout);
+  const saved = localStorage.getItem(getProjectStorageKey(STORAGE_KEYS.layout));
   if (!saved) return INITIAL_LAYOUT;
   try {
     const parsed = JSON.parse(saved);
@@ -2509,8 +4856,6 @@ const DEFAULT_SETTINGS: AppSettings = {
   javaRuntimeLifecycle: 'keep-warm',
   javaIOMode: 'alert-output',
   javaRuntimeVersion: 17,
-  projectRunMode: 'custom',
-  projectRunCustomFileIds: [],
   projectRunEntryFileId: null,
   assistantProvider: 'gemini',
   assistantModel: getAssistantDefaultModel('gemini'),
@@ -2518,32 +4863,21 @@ const DEFAULT_SETTINGS: AppSettings = {
   assistantUseChainOfThought: false,
   assistantShowUsagePopup: true,
   assistantMaxChainOfThoughtDepth: DEFAULT_ASSISTANT_TOOL_PASSES,
-  assistantMcpServerUrl: '',
-  assistantMcpServerLabel: 'remote',
-  assistantMcpServerDescription: '',
-  assistantMcpAllowedTools: '',
-  assistantMcpAuthorization: '',
+  assistantRequestRateLimitPerMinute: DEFAULT_ASSISTANT_REQUEST_RATE_LIMIT_PER_MINUTE,
 };
 
 const CXX_RUNTIME_IDLE_TIMEOUT = 60_000;
 const JAVA_RUNTIME_IDLE_TIMEOUT = 60_000;
-
-const PROJECT_RUN_MODE_OPTIONS: { value: ProjectRunMode; label: string; language: ProjectRuntimeLanguage | null }[] = [
-  { value: 'csharp-only', label: 'C# only', language: 'csharp' },
-  { value: 'c-only', label: 'C only', language: 'c' },
-  { value: 'cpp-only', label: 'C++ only', language: 'cpp' },
-  { value: 'java-only', label: 'Java only', language: 'java' },
-  { value: 'python-only', label: 'Python only', language: 'python' },
-  { value: 'html-only', label: 'HTML only', language: 'html' },
-  { value: 'javascript-only', label: 'JS only', language: 'javascript' },
-  { value: 'custom', label: 'Custom', language: null },
-];
 
 function normalizeProjectFileLanguage(language?: string): ProjectFileLanguage | null {
   switch ((language || '').toLowerCase()) {
     case 'javascript':
     case 'js':
       return 'javascript';
+    case 'typescript':
+    case 'ts':
+    case 'tsx':
+      return 'typescript';
     case 'python':
     case 'py':
       return 'python';
@@ -2568,13 +4902,35 @@ function normalizeProjectFileLanguage(language?: string): ProjectFileLanguage | 
 
 function normalizeProjectRuntimeLanguage(language?: string): ProjectRuntimeLanguage | null {
   const normalized = normalizeProjectFileLanguage(language);
+  if (normalized === 'typescript') return 'javascript';
   return normalized && normalized !== 'css' ? normalized : null;
+}
+
+function getProjectFilePathForRuntime(file: Pick<ProjectSourceFile, 'path' | 'language'> | (Pick<FSItem, 'name' | 'language'> & { path?: string })) {
+  return 'path' in file && file.path ? file.path : 'name' in file ? file.name : '';
+}
+
+function getProjectFileLanguageForRuntime(file: Pick<ProjectSourceFile, 'path' | 'language'> | (Pick<FSItem, 'name' | 'language'> & { path?: string })) {
+  const directLanguage = normalizeProjectFileLanguage(file.language);
+  if (directLanguage) return directLanguage;
+
+  const path = getProjectFilePathForRuntime(file);
+  const filename = path.split('/').pop() || path;
+  return normalizeProjectFileLanguage(langFromFilename(filename));
+}
+
+function getProjectRuntimeLanguageForFile(file: Pick<ProjectSourceFile, 'path' | 'language'> | (Pick<FSItem, 'name' | 'language'> & { path?: string })) {
+  const language = getProjectFileLanguageForRuntime(file);
+  if (language === 'typescript') return 'javascript';
+  return language && language !== 'css' ? language : null;
 }
 
 function getProjectRuntimeLanguageLabel(language: ProjectFileLanguage | null) {
   switch (language) {
     case 'javascript':
       return 'JavaScript';
+    case 'typescript':
+      return 'TypeScript';
     case 'python':
       return 'Python';
     case 'html':
@@ -2592,10 +4948,6 @@ function getProjectRuntimeLanguageLabel(language: ProjectFileLanguage | null) {
     default:
       return 'Unknown';
   }
-}
-
-function getProjectRunModeLanguage(mode: ProjectRunMode): ProjectRuntimeLanguage | null {
-  return PROJECT_RUN_MODE_OPTIONS.find(option => option.value === mode)?.language ?? null;
 }
 
 function isCxxRuntimeLanguage(language: ProjectRuntimeLanguage | ProjectFileLanguage | null | undefined): language is 'c' | 'cpp' {
@@ -2619,62 +4971,52 @@ function isCxxHeaderPath(path: string) {
 }
 
 function isCxxProjectFile(file: FSItem | ProjectSourceFile) {
-  const language = normalizeProjectFileLanguage(file.language);
+  const language = getProjectFileLanguageForRuntime(file);
   const path = 'path' in file ? file.path : file.name;
   return isCxxRuntimeLanguage(language) && (isCxxSourcePath(path) || isCxxHeaderPath(path));
 }
 
 function getCxxResolvedRuntimeLanguage(files: FSItem[]) {
   const hasCpp = files.some(file => {
-    const language = normalizeProjectFileLanguage(file.language);
+    const language = getProjectFileLanguageForRuntime(file);
     const path = file.name || '';
     return language === 'cpp' || isCppSourcePath(path);
   });
   return hasCpp ? 'cpp' : 'c';
 }
 
-function isProjectRunModeFileMatch(file: FSItem & { type: 'file' }, modeLanguage: ProjectRuntimeLanguage | null) {
-  const language = normalizeProjectFileLanguage(file.language);
-  if (modeLanguage === 'cpp') {
-    return isCxxProjectFile(file);
+function isProjectRunEntryCandidate(file: FSItem & { type: 'file' }) {
+  const entryKind = getProjectRunEntryKind(file);
+  if (entryKind === 'html' || entryKind === 'tsx' || entryKind === 'javascript' || entryKind === 'typescript') {
+    return true;
   }
-  if (modeLanguage === 'c') {
-    return language === 'c' && isCxxProjectFile(file);
-  }
-  return normalizeProjectRuntimeLanguage(file.language) === modeLanguage;
+
+  const runtimeLanguage = getProjectRuntimeLanguageForFile(file);
+  if (runtimeLanguage === 'c') return isCSourcePath(file.name);
+  if (runtimeLanguage === 'cpp') return isCxxSourcePath(file.name);
+  return runtimeLanguage === 'python' || runtimeLanguage === 'csharp' || runtimeLanguage === 'java';
 }
 
-function isCxxEntryCandidate(file: FSItem, runtimeLanguage: ProjectRuntimeLanguage | null) {
+function getProjectRunFilesForEntry(entryFile: FSItem & { type: 'file' }, runnableFiles: (FSItem & { type: 'file' })[]) {
+  const entryKind = getProjectRunEntryKind(entryFile);
+  if (entryKind === 'html' || entryKind === 'tsx') {
+    return runnableFiles.filter(isHtmlTsxProjectRunCompatibleFile);
+  }
+  if (entryKind === 'javascript' || entryKind === 'typescript') {
+    return runnableFiles.filter(isJavaScriptOrPlainTypeScriptProjectFile);
+  }
+
+  const runtimeLanguage = getProjectRuntimeLanguageForFile(entryFile);
   if (runtimeLanguage === 'c') {
-    return isCSourcePath(file.name);
+    return runnableFiles.filter(file => getProjectFileLanguageForRuntime(file) === 'c' && isCxxProjectFile(file));
   }
   if (runtimeLanguage === 'cpp') {
-    return isCxxSourcePath(file.name);
+    return runnableFiles.filter(isCxxProjectFile);
   }
-  return normalizeProjectRuntimeLanguage(file.language) === runtimeLanguage;
-}
-
-function getProjectEntryCandidateIds(selectedFiles: FSItem[], preferredLanguage: ProjectRuntimeLanguage | null) {
-  if (isCxxRuntimeLanguage(preferredLanguage)) {
-    return selectedFiles
-      .filter(file => isCxxEntryCandidate(file, preferredLanguage))
-      .map(file => file.id);
+  if (!runtimeLanguage) {
+    return [];
   }
-
-  if (!preferredLanguage && selectedFiles.length > 0 && selectedFiles.every(file => isCxxProjectFile(file))) {
-    const cxxLanguage = getCxxResolvedRuntimeLanguage(selectedFiles);
-    return selectedFiles
-      .filter(file => isCxxEntryCandidate(file, cxxLanguage))
-      .map(file => file.id);
-  }
-
-  const hasHtml = selectedFiles.some(file => normalizeProjectRuntimeLanguage(file.language) === 'html');
-  return selectedFiles
-    .filter(file => {
-      const language = normalizeProjectRuntimeLanguage(file.language);
-      return hasHtml ? language === 'html' : language !== null;
-    })
-    .map(file => file.id);
+  return runnableFiles.filter(file => getProjectRuntimeLanguageForFile(file) === runtimeLanguage);
 }
 
 function normalizeProjectPath(path: string): string {
@@ -2691,6 +5033,28 @@ function normalizeProjectPath(path: string): string {
     resolved.push(part);
   }
   return resolved.join('/');
+}
+
+const CODECRAFT_MONACO_PROJECT_ROOT = '/codecraft-project';
+const CODECRAFT_RUNTIME_PROJECT_ROOT = '__codecraft_project__';
+
+function encodeProjectPathForSpecifier(path: string) {
+  return normalizeProjectPath(path)
+    .split('/')
+    .map(part => encodeURIComponent(part))
+    .join('/');
+}
+
+function getMonacoProjectModelUri(path: string) {
+  return monaco.Uri.file(`${CODECRAFT_MONACO_PROJECT_ROOT}/${normalizeProjectPath(path)}`);
+}
+
+function getMonacoProjectModelPath(path: string) {
+  return getMonacoProjectModelUri(path).toString();
+}
+
+function getRuntimeProjectModuleSpecifier(path: string) {
+  return `${CODECRAFT_RUNTIME_PROJECT_ROOT}/${encodeProjectPathForSpecifier(path)}`;
 }
 
 function dirnameProjectPath(path: string): string {
@@ -2733,6 +5097,77 @@ function escapeHtml(value: string) {
     .replace(/'/g, '&#39;');
 }
 
+function escapeHtmlRawTextElement(value: string) {
+  return value.replace(/<\/(script|style)/gi, '<\\/$1');
+}
+
+function getOutputPreviewBrowserApiShimSource() {
+  return `
+(() => {
+  const createMemoryStorage = () => {
+    const store = new Map();
+    return {
+      get length() {
+        return store.size;
+      },
+      key(index) {
+        const key = Array.from(store.keys())[Number(index)];
+        return key === undefined ? null : key;
+      },
+      getItem(key) {
+        key = String(key);
+        return store.has(key) ? store.get(key) : null;
+      },
+      setItem(key, value) {
+        store.set(String(key), String(value));
+      },
+      removeItem(key) {
+        store.delete(String(key));
+      },
+      clear() {
+        store.clear();
+      },
+    };
+  };
+
+  const isUsableStorage = (storageName) => {
+    try {
+      const storage = globalThis[storageName];
+      const probeKey = '__codecraft_storage_probe__';
+      storage.setItem(probeKey, '1');
+      storage.removeItem(probeKey);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  const installStorage = (storageName) => {
+    if (isUsableStorage(storageName)) return;
+    const storage = createMemoryStorage();
+    try {
+      Object.defineProperty(globalThis, storageName, {
+        configurable: true,
+        enumerable: true,
+        value: storage,
+      });
+    } catch {
+      try {
+        globalThis[storageName] = storage;
+      } catch {}
+    }
+  };
+
+  installStorage('localStorage');
+  installStorage('sessionStorage');
+})();
+`;
+}
+
+function getOutputPreviewBrowserApiShimScriptTag() {
+  return `<script>${escapeHtmlRawTextElement(getOutputPreviewBrowserApiShimSource())}</script>`;
+}
+
 function extractJavaScriptModuleSpecifiers(source: string): string[] {
   const matches = new Set<string>();
   const patterns = [
@@ -2758,6 +5193,673 @@ function containsJavaScriptModuleSyntax(source: string): boolean {
     /\bimport\s+(?:[\s\S]*?\sfrom\s*['"]|['"][^'"]+['"])/m.test(source)
     || /\bexport\s+(?:\{|default\b|const\b|let\b|var\b|function\b|class\b|\*)/m.test(source)
   );
+}
+
+function isJavaScriptRuntimeProjectFile(file: Pick<ProjectSourceFile, 'path' | 'language'> | (Pick<FSItem, 'name' | 'language'> & { path?: string })) {
+  return getProjectRuntimeLanguageForFile(file) === 'javascript';
+}
+
+function isHtmlProjectFile(file: Pick<ProjectSourceFile, 'path' | 'language'> | (Pick<FSItem, 'name' | 'language'> & { path?: string })) {
+  return getProjectFileLanguageForRuntime(file) === 'html' || /\.(?:html|htm)$/i.test(getProjectFilePathForRuntime(file));
+}
+
+function isTsxProjectPath(path: string) {
+  return /\.tsx$/i.test(path);
+}
+
+function isTsxProjectFile(file: Pick<ProjectSourceFile, 'path' | 'language'> | (Pick<FSItem, 'name' | 'language'> & { path?: string })) {
+  return isTsxProjectPath(getProjectFilePathForRuntime(file));
+}
+
+function isTypeScriptProjectPath(path: string) {
+  return /\.(?:ts|tsx|mts|cts)$/i.test(path);
+}
+
+function isTypeScriptProjectFile(file: Pick<ProjectSourceFile, 'path' | 'language'> | (Pick<FSItem, 'name' | 'language'> & { path?: string })) {
+  const path = getProjectFilePathForRuntime(file);
+  return getProjectFileLanguageForRuntime(file) === 'typescript' || isTypeScriptProjectPath(path);
+}
+
+function isJavaScriptOrPlainTypeScriptProjectFile(file: Pick<ProjectSourceFile, 'path' | 'language'> | (Pick<FSItem, 'name' | 'language'> & { path?: string })) {
+  const language = getProjectFileLanguageForRuntime(file);
+  return language === 'javascript' || language === 'typescript' && !isTsxProjectFile(file);
+}
+
+function isHtmlTsxProjectRunCompatibleFile(file: Pick<ProjectSourceFile, 'path' | 'language'> | (Pick<FSItem, 'name' | 'language'> & { path?: string })) {
+  const language = getProjectFileLanguageForRuntime(file);
+  return language === 'html' || language === 'css' || language === 'javascript' || language === 'typescript';
+}
+
+function isCssProjectFile(file: Pick<ProjectSourceFile, 'path' | 'language'> | (Pick<FSItem, 'name' | 'language'> & { path?: string })) {
+  return getProjectFileLanguageForRuntime(file) === 'css' || /\.css$/i.test(getProjectFilePathForRuntime(file));
+}
+
+function getProjectRunEntryKind(file: Pick<ProjectSourceFile, 'path' | 'language'> | (Pick<FSItem, 'name' | 'language'> & { path?: string })): ProjectRunEntryKind {
+  if (isHtmlProjectFile(file)) return 'html';
+  if (isTsxProjectFile(file)) return 'tsx';
+
+  const fileLanguage = getProjectFileLanguageForRuntime(file);
+  if (fileLanguage === 'typescript') return 'typescript';
+
+  return getProjectRuntimeLanguageForFile(file) ?? 'unknown';
+}
+
+function getTypeScriptRuntimeCompilerOptions(tsModule: TypeScriptModule): TypeScript.CompilerOptions {
+  return {
+    target: tsModule.ScriptTarget.ES2022,
+    module: tsModule.ModuleKind.ESNext,
+    jsx: tsModule.JsxEmit.ReactJSX,
+    jsxImportSource: 'react',
+    useDefineForClassFields: false,
+    esModuleInterop: true,
+    allowSyntheticDefaultImports: true,
+    allowJs: true,
+    allowImportingTsExtensions: true,
+    isolatedModules: true,
+  };
+}
+
+function formatTypeScriptDiagnostic(tsModule: TypeScriptModule, diagnostic: TypeScript.Diagnostic) {
+  const message = tsModule.flattenDiagnosticMessageText(diagnostic.messageText, '\n');
+  if (diagnostic.file && typeof diagnostic.start === 'number') {
+    const position = diagnostic.file.getLineAndCharacterOfPosition(diagnostic.start);
+    return `${diagnostic.file.fileName}:${position.line + 1}:${position.character + 1} - ${message}`;
+  }
+  return message;
+}
+
+function getTypeScriptJsxRuntimeSource() {
+  return `
+const __codecraftAppendChild = (parent, child) => {
+  if (child == null || child === false || child === true) return;
+  if (Array.isArray(child)) {
+    child.forEach((item) => __codecraftAppendChild(parent, item));
+    return;
+  }
+  if (typeof Node !== 'undefined' && child instanceof Node) {
+    parent.appendChild(child);
+    return;
+  }
+  parent.appendChild(document.createTextNode(String(child)));
+};
+const __codecraftCreateElement = (type, props, ...children) => {
+  props = props || {};
+  if (typeof type === 'function') {
+    return type({ ...props, children });
+  }
+  if (type === globalThis.React?.Fragment) {
+    if (typeof document === 'undefined') return children;
+    const fragment = document.createDocumentFragment();
+    children.forEach((child) => __codecraftAppendChild(fragment, child));
+    return fragment;
+  }
+  if (typeof document === 'undefined') {
+    return { type, props, children };
+  }
+  const element = document.createElement(String(type));
+  for (const [key, value] of Object.entries(props)) {
+    if (key === 'children' || value == null || value === false) continue;
+    if (key === 'className') {
+      element.setAttribute('class', String(value));
+    } else if (key === 'style' && value && typeof value === 'object') {
+      Object.assign(element.style, value);
+    } else if (/^on[A-Z]/.test(key) && typeof value === 'function') {
+      element.addEventListener(key.slice(2).toLowerCase(), value);
+    } else if (value === true) {
+      element.setAttribute(key, '');
+    } else {
+      element.setAttribute(key, String(value));
+    }
+  }
+  children.forEach((child) => __codecraftAppendChild(element, child));
+  return element;
+};
+const __codecraftCreateJsxElement = (type, props, key) => {
+  const normalizedProps = { ...(props || {}) };
+  if (key !== undefined) {
+    normalizedProps.key = key;
+  }
+  const { children, ...elementProps } = normalizedProps;
+  const childList = children === undefined
+    ? []
+    : Array.isArray(children)
+      ? children
+      : [children];
+  return __codecraftCreateElement(type, elementProps, ...childList);
+};
+const __codecraftHookState = globalThis.__codecraftHookState || [];
+globalThis.__codecraftHookState = __codecraftHookState;
+let __codecraftHookCursor = 0;
+const __codecraftResetHooks = () => {
+  __codecraftHookCursor = 0;
+};
+const __codecraftUseState = (initialValue) => {
+  const stateIndex = __codecraftHookCursor++;
+  if (!(stateIndex in __codecraftHookState)) {
+    __codecraftHookState[stateIndex] = typeof initialValue === 'function' ? initialValue() : initialValue;
+  }
+  const setState = (nextValue) => {
+    const previousValue = __codecraftHookState[stateIndex];
+    __codecraftHookState[stateIndex] = typeof nextValue === 'function' ? nextValue(previousValue) : nextValue;
+    if (typeof globalThis.__codecraftRerender === 'function') {
+      globalThis.__codecraftRerender();
+    }
+  };
+  return [__codecraftHookState[stateIndex], setState];
+};
+const __codecraftUseReducer = (reducer, initialValue) => {
+  const [state, setState] = __codecraftUseState(initialValue);
+  return [state, (action) => setState((current) => reducer(current, action))];
+};
+const __codecraftUseRef = (initialValue) => {
+  const [ref] = __codecraftUseState({ current: initialValue });
+  return ref;
+};
+const __codecraftUseEffect = (effect) => {
+  queueMicrotask(() => {
+    const cleanup = effect?.();
+    if (typeof cleanup === 'function') {
+      globalThis.addEventListener?.('beforeunload', cleanup, { once: true });
+    }
+  });
+};
+let __codecraftIdCounter = 0;
+const __codecraftRender = (node, container) => {
+  if (!container) return;
+  const renderOnce = () => {
+    __codecraftResetHooks();
+    container.textContent = '';
+    const resolvedNode = typeof node === 'function'
+      ? __codecraftCreateElement(node, null)
+      : node;
+    __codecraftAppendChild(container, resolvedNode);
+  };
+  globalThis.__codecraftRerender = renderOnce;
+  renderOnce();
+};
+globalThis.React = globalThis.React || {
+  Fragment: Symbol.for('codecraft.react.fragment'),
+  createElement: __codecraftCreateElement,
+  useState: __codecraftUseState,
+  useReducer: __codecraftUseReducer,
+  useEffect: __codecraftUseEffect,
+  useLayoutEffect: __codecraftUseEffect,
+  useMemo: (factory) => factory(),
+  useCallback: (callback) => callback,
+  useRef: __codecraftUseRef,
+  useId: () => \`codecraft-\${++__codecraftIdCounter}\`,
+};
+globalThis.ReactDOM = globalThis.ReactDOM || {
+  render: __codecraftRender,
+  createRoot: (container) => ({
+    render: (node) => __codecraftRender(node, container),
+    unmount: () => {
+      if (container) container.textContent = '';
+    },
+  }),
+};
+globalThis.__codecraftJsx = globalThis.__codecraftJsx || __codecraftCreateJsxElement;
+globalThis.__codecraftJsxDEV = globalThis.__codecraftJsxDEV || ((type, props, key) => __codecraftCreateJsxElement(type, props, key));
+`;
+}
+
+function getTypeScriptReactShimModuleSource() {
+  return `${getTypeScriptJsxRuntimeSource()}
+const React = globalThis.React;
+export const Fragment = React.Fragment;
+export const createElement = React.createElement;
+export const useState = React.useState;
+export const useReducer = React.useReducer;
+export const useEffect = React.useEffect;
+export const useLayoutEffect = React.useLayoutEffect;
+export const useMemo = React.useMemo;
+export const useCallback = React.useCallback;
+export const useRef = React.useRef;
+export const useId = React.useId;
+export default React;
+`;
+}
+
+function getTypeScriptJsxRuntimeShimModuleSource() {
+  return `${getTypeScriptJsxRuntimeSource()}
+export const Fragment = globalThis.React.Fragment;
+export const jsx = globalThis.__codecraftJsx;
+export const jsxs = globalThis.__codecraftJsx;
+export const jsxDEV = globalThis.__codecraftJsxDEV;
+`;
+}
+
+function getTypeScriptReactDomShimModuleSource() {
+  return `${getTypeScriptJsxRuntimeSource()}
+const ReactDOM = globalThis.ReactDOM;
+export const createRoot = ReactDOM.createRoot;
+export const render = ReactDOM.render;
+export default ReactDOM;
+`;
+}
+
+function createJavaScriptDataUrl(source: string) {
+  return `data:text/javascript;charset=utf-8,${encodeURIComponent(source)}`;
+}
+
+function getJavaScriptStyleRuntimeIdentifier(path: string) {
+  let hash = 0;
+  for (const char of normalizeProjectPath(path)) {
+    hash = (Math.imul(hash, 31) + char.charCodeAt(0)) | 0;
+  }
+  return `__codecraft_css_${Math.abs(hash).toString(36)}`;
+}
+
+function createJavaScriptStyleRuntimeSource(file: ProjectSourceFile, moduleIdentifier: string) {
+  return `
+const ${moduleIdentifier} = (() => {
+const cssPath = ${JSON.stringify(normalizeProjectPath(file.path))};
+const cssText = ${JSON.stringify(file.content)};
+if (typeof document !== 'undefined') {
+  const existing = Array.from(document.querySelectorAll('style[data-codecraft-css]'))
+    .find(style => style.getAttribute('data-codecraft-css') === cssPath);
+  if (!existing) {
+    const style = document.createElement('style');
+    style.setAttribute('data-codecraft-css', cssPath);
+    style.setAttribute('data-codecraft-source', 'import');
+    style.textContent = "\\n/* " + cssPath + " */\\n" + cssText + "\\n";
+    document.head.appendChild(style);
+  }
+}
+const classes = new Proxy({}, {
+  get(_target, key) {
+    return typeof key === 'string' ? key : undefined;
+  },
+});
+return classes;
+})();`;
+}
+
+function createJavaScriptStyleModuleSource(file: ProjectSourceFile) {
+  const moduleIdentifier = getJavaScriptStyleRuntimeIdentifier(file.path);
+  return `${createJavaScriptStyleRuntimeSource(file, moduleIdentifier)}
+const classes = ${moduleIdentifier};
+export default classes;
+//# sourceURL=codecraft://${normalizeProjectPath(file.path).replace(/\s/g, '%20')}.js`;
+}
+
+async function getJavaScriptRuntimeImportMapImports(): Promise<Record<string, string>> {
+  const reactUrl = createJavaScriptDataUrl(getTypeScriptReactShimModuleSource());
+  const reactDomUrl = createJavaScriptDataUrl(getTypeScriptReactDomShimModuleSource());
+  const jsxRuntimeUrl = createJavaScriptDataUrl(getTypeScriptJsxRuntimeShimModuleSource());
+  const imports: Record<string, string> = {
+    react: reactUrl,
+    'react-dom': reactDomUrl,
+    'react-dom/client': reactDomUrl,
+    'react/jsx-runtime': jsxRuntimeUrl,
+    'react/jsx-dev-runtime': jsxRuntimeUrl,
+  };
+
+  for (const moduleInfo of loadSavedJavaScriptIncludedModules()) {
+    imports[moduleInfo.name] = moduleInfo.url;
+    imports[`${moduleInfo.name}/`] = moduleInfo.url.endsWith('/')
+      ? moduleInfo.url
+      : `${moduleInfo.url}/`;
+  }
+
+  const installedPackages = loadSavedNpmInstalledPackages();
+  const storedPackages = (await Promise.all(
+    installedPackages.map(packageInfo => loadStoredNpmPackage(packageInfo.name, packageInfo.version).catch(() => null))
+  )).filter((packageInfo): packageInfo is StoredNpmPackage => packageInfo !== null);
+
+  for (const packageInfo of storedPackages) {
+    const aliases = collectNpmPackageExportAliases(packageInfo);
+    const runtimeFiles = Object.keys(packageInfo.files).filter(isRuntimeExposedNpmPackagePath);
+    const urlByPath = new Map<string, string>();
+
+    for (const path of runtimeFiles) {
+      const url = createJavaScriptDataUrl(createNpmPackageRuntimeModuleSource(packageInfo, path));
+      urlByPath.set(path, url);
+      imports[getNpmPackageInternalSpecifier(packageInfo, path)] = url;
+    }
+
+    for (const [specifier, path] of aliases) {
+      const url = urlByPath.get(path);
+      if (url) imports[specifier] = url;
+    }
+  }
+
+  return imports;
+}
+
+const CODECRAFT_REACT_TYPE_DECLARATIONS = `
+declare namespace React {
+  type ReactNode = any;
+  type Key = string | number;
+  type CSSProperties = Record<string, string | number | undefined>;
+  type Dispatch<A> = (value: A) => void;
+  type SetStateAction<S> = S | ((previousState: S) => S);
+  interface MutableRefObject<T> { current: T; }
+  interface RefObject<T> { current: T | null; }
+  interface FunctionComponent<P = {}> {
+    (props: P & { children?: ReactNode }): ReactNode;
+  }
+  type FC<P = {}> = FunctionComponent<P>;
+  type ComponentType<P = {}> = FunctionComponent<P>;
+  type PropsWithChildren<P = {}> = P & { children?: ReactNode };
+  namespace JSX {
+    type Element = any;
+    interface ElementClass { render: any; }
+    interface ElementChildrenAttribute { children: {}; }
+    interface IntrinsicAttributes { key?: Key; }
+    interface IntrinsicElements { [elementName: string]: any; }
+  }
+}
+
+declare namespace JSX {
+  type Element = any;
+  interface ElementClass { render: any; }
+  interface ElementChildrenAttribute { children: {}; }
+  interface IntrinsicAttributes { key?: React.Key; }
+  interface IntrinsicElements { [elementName: string]: any; }
+}
+
+declare module 'react' {
+  export type ReactNode = React.ReactNode;
+  export type Key = React.Key;
+  export type CSSProperties = React.CSSProperties;
+  export type Dispatch<A> = React.Dispatch<A>;
+  export type SetStateAction<S> = React.SetStateAction<S>;
+  export type MutableRefObject<T> = React.MutableRefObject<T>;
+  export type RefObject<T> = React.RefObject<T>;
+  export type FunctionComponent<P = {}> = React.FunctionComponent<P>;
+  export type FC<P = {}> = React.FC<P>;
+  export type ComponentType<P = {}> = React.ComponentType<P>;
+  export type PropsWithChildren<P = {}> = React.PropsWithChildren<P>;
+  export const Fragment: any;
+  export function createElement(type: any, props?: any, ...children: any[]): any;
+  export function useState<S>(initialState: S | (() => S)): [S, (value: S | ((previousState: S) => S)) => void];
+  export function useReducer<R extends (state: any, action: any) => any, S>(reducer: R, initialState: S): [S, (action: Parameters<R>[1]) => void];
+  export function useEffect(effect: () => void | (() => void), deps?: readonly unknown[]): void;
+  export function useLayoutEffect(effect: () => void | (() => void), deps?: readonly unknown[]): void;
+  export function useMemo<T>(factory: () => T, deps?: readonly unknown[]): T;
+  export function useCallback<T extends (...args: any[]) => any>(callback: T, deps?: readonly unknown[]): T;
+  export function useRef<T>(initialValue: T): React.MutableRefObject<T>;
+  export function useId(): string;
+  const ReactDefault: {
+    Fragment: typeof Fragment;
+    createElement: typeof createElement;
+    useState: typeof useState;
+    useReducer: typeof useReducer;
+    useEffect: typeof useEffect;
+    useLayoutEffect: typeof useLayoutEffect;
+    useMemo: typeof useMemo;
+    useCallback: typeof useCallback;
+    useRef: typeof useRef;
+    useId: typeof useId;
+  };
+  export default ReactDefault;
+}
+
+declare module 'react/jsx-runtime' {
+  export const Fragment: any;
+  export function jsx(type: any, props: any, key?: React.Key): any;
+  export function jsxs(type: any, props: any, key?: React.Key): any;
+}
+
+declare module 'react/jsx-dev-runtime' {
+  export const Fragment: any;
+  export function jsxDEV(type: any, props: any, key?: React.Key): any;
+}
+
+declare module 'react-dom' {
+  export function render(node: any, container: Element | DocumentFragment | null): void;
+  const ReactDOMDefault: { render: typeof render };
+  export default ReactDOMDefault;
+}
+
+declare module 'react-dom/client' {
+  export interface Root {
+    render(node: any): void;
+    unmount(): void;
+  }
+  export function createRoot(container: Element | DocumentFragment): Root;
+}
+
+declare module '*.css' {
+  const classes: Record<string, string>;
+  export default classes;
+}
+`;
+
+let codecraftTypeScriptDefaultsConfigured = false;
+
+function getJavaScriptIncludedModuleTypeDeclarations() {
+  const declarations = loadSavedJavaScriptIncludedModules()
+    .map(moduleInfo => {
+      const escapedName = moduleInfo.name.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+      return `declare module '${escapedName}';\ndeclare module '${escapedName}/*';`;
+    });
+  declarations.push(
+    ...loadSavedNpmInstalledPackages().map(packageInfo => {
+      const escapedName = packageInfo.name.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+      return `declare module '${escapedName}';\ndeclare module '${escapedName}/*';`;
+    })
+  );
+
+  return declarations.length > 0
+    ? `\n${declarations.join('\n')}\n`
+    : '';
+}
+
+function refreshCodeCraftTypeScriptExtraLibs() {
+  const extraLibs = [
+    {
+      content: `${CODECRAFT_REACT_TYPE_DECLARATIONS}${getJavaScriptIncludedModuleTypeDeclarations()}`,
+      filePath: 'file:///node_modules/@types/codecraft-runtime/index.d.ts',
+    },
+  ];
+
+  const ts = monaco.languages.typescript;
+  ts.typescriptDefaults.setExtraLibs(extraLibs);
+  ts.javascriptDefaults.setExtraLibs(extraLibs);
+}
+
+function configureCodeCraftTypeScriptDefaults() {
+  const ts = monaco.languages.typescript;
+  if (codecraftTypeScriptDefaultsConfigured) {
+    refreshCodeCraftTypeScriptExtraLibs();
+    return;
+  }
+  codecraftTypeScriptDefaultsConfigured = true;
+
+  const compilerOptions = {
+    target: ts.ScriptTarget.ES2020,
+    module: ts.ModuleKind.ESNext,
+    moduleResolution: ts.ModuleResolutionKind.NodeJs,
+    jsx: ts.JsxEmit.ReactJSX,
+    jsxImportSource: 'react',
+    allowJs: true,
+    checkJs: false,
+    allowNonTsExtensions: true,
+    allowSyntheticDefaultImports: true,
+    esModuleInterop: true,
+    allowImportingTsExtensions: true,
+    noEmit: true,
+  } as monaco.languages.typescript.CompilerOptions;
+
+  ts.typescriptDefaults.setCompilerOptions(compilerOptions);
+  ts.javascriptDefaults.setCompilerOptions(compilerOptions);
+  ts.typescriptDefaults.setDiagnosticsOptions({
+    noSemanticValidation: false,
+    noSyntaxValidation: false,
+  });
+  ts.javascriptDefaults.setDiagnosticsOptions({
+    noSemanticValidation: false,
+    noSyntaxValidation: false,
+  });
+
+  refreshCodeCraftTypeScriptExtraLibs();
+}
+
+async function transpileTypeScriptProjectFile(file: ProjectSourceFile) {
+  if (!isTypeScriptProjectFile(file)) {
+    return file.content;
+  }
+
+  const tsModule = await loadTypeScriptModule();
+  const output = tsModule.transpileModule(file.content, {
+    fileName: file.path,
+    compilerOptions: getTypeScriptRuntimeCompilerOptions(tsModule),
+    reportDiagnostics: true,
+  });
+
+  const diagnostics = (output.diagnostics ?? []).filter(diagnostic => diagnostic.category === tsModule.DiagnosticCategory.Error);
+  if (diagnostics.length > 0) {
+    throw new Error(`TypeScript compile failed:\n${diagnostics.map(diagnostic => formatTypeScriptDiagnostic(tsModule, diagnostic)).join('\n')}`);
+  }
+
+  return `${getTypeScriptJsxRuntimeSource()}\n${output.outputText}\n//# sourceURL=codecraft://${file.path.replace(/\s/g, '%20')}.js`;
+}
+
+function resolveProjectScriptPath(fromPath: string, specifier: string, availablePaths: Set<string>) {
+  const basePath = resolveProjectRelativePath(fromPath, stripProjectResourceSuffix(specifier));
+  const hasKnownExtension = /\.[cm]?[jt]sx?$/i.test(basePath);
+  const candidates = hasKnownExtension
+    ? [basePath]
+    : [
+      basePath,
+      `${basePath}.ts`,
+      `${basePath}.tsx`,
+      `${basePath}.js`,
+      `${basePath}.jsx`,
+      `${basePath}.mjs`,
+      `${basePath}.cjs`,
+      `${basePath}/index.ts`,
+      `${basePath}/index.tsx`,
+      `${basePath}/index.js`,
+      `${basePath}/index.jsx`,
+    ];
+
+  return candidates.find(path => availablePaths.has(path)) ?? '';
+}
+
+function resolveProjectStylePath(fromPath: string, specifier: string, availablePaths: Set<string>) {
+  const basePath = resolveProjectRelativePath(fromPath, stripProjectResourceSuffix(specifier));
+  const hasKnownExtension = /\.css$/i.test(basePath);
+  const candidates = hasKnownExtension
+    ? [basePath]
+    : [
+      basePath,
+      `${basePath}.css`,
+      `${basePath}/index.css`,
+    ];
+
+  return candidates.find(path => availablePaths.has(path)) ?? '';
+}
+
+function isValidJavaScriptIdentifier(value: string) {
+  return /^[A-Za-z_$][\w$]*$/.test(value);
+}
+
+function getJavaScriptStyleImportBindings(fullMatch: string, moduleIdentifier: string) {
+  const importClauseMatch = fullMatch.match(/\bimport\s+([\s\S]*?)\s+from\s*(['"])/);
+  if (!importClauseMatch) return '';
+
+  const statements: string[] = [];
+  let clause = importClauseMatch[1].replace(/^type\s+/, '').trim();
+  const parseNamedBindings = (namedClause: string) => {
+    const inner = namedClause.replace(/^\{/, '').replace(/\}$/, '');
+    for (const rawPart of inner.split(',')) {
+      const part = rawPart.trim().replace(/^type\s+/, '');
+      if (!part) continue;
+      const pieces = part.split(/\s+as\s+/i).map(piece => piece.trim()).filter(Boolean);
+      const exportName = pieces[0] ?? '';
+      const localName = pieces[pieces.length - 1] ?? '';
+      if (isValidJavaScriptIdentifier(exportName) && isValidJavaScriptIdentifier(localName)) {
+        statements.push(`const ${localName} = ${moduleIdentifier}[${JSON.stringify(exportName)}];`);
+      }
+    }
+  };
+
+  if (clause.startsWith('*')) {
+    const namespaceMatch = clause.match(/^\*\s+as\s+([A-Za-z_$][\w$]*)/);
+    return namespaceMatch ? `const ${namespaceMatch[1]} = ${moduleIdentifier};` : '';
+  }
+
+  if (clause.startsWith('{')) {
+    parseNamedBindings(clause);
+    return statements.join('\n');
+  }
+
+  const commaIndex = clause.indexOf(',');
+  const defaultName = (commaIndex >= 0 ? clause.slice(0, commaIndex) : clause).trim();
+  if (isValidJavaScriptIdentifier(defaultName)) {
+    statements.push(`const ${defaultName} = ${moduleIdentifier};`);
+  }
+  if (commaIndex >= 0) {
+    clause = clause.slice(commaIndex + 1).trim();
+    if (clause.startsWith('*')) {
+      const namespaceMatch = clause.match(/^\*\s+as\s+([A-Za-z_$][\w$]*)/);
+      if (namespaceMatch) statements.push(`const ${namespaceMatch[1]} = ${moduleIdentifier};`);
+    } else if (clause.startsWith('{')) {
+      parseNamedBindings(clause);
+    }
+  }
+
+  return statements.join('\n');
+}
+
+function createJavaScriptStyleImportReplacement(fullMatch: string, file: ProjectSourceFile) {
+  const moduleIdentifier = getJavaScriptStyleRuntimeIdentifier(file.path);
+  const bindings = getJavaScriptStyleImportBindings(fullMatch, moduleIdentifier);
+  return `${createJavaScriptStyleRuntimeSource(file, moduleIdentifier)}${bindings ? `\n${bindings}` : ''}`;
+}
+
+function rewriteJavaScriptModuleSpecifiers(
+  source: string,
+  importerPath: string,
+  scriptPaths: Set<string>,
+  styleFiles: Map<string, ProjectSourceFile>
+) {
+  const stylePaths = new Set(styleFiles.keys());
+  const rewriteSpecifier = (specifier: string) => {
+    if (isExternalProjectResourceSpecifier(specifier)) return specifier;
+    const resolvedScriptPath = resolveProjectScriptPath(importerPath, specifier, scriptPaths);
+    if (resolvedScriptPath) return getRuntimeProjectModuleSpecifier(resolvedScriptPath);
+
+    const resolvedStylePath = resolveProjectStylePath(importerPath, specifier, stylePaths);
+    return resolvedStylePath ? getRuntimeProjectModuleSpecifier(resolvedStylePath) : specifier;
+  };
+
+  const rewriteImportDeclaration = (fullMatch: string, quote: string, specifier: string) => {
+    const resolvedStylePath = !isExternalProjectResourceSpecifier(specifier)
+      ? resolveProjectStylePath(importerPath, specifier, stylePaths)
+      : '';
+    const styleFile = resolvedStylePath ? styleFiles.get(resolvedStylePath) : null;
+    if (styleFile) {
+      return createJavaScriptStyleImportReplacement(fullMatch, styleFile);
+    }
+
+    return fullMatch.replace(`${quote}${specifier}${quote}`, `${quote}${rewriteSpecifier(specifier)}${quote}`);
+  };
+
+  return source
+    .replace(
+      /\bimport\s*(['"])([^'"]+)\1/g,
+      (fullMatch, quote: string, specifier: string) => rewriteImportDeclaration(fullMatch, quote, specifier)
+    )
+    .replace(
+      /\bimport\s+((?:type\s+)?[^'"]*?)\s+from\s*(['"])([^'"]+)\2/g,
+      (fullMatch, _importClause: string, quote: string, specifier: string) => rewriteImportDeclaration(fullMatch, quote, specifier)
+    )
+    .replace(
+      /\bexport\s+(?:type\s+)?[^'"]*?\sfrom\s*(['"])([^'"]+)\1/g,
+      (fullMatch, quote: string, specifier: string) => (
+        fullMatch.replace(`${quote}${specifier}${quote}`, `${quote}${rewriteSpecifier(specifier)}${quote}`)
+      )
+    )
+    .replace(
+      /\bimport\s*\(\s*(['"])([^'"]+)\1\s*\)/g,
+      (fullMatch, quote: string, specifier: string) => (
+        fullMatch.replace(`${quote}${specifier}${quote}`, `${quote}${rewriteSpecifier(specifier)}${quote}`)
+      )
+    );
 }
 
 function normalizeExecutionTimeoutMs(value: number) {
@@ -2792,7 +5894,12 @@ function normalizeJavaRuntimeVersion(value: unknown): JavaRuntimeVersion {
 
 function normalizeAssistantMaxChainOfThoughtDepth(value: number) {
   if (!Number.isFinite(value)) return DEFAULT_ASSISTANT_TOOL_PASSES;
-  return Math.min(12, Math.max(1, Math.floor(value)));
+  return Math.min(MAX_ASSISTANT_CHAIN_OF_THOUGHT_DEPTH, Math.max(1, Math.floor(value)));
+}
+
+function normalizeAssistantRequestRateLimitPerMinute(value: number) {
+  if (!Number.isFinite(value)) return DEFAULT_ASSISTANT_REQUEST_RATE_LIMIT_PER_MINUTE;
+  return Math.min(MAX_ASSISTANT_REQUEST_RATE_LIMIT_PER_MINUTE, Math.max(0, Math.floor(value)));
 }
 
 function estimateFallbackTokenCount(text: string) {
@@ -2878,6 +5985,12 @@ const INITIAL_FILES: FSItem[] = [
   }
 ];
 
+interface FileTreeContextMenuState {
+  itemId: string | null;
+  x: number;
+  y: number;
+}
+
 interface FileTreeContextValue {
   files: FSItem[];
   activeFileId: string;
@@ -2889,8 +6002,11 @@ interface FileTreeContextValue {
   toggleFolder: (id: string) => void;
   setDraggedItemId: (id: string | null) => void;
   handleDrop: (targetId: string | null) => void;
+  importFilesFromDataTransfer: (targetId: string | null, dataTransfer: DataTransfer) => Promise<void>;
   addNewItem: (type: 'file' | 'folder', parentId: string | null, mode?: 'modal' | 'inline') => void;
   deleteItem: (id: string) => void;
+  duplicateItem: (id: string) => void;
+  openContextMenu: (itemId: string | null, clientX: number, clientY: number) => void;
   confirmRename: () => void;
   setRenamingId: (id: string | null) => void;
   setRenamingName: (name: string) => void;
@@ -2934,6 +6050,10 @@ const FileTreeItem = React.memo(({ item, depth = 0 }: { item: FSItem; depth?: nu
           e.preventDefault();
           e.stopPropagation();
           e.currentTarget.classList.remove('bg-white/10');
+          if (hasFileDataTransferPayload(e.dataTransfer)) {
+            void ctx.importFilesFromDataTransfer(item.type === 'folder' ? item.id : item.parentId, e.dataTransfer);
+            return;
+          }
           ctx.handleDrop(item.type === 'folder' ? item.id : item.parentId);
         }}
         onPointerDown={(e) => {
@@ -2941,6 +6061,12 @@ const FileTreeItem = React.memo(({ item, depth = 0 }: { item: FSItem; depth?: nu
           if (isRenaming) return;
           if (item.type === 'folder') ctx.toggleFolder(item.id);
           ctx.openEditorTab(item.id);
+        }}
+        onContextMenu={(e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          if (isRenaming) return;
+          ctx.openContextMenu(item.id, e.clientX, e.clientY);
         }}
         className={cn(
           "group flex items-center justify-between px-4 py-2 cursor-pointer transition-all border-l-2 relative",
@@ -3026,8 +6152,14 @@ const FileTreeItem = React.memo(({ item, depth = 0 }: { item: FSItem; depth?: nu
 });
 
 export default function App() {
+  const [projects, setProjects] = useState<CodeCraftProjectMeta[]>(() => loadProjectRegistry());
+  const [activeProjectId, setActiveProjectIdState] = useState(() => getActiveProjectId());
+  const [isProjectMenuOpen, setIsProjectMenuOpen] = useState(false);
+  const [projectMenuStatus, setProjectMenuStatus] = useState('');
+  const [renamingProjectId, setRenamingProjectId] = useState<string | null>(null);
+  const [renamingProjectName, setRenamingProjectName] = useState('');
   const [files, setFiles] = useState<FSItem[]>(() => {
-    const saved = localStorage.getItem(STORAGE_KEYS.files);
+    const saved = localStorage.getItem(getProjectStorageKey(STORAGE_KEYS.files));
     if (!saved) return INITIAL_FILES;
     const parsed: FSItem[] = JSON.parse(saved);
     return parsed.map(f => f.type === 'file' && f.name ? { ...f, language: langFromFilename(f.name) } : f);
@@ -3049,6 +6181,8 @@ export default function App() {
   const [assistantInputs, setAssistantInputs] = useState<Record<string, string>>({
     [INITIAL_ASSISTANT_CHAT_ID]: ''
   });
+  const [assistantAttachmentsByChatId, setAssistantAttachmentsByChatId] = useState<Record<string, AssistantAttachmentFile[]>>({});
+  const [assistantAttachmentStatusByChatId, setAssistantAttachmentStatusByChatId] = useState<Record<string, string>>({});
   const [assistantTokenEstimates, setAssistantTokenEstimates] = useState<Record<string, AssistantTokenEstimate>>({});
   const [assistantTurnUsageByChatId, setAssistantTurnUsageByChatId] = useState<Record<string, AssistantTurnUsage>>({});
   const [loadingAssistantChatId, setLoadingAssistantChatId] = useState<string | null>(null);
@@ -3056,6 +6190,8 @@ export default function App() {
   const [outputPreviewHtml, setOutputPreviewHtml] = useState<string | null>(null);
   const [pendingEdits, setPendingEdits] = useState<PendingEdit[]>([]);
   const [draggedItemId, setDraggedItemId] = useState<string | null>(null);
+  const [fileTreeContextMenu, setFileTreeContextMenu] = useState<FileTreeContextMenuState | null>(null);
+  const [fileTreeClipboardItemId, setFileTreeClipboardItemId] = useState<string | null>(null);
   const [layoutModel, setLayoutModel] = useState(() => Model.fromJson(loadSavedLayout()));
   const [namingState, setNamingState] = useState<{ type: 'file' | 'folder', parentId: string | null } | null>(null);
   const [namingName, setNamingName] = useState('');
@@ -3064,10 +6200,22 @@ export default function App() {
   const [pendingNewItem, setPendingNewItem] = useState<FSItem | null>(null);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [settings, setSettings] = useState<AppSettings>(() => {
-    const saved = localStorage.getItem(STORAGE_KEYS.settings);
+    const saved = localStorage.getItem(getProjectStorageKey(STORAGE_KEYS.settings));
     if (!saved) return DEFAULT_SETTINGS;
     const parsed = JSON.parse(saved);
     const merged = { ...DEFAULT_SETTINGS, ...parsed };
+    const cleanedMerged = { ...merged } as any;
+    delete cleanedMerged.assistantMcpServerUrl;
+    delete cleanedMerged.assistantMcpServerLabel;
+    delete cleanedMerged.assistantMcpServerDescription;
+    delete cleanedMerged.assistantMcpAllowedTools;
+    delete cleanedMerged.assistantMcpAuthorization;
+    delete cleanedMerged.assistantCotMessageRateLimitPerMinute;
+    delete cleanedMerged.assistantCursorRepositoryUrl;
+    delete cleanedMerged.assistantCursorRepositoryRef;
+    delete cleanedMerged.assistantCursorAutoCreatePr;
+    delete cleanedMerged.projectRunMode;
+    delete cleanedMerged.projectRunCustomFileIds;
     const assistantProvider = isAssistantProvider(merged.assistantProvider)
       ? merged.assistantProvider
       : DEFAULT_SETTINGS.assistantProvider;
@@ -3075,7 +6223,7 @@ export default function App() {
       ? merged.assistantModel.trim()
       : getAssistantDefaultModel(assistantProvider);
     return {
-      ...merged,
+      ...cleanedMerged,
       javascriptExecutionTimeoutMs: normalizeExecutionTimeoutMs(merged.javascriptExecutionTimeoutMs),
       pythonExecutionTimeoutMs: normalizeExecutionTimeoutMs(merged.pythonExecutionTimeoutMs),
       pythonRuntimeLifecycle: normalizeRuntimeLifecycle(merged.pythonRuntimeLifecycle),
@@ -3090,12 +6238,6 @@ export default function App() {
       javaRuntimeLifecycle: normalizeRuntimeLifecycle(merged.javaRuntimeLifecycle),
       javaIOMode: normalizeRuntimeIOMode(merged.javaIOMode),
       javaRuntimeVersion: normalizeJavaRuntimeVersion(merged.javaRuntimeVersion),
-      projectRunMode: PROJECT_RUN_MODE_OPTIONS.some(option => option.value === merged.projectRunMode)
-        ? merged.projectRunMode
-        : DEFAULT_SETTINGS.projectRunMode,
-      projectRunCustomFileIds: Array.isArray(merged.projectRunCustomFileIds)
-        ? merged.projectRunCustomFileIds.filter((value: unknown): value is string => typeof value === 'string')
-        : [],
       projectRunEntryFileId: typeof merged.projectRunEntryFileId === 'string' ? merged.projectRunEntryFileId : null,
       assistantProvider,
       assistantModel,
@@ -3107,18 +6249,20 @@ export default function App() {
           ? merged.assistantMaxChainOfThoughtDepth
           : DEFAULT_SETTINGS.assistantMaxChainOfThoughtDepth
       ),
-      assistantMcpServerUrl: typeof merged.assistantMcpServerUrl === 'string' ? merged.assistantMcpServerUrl : '',
-      assistantMcpServerLabel: typeof merged.assistantMcpServerLabel === 'string' && merged.assistantMcpServerLabel.trim()
-        ? merged.assistantMcpServerLabel.trim()
-        : DEFAULT_SETTINGS.assistantMcpServerLabel,
-      assistantMcpServerDescription: typeof merged.assistantMcpServerDescription === 'string' ? merged.assistantMcpServerDescription : '',
-      assistantMcpAllowedTools: typeof merged.assistantMcpAllowedTools === 'string' ? merged.assistantMcpAllowedTools : '',
-      assistantMcpAuthorization: typeof merged.assistantMcpAuthorization === 'string' ? merged.assistantMcpAuthorization : '',
+      assistantRequestRateLimitPerMinute: normalizeAssistantRequestRateLimitPerMinute(
+        typeof merged.assistantRequestRateLimitPerMinute === 'number'
+          ? merged.assistantRequestRateLimitPerMinute
+          : typeof merged.assistantCotMessageRateLimitPerMinute === 'number'
+            ? merged.assistantCotMessageRateLimitPerMinute
+            : DEFAULT_SETTINGS.assistantRequestRateLimitPerMinute
+      ),
     };
   });
   const [settingsPipPackages, setSettingsPipPackages] = useState<SavedPipPackage[]>(() => loadSavedPipPackages());
   const [settingsPipIncludedModules, setSettingsPipIncludedModules] = useState<string[]>(() => loadSavedPipIncludedModules());
   const [settingsPyiImportSizeLimitOverrides, setSettingsPyiImportSizeLimitOverrides] = useState<SavedPyiImportSizeLimitOverride[]>(() => loadSavedPyiImportSizeLimitOverrides());
+  const [settingsNpmInstalledPackages, setSettingsNpmInstalledPackages] = useState<SavedNpmInstalledPackage[]>(() => loadSavedNpmInstalledPackages());
+  const [settingsJavaScriptIncludedModules, setSettingsJavaScriptIncludedModules] = useState<SavedJavaScriptModule[]>(() => loadSavedJavaScriptIncludedModules());
   const [settingsCSharpNamespaces, setSettingsCSharpNamespaces] = useState<string[]>(() => loadSavedCSharpNamespaces());
   const [settingsPipInput, setSettingsPipInput] = useState('');
   const [settingsPipForceBuild, setSettingsPipForceBuild] = useState(false);
@@ -3131,9 +6275,18 @@ export default function App() {
   const [settingsPyiImportSizeLimitInput, setSettingsPyiImportSizeLimitInput] = useState('200');
   const [settingsPyiImportSizeUnlimited, setSettingsPyiImportSizeUnlimited] = useState(false);
   const [settingsPyiImportSizeLimitStatus, setSettingsPyiImportSizeLimitStatus] = useState('');
+  const [settingsNpmPackageInput, setSettingsNpmPackageInput] = useState('');
+  const [settingsNpmPackageBusy, setSettingsNpmPackageBusy] = useState(false);
+  const [settingsNpmPackageStatus, setSettingsNpmPackageStatus] = useState('');
+  const [settingsJavaScriptModuleInput, setSettingsJavaScriptModuleInput] = useState('');
+  const [settingsJavaScriptModuleUrlInput, setSettingsJavaScriptModuleUrlInput] = useState('');
+  const [settingsJavaScriptModuleBusy, setSettingsJavaScriptModuleBusy] = useState(false);
+  const [settingsJavaScriptModuleStatus, setSettingsJavaScriptModuleStatus] = useState('');
   const [settingsCSharpNamespaceInput, setSettingsCSharpNamespaceInput] = useState('');
   const [settingsCSharpNamespaceBusy, setSettingsCSharpNamespaceBusy] = useState(false);
   const [settingsCSharpNamespaceStatus, setSettingsCSharpNamespaceStatus] = useState('');
+  const [settingsUserDataBusy, setSettingsUserDataBusy] = useState(false);
+  const [settingsUserDataStatus, setSettingsUserDataStatus] = useState('');
   const [showAssistantApiKey, setShowAssistantApiKey] = useState(false);
   const [syncMeta, setSyncMeta] = useState<SyncMeta[]>(loadSyncMeta);
   const pendingEdit = pendingEdits[0] ?? null;
@@ -3169,21 +6322,31 @@ export default function App() {
   const skipEditorSyncRef = useRef(false);
   const pendingSharedEditorTargetRef = useRef<{ tabId: string; itemId: string } | null>(null);
   const sharedEditorVersionRef = useRef(0);
+  const monacoProjectModelUrisRef = useRef<Set<string>>(new Set());
   const pyodideEnsurePromiseRef = useRef<Promise<void> | null>(null);
   const persistedPyodidePackageMetaLoadPromiseRef = useRef<Promise<void> | null>(null);
   const persistedPyodidePackageMetaLoadedRef = useRef(false);
   const persistedPyodidePackageSnapshotLoadPromiseRef = useRef<Promise<void> | null>(null);
+  const userDataImportInputRef = useRef<HTMLInputElement>(null);
+  const projectDataImportInputRef = useRef<HTMLInputElement>(null);
+  const packageJsonSyncFingerprintRef = useRef('');
+  const packageJsonSyncRunningRef = useRef(false);
+  const packageJsonSyncQueuedRef = useRef(false);
   const filesRef = useRef(files);
   filesRef.current = files;
   const syncHandlesRef = useRef<Map<string, FileSystemDirectoryHandle>>(new Map());
   const syncLocksRef = useRef<Map<string, Promise<void>>>(new Map());
   const syncInitializedRef = useRef<Set<string>>(new Set());
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const assistantRequestRateNextSlotAtRef = useRef(0);
   const [activeSyncIds, setActiveSyncIds] = useState<Set<string>>(new Set());
   const persistedPipIncludesRestoredRef = useRef(false);
   const persistedCSharpNamespacesRestoredRef = useRef(false);
   const persistedPythonPackageStubsRestoredRef = useRef(false);
 
+  const activeProject = projects.find(project => project.id === activeProjectId)
+    || projects[0]
+    || createDefaultProjectMeta();
   const activeItem = files.find(f => f.id === activeFileId);
   const assistantReasoningControl = getAssistantReasoningControl(settings.assistantProvider, settings.assistantModel);
   const effectiveAssistantUseChainOfThought =
@@ -3193,8 +6356,8 @@ export default function App() {
         ? settings.assistantUseChainOfThought
         : false;
   const effectiveAssistantMaxChainOfThoughtDepth = normalizeAssistantMaxChainOfThoughtDepth(settings.assistantMaxChainOfThoughtDepth);
+  const effectiveAssistantRequestRateLimitPerMinute = normalizeAssistantRequestRateLimitPerMinute(settings.assistantRequestRateLimitPerMinute);
   const assistantConfiguredApiKey = settings.assistantApiKey.trim();
-  const assistantProviderSupportsRemoteMcp = getAssistantSupportsRemoteMcp(settings.assistantProvider);
   const activeEditorTabNode: any = activeEditorTabId ? layoutModel.getNodeById(activeEditorTabId) : null;
   const activeEditorTabItemId =
     activeEditorTabNode?.getComponent?.() === 'editor'
@@ -3202,6 +6365,26 @@ export default function App() {
       ? activeEditorTabNode.getConfig().itemId
       : null;
   const activeEditorTabItem = activeEditorTabItemId ? files.find(f => f.id === activeEditorTabItemId) : null;
+
+  useEffect(() => {
+    if (!fileTreeContextMenu) return;
+
+    const closeMenu = () => setFileTreeContextMenu(null);
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') closeMenu();
+    };
+
+    window.addEventListener('pointerdown', closeMenu);
+    window.addEventListener('resize', closeMenu);
+    window.addEventListener('scroll', closeMenu, true);
+    window.addEventListener('keydown', handleKeyDown);
+    return () => {
+      window.removeEventListener('pointerdown', closeMenu);
+      window.removeEventListener('resize', closeMenu);
+      window.removeEventListener('scroll', closeMenu, true);
+      window.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [fileTreeContextMenu]);
 
   const createSharedEditorTarget = useCallback((tabId: string, itemId: string): SharedEditorTarget => {
     sharedEditorVersionRef.current += 1;
@@ -3523,7 +6706,11 @@ export default function App() {
     if (editorRef.current !== editor) return;
     if (editor.getModel?.()?.getLanguageId?.() !== 'csharp') return;
 
-    csharpAuthoring.csharpService.setupEditor(editor);
+    csharpAuthoring.csharpService.setupEditor(editor, () => (
+      toProjectSourceFiles(getProjectRunnableFiles())
+        .filter(file => file.language === 'csharp')
+        .map(file => ({ path: file.path, content: file.content, language: 'csharp' as const }))
+    ));
   }, [ensureCSharpAuthoringReady]);
 
   const refreshCxxDiagnostics = useCallback(async () => {
@@ -3647,25 +6834,62 @@ export default function App() {
 
   // Helper to get full path
   const getPath = (id: string | undefined): string => {
-    if (!id) return '';
-    const item = files.find(f => f.id === id);
-    if (!item) return '';
-    if (!item.parentId) return item.name;
-    return `${getPath(item.parentId)}/${item.name}`;
+    return getFsItemPath(files, id);
   };
+
+  useEffect(() => {
+    configureCodeCraftTypeScriptDefaults();
+
+    const nextModelUris = new Set<string>();
+    for (const item of files) {
+      if (item.type !== 'file') continue;
+
+      const uri = getMonacoProjectModelUri(getPath(item.id));
+      const uriKey = uri.toString();
+      const language = item.language || langFromFilename(item.name);
+      const content = item.content || '';
+      const existingModel = monaco.editor.getModel(uri);
+
+      nextModelUris.add(uriKey);
+      if (!existingModel) {
+        monaco.editor.createModel(content, language, uri);
+        continue;
+      }
+
+      if (existingModel.getLanguageId() !== language) {
+        monaco.editor.setModelLanguage(existingModel, language);
+      }
+      if (existingModel.getValue() !== content) {
+        existingModel.setValue(content);
+      }
+    }
+
+    for (const uriKey of monacoProjectModelUrisRef.current) {
+      if (nextModelUris.has(uriKey)) continue;
+      monaco.editor.getModel(monaco.Uri.parse(uriKey))?.dispose();
+    }
+    monacoProjectModelUrisRef.current = nextModelUris;
+  }, [files]);
+
+  useEffect(() => () => {
+    for (const uriKey of monacoProjectModelUrisRef.current) {
+      monaco.editor.getModel(monaco.Uri.parse(uriKey))?.dispose();
+    }
+    monacoProjectModelUrisRef.current.clear();
+  }, []);
 
   function getProjectRunnableFiles() {
     return files
       .filter((item): item is FSItem & { type: 'file' } => (
         item.type === 'file'
-        && normalizeProjectFileLanguage(item.language) !== null
+        && getProjectFileLanguageForRuntime(item) !== null
       ))
       .sort((left, right) => getPath(left.id).localeCompare(getPath(right.id)));
   }
 
   function getActiveRunnableFile() {
     if (activeItem?.type !== 'file') return null;
-    const runtimeLanguage = normalizeProjectRuntimeLanguage(activeItem.language);
+    const runtimeLanguage = getProjectRuntimeLanguageForFile(activeItem);
     if (!runtimeLanguage) return null;
     if (isCxxRuntimeLanguage(runtimeLanguage) && !isCxxSourcePath(activeItem.name)) return null;
     return activeItem;
@@ -3673,98 +6897,7 @@ export default function App() {
 
   function getResolvedProjectRun(): ResolvedProjectRun {
     const runnableFiles = getProjectRunnableFiles();
-    const fixedLanguage = getProjectRunModeLanguage(settings.projectRunMode);
-
-    const selectedFiles = settings.projectRunMode === 'custom'
-      ? runnableFiles.filter(file => settings.projectRunCustomFileIds.includes(file.id))
-      : runnableFiles.filter(file => isProjectRunModeFileMatch(file, fixedLanguage));
-
-    if (selectedFiles.length === 0) {
-      return {
-        mode: settings.projectRunMode,
-        language: fixedLanguage,
-        selectedFiles,
-        entryCandidates: [],
-        entryFile: null,
-        error: settings.projectRunMode === 'custom'
-          ? 'Custom project run has no files selected.'
-          : `No ${getProjectRuntimeLanguageLabel(fixedLanguage)} files are available for project run.`,
-      };
-    }
-
-    const selectedLanguageSet = new Set<ProjectFileLanguage>(
-      selectedFiles
-        .map(file => normalizeProjectFileLanguage(file.language))
-        .filter((language): language is ProjectFileLanguage => language !== null)
-    );
-
-    let resolvedLanguage: ProjectRuntimeLanguage | null = fixedLanguage;
-    if (!resolvedLanguage) {
-      const hasHtml = selectedLanguageSet.has('html');
-      const runtimeLanguages = [...selectedLanguageSet]
-        .filter((language): language is ProjectRuntimeLanguage => language !== 'css');
-      const cxxOnly = selectedFiles.every(file => isCxxProjectFile(file));
-
-      if (hasHtml) {
-        const unsupportedRuntimeLanguages = runtimeLanguages.filter(language => language !== 'html' && language !== 'javascript');
-        if (unsupportedRuntimeLanguages.length === 0) {
-          resolvedLanguage = 'html';
-        } else {
-          return {
-            mode: settings.projectRunMode,
-            language: null,
-            selectedFiles,
-            entryCandidates: [],
-            entryFile: null,
-            error: 'HTML custom project runs can only be combined with selected JavaScript and CSS files.',
-          };
-        }
-      } else if (selectedLanguageSet.has('css')) {
-        if (runtimeLanguages.length === 0) {
-          return {
-            mode: settings.projectRunMode,
-            language: null,
-            selectedFiles,
-            entryCandidates: [],
-            entryFile: null,
-            error: 'Custom project run with CSS needs an HTML entry file.',
-          };
-        }
-        return {
-          mode: settings.projectRunMode,
-          language: null,
-          selectedFiles,
-          entryCandidates: [],
-          entryFile: null,
-          error: 'CSS files can only be combined with HTML in a custom project run.',
-        };
-      } else if (cxxOnly) {
-        resolvedLanguage = getCxxResolvedRuntimeLanguage(selectedFiles);
-      } else if (runtimeLanguages.length === 1) {
-        resolvedLanguage = runtimeLanguages[0];
-      }
-    }
-
-    const isHtmlAssetRun =
-      resolvedLanguage === 'html'
-      && [...selectedLanguageSet].every(language => language === 'html' || language === 'javascript' || language === 'css');
-    const isCxxAssetRun =
-      isCxxRuntimeLanguage(resolvedLanguage)
-      && selectedFiles.every(file => isCxxProjectFile(file));
-    if (!resolvedLanguage || selectedLanguageSet.size > 1 && !isHtmlAssetRun && !isCxxAssetRun) {
-      return {
-        mode: settings.projectRunMode,
-        language: null,
-        selectedFiles,
-        entryCandidates: [],
-        entryFile: null,
-        error: 'Project run requires files from a single supported language, except HTML with JS/CSS assets or C/C++ source/header sets.',
-      };
-    }
-
-    const entryCandidates = selectedFiles.filter(file => isCxxRuntimeLanguage(resolvedLanguage)
-      ? isCxxEntryCandidate(file, resolvedLanguage)
-      : normalizeProjectRuntimeLanguage(file.language) === resolvedLanguage);
+    const entryCandidates = runnableFiles.filter(isProjectRunEntryCandidate);
     const activeRunnableFile = activeFileId
       ? entryCandidates.find(file => file.id === activeFileId) ?? null
       : null;
@@ -3773,20 +6906,127 @@ export default function App() {
       : null;
     const entryFile = configuredEntry ?? activeRunnableFile ?? entryCandidates[0] ?? null;
 
+    if (!entryFile) {
+      return {
+        language: null,
+        includedFiles: [],
+        entryCandidates,
+        entryFile: null,
+        error: 'Project run could not determine an entry file.',
+      };
+    }
+
+    const includedFiles = getProjectRunFilesForEntry(entryFile, runnableFiles);
+    const selectedLanguageSet = new Set<ProjectFileLanguage>(
+      includedFiles
+        .map(file => getProjectFileLanguageForRuntime(file))
+        .filter((language): language is ProjectFileLanguage => language !== null)
+    );
+    const selectedRuntimeLanguageSet = new Set<ProjectRuntimeLanguage>(
+      includedFiles
+        .map(file => getProjectRuntimeLanguageForFile(file))
+        .filter((language): language is ProjectRuntimeLanguage => language !== null)
+    );
+
+    if (selectedLanguageSet.has('css') && !includedFiles.some(file => isHtmlProjectFile(file) || isTsxProjectFile(file))) {
+      return {
+        language: null,
+        includedFiles,
+        entryCandidates,
+        entryFile: null,
+        error: 'Project run with CSS needs an HTML or TSX entry file.',
+      };
+    }
+
+    if (includedFiles.length === 0 || !includedFiles.some(file => file.id === entryFile.id)) {
+      return {
+        language: null,
+        includedFiles,
+        entryCandidates,
+        entryFile,
+        error: 'Project run could not include the configured entry file.',
+      };
+    }
+
+    const entryKind = getProjectRunEntryKind(entryFile);
+    if (entryKind === 'html' || entryKind === 'tsx') {
+      if (!includedFiles.every(isHtmlTsxProjectRunCompatibleFile)) {
+        return {
+          language: null,
+          includedFiles,
+          entryCandidates,
+          entryFile,
+          error: 'HTML and TSX entry files can only be combined with included HTML, TSX, JavaScript, TypeScript, and CSS files.',
+        };
+      }
+
+      return {
+        language: entryKind === 'html' ? 'html' : 'javascript',
+        includedFiles,
+        entryCandidates,
+        entryFile,
+        error: null,
+      };
+    }
+
+    if (entryKind === 'javascript' || entryKind === 'typescript') {
+      if (!includedFiles.every(isJavaScriptOrPlainTypeScriptProjectFile)) {
+        return {
+          language: null,
+          includedFiles,
+          entryCandidates,
+          entryFile,
+          error: 'JavaScript and TypeScript entry files can only be combined with included JavaScript and TypeScript files.',
+        };
+      }
+
+      return {
+        language: 'javascript',
+        includedFiles,
+        entryCandidates,
+        entryFile,
+        error: null,
+      };
+    }
+
+    let resolvedLanguage: ProjectRuntimeLanguage | null = getProjectRuntimeLanguageForFile(entryFile);
+    if (!resolvedLanguage) {
+      const runtimeLanguages = [...selectedRuntimeLanguageSet];
+      const cxxOnly = includedFiles.every(file => isCxxProjectFile(file));
+
+      if (cxxOnly) {
+        resolvedLanguage = getCxxResolvedRuntimeLanguage(includedFiles);
+      } else if (runtimeLanguages.length === 1) {
+        resolvedLanguage = runtimeLanguages[0];
+      }
+    }
+
+    const isCxxAssetRun =
+      isCxxRuntimeLanguage(resolvedLanguage)
+      && includedFiles.every(file => isCxxProjectFile(file));
+    if (!resolvedLanguage || selectedRuntimeLanguageSet.size > 1 && !isCxxAssetRun) {
+      return {
+        language: null,
+        includedFiles,
+        entryCandidates,
+        entryFile,
+        error: 'Project run requires files from a single supported language, except HTML/TSX web projects or C/C++ source/header sets.',
+      };
+    }
+
     return {
-      mode: settings.projectRunMode,
       language: resolvedLanguage,
-      selectedFiles,
+      includedFiles,
       entryCandidates,
       entryFile,
-      error: entryFile ? null : 'Project run could not determine an entry file.',
+      error: null,
     };
   }
 
   const toProjectSourceFiles = (projectFiles: FSItem[]): ProjectSourceFile[] => (
     projectFiles
       .map((file) => {
-        const language = normalizeProjectFileLanguage(file.language);
+        const language = getProjectFileLanguageForRuntime(file);
         if (!language) return null;
         return {
           id: file.id,
@@ -3800,7 +7040,6 @@ export default function App() {
       .sort((left, right) => left.path.localeCompare(right.path))
   );
 
-  const projectRunnableFiles = getProjectRunnableFiles();
   const resolvedProjectRun = getResolvedProjectRun();
   const activeRunnableFile = getActiveRunnableFile();
   const canRunCurrentFile = !isRunning && activeRunnableFile !== null;
@@ -4178,48 +7417,38 @@ export default function App() {
     return () => { cancelled = true; };
   }, []);
 
+  useEffect(() => {
+    const timeoutId = window.setTimeout(() => {
+      setProjects(touchProjectUpdatedAt(activeProjectId));
+    }, 500);
+    return () => window.clearTimeout(timeoutId);
+  }, [activeProjectId, assistantChats, files, settings, syncMeta]);
+
   // Save settings to localStorage
   useEffect(() => {
-    localStorage.setItem(STORAGE_KEYS.settings, JSON.stringify(settings));
+    localStorage.setItem(getProjectStorageKey(STORAGE_KEYS.settings), JSON.stringify(settings));
   }, [settings]);
 
   useEffect(() => {
     const nextRunnableFiles = getProjectRunnableFiles();
-    const runnableIds = new Set(nextRunnableFiles.map(file => file.id));
+    const entryCandidateIds = nextRunnableFiles
+      .filter(isProjectRunEntryCandidate)
+      .map(file => file.id);
 
     setSettings(current => {
-      const nextCustomFileIds = current.projectRunCustomFileIds.filter(id => runnableIds.has(id));
-      const modeLanguage = getProjectRunModeLanguage(current.projectRunMode);
-      const selectedIds = current.projectRunMode === 'custom'
-        ? nextCustomFileIds
-        : nextRunnableFiles
-          .filter(file => normalizeProjectRuntimeLanguage(file.language) === modeLanguage)
-          .map(file => file.id);
-      const selectedEntryIds = current.projectRunMode === 'custom'
-        ? (() => {
-          const selectedCustomFiles = nextRunnableFiles.filter(file => selectedIds.includes(file.id));
-          return getProjectEntryCandidateIds(selectedCustomFiles, null);
-        })()
-        : getProjectEntryCandidateIds(nextRunnableFiles.filter(file => selectedIds.includes(file.id)), modeLanguage);
-
       const preferredEntryId =
-        current.projectRunEntryFileId && selectedEntryIds.includes(current.projectRunEntryFileId)
+        current.projectRunEntryFileId && entryCandidateIds.includes(current.projectRunEntryFileId)
           ? current.projectRunEntryFileId
-          : selectedEntryIds.includes(activeFileId)
+          : entryCandidateIds.includes(activeFileId)
             ? activeFileId
-            : selectedEntryIds[0] ?? null;
+            : entryCandidateIds[0] ?? null;
 
-      if (
-        nextCustomFileIds.length === current.projectRunCustomFileIds.length
-        && nextCustomFileIds.every((id, index) => id === current.projectRunCustomFileIds[index])
-        && preferredEntryId === current.projectRunEntryFileId
-      ) {
+      if (preferredEntryId === current.projectRunEntryFileId) {
         return current;
       }
 
       return {
         ...current,
-        projectRunCustomFileIds: nextCustomFileIds,
         projectRunEntryFileId: preferredEntryId,
       };
     });
@@ -4230,11 +7459,16 @@ export default function App() {
       setSettingsPipPackages(loadSavedPipPackages());
       setSettingsPipIncludedModules(loadSavedPipIncludedModules());
       setSettingsPyiImportSizeLimitOverrides(loadSavedPyiImportSizeLimitOverrides());
+      setSettingsNpmInstalledPackages(loadSavedNpmInstalledPackages());
+      setSettingsJavaScriptIncludedModules(loadSavedJavaScriptIncludedModules());
       setSettingsCSharpNamespaces(loadSavedCSharpNamespaces());
       setSettingsPipStatus('');
       setSettingsPipIncludeStatus('');
       setSettingsPyiImportSizeLimitStatus('');
+      setSettingsNpmPackageStatus('');
+      setSettingsJavaScriptModuleStatus('');
       setSettingsCSharpNamespaceStatus('');
+      setSettingsUserDataStatus('');
     }
   }, [isSettingsOpen]);
 
@@ -4283,7 +7517,7 @@ export default function App() {
     if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
     saveTimerRef.current = setTimeout(() => {
       if (settings.autoSave) {
-        localStorage.setItem(STORAGE_KEYS.files, JSON.stringify(filesRef.current));
+        localStorage.setItem(getProjectStorageKey(STORAGE_KEYS.files), JSON.stringify(filesRef.current));
       }
       for (const folderId of syncHandlesRef.current.keys()) {
         if (!syncInitializedRef.current.has(folderId)) continue;
@@ -4294,11 +7528,11 @@ export default function App() {
   }, [files, settings.autoSave]);
 
   useEffect(() => {
-    localStorage.setItem(STORAGE_KEYS.assistantChats, JSON.stringify(assistantChats));
+    localStorage.setItem(getProjectStorageKey(STORAGE_KEYS.assistantChats), JSON.stringify(assistantChats));
   }, [assistantChats]);
 
   useEffect(() => {
-    localStorage.setItem(STORAGE_KEYS.layout, JSON.stringify(layoutModel.toJson()));
+    localStorage.setItem(getProjectStorageKey(STORAGE_KEYS.layout), JSON.stringify(layoutModel.toJson()));
   }, []);
 
   useEffect(() => {
@@ -4326,13 +7560,43 @@ export default function App() {
   }, [assistantChats]);
 
   useEffect(() => {
+    const chatIds = new Set(assistantChats.map(chat => chat.id));
+    setAssistantAttachmentsByChatId(prev => {
+      let changed = false;
+      const next: Record<string, AssistantAttachmentFile[]> = {};
+      for (const chatId of chatIds) {
+        next[chatId] = prev[chatId] || [];
+      }
+      for (const chatId of Object.keys(prev)) {
+        if (!chatIds.has(chatId)) changed = true;
+      }
+      for (const chatId of chatIds) {
+        if (prev[chatId] === undefined) changed = true;
+      }
+      return changed ? next : prev;
+    });
+    setAssistantAttachmentStatusByChatId(prev => {
+      const next: Record<string, string> = {};
+      let changed = false;
+      for (const chatId of chatIds) {
+        if (prev[chatId]) next[chatId] = prev[chatId];
+      }
+      for (const chatId of Object.keys(prev)) {
+        if (!chatIds.has(chatId)) changed = true;
+      }
+      return changed ? next : prev;
+    });
+  }, [assistantChats]);
+
+  useEffect(() => {
     const draftChats = assistantChats
       .map(chat => ({
         chatId: chat.id,
         chat,
         draft: (assistantInputs[chat.id] || '').trim(),
+        attachments: assistantAttachmentsByChatId[chat.id] || [],
       }))
-      .filter(entry => entry.draft.length > 0);
+      .filter(entry => entry.draft.length > 0 || entry.attachments.length > 0);
 
     const draftChatIds = new Set(draftChats.map(entry => entry.chatId));
     setAssistantTokenEstimates(prev => {
@@ -4371,14 +7635,15 @@ export default function App() {
             ? settings.assistantUseChainOfThought
             : false;
       const estimateHasAssistantTools = getAssistantSupportsLocalTools(estimateProvider, estimateModel);
-      draftChats.forEach(({ chatId, chat, draft }) => {
+      draftChats.forEach(({ chatId, chat, draft, attachments }) => {
         const projectedOutputTokens = assistantTurnUsageByChatId[chatId]?.outputTokenCount || DEFAULT_ASSISTANT_ESTIMATED_OUTPUT_TOKENS;
         const assistantFiles = files.map(file => ({ ...file }));
         const assistantActiveItemId = activeItem?.id || activeFileId || '';
+        const userContent = `${draft}${selectionContext}${formatAssistantAttachmentPromptSection(attachments)}`;
         const prompt = buildAssistantPromptFromSnapshot({
           chatId,
           messages: chat.messages,
-          userContent: draft + selectionContext,
+          userContent,
           assistantFiles,
           assistantActiveItemId,
           assistantTerminalCwd: terminalCwd,
@@ -4471,6 +7736,7 @@ export default function App() {
     settings.assistantProvider,
     settings.assistantShowUsagePopup,
     settings.assistantUseChainOfThought,
+    assistantAttachmentsByChatId,
     terminalCwd,
     effectiveAssistantMaxChainOfThoughtDepth,
   ]);
@@ -4608,6 +7874,51 @@ export default function App() {
     const liveAssistantProgress = assistantLiveNotes.length > 0
       ? `\nAssistant Messages Already Shown This Turn:\n${assistantLiveNotes.map((note, index) => `${index + 1}. ${note}`).join('\n')}\nContinue from there and avoid repeating the same message word-for-word.`
       : '';
+    const projectFileItems = assistantFiles
+      .filter((file): file is FSItem & { type: 'file' } => file.type === 'file')
+      .map(file => ({
+        file,
+        path: getPathFromSnapshot(file.id),
+        language: file.language || langFromFilename(file.name),
+        content: file.content || '',
+      }))
+      .sort((left, right) => left.path.localeCompare(right.path));
+    const projectTree = assistantFiles
+      .map(file => `- Path: ${getPathFromSnapshot(file.id)}, Type: ${file.type}, Language: ${file.language || 'N/A'}`)
+      .join('\n');
+    const maxProjectContextFiles = 30;
+    const maxProjectContextChars = 80000;
+    const maxProjectContextCharsPerFile = 16000;
+    let remainingProjectContextChars = maxProjectContextChars;
+    let omittedProjectFileCount = 0;
+    const projectFileContents = projectFileItems.flatMap(({ file, path, language, content }, index) => {
+      if (remainingProjectContextChars <= 0 || index >= maxProjectContextFiles) {
+        omittedProjectFileCount += 1;
+        return [];
+      }
+      const pathOverhead = path.length + language.length + 120;
+      const fileBudget = Math.max(0, Math.min(maxProjectContextCharsPerFile, remainingProjectContextChars - pathOverhead));
+      if (fileBudget <= 0) {
+        omittedProjectFileCount += 1;
+        return [];
+      }
+      const truncated = content.length > fileBudget;
+      const visibleContent = truncated
+        ? `${content.slice(0, fileBudget)}\n... [truncated ${content.length - fileBudget} character${content.length - fileBudget === 1 ? '' : 's'}]`
+        : content;
+      remainingProjectContextChars -= visibleContent.length + pathOverhead;
+      const escapedPath = path.replace(/"/g, '&quot;');
+      const activeAttribute = file.id === assistantActiveItemId ? ' active="true"' : '';
+      return [`<project_file path="${escapedPath}" language="${language}"${activeAttribute}>\n${visibleContent}\n</project_file>`];
+    }).join('\n\n');
+    const projectWorkspaceContext = `
+        Project Workspace:
+        ${projectTree || '(empty)'}
+
+        Project File Contents:
+        ${projectFileContents || '(no file contents available)'}
+        ${omittedProjectFileCount > 0 ? `\n        (${omittedProjectFileCount} additional project file${omittedProjectFileCount === 1 ? '' : 's'} omitted from this prompt budget.)` : ''}
+    `;
 
     if (useChainOfThought && hasAssistantTools) {
       return `
@@ -4615,13 +7926,15 @@ export default function App() {
         Internal Chat ID: ${chatId}
         Keep continuity with the existing chat history for this chat.
         You are in tool-driven Chain of Thought mode.
-        Use the discrete MCP-style terminal tools to inspect the project one command at a time instead of assuming unseen files or folders.
+        Use the discrete local terminal tools to inspect the project one command at a time instead of assuming unseen files or folders.
         When you want to change code, use 'proposeEdit' so the user can review it.
         Keep user-facing explanations separate from tool and edit logs.
         If you need more context, discover it through the available terminal tools.
         You have at most ${maxChainOfThoughtDepth} tool rounds available for this turn, so prioritize your steps.
 
         Current terminal working directory: ${assistantTerminalCwd ? `/${getPathFromSnapshot(assistantTerminalCwd)}` : '/'}
+        ${projectWorkspaceContext}
+
         Active Item: ${activeSnapshotItem ? getPathFromSnapshot(activeSnapshotItem.id) : 'None selected'}
         ${activeSnapshotItem ? (activeSnapshotItem.type === 'file' ? `Active file content:\n${activeSnapshotItem.content || ''}` : 'The active item is a folder.') : 'No file is currently active.'}
 
@@ -4639,10 +7952,34 @@ export default function App() {
         Context: You are an AI coding assistant inside CodeCraft IDE.
         Internal Chat ID: ${chatId}
         Keep continuity with the existing chat history for this chat.
-        The selected provider/model supports reasoning, but CodeCraft cannot expose its local MCP-style tools through this provider/model.
+        The selected provider/model supports reasoning, but CodeCraft cannot expose its local tools through this provider/model.
         Reason carefully, keep conclusions user-facing, and avoid claiming you changed files unless a tool is available to do it.
 
         Current terminal working directory: ${assistantTerminalCwd ? `/${getPathFromSnapshot(assistantTerminalCwd)}` : '/'}
+        ${projectWorkspaceContext}
+
+        Active Item: ${activeSnapshotItem ? getPathFromSnapshot(activeSnapshotItem.id) : 'None selected'}
+        ${activeSnapshotItem ? (activeSnapshotItem.type === 'file' ? `Active file content:\n${activeSnapshotItem.content || ''}` : 'The active item is a folder.') : 'No file is currently active.'}
+
+        Chat History:
+        ${history || '(empty)'}
+        ${toolProgress}
+        ${liveAssistantProgress}
+
+        USER: ${userContent}
+      `;
+    }
+
+    if (!hasAssistantTools) {
+      return `
+        Context: You are an AI coding assistant inside CodeCraft IDE.
+        Internal Chat ID: ${chatId}
+        Keep continuity with the existing chat history for this chat.
+        CodeCraft cannot expose its local tools through this provider/model, so answer from the visible workspace context below and avoid claiming you changed files.
+
+        Current terminal working directory: ${assistantTerminalCwd ? `/${getPathFromSnapshot(assistantTerminalCwd)}` : '/'}
+        ${projectWorkspaceContext}
+
         Active Item: ${activeSnapshotItem ? getPathFromSnapshot(activeSnapshotItem.id) : 'None selected'}
         ${activeSnapshotItem ? (activeSnapshotItem.type === 'file' ? `Active file content:\n${activeSnapshotItem.content || ''}` : 'The active item is a folder.') : 'No file is currently active.'}
 
@@ -4668,8 +8005,7 @@ export default function App() {
         If you need the contents of another file before editing it, navigate to it first. On the next tool round in the same turn, the updated active item and its content will be shown to you.
         If more than one action is needed, emit all needed tool calls in order in the same response instead of stopping after the first action.
 
-        Current File System:
-        ${assistantFiles.map(file => `- Path: ${getPathFromSnapshot(file.id)}, Type: ${file.type}, Language: ${file.language || 'N/A'}`).join('\n')}
+        ${projectWorkspaceContext}
 
         Active Item: ${activeSnapshotItem ? getPathFromSnapshot(activeSnapshotItem.id) : 'None selected'}
         ${activeSnapshotItem ? (activeSnapshotItem.type === 'file' ? `Content:\n${activeSnapshotItem.content || ''}` : 'This is a folder.') : 'No file is currently active.'}
@@ -5012,44 +8348,105 @@ json.dumps(_result)
     return String(response ?? '').replace(/\r\n/g, '\n').split('\n');
   };
 
-  const buildJavaScriptProjectUrlMap = (projectFiles: ProjectSourceFile[]) => {
-    const javascriptFiles = projectFiles.filter(file => file.language === 'javascript');
+  const buildJavaScriptProjectUrlMap = async (projectFiles: ProjectSourceFile[]) => {
+    const importableFileByPath = new Map<string, ProjectSourceFile>();
+    for (const file of toProjectSourceFiles(getProjectRunnableFiles())) {
+      importableFileByPath.set(file.path, file);
+    }
+    for (const file of projectFiles) {
+      importableFileByPath.set(file.path, file);
+    }
+
+    const importableFiles = [...importableFileByPath.values()];
+    const cssFiles = importableFiles.filter(isCssProjectFile);
+    const selectedJavaScriptPaths = new Set(projectFiles.filter(isJavaScriptRuntimeProjectFile).map(file => file.path));
+    const rawJavaScriptFiles = await Promise.all(importableFiles
+      .filter(isJavaScriptRuntimeProjectFile)
+      .map(async file => ({
+        ...file,
+        content: await transpileTypeScriptProjectFile(file),
+      })));
+    const scriptPaths = new Set(rawJavaScriptFiles.map(file => file.path));
+    const styleFiles = new Map(cssFiles.map(file => [file.path, file]));
+    const javascriptFiles = rawJavaScriptFiles.map(file => ({
+      ...file,
+      content: rewriteJavaScriptModuleSpecifiers(file.content, file.path, scriptPaths, styleFiles),
+    }));
     const urlByPath = new Map<string, string>();
+    const cssUrlByPath = new Map<string, string>();
 
     for (const file of javascriptFiles) {
       urlByPath.set(
         file.path,
-        `data:text/javascript;charset=utf-8,${encodeURIComponent(file.content)}`
+        createJavaScriptDataUrl(file.content)
       );
     }
 
-    const scopes: Record<string, Record<string, string>> = {};
-    for (const file of javascriptFiles) {
-      const importerUrl = urlByPath.get(file.path);
-      if (!importerUrl) continue;
-
-      const scopedImports: Record<string, string> = {};
-      for (const specifier of extractJavaScriptModuleSpecifiers(file.content)) {
-        if (isExternalProjectResourceSpecifier(specifier)) continue;
-        const resolvedPath = resolveProjectRelativePath(file.path, stripProjectResourceSuffix(specifier));
-        const resolvedUrl = urlByPath.get(resolvedPath);
-        if (!resolvedUrl) continue;
-        scopedImports[specifier] = resolvedUrl;
-      }
-
-      if (Object.keys(scopedImports).length > 0) {
-        scopes[importerUrl] = scopedImports;
-      }
+    for (const file of cssFiles) {
+      cssUrlByPath.set(
+        file.path,
+        createJavaScriptDataUrl(createJavaScriptStyleModuleSource(file))
+      );
     }
 
-    return { urlByPath, scopes };
+    const imports = await getJavaScriptRuntimeImportMapImports();
+    for (const file of javascriptFiles) {
+      const fileUrl = urlByPath.get(file.path);
+      if (!fileUrl) continue;
+      imports[getRuntimeProjectModuleSpecifier(file.path)] = fileUrl;
+    }
+    for (const file of cssFiles) {
+      const fileUrl = cssUrlByPath.get(file.path);
+      if (!fileUrl) continue;
+      imports[getRuntimeProjectModuleSpecifier(file.path)] = fileUrl;
+    }
+
+    return {
+      urlByPath,
+      scopes: {},
+      imports,
+      files: javascriptFiles.filter(file => selectedJavaScriptPaths.has(file.path)),
+      cssFiles,
+    };
   };
 
-  const buildJavaScriptProjectPreview = (
+  const buildJavaScriptProjectPreview = async (
     projectFiles: ProjectSourceFile[],
     entryFile: ProjectSourceFile
   ) => {
-    const { urlByPath, scopes } = buildJavaScriptProjectUrlMap(projectFiles);
+    const {
+      urlByPath,
+      scopes,
+      imports,
+      cssFiles: transformedCssFiles,
+    } = await buildJavaScriptProjectUrlMap(projectFiles);
+    const isTsxEntry = isTsxProjectFile(entryFile);
+    const entryUrl = urlByPath.get(entryFile.path) || '';
+    const selectedCssPaths = new Set(projectFiles.filter(isCssProjectFile).map(file => file.path));
+    const cssFiles = isTsxProjectFile(entryFile)
+      ? transformedCssFiles.filter(file => selectedCssPaths.has(file.path))
+      : [];
+    const cssAssetTags = cssFiles.map(file => (
+      `  <style data-codecraft-css="${escapeHtml(file.path)}">\n/* ${escapeHtmlRawTextElement(file.path)} */\n${escapeHtmlRawTextElement(file.content)}\n  </style>`
+    )).join('\n');
+    const rootMarkup = isTsxEntry ? '  <div id="root"></div>\n' : '';
+    const autoRenderTsxEntry = isTsxEntry
+      ? `
+      const renderTsxEntryExport = (value) => {
+        if (value == null) return false;
+        let root = document.getElementById('root');
+        if (!root) {
+          root = document.createElement('div');
+          root.id = 'root';
+          document.body.prepend(root);
+        }
+        globalThis.ReactDOM.createRoot(root).render(value);
+        return true;
+      };
+      if (!renderTsxEntryExport(entryModule.default)) {
+        renderTsxEntryExport(entryModule.App);
+      }`
+      : '';
 
     const runnerHtml = `<!DOCTYPE html>
 <html lang="en">
@@ -5065,10 +8462,16 @@ json.dumps(_result)
       color: #e5e7eb;
       font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     }
+    #root {
+      min-height: 100vh;
+    }
   </style>
-  <script type="importmap">${JSON.stringify({ imports: {}, scopes })}</script>
+${cssAssetTags}
+  ${getOutputPreviewBrowserApiShimScriptTag()}
+  <script type="importmap">${JSON.stringify({ imports, scopes })}</script>
 </head>
 <body>
+${rootMarkup}
   <script type="module">
     const formatValue = (value) => {
       if (typeof value === 'string') return value;
@@ -5133,7 +8536,7 @@ json.dumps(_result)
     };
 
     document.documentElement.appendChild(host);
-    appendLine('status', 'Running JavaScript project: ${escapeHtml(entryFile.path)}');
+    appendLine('status', 'Running JavaScript / TypeScript project: ${escapeHtml(entryFile.path)}');
 
     const originalConsole = window.console;
     window.console = {
@@ -5158,8 +8561,9 @@ json.dumps(_result)
     });
 
     try {
-      await import(${JSON.stringify(urlByPath.get(entryFile.path) || '')});
-      appendLine('status', 'JavaScript project finished.');
+      const entryModule = await import(${JSON.stringify(entryUrl)});
+${autoRenderTsxEntry}
+      appendLine('status', 'JavaScript / TypeScript project finished.');
     } catch (error) {
       appendLine('error', error?.stack || error?.message || String(error));
     }
@@ -5177,10 +8581,22 @@ json.dumps(_result)
     projectFiles: ProjectSourceFile[],
     entryFile: ProjectSourceFile
   ) => {
+    const isTsxEntry = isTsxProjectFile(entryFile);
+    const cssFiles = isTsxEntry ? projectFiles.filter(isCssProjectFile) : [];
+    const htmlFiles = isTsxEntry ? projectFiles.filter(isHtmlProjectFile) : [];
+    const details = [
+      cssFiles.length > 0 ? `${cssFiles.length} selected CSS file(s) applied` : '',
+      htmlFiles.length > 0 ? `${htmlFiles.length} selected HTML file(s) available as alternate entry pages` : '',
+    ].filter(Boolean);
+
     setExecutionStartupStatus('');
-    setOutput(`JavaScript project running from ${entryFile.path}. Console output appears in the Output preview.`);
+    setOutput(
+      details.length > 0
+        ? `JavaScript / TypeScript project running from ${entryFile.path}. ${details.join('. ')}. Console output appears in the Output preview.`
+        : `JavaScript / TypeScript project running from ${entryFile.path}. Console output appears in the Output preview.`
+    );
     selectDockPanel('output');
-    const preview = buildJavaScriptProjectPreview(projectFiles, entryFile);
+    const preview = await buildJavaScriptProjectPreview(projectFiles, entryFile);
     showOutputPreview(preview.html, preview.objectUrls);
   };
 
@@ -5188,20 +8604,26 @@ json.dumps(_result)
     projectFiles: ProjectSourceFile[],
     entryFile: ProjectSourceFile
   ) => {
-    const buildHtmlProjectPreview = () => {
-      const cssFiles = projectFiles.filter(file => file.language === 'css');
-      const javascriptFiles = projectFiles.filter(file => file.language === 'javascript');
-      if (cssFiles.length === 0 && javascriptFiles.length === 0) {
-        return { html: entryFile.content, objectUrls: [] };
-      }
-
+    const buildHtmlProjectPreview = async () => {
+      const {
+        urlByPath: javascriptUrlByPath,
+        scopes: javascriptScopes,
+        imports: javascriptImports,
+        files: javascriptFiles,
+        cssFiles: transformedCssFiles,
+      } = await buildJavaScriptProjectUrlMap(projectFiles);
+      const selectedCssPaths = new Set(projectFiles.filter(isCssProjectFile).map(file => file.path));
+      const cssFiles = transformedCssFiles.filter(file => selectedCssPaths.has(file.path));
       const cssByPath = new Map(cssFiles.map(file => [file.path, file]));
       const javascriptByPath = new Map(javascriptFiles.map(file => [file.path, file]));
-      const { urlByPath: javascriptUrlByPath, scopes: javascriptScopes } = buildJavaScriptProjectUrlMap(javascriptFiles);
+      const javascriptPathSet = new Set(javascriptFiles.map(file => file.path));
       const appliedCssPaths = new Set<string>();
       const appliedJavaScriptPaths = new Set<string>();
       const parser = new DOMParser();
       const document = parser.parseFromString(entryFile.content, 'text/html');
+      const browserApiShim = document.createElement('script');
+      browserApiShim.textContent = getOutputPreviewBrowserApiShimSource();
+      document.head.prepend(browserApiShim);
 
       const createStyleElement = (file: ProjectSourceFile, source: string) => {
         const style = document.createElement('style');
@@ -5245,10 +8667,10 @@ json.dumps(_result)
       }
 
       const javascriptScopeKeys = Object.keys(javascriptScopes);
-      if (javascriptScopeKeys.length > 0) {
+      if (javascriptScopeKeys.length > 0 || Object.keys(javascriptImports).length > 0) {
         const importMap = document.createElement('script');
         importMap.type = 'importmap';
-        importMap.textContent = JSON.stringify({ imports: {}, scopes: javascriptScopes });
+        importMap.textContent = JSON.stringify({ imports: javascriptImports, scopes: javascriptScopes });
         document.head.prepend(importMap);
       }
 
@@ -5256,7 +8678,7 @@ json.dumps(_result)
         const src = script.getAttribute('src') || '';
         if (isExternalProjectResourceSpecifier(src)) continue;
 
-        const resolvedPath = resolveProjectRelativePath(entryFile.path, stripProjectResourceSuffix(src));
+        const resolvedPath = resolveProjectScriptPath(entryFile.path, src, javascriptPathSet);
         const javascriptFile = javascriptByPath.get(resolvedPath);
         const scriptUrl = javascriptFile ? javascriptUrlByPath.get(javascriptFile.path) : '';
         if (!javascriptFile || !scriptUrl) {
@@ -5285,15 +8707,16 @@ json.dumps(_result)
         document.body.appendChild(createScriptElement(javascriptFile, 'selection'));
       }
 
+      const html = `<!DOCTYPE html>\n${document.documentElement.outerHTML}`;
       return {
-        html: `<!DOCTYPE html>\n${document.documentElement.outerHTML}`,
+        html,
         objectUrls: [],
       };
     };
 
-    const htmlFiles = projectFiles.filter(file => file.language === 'html');
-    const cssFiles = projectFiles.filter(file => file.language === 'css');
-    const javascriptFiles = projectFiles.filter(file => file.language === 'javascript');
+    const htmlFiles = projectFiles.filter(isHtmlProjectFile);
+    const cssFiles = projectFiles.filter(isCssProjectFile);
+    const javascriptFiles = projectFiles.filter(isJavaScriptRuntimeProjectFile);
     const details = [
       htmlFiles.length > 1
         ? `${htmlFiles.length - 1} additional HTML file(s) remain available as alternate entry pages`
@@ -5302,7 +8725,7 @@ json.dumps(_result)
         ? `${cssFiles.length} selected CSS file(s) applied`
         : '',
       javascriptFiles.length > 0
-        ? `${javascriptFiles.length} selected JavaScript file(s) available to the page`
+        ? `${javascriptFiles.length} selected JavaScript/TypeScript file(s) available to the page`
         : '',
     ].filter(Boolean);
 
@@ -5313,7 +8736,7 @@ json.dumps(_result)
         : `Previewing ${entryFile.path}.`
     );
     selectDockPanel('output');
-    const preview = buildHtmlProjectPreview();
+    const preview = await buildHtmlProjectPreview();
     showOutputPreview(preview.html, preview.objectUrls);
   };
 
@@ -8265,18 +11688,24 @@ finally:
   };
 
   const handleRun = async () => {
-    const currentFile = activeRunnableFile;
+    const currentFile = activeRunnableFile?.type === 'file'
+      ? activeRunnableFile as FSItem & { type: 'file' }
+      : null;
     if (!currentFile) {
       clearOutputPreview();
       setExecutionStartupStatus('');
-      setOutput('Error: Select a runnable Java, C, C++, C#, Python, HTML, or JavaScript source file first.');
+      setOutput('Error: Select a runnable Java, C, C++, C#, Python, HTML, JavaScript, or TypeScript source file first.');
       return;
     }
 
     await runWithExecutionLifecycle(async () => {
-      const runtimeLanguage = normalizeProjectRuntimeLanguage(currentFile.language);
-      const projectFiles = toProjectSourceFiles([currentFile]);
-      const entryFile = projectFiles[0] ?? null;
+      await runPackageJsonDependencySync();
+
+      const runtimeLanguage = getProjectRuntimeLanguageForFile(currentFile);
+      const runnableFiles = getProjectRunnableFiles();
+      const compatibleFiles = getProjectRunFilesForEntry(currentFile, runnableFiles);
+      const projectFiles = toProjectSourceFiles(compatibleFiles.length > 0 ? compatibleFiles : [currentFile]);
+      const entryFile = projectFiles.find(file => file.id === currentFile.id) ?? projectFiles[0] ?? null;
 
       if (!runtimeLanguage || !entryFile) {
         clearOutputPreview();
@@ -8286,14 +11715,30 @@ finally:
       }
 
       if (runtimeLanguage === 'javascript') {
-        clearOutputPreview();
-        await runJavaScript(entryFile.content);
+        if (isTypeScriptProjectFile(entryFile)) {
+          const compiledContent = await transpileTypeScriptProjectFile(entryFile);
+          if (projectFiles.length > 1 || /\.tsx$/i.test(entryFile.path) || containsJavaScriptModuleSyntax(compiledContent)) {
+            await runJavaScriptProject(projectFiles, entryFile);
+          } else {
+            clearOutputPreview();
+            await runJavaScript(compiledContent);
+          }
+        } else if (projectFiles.length > 1 || containsJavaScriptModuleSyntax(entryFile.content)) {
+          await runJavaScriptProject(projectFiles, entryFile);
+        } else {
+          clearOutputPreview();
+          await runJavaScript(entryFile.content);
+        }
         return;
       }
 
       if (runtimeLanguage === 'python') {
         clearOutputPreview();
-        await runPython(entryFile.content);
+        if (projectFiles.length > 1) {
+          await runPythonProject(projectFiles, entryFile);
+        } else {
+          await runPython(entryFile.content);
+        }
         return;
       }
 
@@ -8304,7 +11749,11 @@ finally:
 
       if (runtimeLanguage === 'csharp') {
         clearOutputPreview();
-        await runCSharp(entryFile.content, entryFile.id);
+        if (projectFiles.length > 1) {
+          await runCSharpProject(projectFiles, entryFile);
+        } else {
+          await runCSharp(entryFile.content, entryFile.id);
+        }
         return;
       }
 
@@ -8322,12 +11771,12 @@ finally:
 
       clearOutputPreview();
       setExecutionStartupStatus('');
-      setOutput(`Error: No local runtime available for ${runtimeLanguage}. Supported: HTML, JavaScript, Python, C#, C, C++, and Java.`);
+      setOutput(`Error: No local runtime available for ${runtimeLanguage}. Supported: HTML, JavaScript, TypeScript, Python, C#, C, C++, and Java.`);
     });
   };
 
   const handleProjectRun = async () => {
-    const selectedFiles = resolvedProjectRun.selectedFiles;
+    const includedFiles = resolvedProjectRun.includedFiles;
     const entryItem = resolvedProjectRun.entryFile;
     const runtimeLanguage = resolvedProjectRun.language;
     const runError = resolvedProjectRun.error;
@@ -8340,13 +11789,15 @@ finally:
     }
 
     await runWithExecutionLifecycle(async () => {
-      const projectFiles = toProjectSourceFiles(selectedFiles);
+      await runPackageJsonDependencySync();
+
+      const projectFiles = toProjectSourceFiles(includedFiles);
       const entryFile = projectFiles.find(file => file.id === entryItem.id) ?? null;
 
       if (!entryFile) {
         clearOutputPreview();
         setExecutionStartupStatus('');
-        setOutput('Error: The configured entry file is no longer part of the selected project run files.');
+        setOutput('Error: The configured entry file is no longer part of the included project run files.');
         return;
       }
 
@@ -8386,7 +11837,7 @@ finally:
 
       clearOutputPreview();
       setExecutionStartupStatus('');
-      setOutput(`Error: No local runtime available for ${runtimeLanguage}. Supported: HTML, JavaScript, Python, C#, C, C++, and Java.`);
+      setOutput(`Error: No local runtime available for ${runtimeLanguage}. Supported: HTML, JavaScript, TypeScript, Python, C#, C, C++, and Java.`);
     });
   };
 
@@ -8406,6 +11857,105 @@ finally:
         ? { ...chat, messages: [...chat.messages, message] }
         : chat
     ));
+  };
+
+  const collectWorkspaceAssistantAttachments = (itemId: string): UploadedProjectFile[] => {
+    const currentFiles = filesRef.current;
+    const item = currentFiles.find(candidate => candidate.id === itemId);
+    if (!item) return [];
+
+    const collectFiles = (rootId: string): UploadedProjectFile[] => {
+      const root = currentFiles.find(candidate => candidate.id === rootId);
+      if (!root) return [];
+      if (root.type === 'file') {
+        return [{
+          path: getFsItemPath(currentFiles, root.id),
+          content: root.content || '',
+        }];
+      }
+
+      return currentFiles
+        .filter(candidate => candidate.parentId === root.id)
+        .flatMap(child => collectFiles(child.id));
+    };
+
+    return collectFiles(item.id).sort((left, right) => left.path.localeCompare(right.path));
+  };
+
+  const addAssistantAttachments = (chatId: string, uploadedFiles: UploadedProjectFile[], source: AssistantAttachmentFile['source']) => {
+    const attachments = uploadedFiles
+      .map(file => ({
+        id: createFsItemId(),
+        path: normalizeAssistantAttachmentPath(file.path),
+        content: file.content,
+        source,
+      }))
+      .filter(file => file.path);
+
+    if (attachments.length === 0) {
+      setAssistantAttachmentStatusByChatId(prev => ({
+        ...prev,
+        [chatId]: 'No readable files were found.',
+      }));
+      return;
+    }
+
+    setAssistantAttachmentsByChatId(prev => {
+      const existing = prev[chatId] || [];
+      const byPath = new Map(existing.map(file => [file.path, file]));
+      for (const attachment of attachments) {
+        byPath.set(attachment.path, attachment);
+      }
+      return {
+        ...prev,
+        [chatId]: [...byPath.values()].sort((left, right) => left.path.localeCompare(right.path)),
+      };
+    });
+    setAssistantAttachmentStatusByChatId(prev => ({
+      ...prev,
+      [chatId]: `Attached ${attachments.length} file${attachments.length === 1 ? '' : 's'}.`,
+    }));
+  };
+
+  const addAssistantAttachmentsFromDataTransfer = async (chatId: string, dataTransfer: DataTransfer) => {
+    try {
+      if (hasFileDataTransferPayload(dataTransfer)) {
+        const uploadedFiles = await readUploadedProjectFilesFromDataTransfer(dataTransfer);
+        addAssistantAttachments(chatId, uploadedFiles, 'upload');
+        return;
+      }
+
+      const draggedItemId = dataTransfer.getData('text/plain');
+      if (draggedItemId) {
+        const workspaceFiles = collectWorkspaceAssistantAttachments(draggedItemId);
+        addAssistantAttachments(chatId, workspaceFiles, 'workspace');
+        return;
+      }
+
+      setAssistantAttachmentStatusByChatId(prev => ({
+        ...prev,
+        [chatId]: 'Drop files, folders, or explorer items to attach them.',
+      }));
+    } catch (err) {
+      setAssistantAttachmentStatusByChatId(prev => ({
+        ...prev,
+        [chatId]: `Attachment failed: ${err instanceof Error ? err.message : String(err)}`,
+      }));
+    } finally {
+      setDraggedItemId(null);
+    }
+  };
+
+  const removeAssistantAttachment = (chatId: string, attachmentId: string) => {
+    setAssistantAttachmentsByChatId(prev => ({
+      ...prev,
+      [chatId]: (prev[chatId] || []).filter(file => file.id !== attachmentId),
+    }));
+  };
+
+  const clearAssistantAttachments = (chatId: string) => {
+    setAssistantAttachmentsByChatId(prev => ({ ...prev, [chatId]: [] }));
+    setAssistantAttachmentStatusByChatId(prev => ({ ...prev, [chatId]: '' }));
   };
 
   const autoNameAssistantChat = (prompt: string) => {
@@ -8439,6 +11989,8 @@ finally:
       messages: []
     }]);
     setAssistantInputs(prev => ({ ...prev, [chatId]: '' }));
+    setAssistantAttachmentsByChatId(prev => ({ ...prev, [chatId]: [] }));
+    setAssistantAttachmentStatusByChatId(prev => ({ ...prev, [chatId]: '' }));
 
     openAssistantChatTab(chatId);
   };
@@ -8543,7 +12095,7 @@ finally:
     };
 
     collectLayoutState(jsonModel.layout);
-    localStorage.setItem(STORAGE_KEYS.layout, JSON.stringify(jsonModel));
+    localStorage.setItem(getProjectStorageKey(STORAGE_KEYS.layout), JSON.stringify(jsonModel));
     if (assistantChatIds.size > 0) {
       setAssistantChats(prev => {
         const existingIds = new Set(prev.map(chat => chat.id));
@@ -8726,23 +12278,28 @@ finally:
   const handleChatSubmit = async (chatId: string, e: React.FormEvent) => {
     e.preventDefault();
     const input = (assistantInputs[chatId] || '').trim();
-    if (!input || loadingAssistantChatId) return;
+    const submittedAttachments = assistantAttachmentsByChatId[chatId] || [];
+    if ((!input && submittedAttachments.length === 0) || loadingAssistantChatId) return;
 
     const currentChat = assistantChats.find(chat => chat.id === chatId);
     if (!currentChat) return;
 
     if (currentChat.messages.length === 0 && currentChat.name === DEFAULT_ASSISTANT_CHAT_NAME) {
-      const suggestedName = autoNameAssistantChat(input);
+      const suggestedName = autoNameAssistantChat(input || submittedAttachments[0]?.path || 'Attached files');
       if (suggestedName !== DEFAULT_ASSISTANT_CHAT_NAME) {
         updateAssistantTabName(chatId, suggestedName);
       }
     }
 
     const selectionContext = getCurrentAssistantSelectionContext();
+    const attachmentPromptSection = formatAssistantAttachmentPromptSection(submittedAttachments);
+    const visibleUserContent = `${input || '(sent attached files)'}${formatAssistantAttachmentSummary(submittedAttachments)}`;
+    const submittedUserContent = `${input}${selectionContext}${attachmentPromptSection}`;
 
-    const userMsg: ChatMessage = { role: 'user', content: input + selectionContext };
-    appendAssistantMessage(chatId, { role: 'user', content: input });
+    const userMsg: ChatMessage = { role: 'user', content: submittedUserContent };
+    appendAssistantMessage(chatId, { role: 'user', content: visibleUserContent });
     setAssistantInputs(prev => ({ ...prev, [chatId]: '' }));
+    clearAssistantAttachments(chatId);
     setLoadingAssistantChatId(chatId);
 
     try {
@@ -8826,6 +12383,17 @@ finally:
         toolProgressNotes,
         assistantLiveNotes,
       });
+
+      const waitForAssistantRequestRateLimit = async () => {
+        if (effectiveAssistantRequestRateLimitPerMinute <= 0) return;
+        const intervalMs = 60_000 / effectiveAssistantRequestRateLimitPerMinute;
+        const now = Date.now();
+        const waitMs = Math.max(0, assistantRequestRateNextSlotAtRef.current - now);
+        if (waitMs > 0) {
+          await new Promise(resolve => window.setTimeout(resolve, waitMs));
+        }
+        assistantRequestRateNextSlotAtRef.current = Date.now() + intervalMs;
+      };
 
       const emitAssistantLiveMessage = (content: string) => {
         const trimmed = content.trim();
@@ -9304,7 +12872,9 @@ finally:
           const helpLines = [
             'Standard commands: ls, pwd, cd, mkdir, touch, open, cat, rm, clear, help, date, echo, whoami',
             'Python: pip install <package> [-force] | pip upgrade <package> [-version <ver>] | pip uninstall <package> | pip include <module> | pip list',
+            'JavaScript/TypeScript: npm install <package...> | npm uninstall <package...> | npm include <module> [url] | npm remove <module> | npm list',
             'C#: nuget include <namespace> | nuget list',
+            'JavaScript/TypeScript: use Run or Project Run on .js, .jsx, .ts, and .tsx files',
             'C/C++: use Run or Project Run on .c, .cpp, .cc, .cxx, and matching header files',
             'Java: use Run or Project Run on .java files',
           ];
@@ -9372,6 +12942,42 @@ finally:
           return runRawTerminalCommand('pip list', 'Listed installed Python packages.', 'Listed installed Python packages.');
         }
 
+        if (call.name === 'npmInstall') {
+          const packageName = typeof args.packageName === 'string' ? args.packageName.trim() : '';
+          if (!packageName) {
+            return { summary: 'npm install needs a package name.', detail: 'npm install needs a package name.', result: { ok: false } };
+          }
+          const packageSpecs = getNpmPackageArgs(parseTerminalArgs(packageName));
+          const command = `npm install ${(packageSpecs.length > 0 ? packageSpecs : [packageName]).map(quoteTerminalArg).join(' ')}`;
+          return runRawTerminalCommand(command, `Executed \`${command}\`.`, `Executed ${command}.`);
+        }
+
+        if (call.name === 'npmInclude') {
+          const moduleName = typeof args.moduleName === 'string' ? args.moduleName.trim() : '';
+          if (!moduleName) {
+            return { summary: 'npm include needs a module name.', detail: 'npm include needs a module name.', result: { ok: false } };
+          }
+          const urlSegment = typeof args.url === 'string' && args.url.trim()
+            ? ` ${quoteTerminalArg(args.url.trim())}`
+            : '';
+          const command = `npm include ${quoteTerminalArg(moduleName)}${urlSegment}`;
+          return runRawTerminalCommand(command, `Executed \`${command}\`.`, `Executed ${command}.`);
+        }
+
+        if (call.name === 'npmList') {
+          return runRawTerminalCommand('npm list', 'Listed installed npm packages and included JavaScript modules.', 'Listed installed npm packages and included JavaScript modules.');
+        }
+
+        if (call.name === 'npmUninstall') {
+          const packageName = typeof args.packageName === 'string' ? args.packageName.trim() : '';
+          if (!packageName) {
+            return { summary: 'npm uninstall needs a package name.', detail: 'npm uninstall needs a package name.', result: { ok: false } };
+          }
+          const packageSpecs = getNpmPackageArgs(parseTerminalArgs(packageName));
+          const command = `npm uninstall ${(packageSpecs.length > 0 ? packageSpecs : [packageName]).map(quoteTerminalArg).join(' ')}`;
+          return runRawTerminalCommand(command, `Executed \`${command}\`.`, `Executed ${command}.`);
+        }
+
         if (call.name === 'nugetInclude') {
           const namespaceName = typeof args.namespaceName === 'string' ? args.namespaceName.trim() : '';
           if (!namespaceName) {
@@ -9391,8 +12997,6 @@ finally:
           result: { ok: false },
         };
       };
-
-      const assistantRemoteMcpTool = buildAssistantRemoteMcpTool(provider, settings);
 
       const geminiThinkingConfig = (() => {
         if (!effectiveAssistantUseChainOfThought && getAssistantReasoningControl(provider, model) === 'always_on') {
@@ -9416,6 +13020,7 @@ finally:
         const contents: any[] = [{ role: 'user', parts: [{ text: promptForPass }] }];
 
         for (let pass = 0; pass < maxAssistantToolPasses; pass++) {
+          await waitForAssistantRequestRateLimit();
           const response = await ai.models.generateContent({
             model,
             contents,
@@ -9492,16 +13097,14 @@ finally:
           const payload: any = {
             model,
             input: nextInput,
-            tools: [
-              ...assistantTools.map(toOpenAIToolDefinition),
-              ...(assistantRemoteMcpTool ? [assistantRemoteMcpTool] : []),
-            ],
+            tools: assistantTools.map(toOpenAIToolDefinition),
           };
           if (previousResponseId) payload.previous_response_id = previousResponseId;
           if (getAssistantReasoningControl(provider, model) !== 'always_off') {
             payload.reasoning = { effort: effectiveAssistantUseChainOfThought ? 'medium' : 'none' };
           }
 
+          await waitForAssistantRequestRateLimit();
           const response = await fetch('https://api.openai.com/v1/responses', {
             method: 'POST',
             headers: {
@@ -9583,13 +13186,11 @@ finally:
           const payload: any = {
             model,
             input: nextInput,
-            tools: [
-              ...assistantTools.map(toOpenAIToolDefinition),
-              ...(assistantRemoteMcpTool ? [assistantRemoteMcpTool] : []),
-            ],
+            tools: assistantTools.map(toOpenAIToolDefinition),
           };
           if (previousResponseId) payload.previous_response_id = previousResponseId;
 
+          await waitForAssistantRequestRateLimit();
           const response = await fetch(config.endpoint, {
             method: 'POST',
             headers: {
@@ -9678,6 +13279,7 @@ finally:
             payload.tool_choice = 'auto';
           }
 
+          await waitForAssistantRequestRateLimit();
           const response = await fetch(config.endpoint, {
             method: 'POST',
             headers: {
@@ -9762,6 +13364,7 @@ finally:
             payload.thinking = { type: 'enabled', budget_tokens: 2048 };
           }
 
+          await waitForAssistantRequestRateLimit();
           const response = await fetch('https://api.anthropic.com/v1/messages', {
             method: 'POST',
             headers: {
@@ -9832,12 +13435,208 @@ finally:
         }
       };
 
+      const runCursorAgentsLoop = async () => {
+        const readCursorResponse = async (response: Response) => {
+          const text = await response.text();
+          return {
+            text,
+            json: text ? safeJsonParse(text) : {},
+          };
+        };
+
+        const getCursorErrorMessage = (json: any, text: string, fallback: string) => {
+          const error = json?.error && typeof json.error === 'object' ? json.error : json;
+          const message = typeof error?.message === 'string' && error.message.trim()
+            ? error.message.trim()
+            : text.trim();
+          const code = typeof error?.code === 'string' && error.code.trim()
+            ? error.code.trim()
+            : '';
+          if (message && code) return `[${code}] ${message}`;
+          return message || fallback;
+        };
+
+        const cursorRequest = async (
+          path: string,
+          init: RequestInit,
+          fallbackErrorMessage: string,
+        ) => {
+          await waitForAssistantRequestRateLimit();
+          const response = await fetch(buildDelegatedRequestUrl(`${CURSOR_AGENTS_API_BASE_URL}${path}`), {
+            ...init,
+            headers: {
+              'Authorization': `Bearer ${apiKey}`,
+              ...(init.body ? { 'Content-Type': 'application/json' } : {}),
+              ...(init.headers || {}),
+            },
+          });
+          const body = await readCursorResponse(response);
+          if (!response.ok) {
+            throw new Error(getCursorErrorMessage(body.json, body.text, fallbackErrorMessage));
+          }
+          return body.json;
+        };
+
+        const sleep = (ms: number) => new Promise(resolve => window.setTimeout(resolve, ms));
+
+        const launchCursorAgent = async (promptText: string, passIndex: number) => {
+          const branchSuffix = `${Date.now().toString(36)}-${passIndex + 1}`;
+          const createPayload: any = {
+            prompt: { text: promptText },
+            source: {
+              repository: CURSOR_AGENTS_GITHUB_REPOSITORY_URL,
+            },
+            target: {
+              autoCreatePr: false,
+              branchName: `codecraft/local-ide-bridge-${branchSuffix}`,
+            },
+          };
+          if (model.trim()) createPayload.model = model.trim();
+
+          const createJson = await cursorRequest(
+            '/v0/agents',
+            { method: 'POST', body: JSON.stringify(createPayload) },
+            'Cursor Agents request failed.',
+          );
+          const agentId = createJson?.id;
+          if (typeof agentId !== 'string' || !agentId.trim()) {
+            throw new Error('Cursor Agents request did not return an agent id.');
+          }
+          return agentId;
+        };
+
+        const waitForCursorAgent = async (agentId: string) => {
+          const startedAt = Date.now();
+          let lastStatus: any = null;
+          while (Date.now() - startedAt < CURSOR_AGENT_STATUS_TIMEOUT_MS) {
+            const statusJson = await cursorRequest(
+              `/v0/agents/${encodeURIComponent(agentId)}`,
+              { method: 'GET' },
+              'Cursor Agents status request failed.',
+            );
+            lastStatus = statusJson;
+            const status = typeof statusJson?.status === 'string' ? statusJson.status : '';
+            if (status === 'FINISHED') return statusJson;
+            if (status === 'ERROR' || status === 'EXPIRED') {
+              const summary = typeof statusJson?.summary === 'string' ? statusJson.summary.trim() : '';
+              throw new Error(summary || `Cursor Agent ended with status ${status}.`);
+            }
+            await sleep(CURSOR_AGENT_STATUS_POLL_INTERVAL_MS);
+          }
+
+          const statusLabel = typeof lastStatus?.status === 'string' ? ` Last status: ${lastStatus.status}.` : '';
+          throw new Error(`Cursor Agent timed out before completing.${statusLabel}`);
+        };
+
+        const readCursorConversation = async (agentId: string) => {
+          const conversationJson = await cursorRequest(
+            `/v0/agents/${encodeURIComponent(agentId)}/conversation`,
+            { method: 'GET' },
+            'Cursor Agents conversation request failed.',
+          );
+          const assistantMessages = (Array.isArray(conversationJson?.messages) ? conversationJson.messages : [])
+            .filter((message: any) => message?.type === 'assistant_message' && typeof message?.text === 'string')
+            .map((message: any) => String(message.text).trim())
+            .filter(Boolean);
+          return assistantMessages[assistantMessages.length - 1] || '';
+        };
+
+        const deleteCursorAgent = async (agentId: string) => {
+          try {
+            await cursorRequest(
+              `/v0/agents/${encodeURIComponent(agentId)}`,
+              { method: 'DELETE' },
+              'Cursor Agents delete request failed.',
+            );
+          } catch {
+            // Best-effort cleanup only; the local IDE state has already been updated.
+          }
+        };
+
+        const runCursorAgentPrompt = async (promptText: string, passIndex: number) => {
+          const agentId = await launchCursorAgent(promptText, passIndex);
+          try {
+            const statusJson = await waitForCursorAgent(agentId);
+            const conversationText = await readCursorConversation(agentId);
+            const summaryText = typeof statusJson?.summary === 'string' ? statusJson.summary.trim() : '';
+            return conversationText || summaryText;
+          } finally {
+            await deleteCursorAgent(agentId);
+          }
+        };
+
+        let cursorExecutedLocalTools = false;
+        for (let pass = 0; pass < maxAssistantToolPasses; pass++) {
+          const promptForRun = buildAssistantPrompt();
+          const cursorPromptForRun = `
+            Repository isolation rule:
+            Cursor's public Background Agents API requires a GitHub repository source, but CodeCraft must not use that repository as the editing target. Treat the attached repository as a placeholder transport requirement only. Do not read, inspect, list, search, open, clone, diff, checkout, branch, commit, push, edit, delete, create pull requests for, or otherwise access that repository or any GitHub repository.
+
+            Local IDE tool bridge:
+            ${buildCursorLocalToolBridgeInstruction(assistantTools)}
+
+            CodeCraft task context:
+            ${promptForRun}
+          `;
+
+          const assistantText = (await runCursorAgentPrompt(cursorPromptForRun, pass)).trim();
+          const bridgeResponse = parseCursorLocalToolBridgeResponse(assistantText);
+          const visibleText = bridgeResponse
+            ? (
+              bridgeResponse.message
+              || (bridgeResponse.consumedEntireResponse ? '' : stripCursorLocalToolBridgeBlocks(assistantText))
+            ).trim()
+            : assistantText;
+
+          applyAssistantUsage(
+            usageTotals,
+            {},
+            cursorPromptForRun,
+            assistantText,
+          );
+
+          if (visibleText) {
+            emitAssistantLiveMessage(visibleText);
+          }
+
+          const toolCalls = bridgeResponse?.toolCalls || [];
+          if (toolCalls.length === 0) break;
+
+          cursorExecutedLocalTools = true;
+          const passSummaries: string[] = [];
+          const passResults: unknown[] = [];
+          for (const toolCall of toolCalls) {
+            const outcome = await executeAssistantToolCall(toolCall);
+            passSummaries.push(outcome.summary);
+            passResults.push({
+              toolCall,
+              summary: outcome.summary,
+              detail: outcome.detail,
+              result: outcome.result ?? null,
+            });
+          }
+
+          if (passSummaries.length > 0) {
+            emitAssistantLog(`Cursor IDE step ${pass + 1} log:\n${passSummaries.map(summary => `- ${summary}`).join('\n')}`);
+          }
+          if (passResults.length > 0) {
+            toolProgressNotes.push(`Cursor local tool results from step ${pass + 1}:\n${JSON.stringify(passResults, null, 2)}`);
+          }
+        }
+
+        if (cursorExecutedLocalTools && !emittedAssistantMessage) {
+          emitAssistantLiveMessage('I ran the Cursor-requested IDE tool steps. Review the editor changes and tool log above.');
+        }
+      };
+
       if (provider === 'gemini') {
         await runGeminiLoop();
       } else if (provider === 'openai') {
         await runOpenAILoop();
       } else if (provider === 'anthropic') {
         await runAnthropicLoop();
+      } else if (provider === 'cursor') {
+        await runCursorAgentsLoop();
       } else {
         const responsesConfig = getOpenAIResponsesProviderConfig(provider);
         const chatConfig = getOpenAIChatProviderConfig(provider);
@@ -10006,6 +13805,26 @@ finally:
     });
   };
 
+  const getNpmPackageArgs = (rawArgs: string[]) => {
+    const packageArgs: string[] = [];
+    const flagsWithValues = new Set(['--registry', '--tag', '--save-prefix', '--cache', '--prefix']);
+    for (let index = 0; index < rawArgs.length; index += 1) {
+      const arg = rawArgs[index];
+      if (!arg) continue;
+      if (arg === '--') {
+        packageArgs.push(...rawArgs.slice(index + 1).filter(Boolean));
+        break;
+      }
+      if (arg.startsWith('-')) {
+        const flagName = arg.includes('=') ? arg.slice(0, arg.indexOf('=')) : arg;
+        if (flagsWithValues.has(flagName) && !arg.includes('=')) index += 1;
+        continue;
+      }
+      packageArgs.push(arg);
+    }
+    return packageArgs;
+  };
+
   const confirmNewItem = () => {
     if (!namingState || !namingName.trim()) {
       setNamingState(null);
@@ -10059,6 +13878,73 @@ finally:
     if (toDelete.includes(activeFileId)) {
       setActiveFileId('');
     }
+  };
+
+  const cloneItemIntoParent = (id: string, targetParentId: string | null) => {
+    const currentFiles = filesRef.current;
+    const source = currentFiles.find(item => item.id === id);
+    if (!source) return null;
+
+    const nextFiles = currentFiles.map(item => ({ ...item }));
+    const getPastedName = (name: string, type: FSItem['type'], parentId: string | null) => {
+      const siblingNames = new Set(nextFiles.filter(item => item.parentId === parentId).map(item => item.name));
+      if (!siblingNames.has(name)) return name;
+
+      const dotIndex = type === 'file' ? name.lastIndexOf('.') : -1;
+      const hasExtension = dotIndex > 0;
+      const baseName = hasExtension ? name.slice(0, dotIndex) : name;
+      const extension = hasExtension ? name.slice(dotIndex) : '';
+      const candidateBase = `${baseName} copy`;
+      let candidate = `${candidateBase}${extension}`;
+      let index = 2;
+
+      while (siblingNames.has(candidate)) {
+        candidate = `${candidateBase} ${index}${extension}`;
+        index += 1;
+      }
+
+      return candidate;
+    };
+
+    const cloneRecursively = (item: FSItem, parentId: string | null, isRootClone: boolean): FSItem => {
+      const clone: FSItem = {
+        ...item,
+        id: createFsItemId(),
+        parentId,
+        name: isRootClone ? getPastedName(item.name, item.type, parentId) : item.name,
+      };
+      nextFiles.push(clone);
+
+      if (item.type === 'folder') {
+        currentFiles
+          .filter(child => child.parentId === item.id)
+          .forEach(child => cloneRecursively(child, clone.id, false));
+      }
+
+      return clone;
+    };
+
+    if (targetParentId) {
+      const targetFolder = nextFiles.find(item => item.id === targetParentId && item.type === 'folder');
+      if (!targetFolder) return null;
+      targetFolder.isOpen = true;
+    }
+
+    const clone = cloneRecursively(source, targetParentId, true);
+    setFiles(nextFiles);
+    openEditorTabWithItem(clone);
+    return clone;
+  };
+
+  const duplicateItem = (id: string) => {
+    const source = filesRef.current.find(item => item.id === id);
+    if (!source) return;
+    cloneItemIntoParent(id, source.parentId);
+  };
+
+  const pasteFileTreeClipboardItem = (targetParentId: string | null) => {
+    if (!fileTreeClipboardItemId) return;
+    cloneItemIntoParent(fileTreeClipboardItemId, targetParentId);
   };
 
   const executeTerminalCommand = async (rawCommand: string, clearInputAfter = false) => {
@@ -10818,6 +14704,124 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
       } else {
         setTerminalOutput([...newOutput, 'Usage: pip install <package> [-force] | pip upgrade <package> [-version <ver>] | pip uninstall <package> | pip include <module> | pip list']);
       }
+    } else if (cmd === 'npm' || cmd === 'js' || cmd === 'javascript') {
+      const subCmd = (args[1] || '').toLowerCase();
+      const moduleName = args[2];
+
+      if (subCmd === 'install' || subCmd === 'i') {
+        const packageSpecs = getNpmPackageArgs(args.slice(2));
+        if (packageSpecs.length === 0) {
+          setTerminalOutput([...newOutput, 'Usage: npm install <package...>']);
+        } else {
+          setTerminalOutput([...newOutput, `Installing ${formatNpmPackageListForStatus(packageSpecs)} from npm registry...`]);
+          try {
+            let npmInstallProgressDetailCount = 0;
+            let npmInstallSuppressedProgressCount = 0;
+            const result = await installNpmPackagesFromRegistry(packageSpecs, msg => {
+              const installedMatch = msg.match(/^Installed .* \((\d+) installed,/);
+              const installedCount = installedMatch ? Number(installedMatch[1]) : 0;
+              const fetchMatch = msg.match(/\((\d+) resolved,/);
+              const resolvedCount = fetchMatch ? Number(fetchMatch[1]) : 0;
+              const shouldShowDetail = (
+                npmInstallProgressDetailCount < NPM_INSTALL_PROGRESS_DETAIL_LIMIT
+                || installedCount > 0 && installedCount % 25 === 0
+                || resolvedCount > 0 && resolvedCount % 50 === 0
+                || /complete|error|failed/i.test(msg)
+              );
+              if (shouldShowDetail) {
+                npmInstallProgressDetailCount += 1;
+                const suppressedLine = npmInstallSuppressedProgressCount > 0
+                  ? [`... ${npmInstallSuppressedProgressCount} npm install progress update${npmInstallSuppressedProgressCount === 1 ? '' : 's'} suppressed ...`]
+                  : [];
+                npmInstallSuppressedProgressCount = 0;
+                setTerminalOutput(prev => [...prev, ...suppressedLine, msg]);
+              } else {
+                npmInstallSuppressedProgressCount += 1;
+              }
+            });
+            refreshCodeCraftTypeScriptExtraLibs();
+            setSettingsNpmInstalledPackages(loadSavedNpmInstalledPackages());
+            setTerminalOutput(prev => [
+              ...prev,
+              ...(npmInstallSuppressedProgressCount > 0
+                ? [`... ${npmInstallSuppressedProgressCount} npm install progress update${npmInstallSuppressedProgressCount === 1 ? '' : 's'} suppressed ...`]
+                : []),
+              `npm install complete: ${result.installed.length} package${result.installed.length === 1 ? '' : 's'} installed.`,
+              ...result.skipped.map(note => `Note: skipped ${note}`)
+            ]);
+          } catch (err) {
+            setTerminalOutput(prev => [...prev, `npm install error: ${err instanceof Error ? err.message : String(err)}`]);
+          }
+        }
+      } else if (subCmd === 'include' && moduleName) {
+        const url = args[3];
+        if (!isValidJavaScriptModuleName(moduleName)) {
+          setTerminalOutput([...newOutput, `npm include: invalid module specifier '${moduleName}'`]);
+        } else {
+          setTerminalOutput([
+            ...newOutput,
+            url
+              ? `Including JavaScript module '${moduleName}' from custom URL...`
+              : `Resolving JavaScript module '${moduleName}' through CDN providers...`
+          ]);
+          const moduleInfo = await includeJavaScriptModuleFromProviders(moduleName, url, msg => {
+            setTerminalOutput(prev => [...prev, msg]);
+          });
+          refreshCodeCraftTypeScriptExtraLibs();
+          setSettingsJavaScriptIncludedModules(loadSavedJavaScriptIncludedModules());
+          setTerminalOutput(prev => [
+            ...prev,
+            moduleInfo
+              ? `Included JavaScript module '${moduleInfo.name}' from ${moduleInfo.provider} -> ${moduleInfo.url}`
+              : `npm include: could not include '${moduleName}'. No provider produced an available module URL.`,
+            ...(moduleInfo
+              ? ['Project Run will resolve this module through the import map. The editor will treat it as an available module.']
+              : [])
+          ]);
+        }
+      } else if (subCmd === 'uninstall' && moduleName) {
+        const packageSpecs = getNpmPackageArgs(args.slice(2));
+        const removedPackages: SavedNpmInstalledPackage[] = [];
+        for (const packageSpec of packageSpecs) {
+          const removed = removeSavedNpmInstalledPackage(packageSpec);
+          if (removed) {
+            removedPackages.push(removed);
+            try {
+              await deleteStoredNpmPackage(removed.name, removed.version);
+            } catch { }
+          }
+        }
+        refreshCodeCraftTypeScriptExtraLibs();
+        setSettingsNpmInstalledPackages(loadSavedNpmInstalledPackages());
+        setTerminalOutput([
+          ...newOutput,
+          removedPackages.length > 0
+            ? `Uninstalled npm package${removedPackages.length === 1 ? '' : 's'}: ${removedPackages.map(packageInfo => `${packageInfo.name}@${packageInfo.version}`).join(', ')}.`
+            : `No saved npm package matched ${packageSpecs.join(', ') || moduleName}.`
+        ]);
+      } else if (subCmd === 'remove' && moduleName) {
+        const removed = removeSavedJavaScriptIncludedModule(moduleName);
+        refreshCodeCraftTypeScriptExtraLibs();
+        setSettingsJavaScriptIncludedModules(loadSavedJavaScriptIncludedModules());
+        setTerminalOutput([
+          ...newOutput,
+          removed
+            ? `Removed JavaScript module '${moduleName}'.`
+            : `No saved JavaScript module named '${moduleName}'.`
+        ]);
+      } else if (subCmd === 'list') {
+        const packages = loadSavedNpmInstalledPackages();
+        const modules = loadSavedJavaScriptIncludedModules();
+        setTerminalOutput([
+          ...newOutput,
+          packages.length === 0 ? 'No npm packages installed.' : `Installed npm packages (${packages.length}):`,
+          ...packages.map(packageInfo => `  ${packageInfo.name}@${packageInfo.version} (${packageInfo.fileCount} files, entry ${packageInfo.entry})`),
+          modules.length === 0 ? 'No npm include modules saved.' : `Included JavaScript modules (${modules.length}):`,
+          ...modules.map(moduleInfo => `  ${moduleInfo.name} -> ${moduleInfo.url}`)
+        ]);
+      } else {
+        setTerminalOutput([...newOutput, 'Usage: npm install <package...> | npm uninstall <package...> | npm include <module> [url] | npm remove <module> | npm list']);
+      }
     } else if (cmd === 'nuget') {
       const subCmd = (args[1] || '').toLowerCase();
       const namespaceName = args[2];
@@ -10853,7 +14857,7 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
         setTerminalOutput([...newOutput, 'Usage: nuget include <namespace> | nuget list']);
       }
     } else if (cmd === 'help') {
-      setTerminalOutput([...newOutput, 'Standard commands: ls, pwd, cd, mkdir, touch, open, cat, rm, clear, help, date, echo', 'Python: pip install <package> [-force] | pip upgrade <package> [-version <ver>] | pip uninstall <package> | pip include <module> | pip list', 'C#: nuget include <namespace> | nuget list', 'C/C++: use Run or Project Run on .c, .cpp, .cc, .cxx, and matching header files', 'Java: use Run or Project Run on .java files']);
+      setTerminalOutput([...newOutput, 'Standard commands: ls, pwd, cd, mkdir, touch, open, cat, rm, clear, help, date, echo', 'Python: pip install <package> [-force] | pip upgrade <package> [-version <ver>] | pip uninstall <package> | pip include <module> | pip list', 'JavaScript/TypeScript: npm install <package...> | npm uninstall <package...> | npm include <module> [url] | npm remove <module> | npm list', 'C#: nuget include <namespace> | nuget list', 'JavaScript/TypeScript: use Run or Project Run on .js, .jsx, .ts, and .tsx files', 'C/C++: use Run or Project Run on .c, .cpp, .cc, .cxx, and matching header files', 'Java: use Run or Project Run on .java files']);
     } else if (cmd === 'date') {
       setTerminalOutput([...newOutput, new Date().toLocaleString()]);
     } else if (cmd === 'echo') {
@@ -10887,11 +14891,134 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
     return saved;
   };
 
+  const refreshSettingsNpmInstalledPackages = () => {
+    const saved = loadSavedNpmInstalledPackages();
+    setSettingsNpmInstalledPackages(saved);
+    return saved;
+  };
+
+  const refreshSettingsJavaScriptIncludedModules = () => {
+    const saved = loadSavedJavaScriptIncludedModules();
+    setSettingsJavaScriptIncludedModules(saved);
+    return saved;
+  };
+
   const refreshSettingsCSharpNamespaces = () => {
     const saved = loadSavedCSharpNamespaces();
     setSettingsCSharpNamespaces(saved);
     return saved;
   };
+
+  const runPackageJsonDependencySync = useCallback(async () => {
+    if (packageJsonSyncRunningRef.current) {
+      packageJsonSyncQueuedRef.current = true;
+      return;
+    }
+
+    const plan = collectPackageJsonDependencySyncPlan(filesRef.current);
+    const installedPackages = loadSavedNpmInstalledPackages();
+    const syncFingerprint = JSON.stringify({
+      packageJson: plan.signature,
+      installed: installedPackages.map(packageInfo => [packageInfo.name, packageInfo.version, packageInfo.spec]),
+    });
+    if (syncFingerprint === packageJsonSyncFingerprintRef.current) return;
+    packageJsonSyncFingerprintRef.current = syncFingerprint;
+    if (plan.packageJsonCount === 0) return;
+
+    packageJsonSyncRunningRef.current = true;
+    try {
+      if (plan.invalidFiles.length > 0) {
+        setTerminalOutput(prev => [
+          ...prev,
+          `package.json sync skipped: ${plan.invalidFiles.length} invalid package.json issue${plan.invalidFiles.length === 1 ? '' : 's'} found.`,
+          ...plan.invalidFiles.slice(0, 8).map(issue => `  ${issue.path}: ${issue.message}`),
+          ...(plan.invalidFiles.length > 8 ? [`  ... ${plan.invalidFiles.length - 8} more issue${plan.invalidFiles.length - 8 === 1 ? '' : 's'}`] : [])
+        ]);
+        return;
+      }
+
+      if (plan.conflicts.length > 0) {
+        setTerminalOutput(prev => [
+          ...prev,
+          `package.json sync skipped: conflicting dependency ranges were found across ${plan.packageJsonCount} package.json file${plan.packageJsonCount === 1 ? '' : 's'}.`,
+          ...plan.conflicts.slice(0, 8).map(conflict => `  ${conflict.packageName}: ${conflict.ranges.join(' vs ')} (${conflict.sources.join(', ')})`),
+          ...(plan.conflicts.length > 8 ? [`  ... ${plan.conflicts.length - 8} more conflict${plan.conflicts.length - 8 === 1 ? '' : 's'}`] : [])
+        ]);
+        return;
+      }
+
+      const installedByName = new Map(installedPackages.map(packageInfo => [packageInfo.name, packageInfo]));
+      const specsToInstall = plan.requirements
+        .filter(requirement => {
+          const existing = installedByName.get(requirement.name);
+          if (!existing) return true;
+          return existing.spec !== requirement.spec || !satisfiesNpmRange(existing.version, requirement.range);
+        })
+        .map(requirement => requirement.spec);
+
+      if (specsToInstall.length === 0) {
+        if (plan.unsupportedDependencies.length > 0) {
+          setTerminalOutput(prev => [
+            ...prev,
+            `package.json sync: all supported dependencies are already installed. Skipped ${plan.unsupportedDependencies.length} unsupported dependenc${plan.unsupportedDependencies.length === 1 ? 'y' : 'ies'}.`,
+            ...plan.unsupportedDependencies.slice(0, 6).map(issue => `  ${issue.path}: ${issue.message}`),
+          ]);
+        }
+        return;
+      }
+
+      setTerminalOutput(prev => [
+        ...prev,
+        `package.json sync: installing ${formatNpmPackageListForStatus(specsToInstall)} from npm registry...`,
+        ...(plan.unsupportedDependencies.length > 0
+          ? [`package.json sync: skipped ${plan.unsupportedDependencies.length} unsupported dependenc${plan.unsupportedDependencies.length === 1 ? 'y' : 'ies'}.`]
+          : [])
+      ]);
+
+      let progressDetailCount = 0;
+      let suppressedProgressCount = 0;
+      const result = await installNpmPackagesFromRegistry(specsToInstall, message => {
+        const installedMatch = message.match(/^Installed .* \((\d+) installed,/);
+        const installedCount = installedMatch ? Number(installedMatch[1]) : 0;
+        const shouldShowDetail = (
+          progressDetailCount < 20
+          || installedCount > 0 && installedCount % 25 === 0
+          || /complete|error|failed/i.test(message)
+        );
+        if (shouldShowDetail) {
+          progressDetailCount += 1;
+          const suppressedLine = suppressedProgressCount > 0
+            ? [`... ${suppressedProgressCount} package.json sync progress update${suppressedProgressCount === 1 ? '' : 's'} suppressed ...`]
+            : [];
+          suppressedProgressCount = 0;
+          setTerminalOutput(prev => [...prev, ...suppressedLine, message]);
+        } else {
+          suppressedProgressCount += 1;
+        }
+      });
+
+      refreshCodeCraftTypeScriptExtraLibs();
+      setSettingsNpmInstalledPackages(loadSavedNpmInstalledPackages());
+      setTerminalOutput(prev => [
+        ...prev,
+        ...(suppressedProgressCount > 0
+          ? [`... ${suppressedProgressCount} package.json sync progress update${suppressedProgressCount === 1 ? '' : 's'} suppressed ...`]
+          : []),
+        `package.json sync complete: ${result.installed.length} package${result.installed.length === 1 ? '' : 's'} installed or updated.`,
+        ...result.skipped.map(note => `Note: skipped ${note}`),
+      ]);
+    } catch (err) {
+      packageJsonSyncFingerprintRef.current = '';
+      setTerminalOutput(prev => [...prev, `package.json sync error: ${err instanceof Error ? err.message : String(err)}`]);
+    } finally {
+      packageJsonSyncRunningRef.current = false;
+      if (packageJsonSyncQueuedRef.current) {
+        packageJsonSyncQueuedRef.current = false;
+        packageJsonSyncFingerprintRef.current = '';
+        window.setTimeout(() => void runPackageJsonDependencySync(), 0);
+      }
+    }
+  }, []);
 
   const formatSettingsPyiImportSizeLimit = (maxBytes: number | null) => {
     if (maxBytes == null) {
@@ -10919,6 +15046,33 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
       return refreshSettingsPipIncludedModules();
     } finally {
       setSettingsPipIncludeBusy(false);
+    }
+  };
+
+  const runSettingsNpmPackageCommand = async (command: string) => {
+    setSettingsNpmPackageBusy(true);
+    setSettingsNpmPackageStatus(`Running \`${command}\`. Detailed logs will appear in Terminal.`);
+    try {
+      await executeTerminalCommand(command, false);
+      return refreshSettingsNpmInstalledPackages();
+    } finally {
+      setSettingsNpmPackageBusy(false);
+    }
+  };
+
+  const runSettingsJavaScriptModuleCommand = async (command: string) => {
+    setSettingsJavaScriptModuleBusy(true);
+    setSettingsJavaScriptModuleStatus(`Running \`${command}\`. Detailed logs will appear in Terminal.`);
+    try {
+      const beforeOutputLength = terminalOutputRef.current.length;
+      await executeTerminalCommand(command, false);
+      await new Promise(resolve => window.setTimeout(resolve, 0));
+      return {
+        modules: refreshSettingsJavaScriptIncludedModules(),
+        output: terminalOutputRef.current.slice(beforeOutputLength),
+      };
+    } finally {
+      setSettingsJavaScriptModuleBusy(false);
     }
   };
 
@@ -11052,6 +15206,296 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
     );
   };
 
+  const handleSettingsNpmPackageApply = async () => {
+    const packageSpecs = getNpmPackageArgs(parseTerminalArgs(settingsNpmPackageInput));
+    if (packageSpecs.length === 0) {
+      setSettingsNpmPackageStatus('Enter one or more npm package names first.');
+      return;
+    }
+
+    const invalidPackage = packageSpecs.find(packageSpec => !parseNpmPackageInstallSpec(packageSpec));
+    if (invalidPackage) {
+      setSettingsNpmPackageStatus(`Invalid npm package specifier: ${invalidPackage}`);
+      return;
+    }
+
+    const command = `npm install ${packageSpecs.map(quoteTerminalArg).join(' ')}`;
+    const saved = await runSettingsNpmPackageCommand(command);
+    const installedNames = new Set(saved.map(packageInfo => packageInfo.name));
+    const requestedNames = packageSpecs
+      .map(packageSpec => parseNpmPackageInstallSpec(packageSpec)?.name || '')
+      .filter(Boolean);
+    if (requestedNames.every(name => installedNames.has(name))) {
+      setSettingsNpmPackageStatus(`Installed ${formatNpmPackageListForStatus(requestedNames)}.`);
+      setSettingsNpmPackageInput('');
+    } else {
+      setSettingsNpmPackageStatus('One or more package entries were not added. Check Terminal output for the failure details.');
+    }
+  };
+
+  const handleSettingsNpmPackageRemove = async (packageName: string) => {
+    const saved = await runSettingsNpmPackageCommand(`npm uninstall ${quoteTerminalArg(packageName)}`);
+    if (saved.some(packageInfo => packageInfo.name === packageName)) {
+      setSettingsNpmPackageStatus(`Could not uninstall ${packageName}. Check Terminal output for the failure details.`);
+    } else {
+      setSettingsNpmPackageStatus(`Uninstalled ${packageName}.`);
+    }
+  };
+
+  const handleSettingsJavaScriptModuleApply = async () => {
+    const moduleName = settingsJavaScriptModuleInput.trim();
+    const moduleUrl = settingsJavaScriptModuleUrlInput.trim();
+    if (!moduleName) {
+      setSettingsJavaScriptModuleStatus('Enter a JavaScript module specifier first.');
+      return;
+    }
+    if (!isValidJavaScriptModuleName(moduleName)) {
+      setSettingsJavaScriptModuleStatus(`Invalid JavaScript module specifier: ${moduleName}`);
+      return;
+    }
+
+    const command = `npm include ${quoteTerminalArg(moduleName)}${moduleUrl ? ` ${quoteTerminalArg(moduleUrl)}` : ''}`;
+    const { modules: saved, output } = await runSettingsJavaScriptModuleCommand(command);
+    const moduleInfo = saved.find(entry => entry.name === moduleName);
+    const includeFailed = output.some(line => line.includes(`npm include: could not include '${moduleName}'`));
+    if (moduleInfo && !includeFailed) {
+      setSettingsJavaScriptModuleStatus(`Included ${moduleInfo.name} -> ${moduleInfo.url}.`);
+      setSettingsJavaScriptModuleInput('');
+      setSettingsJavaScriptModuleUrlInput('');
+    } else {
+      setSettingsJavaScriptModuleStatus(`No saved JavaScript module entry was added for ${moduleName}. Check Terminal output for the failure details.`);
+    }
+  };
+
+  const handleSettingsJavaScriptModuleRemove = async (moduleName: string) => {
+    const { modules: saved } = await runSettingsJavaScriptModuleCommand(`npm remove ${quoteTerminalArg(moduleName)}`);
+    if (saved.some(moduleInfo => moduleInfo.name === moduleName)) {
+      setSettingsJavaScriptModuleStatus(`Could not remove ${moduleName}. Check Terminal output for the failure details.`);
+    } else {
+      setSettingsJavaScriptModuleStatus(`Removed saved JavaScript module ${moduleName}.`);
+    }
+  };
+
+  const getLiveUserDataLocalStorageOverrides = () => ({
+    [STORAGE_KEYS.files]: JSON.stringify(filesRef.current),
+    [STORAGE_KEYS.settings]: JSON.stringify(settings),
+    [STORAGE_KEYS.assistantChats]: JSON.stringify(assistantChats),
+    [STORAGE_KEYS.layout]: JSON.stringify(layoutModel.toJson()),
+    [SYNC_META_KEY]: JSON.stringify(syncMeta),
+  });
+
+  const persistCurrentProjectSnapshot = (projectId = activeProjectId) => {
+    const overrides = getLiveUserDataLocalStorageOverrides();
+    for (const [key, value] of Object.entries(overrides)) {
+      localStorage.setItem(getProjectStorageKey(key, projectId), value);
+    }
+    setProjects(touchProjectUpdatedAt(projectId));
+  };
+
+  const switchProject = (projectId: string) => {
+    if (projectId === activeProjectId) {
+      setIsProjectMenuOpen(false);
+      return;
+    }
+    persistCurrentProjectSnapshot(activeProjectId);
+    if (!setActiveProjectId(projectId)) {
+      setProjectMenuStatus('Project no longer exists.');
+      setProjects(loadProjectRegistry());
+      return;
+    }
+    touchProjectUpdatedAt(projectId);
+    setActiveProjectIdState(projectId);
+    setProjectMenuStatus('Switching project...');
+    window.setTimeout(() => window.location.reload(), 100);
+  };
+
+  const startRenamingProject = (project: CodeCraftProjectMeta) => {
+    setRenamingProjectId(project.id);
+    setRenamingProjectName(project.name);
+    setProjectMenuStatus('');
+  };
+
+  const cancelRenamingProject = () => {
+    setRenamingProjectId(null);
+    setRenamingProjectName('');
+  };
+
+  const confirmRenamingProject = () => {
+    if (!renamingProjectId) return;
+
+    const nextName = renamingProjectName.trim();
+    if (!nextName) {
+      cancelRenamingProject();
+      return;
+    }
+
+    const currentProjects = loadProjectRegistry();
+    const renamedProject = currentProjects.find(project => project.id === renamingProjectId);
+    if (!renamedProject) {
+      setProjectMenuStatus('Project no longer exists.');
+      setProjects(loadProjectRegistry());
+      cancelRenamingProject();
+      return;
+    }
+    if (renamedProject.name === nextName) {
+      cancelRenamingProject();
+      return;
+    }
+
+    const uniqueName = getUniqueProjectName(nextName, currentProjects.filter(project => project.id !== renamingProjectId));
+    saveProjectRegistry(currentProjects.map(project => (
+      project.id === renamingProjectId
+        ? { ...project, name: uniqueName, updatedAt: Date.now() }
+        : project
+    )));
+    setProjects(loadProjectRegistry());
+    setProjectMenuStatus(uniqueName === nextName ? 'Renamed project.' : `Renamed project to ${uniqueName}.`);
+    cancelRenamingProject();
+  };
+
+  const handleDeleteProject = async (projectId: string) => {
+    const currentProjects = loadProjectRegistry();
+    const project = currentProjects.find(candidate => candidate.id === projectId);
+    if (!project) {
+      setProjectMenuStatus('Project no longer exists.');
+      setProjects(loadProjectRegistry());
+      return;
+    }
+    if (currentProjects.length <= 1) {
+      setProjectMenuStatus('Keep at least one project.');
+      return;
+    }
+    if (!window.confirm(`Delete project "${project.name}" and its stored data?`)) return;
+
+    if (projectId !== activeProjectId) {
+      persistCurrentProjectSnapshot(activeProjectId);
+    }
+
+    const remainingProjects = currentProjects.filter(candidate => candidate.id !== projectId);
+    saveProjectRegistry(remainingProjects);
+    let cleanupStatus = '';
+    try {
+      await deleteCodeCraftProjectData(projectId);
+    } catch (err) {
+      cleanupStatus = `Deleted project entry, but cleanup failed: ${err instanceof Error ? err.message : String(err)}`;
+    }
+
+    const nextProjects = loadProjectRegistry();
+    setProjects(nextProjects);
+    if (renamingProjectId === projectId) cancelRenamingProject();
+
+    if (projectId === activeProjectId) {
+      const nextProjectId = nextProjects[0]?.id || DEFAULT_PROJECT_ID;
+      setActiveProjectId(nextProjectId);
+      setActiveProjectIdState(nextProjectId);
+      setProjectMenuStatus('Deleted project. Loading another project...');
+      window.setTimeout(() => window.location.reload(), 100);
+      return;
+    }
+
+    setProjectMenuStatus(cleanupStatus || `Deleted ${project.name}.`);
+  };
+
+  const handleCreateProject = () => {
+    persistCurrentProjectSnapshot(activeProjectId);
+    const existingProjects = loadProjectRegistry();
+    const now = Date.now();
+    const project: CodeCraftProjectMeta = {
+      id: createProjectId(),
+      name: getUniqueProjectName('Untitled Project', existingProjects),
+      createdAt: now,
+      updatedAt: now,
+    };
+    saveProjectRegistry([project, ...existingProjects]);
+    setProjects(loadProjectRegistry());
+    setActiveProjectId(project.id);
+    setActiveProjectIdState(project.id);
+    setProjectMenuStatus('Created project. Loading...');
+    window.setTimeout(() => window.location.reload(), 100);
+  };
+
+  const handleImportProjectDataFile = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.currentTarget.files?.[0];
+    event.currentTarget.value = '';
+    if (!file) return;
+
+    persistCurrentProjectSnapshot(activeProjectId);
+    const existingProjects = loadProjectRegistry();
+    const now = Date.now();
+    const project: CodeCraftProjectMeta = {
+      id: createProjectId(),
+      name: getUniqueProjectName(getProjectNameFromDataFileName(file.name), existingProjects),
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    setProjectMenuStatus(`Importing ${file.name}...`);
+    saveProjectRegistry([project, ...existingProjects]);
+    setProjects(loadProjectRegistry());
+    try {
+      const parsed = JSON.parse(await file.text());
+      await restoreCodeCraftUserDataExport(parsed, project.id);
+      setActiveProjectId(project.id);
+      setActiveProjectIdState(project.id);
+      setProjectMenuStatus('Imported project. Loading...');
+      window.setTimeout(() => window.location.reload(), 100);
+    } catch (err) {
+      saveProjectRegistry(loadProjectRegistry().filter(existing => existing.id !== project.id));
+      setProjects(loadProjectRegistry());
+      setProjectMenuStatus(`Project import failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  };
+
+  const handleExportUserData = async () => {
+    setSettingsUserDataBusy(true);
+    setSettingsUserDataStatus('Preparing export...');
+    try {
+      if ((window as any).pyodide) {
+        setSettingsUserDataStatus('Preparing Python runtime cache...');
+        await capturePyodidePackageRestoreSnapshot();
+      } else {
+        await persistPyodidePackageMetaCache();
+      }
+      const backup = await createCodeCraftUserDataExport(getLiveUserDataLocalStorageOverrides());
+      const blob = new Blob([JSON.stringify(backup, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+      link.href = url;
+      link.download = `codecraft-user-data-${timestamp}.json`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+      setSettingsUserDataStatus('Exported complete user data.');
+    } catch (err) {
+      setSettingsUserDataStatus(`Export failed: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      setSettingsUserDataBusy(false);
+    }
+  };
+
+  const handleImportUserDataFile = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.currentTarget.files?.[0];
+    event.currentTarget.value = '';
+    if (!file) return;
+    if (!window.confirm('Importing this backup will replace the current CodeCraft user data in this browser. Continue?')) {
+      return;
+    }
+
+    setSettingsUserDataBusy(true);
+    setSettingsUserDataStatus(`Importing ${file.name}...`);
+    try {
+      const parsed = JSON.parse(await file.text());
+      await restoreCodeCraftUserDataExport(parsed);
+      setSettingsUserDataStatus('Imported complete user data. Reloading...');
+      window.setTimeout(() => window.location.reload(), 500);
+    } catch (err) {
+      setSettingsUserDataStatus(`Import failed: ${err instanceof Error ? err.message : String(err)}`);
+      setSettingsUserDataBusy(false);
+    }
+  };
+
   const handleSettingsCSharpNamespaceApply = async () => {
     const namespaceName = settingsCSharpNamespaceInput.trim();
     if (!namespaceName) {
@@ -11085,6 +15529,142 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
     setFiles(prev => prev.map(f => f.id === id ? { ...f, isOpen: !f.isOpen } : f));
   };
 
+  const openFileTreeContextMenu = (itemId: string | null, clientX: number, clientY: number) => {
+    const menuWidth = 176;
+    const menuHeight = 220;
+    const x = Math.max(8, Math.min(clientX, window.innerWidth - menuWidth - 8));
+    const y = Math.max(8, Math.min(clientY, window.innerHeight - menuHeight - 8));
+    setFileTreeContextMenu({ itemId, x, y });
+  };
+
+  const addUploadedProjectFiles = useCallback((uploadedFiles: UploadedProjectFile[], targetId: string | null) => {
+    const currentFiles = filesRef.current;
+    const targetFolder = targetId
+      ? currentFiles.find(item => item.id === targetId && item.type === 'folder') || null
+      : null;
+    const targetParentId = targetFolder?.id ?? null;
+    const nextFiles = currentFiles.map(item => ({ ...item }));
+    const conflicts: string[] = [];
+    const importedPaths: string[] = [];
+    let firstImportedFileItem: FSItem | null = null;
+
+    const findChild = (parentId: string | null, name: string) => (
+      nextFiles.find(item => item.parentId === parentId && item.name === name)
+    );
+
+    const ensureOpenFolder = (folderId: string) => {
+      const folder = nextFiles.find(item => item.id === folderId && item.type === 'folder');
+      if (folder) folder.isOpen = true;
+    };
+
+    const ensureFolder = (parentId: string | null, name: string, uploadPath: string) => {
+      const existing = findChild(parentId, name);
+      if (existing) {
+        if (existing.type !== 'folder') {
+          conflicts.push(uploadPath);
+          return null;
+        }
+        existing.isOpen = true;
+        return existing.id;
+      }
+
+      const folderId = createFsItemId();
+      nextFiles.push({
+        id: folderId,
+        name,
+        type: 'folder',
+        parentId,
+        isOpen: true,
+      });
+      return folderId;
+    };
+
+    if (targetParentId) ensureOpenFolder(targetParentId);
+
+    for (const uploadedFile of uploadedFiles) {
+      const segments = sanitizeUploadedProjectPath(uploadedFile.path);
+      if (segments.length === 0) continue;
+
+      let parentId: string | null = targetParentId;
+      let canImport = true;
+      for (const folderName of segments.slice(0, -1)) {
+        const folderId = ensureFolder(parentId, folderName, uploadedFile.path);
+        if (!folderId) {
+          canImport = false;
+          break;
+        }
+        parentId = folderId;
+      }
+      if (!canImport) continue;
+
+      const fileName = segments[segments.length - 1];
+      const existing = findChild(parentId, fileName);
+      if (existing?.type === 'folder') {
+        conflicts.push(uploadedFile.path);
+        continue;
+      }
+
+      if (existing?.type === 'file') {
+        existing.content = uploadedFile.content;
+        existing.language = langFromFilename(fileName);
+        firstImportedFileItem ??= existing;
+      } else {
+        const fileId = createFsItemId();
+        const newFile: FSItem = {
+          id: fileId,
+          name: fileName,
+          type: 'file',
+          parentId,
+          content: uploadedFile.content,
+          language: langFromFilename(fileName),
+        };
+        nextFiles.push(newFile);
+        firstImportedFileItem ??= newFile;
+      }
+      importedPaths.push(uploadedFile.path);
+    }
+
+    if (importedPaths.length === 0 && conflicts.length === 0) {
+      setTerminalOutput(prev => [...prev, 'File import: no readable files found.']);
+      return;
+    }
+
+    setFiles(nextFiles);
+    if (firstImportedFileItem) openEditorTabWithItem(firstImportedFileItem);
+    setTerminalOutput(prev => [
+      ...prev,
+      importedPaths.length > 0
+        ? `File import: imported ${importedPaths.length} file${importedPaths.length === 1 ? '' : 's'}.`
+        : 'File import: no files imported.',
+      ...(conflicts.length > 0
+        ? [`File import skipped ${conflicts.length} conflicting path${conflicts.length === 1 ? '' : 's'}: ${formatNpmPackageListForStatus(conflicts)}`]
+        : [])
+    ]);
+  }, [openEditorTabWithItem]);
+
+  const importFilesFromDataTransfer = useCallback(async (targetId: string | null, dataTransfer: DataTransfer) => {
+    try {
+      const uploadedFiles = await readUploadedProjectFilesFromDataTransfer(dataTransfer);
+      addUploadedProjectFiles(uploadedFiles, targetId);
+    } catch (err) {
+      setTerminalOutput(prev => [...prev, `File import error: ${err instanceof Error ? err.message : String(err)}`]);
+    }
+  }, [addUploadedProjectFiles]);
+
+  useEffect(() => {
+    const handleWindowPaste = (event: ClipboardEvent) => {
+      const target = event.target;
+      if (target instanceof Element && target.closest('[data-codecraft-ai-panel="true"]')) return;
+      if (!hasFileDataTransferPayload(event.clipboardData)) return;
+
+      event.preventDefault();
+      void importFilesFromDataTransfer(null, event.clipboardData!);
+    };
+
+    window.addEventListener('paste', handleWindowPaste);
+    return () => window.removeEventListener('paste', handleWindowPaste);
+  }, [importFilesFromDataTransfer]);
+
   const handleDrop = (targetId: string | null) => {
     if (!draggedItemId || draggedItemId === targetId) {
       setDraggedItemId(null);
@@ -11109,8 +15689,9 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
 
   const fileTreeCtx: FileTreeContextValue = {
     files, activeFileId, pendingNewItem, renamingId, renamingName, draggedItemId,
-    openEditorTab, toggleFolder, setDraggedItemId, handleDrop, addNewItem,
-    deleteItem, confirmRename, setRenamingId, setRenamingName, setPendingNewItem,
+    openEditorTab, toggleFolder, setDraggedItemId, handleDrop, importFilesFromDataTransfer, addNewItem,
+    deleteItem, duplicateItem, openContextMenu: openFileTreeContextMenu,
+    confirmRename, setRenamingId, setRenamingName, setPendingNewItem,
   };
 
   const factoryImpl = (node: TabNode) => {
@@ -11120,7 +15701,9 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
       const tabItemId = (node as any).getConfig?.()?.itemId as string | undefined;
       const resolvedTabItemId = tabItemId || activeFileId;
       const tabItem = resolvedTabItemId ? files.find(f => f.id === resolvedTabItemId) : undefined;
-      const editorModelPath = tabItem ? `codecraft-model/${tabItem.id}/${encodeURI(getPath(tabItem.id))}` : undefined;
+      const editorModelPath = tabItem
+        ? getMonacoProjectModelPath(getPath(tabItem.id))
+        : undefined;
       const shouldRenderSharedEditor =
         mountedSharedEditorTarget?.tabId === tabNodeId
         && mountedSharedEditorTarget.itemId === resolvedTabItemId;
@@ -11211,6 +15794,7 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
               {shouldRenderSharedEditor ? (
                 <Editor
                   key={`shared-editor:${mountedSharedEditorTarget.version}`}
+                  path={editorModelPath}
                   defaultPath={editorModelPath}
                   saveViewState={false}
                   keepCurrentModel={false}
@@ -11419,18 +16003,153 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
     }
 
     if (component === "explorer") {
+      const contextMenuItem = fileTreeContextMenu?.itemId
+        ? files.find(item => item.id === fileTreeContextMenu.itemId) || null
+        : null;
+      const contextMenuClipboardItem = fileTreeClipboardItemId
+        ? files.find(item => item.id === fileTreeClipboardItemId) || null
+        : null;
+      const isRootContextMenu = fileTreeContextMenu?.itemId === null;
+      const canPasteInContextMenu = !!contextMenuClipboardItem && (isRootContextMenu || contextMenuItem?.type === 'folder');
+      const contextMenuPasteParentId = contextMenuItem?.type === 'folder' ? contextMenuItem.id : null;
+
       return (
         <FileTreeContext.Provider value={fileTreeCtx}>
           <div className="h-full w-full flex flex-col bg-[rgb(28,28,28)] text-zinc-300 border-white/10 relative">
             <div
               className="flex-1 overflow-y-auto custom-scrollbar"
               onDragOver={(e) => e.preventDefault()}
-              onDrop={() => handleDrop(null)}
+              onContextMenu={(e) => {
+                e.preventDefault();
+                openFileTreeContextMenu(null, e.clientX, e.clientY);
+              }}
+              onDrop={(e) => {
+                e.preventDefault();
+                if (hasFileDataTransferPayload(e.dataTransfer)) {
+                  void importFilesFromDataTransfer(null, e.dataTransfer);
+                  return;
+                }
+                handleDrop(null);
+              }}
             >
               {[...files.filter(f => !f.parentId), ...(pendingNewItem && !pendingNewItem.parentId ? [pendingNewItem] : [])].map(item => (
                 <FileTreeItem key={item.id} item={item} />
               ))}
             </div>
+            {fileTreeContextMenu && (isRootContextMenu || contextMenuItem) && (
+              <div
+                className="fixed z-[80] w-44 rounded-lg border border-white/10 bg-zinc-950 py-1 shadow-2xl shadow-black/40"
+                style={{ left: fileTreeContextMenu.x, top: fileTreeContextMenu.y }}
+                onPointerDown={(e) => e.stopPropagation()}
+                onContextMenu={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                }}
+              >
+                {isRootContextMenu ? (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        addNewItem('file', null, 'inline');
+                        setFileTreeContextMenu(null);
+                      }}
+                      className="flex w-full items-center gap-2 px-3 py-2 text-left text-xs text-zinc-300 transition-colors hover:bg-white/10 hover:text-white"
+                    >
+                      <FilePlus size={14} className="text-indigo-400" />
+                      <span>Create New File</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        addNewItem('folder', null, 'inline');
+                        setFileTreeContextMenu(null);
+                      }}
+                      className="flex w-full items-center gap-2 px-3 py-2 text-left text-xs text-zinc-300 transition-colors hover:bg-white/10 hover:text-white"
+                    >
+                      <FolderPlus size={14} className="text-amber-400" />
+                      <span>Create New Folder</span>
+                    </button>
+                  </>
+                ) : contextMenuItem ? (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setRenamingId(contextMenuItem.id);
+                        setRenamingName(contextMenuItem.name);
+                        setFileTreeContextMenu(null);
+                      }}
+                      className="flex w-full items-center gap-2 px-3 py-2 text-left text-xs text-zinc-300 transition-colors hover:bg-white/10 hover:text-white"
+                    >
+                      <Pencil size={14} className="text-zinc-500" />
+                      <span>Rename</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        duplicateItem(contextMenuItem.id);
+                        setFileTreeContextMenu(null);
+                      }}
+                      className="flex w-full items-center gap-2 px-3 py-2 text-left text-xs text-zinc-300 transition-colors hover:bg-white/10 hover:text-white"
+                    >
+                      <CopyPlus size={14} className="text-zinc-500" />
+                      <span>Duplicate</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setFileTreeClipboardItemId(contextMenuItem.id);
+                        setFileTreeContextMenu(null);
+                      }}
+                      className="flex w-full items-center gap-2 px-3 py-2 text-left text-xs text-zinc-300 transition-colors hover:bg-white/10 hover:text-white"
+                    >
+                      <Copy size={14} className="text-zinc-500" />
+                      <span>Copy</span>
+                    </button>
+                  </>
+                ) : null}
+                {(isRootContextMenu || contextMenuItem?.type === 'folder') && (
+                  <>
+                    <div className="my-1 h-px bg-white/10" />
+                    <button
+                      type="button"
+                      disabled={!canPasteInContextMenu}
+                      onClick={() => {
+                        if (!canPasteInContextMenu) return;
+                        pasteFileTreeClipboardItem(contextMenuPasteParentId);
+                        setFileTreeContextMenu(null);
+                      }}
+                      className={cn(
+                        "flex w-full items-center gap-2 px-3 py-2 text-left text-xs transition-colors",
+                        canPasteInContextMenu
+                          ? "text-zinc-300 hover:bg-white/10 hover:text-white"
+                          : "cursor-not-allowed text-zinc-600"
+                      )}
+                    >
+                      <ClipboardPaste size={14} className={canPasteInContextMenu ? "text-zinc-500" : "text-zinc-700"} />
+                      <span>Paste</span>
+                    </button>
+                  </>
+                )}
+                {contextMenuItem && (
+                  <>
+                    <div className="my-1 h-px bg-white/10" />
+                    <button
+                      type="button"
+                      onClick={() => {
+                        deleteItem(contextMenuItem.id);
+                        setFileTreeContextMenu(null);
+                      }}
+                      className="flex w-full items-center gap-2 px-3 py-2 text-left text-xs text-red-300 transition-colors hover:bg-red-500/10 hover:text-red-200"
+                    >
+                      <Trash2 size={14} className="text-red-400" />
+                      <span>Delete</span>
+                    </button>
+                  </>
+                )}
+              </div>
+            )}
           </div>
         </FileTreeContext.Provider>
       );
@@ -11444,6 +16163,8 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
         messages: []
       };
       const chatInput = assistantInputs[chatId] || '';
+      const chatAttachments = assistantAttachmentsByChatId[chatId] || [];
+      const chatAttachmentStatus = assistantAttachmentStatusByChatId[chatId] || '';
       const isChatLoading = loadingAssistantChatId === chatId;
       const isHistoryOpen = !!assistantHistoryOpenByChatId[chatId];
       const tokenEstimate = assistantTokenEstimates[chatId];
@@ -11451,7 +16172,27 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
       const assistantStatusLabel = `${getAssistantProviderLabel(settings.assistantProvider)} · ${settings.assistantModel || 'No model selected'}`;
 
       return (
-        <div className="h-full w-full bg-[rgb(28,28,28)] border-white/10 flex flex-col min-h-0 relative">
+        <div
+          data-codecraft-ai-panel="true"
+          className="h-full w-full bg-[rgb(28,28,28)] border-white/10 flex flex-col min-h-0 relative"
+          onDragOver={(e) => {
+            if (hasFileDataTransferPayload(e.dataTransfer) || Array.from(e.dataTransfer.types || []).includes('text/plain')) {
+              e.preventDefault();
+            }
+          }}
+          onDrop={(e) => {
+            if (!hasFileDataTransferPayload(e.dataTransfer) && !Array.from(e.dataTransfer.types || []).includes('text/plain')) return;
+            e.preventDefault();
+            e.stopPropagation();
+            void addAssistantAttachmentsFromDataTransfer(chatId, e.dataTransfer);
+          }}
+          onPaste={(e) => {
+            if (!hasFileDataTransferPayload(e.clipboardData)) return;
+            e.preventDefault();
+            e.stopPropagation();
+            void addAssistantAttachmentsFromDataTransfer(chatId, e.clipboardData);
+          }}
+        >
           <button
             type="button"
             onClick={() => setAssistantHistoryOpenByChatId(prev => ({ ...prev, [chatId]: !prev[chatId] }))}
@@ -11583,6 +16324,47 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
                 Add your {getAssistantApiKeyLabel(settings.assistantProvider)} in Settings to send requests.
               </div>
             )}
+            {(chatAttachments.length > 0 || chatAttachmentStatus) && (
+              <div className="mb-3 rounded-xl border border-white/10 bg-white/5 px-3 py-2">
+                {chatAttachments.length > 0 && (
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="text-[10px] font-medium uppercase tracking-wide text-zinc-500">
+                      Files to send ({chatAttachments.length})
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => clearAssistantAttachments(chatId)}
+                      className="text-[10px] text-zinc-500 transition-colors hover:text-white"
+                    >
+                      Clear
+                    </button>
+                  </div>
+                )}
+                {chatAttachments.length > 0 && (
+                  <div className="mt-2 max-h-24 space-y-1 overflow-y-auto custom-scrollbar pr-1">
+                    {chatAttachments.map(file => (
+                      <div key={file.id} className="flex items-center gap-2 rounded-lg bg-black/20 px-2 py-1.5">
+                        <FileCode size={13} className={cn("shrink-0", file.source === 'workspace' ? "text-indigo-300" : "text-emerald-300")} />
+                        <span className="min-w-0 flex-1 truncate text-[11px] text-zinc-300">{file.path}</span>
+                        <button
+                          type="button"
+                          onClick={() => removeAssistantAttachment(chatId, file.id)}
+                          className="shrink-0 rounded p-0.5 text-zinc-600 transition-colors hover:bg-white/10 hover:text-white"
+                          title="Remove"
+                        >
+                          <X size={12} />
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {chatAttachmentStatus && (
+                  <div className={cn("text-[10px] text-zinc-500", chatAttachments.length > 0 && "mt-2")}>
+                    {chatAttachmentStatus}
+                  </div>
+                )}
+              </div>
+            )}
             <div className="relative flex flex-col gap-2">
               <textarea
                 value={chatInput}
@@ -11599,15 +16381,15 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
               />
               <button
                 type="submit"
-                disabled={!chatInput.trim() || isChatLoading || !assistantConfiguredApiKey}
+                disabled={(!chatInput.trim() && chatAttachments.length === 0) || isChatLoading || !assistantConfiguredApiKey}
                 className="absolute right-2 bottom-2 p-2 text-indigo-400 hover:text-indigo-300 disabled:text-zinc-600 transition-colors"
               >
                 <ChevronRight size={20} />
               </button>
             </div>
-            {settings.assistantShowUsagePopup && (chatInput.trim() || lastTurnUsage) && (
+            {settings.assistantShowUsagePopup && (chatInput.trim() || chatAttachments.length > 0 || lastTurnUsage) && (
               <div className="mt-3 grid grid-cols-1 gap-2">
-                {chatInput.trim() && tokenEstimate && (
+                {(chatInput.trim() || chatAttachments.length > 0) && tokenEstimate && (
                   <div className="rounded-xl border border-white/10 bg-white/5 px-3 py-2">
                     <div className="flex items-center justify-between gap-3">
                       <div className="text-[11px] font-medium uppercase tracking-wide text-zinc-500">Next Send Estimate</div>
@@ -11745,6 +16527,166 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
 
           {/* Right Actions */}
           <div className="flex items-center gap-1 shrink-0">
+            <input
+              ref={projectDataImportInputRef}
+              type="file"
+              accept="application/json,.json"
+              className="hidden"
+              onChange={handleImportProjectDataFile}
+            />
+            <div className="relative">
+              <Tooltip.Root>
+                <Tooltip.Trigger asChild>
+                  <button
+                    type="button"
+                    onClick={() => setIsProjectMenuOpen(open => !open)}
+                    className="inline-flex items-center gap-1.5 h-8 max-w-[180px] px-2.5 rounded-md text-xs text-zinc-300 hover:text-zinc-100 hover:bg-zinc-800 border border-zinc-800 transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-zinc-600"
+                  >
+                    <Folder size={14} className="shrink-0 text-amber-400" />
+                    <span className="truncate">{activeProject.name}</span>
+                    <ChevronDown size={12} className="shrink-0 text-zinc-500" />
+                  </button>
+                </Tooltip.Trigger>
+                <Tooltip.Portal>
+                  <Tooltip.Content sideOffset={6} className="z-50 overflow-hidden rounded-md bg-zinc-900 border border-zinc-700 px-3 py-1.5 text-xs text-zinc-200 shadow-md animate-in fade-in-0 zoom-in-95 data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=closed]:zoom-out-95">
+                    Projects
+                    <Tooltip.Arrow className="fill-zinc-700" />
+                  </Tooltip.Content>
+                </Tooltip.Portal>
+              </Tooltip.Root>
+
+              {isProjectMenuOpen && (
+                <div className="absolute right-0 top-10 z-50 w-80 max-w-[calc(100vw-1rem)] rounded-xl border border-white/10 bg-zinc-950 shadow-2xl overflow-hidden">
+                  <div className="px-3 py-2 border-b border-white/10">
+                    <div className="text-[11px] font-semibold uppercase tracking-wide text-zinc-500">Projects</div>
+                    {projectMenuStatus ? (
+                      <div className="mt-1 text-[10px] text-zinc-400">{projectMenuStatus}</div>
+                    ) : null}
+                  </div>
+                  <div className="max-h-64 overflow-y-auto p-1 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+                    {projects.map(project => {
+                      const isRenamingProject = renamingProjectId === project.id;
+                      return (
+                        <div
+                          key={project.id}
+                          className={cn(
+                            "group mb-1 flex items-stretch rounded-lg transition-colors last:mb-0",
+                            project.id === activeProjectId
+                              ? "bg-indigo-500/15 text-indigo-200"
+                              : "text-zinc-300 hover:bg-white/5 hover:text-white"
+                          )}
+                        >
+                          {isRenamingProject ? (
+                            <div className="min-w-0 flex-1 px-3 py-2">
+                              <div className="flex items-center gap-2">
+                                <Folder size={14} className="shrink-0 text-amber-400" />
+                                <input
+                                  autoFocus
+                                  type="text"
+                                  value={renamingProjectName}
+                                  onChange={(e) => setRenamingProjectName(e.target.value)}
+                                  onBlur={confirmRenamingProject}
+                                  onKeyDown={(e) => {
+                                    if (e.key === 'Enter') confirmRenamingProject();
+                                    if (e.key === 'Escape') cancelRenamingProject();
+                                  }}
+                                  className="min-w-0 flex-1 rounded border border-indigo-500/50 bg-black/30 px-2 py-1 text-sm text-white outline-none"
+                                />
+                              </div>
+                              <div className="mt-1 pl-6 text-[10px] text-zinc-500">
+                                Updated {new Date(project.updatedAt).toLocaleDateString()}
+                              </div>
+                            </div>
+                          ) : (
+                            <button
+                              type="button"
+                              onClick={() => switchProject(project.id)}
+                              className="min-w-0 flex-1 px-3 py-2 text-left"
+                            >
+                              <div className="flex items-center gap-2">
+                                <Folder size={14} className="shrink-0 text-amber-400" />
+                                <span className="min-w-0 truncate text-sm">{project.name}</span>
+                              </div>
+                              <div className="mt-1 text-[10px] text-zinc-500">
+                                Updated {new Date(project.updatedAt).toLocaleDateString()}
+                              </div>
+                            </button>
+                          )}
+                          <div className="flex shrink-0 items-start gap-1 py-2 pr-2 opacity-100 transition-opacity sm:opacity-0 sm:group-hover:opacity-100">
+                            {isRenamingProject ? (
+                              <>
+                                <button
+                                  type="button"
+                                  title="Save project name"
+                                  onMouseDown={(e) => e.preventDefault()}
+                                  onClick={confirmRenamingProject}
+                                  className="rounded-md p-1 text-emerald-300 transition-colors hover:bg-emerald-500/10 hover:text-emerald-200"
+                                >
+                                  <Check size={14} />
+                                </button>
+                                <button
+                                  type="button"
+                                  title="Cancel rename"
+                                  onMouseDown={(e) => e.preventDefault()}
+                                  onClick={cancelRenamingProject}
+                                  className="rounded-md p-1 text-zinc-500 transition-colors hover:bg-white/10 hover:text-zinc-200"
+                                >
+                                  <X size={14} />
+                                </button>
+                              </>
+                            ) : (
+                              <>
+                                <button
+                                  type="button"
+                                  title="Rename project"
+                                  onClick={() => startRenamingProject(project)}
+                                  className="rounded-md p-1 text-zinc-500 transition-colors hover:bg-white/10 hover:text-zinc-200"
+                                >
+                                  <Pencil size={14} />
+                                </button>
+                                <button
+                                  type="button"
+                                  title="Delete project"
+                                  disabled={projects.length <= 1}
+                                  onClick={() => void handleDeleteProject(project.id)}
+                                  className={cn(
+                                    "rounded-md p-1 transition-colors",
+                                    projects.length <= 1
+                                      ? "cursor-not-allowed text-zinc-700"
+                                      : "text-zinc-500 hover:bg-red-500/10 hover:text-red-300"
+                                  )}
+                                >
+                                  <Trash2 size={14} />
+                                </button>
+                              </>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                  <div className="grid grid-cols-2 gap-2 border-t border-white/10 p-2">
+                    <button
+                      type="button"
+                      onClick={handleCreateProject}
+                      className="inline-flex items-center justify-center gap-1.5 rounded-lg bg-white/5 px-3 py-2 text-xs text-zinc-200 hover:bg-white/10 transition-colors"
+                    >
+                      <FolderPlus size={14} />
+                      New
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => projectDataImportInputRef.current?.click()}
+                      className="inline-flex items-center justify-center gap-1.5 rounded-lg bg-white/5 px-3 py-2 text-xs text-zinc-200 hover:bg-white/10 transition-colors"
+                    >
+                      <Upload size={14} />
+                      Import
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+
             <button
               onClick={handleRun}
               disabled={!canRunCurrentFile}
@@ -11995,67 +16937,6 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
                       </button>
                     </div>
 
-                    {assistantProviderSupportsRemoteMcp && (
-                      <div className="rounded-xl border border-white/10 bg-black/20 p-4 space-y-3">
-                        <div>
-                          <div className="text-sm font-medium text-white">Remote MCP Server</div>
-                          <div className="text-xs text-zinc-500">
-                            Optional server-side MCP tools for {getAssistantProviderLabel(settings.assistantProvider)} Responses API requests.
-                          </div>
-                        </div>
-                        <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,2fr)_minmax(0,1fr)] gap-3">
-                          <label className="block space-y-2">
-                            <div className="text-xs font-medium uppercase tracking-wide text-zinc-500">Server URL</div>
-                            <input
-                              value={settings.assistantMcpServerUrl}
-                              onChange={(e) => setSettings(current => ({ ...current, assistantMcpServerUrl: e.target.value }))}
-                              placeholder="https://example.com/mcp"
-                              className="w-full rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-sm text-white outline-none transition-colors focus:border-indigo-500"
-                            />
-                          </label>
-                          <label className="block space-y-2">
-                            <div className="text-xs font-medium uppercase tracking-wide text-zinc-500">Label</div>
-                            <input
-                              value={settings.assistantMcpServerLabel}
-                              onChange={(e) => setSettings(current => ({ ...current, assistantMcpServerLabel: e.target.value }))}
-                              placeholder="workspace"
-                              className="w-full rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-sm text-white outline-none transition-colors focus:border-indigo-500"
-                            />
-                          </label>
-                        </div>
-                        <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)] gap-3">
-                          <label className="block space-y-2">
-                            <div className="text-xs font-medium uppercase tracking-wide text-zinc-500">Allowed Tools</div>
-                            <input
-                              value={settings.assistantMcpAllowedTools}
-                              onChange={(e) => setSettings(current => ({ ...current, assistantMcpAllowedTools: e.target.value }))}
-                              placeholder="search, fetch"
-                              className="w-full rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-sm text-white outline-none transition-colors focus:border-indigo-500"
-                            />
-                          </label>
-                          <label className="block space-y-2">
-                            <div className="text-xs font-medium uppercase tracking-wide text-zinc-500">Authorization</div>
-                            <input
-                              type="password"
-                              value={settings.assistantMcpAuthorization}
-                              onChange={(e) => setSettings(current => ({ ...current, assistantMcpAuthorization: e.target.value }))}
-                              placeholder="Bearer token or OAuth token"
-                              className="w-full rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-sm text-white outline-none transition-colors focus:border-indigo-500"
-                            />
-                          </label>
-                        </div>
-                        <label className="block space-y-2">
-                          <div className="text-xs font-medium uppercase tracking-wide text-zinc-500">Description</div>
-                          <input
-                            value={settings.assistantMcpServerDescription}
-                            onChange={(e) => setSettings(current => ({ ...current, assistantMcpServerDescription: e.target.value }))}
-                            placeholder="What this server provides"
-                            className="w-full rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-sm text-white outline-none transition-colors focus:border-indigo-500"
-                          />
-                        </label>
-                      </div>
-                    )}
-
                     <div className="flex items-center justify-between gap-4 rounded-xl border border-white/10 bg-black/20 px-4 py-3">
                       <div>
                         <div className="text-sm font-medium text-white">Show Usage Popup</div>
@@ -12086,7 +16967,7 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
                       <input
                         type="number"
                         min={1}
-                        max={12}
+                        max={MAX_ASSISTANT_CHAIN_OF_THOUGHT_DEPTH}
                         step={1}
                         value={settings.assistantMaxChainOfThoughtDepth}
                         onChange={(e) => setSettings(current => ({
@@ -12096,7 +16977,26 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
                         className="w-full rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-sm text-white outline-none transition-colors focus:border-indigo-500"
                       />
                       <div className="text-xs text-zinc-500">
-                        Limits Chain of Thought tool rounds per assistant turn. Range: 1 to 12. Current effective limit: {effectiveAssistantMaxChainOfThoughtDepth}.
+                        Limits Chain of Thought tool rounds per assistant turn. Range: 1 to {MAX_ASSISTANT_CHAIN_OF_THOUGHT_DEPTH}. Current effective limit: {effectiveAssistantMaxChainOfThoughtDepth}.
+                      </div>
+                    </label>
+
+                    <label className="block space-y-2">
+                      <div className="text-xs font-medium uppercase tracking-wide text-zinc-500">Assistant Request Rate Limit</div>
+                      <input
+                        type="number"
+                        min={0}
+                        max={MAX_ASSISTANT_REQUEST_RATE_LIMIT_PER_MINUTE}
+                        step={1}
+                        value={settings.assistantRequestRateLimitPerMinute}
+                        onChange={(e) => setSettings(current => ({
+                          ...current,
+                          assistantRequestRateLimitPerMinute: normalizeAssistantRequestRateLimitPerMinute(Number(e.target.value)),
+                        }))}
+                        className="w-full rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-sm text-white outline-none transition-colors focus:border-indigo-500"
+                      />
+                      <div className="text-xs text-zinc-500">
+                        Limits outbound assistant provider requests per minute across all providers and reasoning modes. Use 0 for unlimited; when the limit is reached, CodeCraft waits and then continues automatically. Current effective rate: {effectiveAssistantRequestRateLimitPerMinute > 0 ? `${effectiveAssistantRequestRateLimitPerMinute}/min` : 'Unlimited'}.
                       </div>
                     </label>
                   </div>
@@ -12152,89 +17052,29 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
                   <h4 className="text-xs font-bold uppercase tracking-widest text-zinc-500 mb-4">Project Run</h4>
                   <div className="space-y-4">
                     <div className="rounded-2xl border border-white/10 bg-white/5 p-4 space-y-4">
-                      <div className="text-xs text-zinc-500">
-                        These settings apply only to the `Project Run` button. The regular `Run` button always executes just the current file.
-                      </div>
-
-                      <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)] gap-4">
-                        <label className="block space-y-2">
-                          <div className="text-xs font-medium uppercase tracking-wide text-zinc-500">Run Scope</div>
-                          <select
-                            value={settings.projectRunMode}
-                            onChange={(e) => {
-                              const nextMode = e.target.value as ProjectRunMode;
-                              setSettings(current => {
-                                const modeLanguage = getProjectRunModeLanguage(nextMode);
-                                const activeRunnableLanguage = activeItem?.type === 'file'
-                                  ? normalizeProjectRuntimeLanguage(activeItem.language)
-                                  : null;
-                                const nextCustomFileIds = nextMode === 'custom'
-                                  ? current.projectRunCustomFileIds.length > 0
-                                    ? current.projectRunCustomFileIds
-                                    : activeItem?.type === 'file' && activeRunnableLanguage
-                                      ? [activeItem.id]
-                                      : []
-                                  : current.projectRunCustomFileIds;
-                                const selectedIds = nextMode === 'custom'
-                                  ? nextCustomFileIds
-                                  : projectRunnableFiles
-                                    .filter(file => normalizeProjectRuntimeLanguage(file.language) === modeLanguage)
-                                    .map(file => file.id);
-                                const selectedEntryIds = nextMode === 'custom'
-                                  ? (() => {
-                                    const selectedCustomFiles = projectRunnableFiles.filter(file => selectedIds.includes(file.id));
-                                    return getProjectEntryCandidateIds(selectedCustomFiles, null);
-                                  })()
-                                  : getProjectEntryCandidateIds(projectRunnableFiles.filter(file => selectedIds.includes(file.id)), modeLanguage);
-                                const nextEntryFileId =
-                                  current.projectRunEntryFileId && selectedEntryIds.includes(current.projectRunEntryFileId)
-                                    ? current.projectRunEntryFileId
-                                    : selectedEntryIds.includes(activeFileId)
-                                      ? activeFileId
-                                      : selectedEntryIds[0] ?? null;
-                                return {
-                                  ...current,
-                                  projectRunMode: nextMode,
-                                  projectRunCustomFileIds: nextCustomFileIds,
-                                  projectRunEntryFileId: nextEntryFileId,
-                                };
-                              });
-                            }}
-                            className="w-full rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-sm text-white outline-none transition-colors focus:border-indigo-500"
-                          >
-                            {PROJECT_RUN_MODE_OPTIONS.map(option => (
-                              <option key={option.value} value={option.value}>{option.label}</option>
-                            ))}
-                          </select>
-                          <div className="text-xs text-zinc-500">
-                            Language-specific modes automatically include every runnable file for that language. `Custom` lets you pick the exact files to include for project execution.
-                          </div>
-                        </label>
-
-                        <label className="block space-y-2">
-                          <div className="text-xs font-medium uppercase tracking-wide text-zinc-500">Entry File</div>
-                          <select
-                            value={resolvedProjectRun.entryFile?.id ?? ''}
-                            onChange={(e) => setSettings(current => ({
-                              ...current,
-                              projectRunEntryFileId: e.target.value || null,
-                            }))}
-                            disabled={resolvedProjectRun.entryCandidates.length === 0}
-                            className="w-full rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-sm text-white outline-none transition-colors focus:border-indigo-500 disabled:opacity-60 disabled:cursor-not-allowed"
-                          >
-                            {resolvedProjectRun.entryCandidates.length === 0 ? (
-                              <option value="">No entry files available</option>
-                            ) : (
-                              resolvedProjectRun.entryCandidates.map(file => (
-                                <option key={file.id} value={file.id}>{getPath(file.id)}</option>
-                              ))
-                            )}
-                          </select>
-                          <div className="text-xs text-zinc-500">
-                            The entry file is the file CodeCraft executes or previews when you press `Project Run`.
-                          </div>
-                        </label>
-                      </div>
+                      <label className="block space-y-2">
+                        <div className="text-xs font-medium uppercase tracking-wide text-zinc-500">Entry File</div>
+                        <select
+                          value={resolvedProjectRun.entryFile?.id ?? ''}
+                          onChange={(e) => setSettings(current => ({
+                            ...current,
+                            projectRunEntryFileId: e.target.value || null,
+                          }))}
+                          disabled={resolvedProjectRun.entryCandidates.length === 0}
+                          className="w-full rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-sm text-white outline-none transition-colors focus:border-indigo-500 disabled:opacity-60 disabled:cursor-not-allowed"
+                        >
+                          {resolvedProjectRun.entryCandidates.length === 0 ? (
+                            <option value="">No entry files available</option>
+                          ) : (
+                            resolvedProjectRun.entryCandidates.map(file => (
+                              <option key={file.id} value={file.id}>{getPath(file.id)}</option>
+                            ))
+                          )}
+                        </select>
+                        <div className="text-xs text-zinc-500">
+                          Project Run automatically includes the compatible project files for this entry.
+                        </div>
+                      </label>
 
                       <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
                         <div className="rounded-xl border border-white/10 bg-black/20 px-4 py-3">
@@ -12244,8 +17084,8 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
                           </div>
                         </div>
                         <div className="rounded-xl border border-white/10 bg-black/20 px-4 py-3">
-                          <div className="text-[11px] uppercase tracking-wide text-zinc-500">Selected Files</div>
-                          <div className="mt-1 text-sm text-white">{resolvedProjectRun.selectedFiles.length}</div>
+                          <div className="text-[11px] uppercase tracking-wide text-zinc-500">Included Files</div>
+                          <div className="mt-1 text-sm text-white">{resolvedProjectRun.includedFiles.length}</div>
                         </div>
                         <div className="rounded-xl border border-white/10 bg-black/20 px-4 py-3">
                           <div className="text-[11px] uppercase tracking-wide text-zinc-500">Current Entry</div>
@@ -12258,62 +17098,6 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
                           {resolvedProjectRun.error}
                         </div>
                       )}
-
-                      {settings.projectRunMode === 'custom' && (
-                        <div className="space-y-3">
-                          <div>
-                            <div className="text-sm font-medium text-white">Custom File Selection</div>
-                            <div className="text-xs text-zinc-500 mt-1">Select the exact files to include. HTML can be combined with JS and CSS; C/C++ runs can include matching source and header files.</div>
-                          </div>
-
-                          {projectRunnableFiles.length === 0 ? (
-                            <div className="rounded-xl border border-white/10 bg-black/20 px-4 py-3 text-sm text-zinc-500">
-                              Add at least one `Java`, `C`, `C++`, `C#`, `Python`, `HTML`, `JS`, or `CSS` file to configure a project run.
-                            </div>
-                          ) : (
-                            <div className="max-h-64 overflow-y-auto custom-scrollbar rounded-xl border border-white/10 bg-black/20 divide-y divide-white/5">
-                              {projectRunnableFiles.map(file => {
-                                const language = normalizeProjectFileLanguage(file.language);
-                                const isChecked = settings.projectRunCustomFileIds.includes(file.id);
-                                return (
-                                  <label key={file.id} className="flex items-center gap-3 px-4 py-3 cursor-pointer hover:bg-white/5">
-                                    <input
-                                      type="checkbox"
-                                      checked={isChecked}
-                                      onChange={(e) => {
-                                        const checked = e.target.checked;
-                                        setSettings(current => {
-                                          const nextIds = checked
-                                            ? [...current.projectRunCustomFileIds, file.id]
-                                            : current.projectRunCustomFileIds.filter(id => id !== file.id);
-                                          const selectedCustomFiles = projectRunnableFiles.filter(candidate => nextIds.includes(candidate.id));
-                                          const nextEntryIds = getProjectEntryCandidateIds(selectedCustomFiles, null);
-                                          const nextEntryFileId =
-                                            current.projectRunEntryFileId && nextEntryIds.includes(current.projectRunEntryFileId)
-                                              ? current.projectRunEntryFileId
-                                              : nextEntryIds.includes(activeFileId)
-                                                ? activeFileId
-                                                : nextEntryIds[0] ?? null;
-                                          return {
-                                            ...current,
-                                            projectRunCustomFileIds: nextIds,
-                                            projectRunEntryFileId: nextEntryFileId,
-                                          };
-                                        });
-                                      }}
-                                      className="h-4 w-4 rounded border-white/20 bg-black/20 text-indigo-500 focus:ring-indigo-500"
-                                    />
-                                    <div className="min-w-0 flex-1">
-                                      <div className="text-sm text-white truncate">{getPath(file.id)}</div>
-                                      <div className="text-xs text-zinc-500">{getProjectRuntimeLanguageLabel(language)}</div>
-                                    </div>
-                                  </label>
-                                );
-                              })}
-                            </div>
-                          )}
-                        </div>
-                      )}
                     </div>
                   </div>
                 </section>
@@ -12323,8 +17107,8 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
                   <div className="grid grid-cols-1 xl:grid-cols-5 gap-4">
                     <div className="rounded-2xl border border-white/10 bg-white/5 p-4 space-y-4">
                       <div>
-                        <div className="text-sm font-medium text-white">JavaScript</div>
-                        <div className="text-xs text-zinc-500 mt-1">Runs in a dedicated worker so timeout termination can stop long-running scripts. Set timeout to `0` to disable it.</div>
+                        <div className="text-sm font-medium text-white">JavaScript / TypeScript</div>
+                        <div className="text-xs text-zinc-500 mt-1">Runs JavaScript directly and transpiles TypeScript or TSX before execution. Set timeout to `0` to disable it.</div>
                       </div>
 
                       <label className="block space-y-2">
@@ -13038,6 +17822,155 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
 
                     <div className="rounded-2xl border border-white/10 bg-white/5 p-4 space-y-3">
                       <div>
+                        <div className="text-sm font-medium text-white">Manage Saved `npm install` Packages</div>
+                        <div className="text-xs text-zinc-500 mt-1">Packages are fetched from the npm registry and unpacked into CodeCraft's browser npm store.</div>
+                      </div>
+
+                      <div className="grid grid-cols-1 sm:grid-cols-[minmax(0,1fr)_auto] gap-3">
+                        <input
+                          type="text"
+                          value={settingsNpmPackageInput}
+                          onChange={(e) => setSettingsNpmPackageInput(e.target.value)}
+                          onKeyDown={async (e) => {
+                            if (e.key === 'Enter' && !settingsNpmPackageBusy) {
+                              e.preventDefault();
+                              await handleSettingsNpmPackageApply();
+                            }
+                          }}
+                          placeholder="Packages, e.g. tailwindcss @tailwindcss/vite"
+                          className="w-full rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-sm text-white outline-none transition-colors focus:border-indigo-500"
+                        />
+                        <button
+                          onClick={handleSettingsNpmPackageApply}
+                          disabled={settingsNpmPackageBusy}
+                          className={cn(
+                            "px-4 py-2 rounded-xl text-sm font-semibold transition-colors",
+                            settingsNpmPackageBusy
+                              ? "bg-zinc-700 text-zinc-400 cursor-not-allowed"
+                              : "bg-indigo-600 hover:bg-indigo-500 text-white"
+                          )}
+                        >
+                          {settingsNpmPackageBusy ? 'Working...' : 'Install'}
+                        </button>
+                      </div>
+
+                      {settingsNpmPackageStatus && (
+                        <p className="text-xs text-indigo-300 bg-indigo-500/10 border border-indigo-500/20 rounded-xl px-3 py-2">
+                          {settingsNpmPackageStatus}
+                        </p>
+                      )}
+
+                      {settingsNpmInstalledPackages.length === 0 ? (
+                        <p className="text-sm text-zinc-500">No saved `npm install` packages.</p>
+                      ) : (
+                        <div className="space-y-2">
+                          {settingsNpmInstalledPackages.map(packageInfo => (
+                            <div key={packageInfo.name} className="flex items-center justify-between gap-3 p-3 rounded-xl bg-black/20 border border-white/10">
+                              <div className="min-w-0">
+                                <div className="text-sm font-medium text-white break-all">{packageInfo.name}@{packageInfo.version}</div>
+                                <div className="text-xs text-zinc-500 break-all">{packageInfo.fileCount} files, entry {packageInfo.entry}</div>
+                              </div>
+                              <button
+                                onClick={() => handleSettingsNpmPackageRemove(packageInfo.name)}
+                                disabled={settingsNpmPackageBusy}
+                                className={cn(
+                                  "px-3 py-1.5 rounded-lg text-xs font-medium transition-colors shrink-0",
+                                  settingsNpmPackageBusy
+                                    ? "bg-zinc-700 text-zinc-400 cursor-not-allowed"
+                                    : "bg-red-500/10 text-red-300 hover:bg-red-500/20 border border-red-500/20"
+                                )}
+                              >
+                                Uninstall
+                              </button>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+
+                    <div className="rounded-2xl border border-white/10 bg-white/5 p-4 space-y-3">
+                      <div>
+                        <div className="text-sm font-medium text-white">Manage Saved `npm include` Modules</div>
+                        <div className="text-xs text-zinc-500 mt-1">Include checks cdnjs, jsDelivr, Google Hosted Libraries, unpkg, then esm.sh when no URL is provided.</div>
+                      </div>
+
+                      <div className="grid grid-cols-1 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto] gap-3">
+                        <input
+                          type="text"
+                          value={settingsJavaScriptModuleInput}
+                          onChange={(e) => setSettingsJavaScriptModuleInput(e.target.value)}
+                          onKeyDown={async (e) => {
+                            if (e.key === 'Enter' && !settingsJavaScriptModuleBusy) {
+                              e.preventDefault();
+                              await handleSettingsJavaScriptModuleApply();
+                            }
+                          }}
+                          placeholder="Module, e.g. lodash-es"
+                          className="w-full rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-sm text-white outline-none transition-colors focus:border-indigo-500"
+                        />
+                        <input
+                          type="text"
+                          value={settingsJavaScriptModuleUrlInput}
+                          onChange={(e) => setSettingsJavaScriptModuleUrlInput(e.target.value)}
+                          onKeyDown={async (e) => {
+                            if (e.key === 'Enter' && !settingsJavaScriptModuleBusy) {
+                              e.preventDefault();
+                              await handleSettingsJavaScriptModuleApply();
+                            }
+                          }}
+                          placeholder="Optional URL, skips provider checks"
+                          className="w-full rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-sm text-white outline-none transition-colors focus:border-indigo-500"
+                        />
+                        <button
+                          onClick={handleSettingsJavaScriptModuleApply}
+                          disabled={settingsJavaScriptModuleBusy}
+                          className={cn(
+                            "px-4 py-2 rounded-xl text-sm font-semibold transition-colors",
+                            settingsJavaScriptModuleBusy
+                              ? "bg-zinc-700 text-zinc-400 cursor-not-allowed"
+                              : "bg-indigo-600 hover:bg-indigo-500 text-white"
+                          )}
+                        >
+                          {settingsJavaScriptModuleBusy ? 'Working...' : 'Include'}
+                        </button>
+                      </div>
+
+                      {settingsJavaScriptModuleStatus && (
+                        <p className="text-xs text-indigo-300 bg-indigo-500/10 border border-indigo-500/20 rounded-xl px-3 py-2">
+                          {settingsJavaScriptModuleStatus}
+                        </p>
+                      )}
+
+                      {settingsJavaScriptIncludedModules.length === 0 ? (
+                        <p className="text-sm text-zinc-500">No saved `npm include` modules.</p>
+                      ) : (
+                        <div className="space-y-2">
+                          {settingsJavaScriptIncludedModules.map(moduleInfo => (
+                            <div key={moduleInfo.name} className="flex items-center justify-between gap-3 p-3 rounded-xl bg-black/20 border border-white/10">
+                              <div className="min-w-0">
+                                <div className="text-sm font-medium text-white break-all">{moduleInfo.name}</div>
+                                <div className="text-xs text-zinc-500 break-all">{moduleInfo.url}</div>
+                              </div>
+                              <button
+                                onClick={() => handleSettingsJavaScriptModuleRemove(moduleInfo.name)}
+                                disabled={settingsJavaScriptModuleBusy}
+                                className={cn(
+                                  "px-3 py-1.5 rounded-lg text-xs font-medium transition-colors shrink-0",
+                                  settingsJavaScriptModuleBusy
+                                    ? "bg-zinc-700 text-zinc-400 cursor-not-allowed"
+                                    : "bg-red-500/10 text-red-300 hover:bg-red-500/20 border border-red-500/20"
+                                )}
+                              >
+                                Remove
+                              </button>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+
+                    <div className="rounded-2xl border border-white/10 bg-white/5 p-4 space-y-3">
+                      <div>
                         <div className="text-sm font-medium text-white">Manage Saved `nuget include` Namespaces</div>
                         <div className="text-xs text-zinc-500 mt-1">These namespaces are restored when C# authoring initializes.</div>
                       </div>
@@ -13101,10 +18034,59 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
                       )}
                     </div>
                   </div>
-                </section>
-
-                {/* Folder Sync */}
-                <section>
+	                </section>
+	
+	                {/* User Data */}
+	                <section>
+	                  <h4 className="text-xs font-bold uppercase tracking-widest text-zinc-500 mb-4">User Data</h4>
+	                  <div className="rounded-2xl border border-white/10 bg-white/5 p-4 space-y-4">
+	                    <div>
+	                      <div className="text-sm font-medium text-white">Complete Backup</div>
+	                      <div className="text-xs text-zinc-500 mt-1">Includes projects, settings, chats, layout, saved packages, npm package cache, and Python package cache. Folder permissions are browser-bound and must be reconnected after import.</div>
+	                    </div>
+	                    <input
+	                      ref={userDataImportInputRef}
+	                      type="file"
+	                      accept="application/json,.json"
+	                      className="hidden"
+	                      onChange={handleImportUserDataFile}
+	                    />
+	                    <div className="flex flex-wrap gap-3">
+	                      <button
+	                        onClick={handleExportUserData}
+	                        disabled={settingsUserDataBusy}
+	                        className={cn(
+	                          "inline-flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-semibold transition-colors",
+	                          settingsUserDataBusy
+	                            ? "bg-zinc-700 text-zinc-400 cursor-not-allowed"
+	                            : "bg-indigo-600 hover:bg-indigo-500 text-white"
+	                        )}
+	                      >
+	                        <Download size={16} /> Export
+	                      </button>
+	                      <button
+	                        onClick={() => userDataImportInputRef.current?.click()}
+	                        disabled={settingsUserDataBusy}
+	                        className={cn(
+	                          "inline-flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-semibold transition-colors",
+	                          settingsUserDataBusy
+	                            ? "bg-zinc-700 text-zinc-400 cursor-not-allowed"
+	                            : "bg-white/10 hover:bg-white/15 text-white border border-white/10"
+	                        )}
+	                      >
+	                        <Upload size={16} /> Import
+	                      </button>
+	                    </div>
+	                    {settingsUserDataStatus && (
+	                      <p className="text-xs text-indigo-300 bg-indigo-500/10 border border-indigo-500/20 rounded-xl px-3 py-2">
+	                        {settingsUserDataStatus}
+	                      </p>
+	                    )}
+	                  </div>
+	                </section>
+	
+	                {/* Folder Sync */}
+	                <section>
                   <h4 className="text-xs font-bold uppercase tracking-widest text-zinc-500 mb-4">Folder Sync</h4>
                   {syncMeta.length === 0 ? (
                     <p className="text-sm text-zinc-500">No folders have been synced yet. Open a folder and use the "Sync with Local Folder" button to get started.</p>
