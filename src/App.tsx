@@ -7879,36 +7879,10 @@ export default function App() {
       if (!item.parentId) return item.name;
       return `${getPathFromSnapshot(item.parentId)}/${item.name}`;
     };
-    const escapePromptAttribute = (value: string) => value.replace(/"/g, '&quot;');
-    const getSnapshotFileLanguage = (file: Pick<FSItem, 'name' | 'language'>) => file.language || langFromFilename(file.name);
-    const formatProjectItemSummary = (item: FSItem) => {
-      const path = getPathFromSnapshot(item.id);
-      const language = item.type === 'file' ? getSnapshotFileLanguage(item) : 'N/A';
-      return `- Path: ${path}, Type: ${item.type}, Language: ${language}`;
-    };
-    const formatProjectFileBlock = (path: string, language: string, content: string, active = false) => {
-      const escapedPath = escapePromptAttribute(path);
-      const escapedLanguage = escapePromptAttribute(language);
-      const activeAttribute = active ? ' active="true"' : '';
-      return `<project_file path="${escapedPath}" language="${escapedLanguage}"${activeAttribute}>\n${content}\n</project_file>`;
-    };
 
     const activeSnapshotItem = assistantActiveItemId
       ? assistantFiles.find(file => file.id === assistantActiveItemId) || null
       : null;
-    const activeItemContext = activeSnapshotItem
-      ? [
-          formatProjectItemSummary(activeSnapshotItem),
-          activeSnapshotItem.type === 'file'
-            ? formatProjectFileBlock(
-                getPathFromSnapshot(activeSnapshotItem.id),
-                getSnapshotFileLanguage(activeSnapshotItem),
-                activeSnapshotItem.content || '',
-                true
-              )
-            : `<project_folder path="${escapePromptAttribute(getPathFromSnapshot(activeSnapshotItem.id))}" active="true" />`,
-        ].join('\n')
-      : 'No item is currently active.';
     const history = messages.map(msg => `${msg.role.toUpperCase()}: ${msg.content}`).join('\n');
     const toolProgress = toolProgressNotes.length > 0
       ? `\nTurn Progress:\n${toolProgressNotes.map((note, index) => `${index + 1}. ${note}`).join('\n')}\nUse the updated workspace state above when deciding the next action. If the task is complete, respond to the user normally.`
@@ -7926,7 +7900,7 @@ export default function App() {
       }))
       .sort((left, right) => left.path.localeCompare(right.path));
     const projectTree = assistantFiles
-      .map(formatProjectItemSummary)
+      .map(file => `- Path: ${getPathFromSnapshot(file.id)}, Type: ${file.type}, Language: ${file.language || 'N/A'}`)
       .join('\n');
     const maxProjectContextFiles = 30;
     const maxProjectContextChars = 80000;
@@ -7949,7 +7923,9 @@ export default function App() {
         ? `${content.slice(0, fileBudget)}\n... [truncated ${content.length - fileBudget} character${content.length - fileBudget === 1 ? '' : 's'}]`
         : content;
       remainingProjectContextChars -= visibleContent.length + pathOverhead;
-      return [formatProjectFileBlock(path, language, visibleContent, file.id === assistantActiveItemId)];
+      const escapedPath = path.replace(/"/g, '&quot;');
+      const activeAttribute = file.id === assistantActiveItemId ? ' active="true"' : '';
+      return [`<project_file path="${escapedPath}" language="${language}"${activeAttribute}>\n${visibleContent}\n</project_file>`];
     }).join('\n\n');
     const projectWorkspaceContext = `
         Project Workspace:
@@ -7975,8 +7951,8 @@ export default function App() {
         Current terminal working directory: ${assistantTerminalCwd ? `/${getPathFromSnapshot(assistantTerminalCwd)}` : '/'}
         ${projectWorkspaceContext}
 
-        Active Item:
-        ${activeItemContext}
+        Active Item: ${activeSnapshotItem ? getPathFromSnapshot(activeSnapshotItem.id) : 'None selected'}
+        ${activeSnapshotItem ? (activeSnapshotItem.type === 'file' ? `Active file content:\n${activeSnapshotItem.content || ''}` : 'The active item is a folder.') : 'No file is currently active.'}
 
         Chat History:
         ${history || '(empty)'}
@@ -7998,8 +7974,8 @@ export default function App() {
         Current terminal working directory: ${assistantTerminalCwd ? `/${getPathFromSnapshot(assistantTerminalCwd)}` : '/'}
         ${projectWorkspaceContext}
 
-        Active Item:
-        ${activeItemContext}
+        Active Item: ${activeSnapshotItem ? getPathFromSnapshot(activeSnapshotItem.id) : 'None selected'}
+        ${activeSnapshotItem ? (activeSnapshotItem.type === 'file' ? `Active file content:\n${activeSnapshotItem.content || ''}` : 'The active item is a folder.') : 'No file is currently active.'}
 
         Chat History:
         ${history || '(empty)'}
@@ -8020,8 +7996,8 @@ export default function App() {
         Current terminal working directory: ${assistantTerminalCwd ? `/${getPathFromSnapshot(assistantTerminalCwd)}` : '/'}
         ${projectWorkspaceContext}
 
-        Active Item:
-        ${activeItemContext}
+        Active Item: ${activeSnapshotItem ? getPathFromSnapshot(activeSnapshotItem.id) : 'None selected'}
+        ${activeSnapshotItem ? (activeSnapshotItem.type === 'file' ? `Active file content:\n${activeSnapshotItem.content || ''}` : 'The active item is a folder.') : 'No file is currently active.'}
 
         Chat History:
         ${history || '(empty)'}
@@ -8047,8 +8023,8 @@ export default function App() {
 
         ${projectWorkspaceContext}
 
-        Active Item:
-        ${activeItemContext}
+        Active Item: ${activeSnapshotItem ? getPathFromSnapshot(activeSnapshotItem.id) : 'None selected'}
+        ${activeSnapshotItem ? (activeSnapshotItem.type === 'file' ? `Content:\n${activeSnapshotItem.content || ''}` : 'This is a folder.') : 'No file is currently active.'}
 
         Chat History:
         ${history || '(empty)'}
