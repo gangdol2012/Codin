@@ -84,6 +84,7 @@ public class RoslynProject
     private readonly Dictionary<string, DocumentId> _additionalDocumentIds = new(StringComparer.Ordinal);
     private readonly Dictionary<string, string> _additionalDocumentContents = new(StringComparer.Ordinal);
     private string _primaryDocumentText = string.Empty;
+    private string _primaryDocumentPath = string.Empty;
     private string Uri {get; init;}
     public RoslynProject(string uri)
     {
@@ -209,6 +210,7 @@ public class RoslynProject
 
         if (safeCode == _primaryDocumentText && DictionariesEqual(_additionalDocumentContents, nextDocuments))
         {
+            _primaryDocumentPath = normalizedActivePath;
             return Task.FromResult(Workspace.CurrentSolution.GetDocument(DocumentId)!);
         }
 
@@ -251,6 +253,7 @@ public class RoslynProject
         if (Workspace.TryApplyChanges(solution))
         {
             _primaryDocumentText = safeCode;
+            _primaryDocumentPath = normalizedActivePath;
             _additionalDocumentIds.Clear();
             foreach (var (path, documentId) in nextDocumentIds)
             {
@@ -269,6 +272,16 @@ public class RoslynProject
         }
 
         return Task.FromResult(Workspace.CurrentSolution.GetDocument(DocumentId)!);
+    }
+
+    public string GetDocumentPath(Document document)
+    {
+        if (document.Id == DocumentId)
+        {
+            return _primaryDocumentPath;
+        }
+
+        return NormalizeSourcePath(document.FilePath ?? document.Name);
     }
 
     public async Task<NamespaceIncludeResult> IncludeNamespaceAsync(string namespaceName)

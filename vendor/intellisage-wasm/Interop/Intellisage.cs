@@ -14,41 +14,41 @@ public class MonacoServiceWrapper {
 
         switch (name) {
             case "GetCompletionAsync":
-                return await worker.RunAsync(a => a.GetCompletionAsync(args[0], args[1]));
+                return await worker.RunAsync(a => a.GetCompletionAsync(args[0], args[1], args.Length > 2 ? args[2] : ""));
             case "GetCompletionResolveAsync":
                 return await worker.RunAsync(a => a.GetCompletionResolveAsync(args[0]));
             case "GetSignatureHelpAsync":
-                return await worker.RunAsync(a => a.GetSignatureHelpAsync(args[0], args[1]));
+                return await worker.RunAsync(a => a.GetSignatureHelpAsync(args[0], args[1], args.Length > 2 ? args[2] : ""));
             case "GetQuickInfoAsync":
                 return args.Length > 1
-                    ? await worker.RunAsync(a => a.GetQuickInfoAsync(args[0], args[1]))
+                    ? await worker.RunAsync(a => a.GetQuickInfoAsync(args[0], args[1], args.Length > 2 ? args[2] : ""))
                     : await worker.RunAsync(a => a.GetQuickInfoAsync(args[0]));
             case "GetDiagnosticsAsync":
                 return args.Length > 1
                     ? await worker.RunAsync(a => a.GetDiagnosticsAsync(args[0], args[1]))
                     : await worker.RunAsync(a => a.GetDiagnosticsAsync(args[0]));
             case "GetSemanticTokensAsync":
-                return await worker.RunAsync(a => a.GetSemanticTokensAsync(args[0]));
+                return await worker.RunAsync(a => a.GetSemanticTokensAsync(args[0], args.Length > 1 ? args[1] : ""));
             case "GetDefinitionAsync":
-                return await worker.RunAsync(a => a.GetDefinitionAsync(args[0], args[1]));
+                return await worker.RunAsync(a => a.GetDefinitionAsync(args[0], args[1], args.Length > 2 ? args[2] : ""));
             case "GetReferencesAsync":
-                return await worker.RunAsync(a => a.GetReferencesAsync(args[0], args[1], args[2]));
+                return await worker.RunAsync(a => a.GetReferencesAsync(args[0], args[1], args[2], args.Length > 3 ? args[3] : ""));
             case "GetRenameInfoAsync":
-                return await worker.RunAsync(a => a.GetRenameInfoAsync(args[0], args[1]));
+                return await worker.RunAsync(a => a.GetRenameInfoAsync(args[0], args[1], args.Length > 2 ? args[2] : ""));
             case "GetRenameEditsAsync":
-                return await worker.RunAsync(a => a.GetRenameEditsAsync(args[0], args[1], args[2]));
+                return await worker.RunAsync(a => a.GetRenameEditsAsync(args[0], args[1], args[2], args.Length > 3 ? args[3] : ""));
             case "GetDocumentSymbolsAsync":
-                return await worker.RunAsync(a => a.GetDocumentSymbolsAsync(args[0]));
+                return await worker.RunAsync(a => a.GetDocumentSymbolsAsync(args[0], args.Length > 1 ? args[1] : ""));
             case "GetFormattingAsync":
-                return await worker.RunAsync(a => a.GetFormattingAsync(args[0]));
+                return await worker.RunAsync(a => a.GetFormattingAsync(args[0], args.Length > 1 ? args[1] : ""));
             case "GetRangeFormattingAsync":
-                return await worker.RunAsync(a => a.GetRangeFormattingAsync(args[0], args[1]));
+                return await worker.RunAsync(a => a.GetRangeFormattingAsync(args[0], args[1], args.Length > 2 ? args[2] : ""));
             case "GetCodeActionsAsync":
-                return await worker.RunAsync(a => a.GetCodeActionsAsync(args[0], args[1]));
+                return await worker.RunAsync(a => a.GetCodeActionsAsync(args[0], args[1], args.Length > 2 ? args[2] : ""));
             case "GetInlayHintsAsync":
-                return await worker.RunAsync(a => a.GetInlayHintsAsync(args[0], args[1]));
+                return await worker.RunAsync(a => a.GetInlayHintsAsync(args[0], args[1], args.Length > 2 ? args[2] : ""));
             case "GetFoldingRangesAsync":
-                return await worker.RunAsync(a => a.GetFoldingRangesAsync(args[0]));
+                return await worker.RunAsync(a => a.GetFoldingRangesAsync(args[0], args.Length > 1 ? args[1] : ""));
             case "IncludeNamespaceAsync":
                 return await worker.RunAsync(a => a.IncludeNamespaceAsync(args[0]));
         }
