@@ -6327,6 +6327,7 @@ export default function App() {
   terminalCwdRef.current = terminalCwd;
   const csharpRuntimeReadyRef = useRef<Promise<void> | null>(null);
   const csharpInteractiveWorkerRef = useRef<Worker | null>(null);
+  const csharpInteractiveWorkerRunRejectRef = useRef<((error: Error) => void) | null>(null);
   const skipEditorSyncRef = useRef(false);
   const pendingSharedEditorTargetRef = useRef<{ tabId: string; itemId: string } | null>(null);
   const sharedEditorVersionRef = useRef(0);
@@ -7774,6 +7775,8 @@ export default function App() {
     return () => {
       outputInteractionResolverRef.current?.(null);
       outputInteractionResolverRef.current = null;
+      csharpInteractiveWorkerRunRejectRef.current?.(new Error('C# interactive runner was stopped.'));
+      csharpInteractiveWorkerRunRejectRef.current = null;
       csharpInteractiveWorkerRef.current?.terminate();
       csharpInteractiveWorkerRef.current = null;
     };
@@ -8209,11 +8212,26 @@ export default function App() {
   ) => {
     const header = new Int32Array(headerBuffer);
     const buffer = new Uint8Array(payloadBuffer);
-    const encoded = new TextEncoder().encode(JSON.stringify(payload));
-    const maxLength = Math.min(encoded.length, buffer.byteLength);
+    if (buffer.byteLength === 0) {
+      Atomics.store(header, 1, 0);
+      Atomics.store(header, 0, 1);
+      Atomics.notify(header, 0, 1);
+      return;
+    }
+
+    const encoder = new TextEncoder();
+    let encoded = encoder.encode(JSON.stringify(payload));
+    if (encoded.length > buffer.byteLength) {
+      encoded = encoder.encode(JSON.stringify({
+        __codecraftError: `Runtime stdin response is too large for the ${buffer.byteLength} byte shared buffer.`,
+      }));
+    }
+    if (encoded.length > buffer.byteLength) {
+      encoded = encoder.encode('{}').subarray(0, buffer.byteLength);
+    }
     buffer.fill(0);
-    buffer.set(encoded.subarray(0, maxLength), 0);
-    Atomics.store(header, 1, maxLength);
+    buffer.set(encoded, 0);
+    Atomics.store(header, 1, encoded.length);
     Atomics.store(header, 0, 1);
     Atomics.notify(header, 0, 1);
   };
@@ -10702,9 +10720,12 @@ json.dumps(sorted(_imports))
     return csharpInteractiveWorkerRef.current;
   };
 
-  const terminateCSharpInteractiveWorker = () => {
+  const terminateCSharpInteractiveWorker = (error = new Error('C# interactive runner was stopped.')) => {
+    const rejectActiveRun = csharpInteractiveWorkerRunRejectRef.current;
+    csharpInteractiveWorkerRunRejectRef.current = null;
     csharpInteractiveWorkerRef.current?.terminate();
     csharpInteractiveWorkerRef.current = null;
+    rejectActiveRun?.(error);
   };
 
   const runCSharpInInteractiveWorker = (payload: {
@@ -10716,13 +10737,27 @@ json.dumps(sorted(_imports))
     contents?: string[];
     entryPath?: string;
   }): Promise<any> => new Promise((resolve, reject) => {
+    if (csharpInteractiveWorkerRunRejectRef.current) {
+      reject(new Error('C# interactive runner is already active.'));
+      return;
+    }
+
     const worker = getCSharpInteractiveWorker();
     let settled = false;
 
     const finish = (callback: () => void) => {
       if (settled) return;
       settled = true;
+      if (csharpInteractiveWorkerRunRejectRef.current) {
+        csharpInteractiveWorkerRunRejectRef.current = null;
+      }
+      worker.onmessage = null;
+      worker.onerror = null;
       callback();
+    };
+
+    csharpInteractiveWorkerRunRejectRef.current = (error) => {
+      finish(() => reject(error));
     };
 
     worker.onmessage = (event) => {
@@ -10767,8 +10802,7 @@ json.dumps(sorted(_imports))
     };
 
     worker.onerror = (event) => {
-      terminateCSharpInteractiveWorker();
-      finish(() => reject(new Error(event.message || 'C# worker execution failed.')));
+      terminateCSharpInteractiveWorker(new Error(event.message || 'C# worker execution failed.'));
     };
 
     worker.postMessage({ type: 'run', ...payload });
@@ -11221,7 +11255,8 @@ finally:
   const ensureCSharpRuntime = async () => {
     if (csharpRuntimeReadyRef.current) return csharpRuntimeReadyRef.current;
 
-    csharpRuntimeReadyRef.current = new Promise<void>((resolve, reject) => {
+    const scriptId = 'codecraft-csharp-wasm-loader';
+    const pendingRuntime = new Promise<void>((resolve, reject) => {
       let settled = false;
       const settle = (success: boolean, error?: Error) => {
         if (settled) return;
@@ -11236,7 +11271,6 @@ finally:
             settle(success, new Error('C# WebAssembly runtime failed to load.'));
           });
 
-          const scriptId = 'codecraft-csharp-wasm-loader';
           if (document.getElementById(scriptId)) return;
 
           const script = document.createElement('script');
@@ -11249,6 +11283,12 @@ finally:
         .catch((error) => {
           settle(false, error instanceof Error ? error : new Error(String(error)));
         });
+    });
+
+    csharpRuntimeReadyRef.current = pendingRuntime.catch(error => {
+      csharpRuntimeReadyRef.current = null;
+      document.getElementById(scriptId)?.remove();
+      throw error;
     });
 
     return csharpRuntimeReadyRef.current;
@@ -11317,7 +11357,10 @@ finally:
         executeCSharp,
         async () => {
           if (useInteractiveWorker) {
-            terminateCSharpInteractiveWorker();
+            resolveOutputPanelInteraction(null);
+            terminateCSharpInteractiveWorker(
+              createExecutionTimeoutError('C# execution', settings.csharpExecutionTimeoutMs)
+            );
             return;
           }
           if (settings.csharpExecutionMode === 'script-context') {
@@ -11386,7 +11429,10 @@ finally:
           ),
         async () => {
           if (useInteractiveWorker) {
-            terminateCSharpInteractiveWorker();
+            resolveOutputPanelInteraction(null);
+            terminateCSharpInteractiveWorker(
+              createExecutionTimeoutError('C# execution', settings.csharpExecutionTimeoutMs)
+            );
           }
         }
       );

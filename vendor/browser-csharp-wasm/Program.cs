@@ -464,6 +464,7 @@ internal static class __CodeCraftEntry
 			try
 			{
 				StringWriter sw = interactive ? null : new StringWriter();
+				StringWriter ew = interactive ? null : new StringWriter();
 				if (interactive)
 				{
 					Console.SetOut(new CodeCraftInteractiveTextWriter("stdout"));
@@ -473,6 +474,7 @@ internal static class __CodeCraftEntry
 				else
 				{
 					Console.SetOut(sw);
+					Console.SetError(ew);
 				}
 				ParameterInfo[] parameters = entry.GetParameters();
 				object[] mainArgs = parameters.Length == 0 ? null : new object[] { Array.Empty<string>() };
@@ -495,18 +497,21 @@ internal static class __CodeCraftEntry
 				}
 
 				string stdOut = sw?.ToString();
-				string outStr = !String.IsNullOrEmpty(stdOut) ? stdOut : null;
+				string stdErr = ew?.ToString();
+				string outStr = ToNonEmptyString(stdOut);
+				string errStr = ToNonEmptyString(stdErr);
 				if (exitOrResult != null && !(exitOrResult is Task))
 				{
-					return new ExecutionResult(exitOrResult, outStr, null);
+					return new ExecutionResult(exitOrResult, outStr, errStr);
 				}
 
-				return new ExecutionResult(null, outStr, null);
+				return new ExecutionResult(null, outStr, errStr);
 			}
 			catch (Exception ex)
 			{
 				string stdOut = Console.Out is StringWriter sw ? sw.ToString() : null;
-				return new ExecutionResult(null, stdOut?.Length > 0 ? stdOut : null, FormatExecutionException(ex));
+				string stdErr = Console.Error is StringWriter ew ? ew.ToString() : null;
+				return new ExecutionResult(null, ToNonEmptyString(stdOut), AppendExecutionError(stdErr, FormatExecutionException(ex)));
 			}
 			finally
 			{
@@ -578,6 +583,7 @@ internal static class __CodeCraftEntry
 			try
 			{
 				StringWriter sw = interactive ? null : new StringWriter();
+				StringWriter ew = interactive ? null : new StringWriter();
 				if (interactive)
 				{
 					Console.SetOut(new CodeCraftInteractiveTextWriter("stdout"));
@@ -587,18 +593,21 @@ internal static class __CodeCraftEntry
 				else
 				{
 					Console.SetOut(sw);
+					Console.SetError(ew);
 				}
 
 				Func<object[], Task<object>> submission = (Func<object[], Task<object>>)entryPointMethod.CreateDelegate(typeof(Func<object[], Task<object>>));
 				object result = await submission.Invoke(states).ConfigureAwait(false);
 
 				string stdOut = sw?.ToString();
-				return new ExecutionResult(result, !String.IsNullOrEmpty(stdOut) ? stdOut : null, null);
+				string stdErr = ew?.ToString();
+				return new ExecutionResult(result, ToNonEmptyString(stdOut), ToNonEmptyString(stdErr));
 			}
 			catch (Exception ex)
 			{
 				string stdOut = Console.Out is StringWriter sw ? sw.ToString() : null;
-				return new ExecutionResult(null, stdOut?.Length > 0 ? stdOut : null, FormatExecutionException(ex));
+				string stdErr = Console.Error is StringWriter ew ? ew.ToString() : null;
+				return new ExecutionResult(null, ToNonEmptyString(stdOut), AppendExecutionError(stdErr, FormatExecutionException(ex)));
 			}
 			finally
 			{
@@ -694,6 +703,27 @@ internal static class __CodeCraftEntry
 		private static string FormatExecutionException(Exception exception)
 		{
 			return UnwrapExecutionException(exception).ToString();
+		}
+
+		private static string ToNonEmptyString(string value)
+		{
+			return !String.IsNullOrEmpty(value) ? value : null;
+		}
+
+		private static string AppendExecutionError(string capturedStdErr, string executionError)
+		{
+			string errStr = ToNonEmptyString(capturedStdErr);
+			if (String.IsNullOrEmpty(errStr))
+			{
+				return executionError;
+			}
+			if (String.IsNullOrEmpty(executionError))
+			{
+				return errStr;
+			}
+			return errStr.EndsWith(Environment.NewLine)
+				? errStr + executionError
+				: errStr + Environment.NewLine + executionError;
 		}
 
 		private static Exception UnwrapExecutionException(Exception exception)

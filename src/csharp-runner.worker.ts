@@ -21,10 +21,49 @@ type RuntimeMessage = {
 };
 
 function toRootedFrameworkUrl(value: string) {
-  return value.startsWith('_framework/') ? `/${value}` : value;
+  if (value.startsWith('/_framework/')) return value;
+  if (value.startsWith('_framework/')) return `/${value}`;
+  if (value.startsWith('./_framework/')) return value.slice(1);
+  const nestedFrameworkIndex = value.indexOf('/_framework/');
+  if (nestedFrameworkIndex > 0) return value.slice(nestedFrameworkIndex);
+  return value;
+}
+
+function toRootedFrameworkUrlObject(url: URL) {
+  const rootedPath = toRootedFrameworkUrl(url.pathname.replace(/^\//, ''));
+  const normalizedPath = rootedPath.startsWith('/') ? rootedPath : `/${rootedPath}`;
+  if (normalizedPath === url.pathname) {
+    return url;
+  }
+
+  const nextUrl = new URL(url.href);
+  nextUrl.pathname = normalizedPath;
+  return nextUrl;
+}
+
+function toWorkerFetchInput(input: RequestInfo | URL) {
+  if (typeof input === 'string') {
+    return toRootedFrameworkUrl(input);
+  }
+
+  if (input instanceof URL) {
+    return toRootedFrameworkUrlObject(input);
+  }
+
+  if (typeof Request === 'function' && input instanceof Request) {
+    const url = new URL(input.url);
+    const rootedUrl = toRootedFrameworkUrlObject(url);
+    return rootedUrl.href === input.url ? input : new Request(rootedUrl, input);
+  }
+
+  return input;
 }
 
 function installWorkerBrowserShims() {
+  if (workerScope.__codecraftCSharpWorkerBrowserShimsInstalled) {
+    return;
+  }
+
   const blazorScriptSrc = `${workerScope.location.origin}/_framework/blazor.webassembly.js`;
   const currentScript = {
     src: blazorScriptSrc,
@@ -33,12 +72,7 @@ function installWorkerBrowserShims() {
     },
   };
   const originalFetch = workerScope.fetch.bind(workerScope);
-  workerScope.fetch = (input: RequestInfo | URL, init?: RequestInit) => {
-    if (typeof input === 'string') {
-      return originalFetch(toRootedFrameworkUrl(input), init);
-    }
-    return originalFetch(input, init);
-  };
+  workerScope.fetch = (input: RequestInfo | URL, init?: RequestInit) => originalFetch(toWorkerFetchInput(input), init);
 
   function createScriptElement() {
     return {
@@ -74,6 +108,11 @@ function installWorkerBrowserShims() {
     baseURI: `${workerScope.location.origin}/`,
     location: workerScope.location,
     currentScript,
+    documentElement: {
+      style: {
+        setProperty() {},
+      },
+    },
     body: {
       appendChild: appendElement,
     },
@@ -113,16 +152,31 @@ function installWorkerBrowserShims() {
     addEventListener() {},
     removeEventListener() {},
   };
+  workerScope.__codecraftCSharpWorkerBrowserShimsInstalled = true;
 }
 
 function completeSharedBufferInteraction(headerBuffer: SharedArrayBuffer, payloadBuffer: SharedArrayBuffer, payload: unknown) {
   const header = new Int32Array(headerBuffer);
   const buffer = new Uint8Array(payloadBuffer);
-  const encoded = textEncoder.encode(JSON.stringify(payload));
-  const maxLength = Math.min(encoded.length, buffer.byteLength);
+  if (buffer.byteLength === 0) {
+    Atomics.store(header, 1, 0);
+    Atomics.store(header, 0, 1);
+    Atomics.notify(header, 0, 1);
+    return;
+  }
+
+  let encoded = textEncoder.encode(JSON.stringify(payload));
+  if (encoded.length > buffer.byteLength) {
+    encoded = textEncoder.encode(JSON.stringify({
+      __codecraftError: `C# stdin response is too large for the ${buffer.byteLength} byte shared buffer.`,
+    }));
+  }
+  if (encoded.length > buffer.byteLength) {
+    encoded = textEncoder.encode('{}').subarray(0, buffer.byteLength);
+  }
   buffer.fill(0);
-  buffer.set(encoded.subarray(0, maxLength), 0);
-  Atomics.store(header, 1, maxLength);
+  buffer.set(encoded, 0);
+  Atomics.store(header, 1, encoded.length);
   Atomics.store(header, 0, 1);
   Atomics.notify(header, 0, 1);
 }
@@ -137,7 +191,7 @@ function requestInputSync(prompt: unknown) {
   const header = new Int32Array(headerBuffer);
   workerScope.postMessage({
     type: 'stdin-request',
-    prompt: String(prompt || ''),
+    prompt: String(prompt ?? ''),
     headerBuffer,
     payloadBuffer,
   });
@@ -148,7 +202,12 @@ function requestInputSync(prompt: unknown) {
   const decodedPayload = new Uint8Array(payloadLength);
   decodedPayload.set(sharedPayload);
   const json = textDecoder.decode(decodedPayload);
-  const parsed = json ? JSON.parse(json) : { value: '' };
+  let parsed: any;
+  try {
+    parsed = json ? JSON.parse(json) : { value: '' };
+  } catch {
+    throw new Error('C# stdin response could not be decoded.');
+  }
   if (parsed && parsed.__codecraftError) {
     throw new Error(String(parsed.__codecraftError));
   }
@@ -158,7 +217,7 @@ function requestInputSync(prompt: unknown) {
 function ensureRuntime() {
   if (runtimeReadyPromise) return runtimeReadyPromise;
 
-  runtimeReadyPromise = new Promise((resolve, reject) => {
+  const pendingRuntime = new Promise<void>((resolve, reject) => {
     installWorkerBrowserShims();
     workerScope.BrowserCSharp = {
       loaded: () => resolve(),
@@ -181,6 +240,11 @@ function ensureRuntime() {
     } catch (error) {
       reject(error);
     }
+  });
+
+  runtimeReadyPromise = pendingRuntime.catch(error => {
+    runtimeReadyPromise = null;
+    throw error;
   });
 
   return runtimeReadyPromise;
