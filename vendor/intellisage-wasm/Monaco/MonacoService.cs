@@ -61,7 +61,6 @@ public class MonacoService
 
     public record DiagnosticDto()
     {
-        public string Path { get; init; } = "";
         public LinePosition Start { get; init; }
         public LinePosition End { get; init; }
         public string Message { get; init; } = "";
@@ -75,8 +74,8 @@ public class MonacoService
     public record RangeRequest(PositionDto Start, PositionDto End);
     public record DiagnosticProjectFileDto(string Path, string Content);
     public record DiagnosticProjectRequest(string? CurrentPath, DiagnosticProjectFileDto[]? Files);
-    public record MonacoLocation(TextRange Range, string? Path = null, string? Name = null, string? Kind = null, string? Detail = null);
-    public record MonacoTextEdit(TextRange Range, string Text, string? Path = null);
+    public record MonacoLocation(TextRange Range, string? Name = null, string? Kind = null, string? Detail = null);
+    public record MonacoTextEdit(TextRange Range, string Text);
     public record RenameInfo(bool CanRename, TextRange? Range, string? Text, string? RejectReason);
     public record CodeActionDto(string Title, string Kind, MonacoTextEdit[] Edits, bool IsPreferred);
     public record DocumentSymbolDto(string Name, string Detail, string Kind, TextRange Range, TextRange SelectionRange, DocumentSymbolDto[] Children);
@@ -128,10 +127,10 @@ $@"using System;
         _quickInfoProvider = new OmniSharpQuickInfoProvider(_diagnosticProject.Workspace, formattingOptions, loggerFactory);
     }
 
-    public async Task<byte[]> GetCompletionAsync(string code, string completionRequestString, string projectRequestString = "")
+    public async Task<byte[]> GetCompletionAsync(string code, string completionRequestString)
     {
         var completionRequest = DeserializeRequest<CompletionRequest>(completionRequestString);
-        var document = await UpdateProjectDocumentAsync(_completionProject, code, projectRequestString);
+        var document = await UpdateDocumentAsync(_completionProject, code);
         var completionResponse = await _completionService.Handle(completionRequest, document);
 
         return Payload(completionResponse, "GetCompletionAsync");
@@ -146,10 +145,10 @@ $@"using System;
         return Payload(completionResponse, "GetCompletionResolveAsync");
     }
 
-    public async Task<byte[]> GetSignatureHelpAsync(string code, string signatureHelpRequestString, string projectRequestString = "")
+    public async Task<byte[]> GetSignatureHelpAsync(string code, string signatureHelpRequestString)
     {
         var signatureHelpRequest = DeserializeRequest<SignatureHelpRequest>(signatureHelpRequestString);
-        var document = await UpdateProjectDocumentAsync(_completionProject, code, projectRequestString);
+        var document = await UpdateDocumentAsync(_completionProject, code);
         var signatureHelpResponse = await _signatureService.Handle(signatureHelpRequest, document);
 
         return Payload(signatureHelpResponse, "GetSignatureHelpAsync");
@@ -164,9 +163,9 @@ $@"using System;
         return Payload(quickInfoResponse, "GetQuickInfoAsync");
     }
 
-    public async Task<byte[]> GetQuickInfoAsync(string code, string quickInfoRequestString, string projectRequestString = "")
+    public async Task<byte[]> GetQuickInfoAsync(string code, string quickInfoRequestString)
     {
-        var document = await UpdateProjectDocumentAsync(_diagnosticProject, code, projectRequestString);
+        var document = await UpdateDocumentAsync(_diagnosticProject, code);
         var quickInfoRequest = DeserializeRequest<QuickInfoRequest>(quickInfoRequestString);
         var quickInfoResponse = await _quickInfoProvider.Handle(quickInfoRequest, document);
 
@@ -180,34 +179,33 @@ $@"using System;
 
     public async Task<byte[]> GetDiagnosticsAsync(string code, string diagnosticRequestString)
     {
-        var document = await UpdateProjectDocumentAsync(_diagnosticProject, code, diagnosticRequestString);
-        var diagnostics = string.IsNullOrWhiteSpace(diagnosticRequestString)
-            ? await GetCurrentDocumentDiagnosticsAsync(document)
-            : await GetProjectDiagnosticsAsync(document.Project);
-        if (diagnostics.Count == 0)
+        var document = await UpdateDiagnosticDocumentAsync(code, diagnosticRequestString);
+        var semanticModel = await document.GetSemanticModelAsync();
+        if (semanticModel == null)
         {
             return Payload(Array.Empty<DiagnosticDto>(), "GetDiagnosticsAsync");
         }
 
-        var diagnosticDtos = diagnostics
-            .Select(diagnostic => ToDiagnosticDto(diagnostic, document.Project, _diagnosticProject))
+        var diagnostics = semanticModel
+            .GetDiagnostics()
+            .Select(ToDiagnosticDto)
             .Where(current => current != null)
             .Cast<DiagnosticDto>()
             .ToList();
 
-        return Payload(diagnosticDtos, "GetDiagnosticsAsync");
+        return Payload(diagnostics, "GetDiagnosticsAsync");
     }
 
-    public async Task<byte[]> GetSemanticTokensAsync(string code, string projectRequestString = "")
+    public async Task<byte[]> GetSemanticTokensAsync(string code)
     {
-        var document = await UpdateProjectDocumentAsync(_diagnosticProject, code, projectRequestString);
+        var document = await UpdateDocumentAsync(_diagnosticProject, code);
         var tokens = await BuildSemanticTokensAsync(document);
         return Payload(tokens, "GetSemanticTokensAsync");
     }
 
-    public async Task<byte[]> GetDefinitionAsync(string code, string positionRequestString, string projectRequestString = "")
+    public async Task<byte[]> GetDefinitionAsync(string code, string positionRequestString)
     {
-        var document = await UpdateProjectDocumentAsync(_diagnosticProject, code, projectRequestString);
+        var document = await UpdateDocumentAsync(_diagnosticProject, code);
         var symbol = await FindSymbolAsync(document, positionRequestString);
         if (symbol == null)
         {
@@ -218,7 +216,7 @@ $@"using System;
         var sourceSymbol = await SymbolFinder.FindSourceDefinitionAsync(symbol, solution) ?? symbol;
         var locations = sourceSymbol.Locations
             .Where(location => location.IsInSource)
-            .Select(location => ToLocation(location, document, _diagnosticProject, sourceSymbol))
+            .Select(location => ToLocation(location, document, sourceSymbol))
             .Where(location => location != null)
             .Cast<MonacoLocation>()
             .ToArray();
@@ -226,9 +224,9 @@ $@"using System;
         return Payload(locations, "GetDefinitionAsync");
     }
 
-    public async Task<byte[]> GetReferencesAsync(string code, string positionRequestString, string includeDeclarationString, string projectRequestString = "")
+    public async Task<byte[]> GetReferencesAsync(string code, string positionRequestString, string includeDeclarationString)
     {
-        var document = await UpdateProjectDocumentAsync(_diagnosticProject, code, projectRequestString);
+        var document = await UpdateDocumentAsync(_diagnosticProject, code);
         var symbol = await FindSymbolAsync(document, positionRequestString);
         if (symbol == null)
         {
@@ -243,7 +241,7 @@ $@"using System;
         {
             references.AddRange(symbol.Locations
                 .Where(location => location.IsInSource)
-                .Select(location => ToLocation(location, document, _diagnosticProject, symbol))
+                .Select(location => ToLocation(location, document, symbol))
                 .Where(location => location != null)
                 .Cast<MonacoLocation>());
         }
@@ -257,7 +255,7 @@ $@"using System;
                     continue;
                 }
 
-                var monacoLocation = ToLocation(location.Location, document, _diagnosticProject, referencedSymbol.Definition);
+                var monacoLocation = ToLocation(location.Location, document, referencedSymbol.Definition);
                 if (monacoLocation != null)
                 {
                     references.Add(monacoLocation);
@@ -266,19 +264,18 @@ $@"using System;
         }
 
         var distinct = references
-            .GroupBy(location => $"{location.Path}:{location.Range.Start.Line}:{location.Range.Start.Character}:{location.Range.End.Line}:{location.Range.End.Character}")
+            .GroupBy(location => $"{location.Range.Start.Line}:{location.Range.Start.Character}:{location.Range.End.Line}:{location.Range.End.Character}")
             .Select(group => group.First())
-            .OrderBy(location => location.Path ?? string.Empty, StringComparer.Ordinal)
-            .ThenBy(location => location.Range.Start.Line)
+            .OrderBy(location => location.Range.Start.Line)
             .ThenBy(location => location.Range.Start.Character)
             .ToArray();
 
         return Payload(distinct, "GetReferencesAsync");
     }
 
-    public async Task<byte[]> GetRenameInfoAsync(string code, string positionRequestString, string projectRequestString = "")
+    public async Task<byte[]> GetRenameInfoAsync(string code, string positionRequestString)
     {
-        var document = await UpdateProjectDocumentAsync(_diagnosticProject, code, projectRequestString);
+        var document = await UpdateDocumentAsync(_diagnosticProject, code);
         var symbol = await FindSymbolAsync(document, positionRequestString);
         if (symbol == null || IsReservedSymbol(symbol))
         {
@@ -289,7 +286,7 @@ $@"using System;
         return Payload(new RenameInfo(true, tokenRange, symbol.Name, null), "GetRenameInfoAsync");
     }
 
-    public async Task<byte[]> GetRenameEditsAsync(string code, string positionRequestString, string newName, string projectRequestString = "")
+    public async Task<byte[]> GetRenameEditsAsync(string code, string positionRequestString, string newName)
     {
         var sanitizedName = newName.Trim();
         var rawIdentifier = sanitizedName.StartsWith("@", StringComparison.Ordinal) ? sanitizedName[1..] : sanitizedName;
@@ -298,7 +295,7 @@ $@"using System;
             return Payload(new { edits = Array.Empty<MonacoTextEdit>(), rejectReason = "Enter a valid C# identifier." }, "GetRenameEditsAsync");
         }
 
-        var document = await UpdateProjectDocumentAsync(_diagnosticProject, code, projectRequestString);
+        var document = await UpdateDocumentAsync(_diagnosticProject, code);
         var symbol = await FindSymbolAsync(document, positionRequestString);
         if (symbol == null || IsReservedSymbol(symbol))
         {
@@ -310,7 +307,7 @@ $@"using System;
 
         foreach (var declaration in symbol.Locations.Where(location => location.IsInSource))
         {
-            var edit = ToRenameEdit(declaration, document, _diagnosticProject, sanitizedName);
+            var edit = ToRenameEdit(declaration, document, sanitizedName);
             if (edit != null)
             {
                 edits.Add(edit);
@@ -326,7 +323,7 @@ $@"using System;
                     continue;
                 }
 
-                var edit = ToRenameEdit(reference.Location, document, _diagnosticProject, sanitizedName);
+                var edit = ToRenameEdit(reference.Location, document, sanitizedName);
                 if (edit != null)
                 {
                     edits.Add(edit);
@@ -335,34 +332,33 @@ $@"using System;
         }
 
         var distinct = edits
-            .GroupBy(edit => $"{edit.Path}:{edit.Range.Start.Line}:{edit.Range.Start.Character}:{edit.Range.End.Line}:{edit.Range.End.Character}")
+            .GroupBy(edit => $"{edit.Range.Start.Line}:{edit.Range.Start.Character}:{edit.Range.End.Line}:{edit.Range.End.Character}")
             .Select(group => group.First())
-            .OrderByDescending(edit => edit.Path ?? string.Empty, StringComparer.Ordinal)
-            .ThenByDescending(edit => edit.Range.Start.Line)
+            .OrderByDescending(edit => edit.Range.Start.Line)
             .ThenByDescending(edit => edit.Range.Start.Character)
             .ToArray();
 
         return Payload(new { edits = distinct, rejectReason = (string?)null }, "GetRenameEditsAsync");
     }
 
-    public async Task<byte[]> GetDocumentSymbolsAsync(string code, string projectRequestString = "")
+    public async Task<byte[]> GetDocumentSymbolsAsync(string code)
     {
-        var document = await UpdateProjectDocumentAsync(_diagnosticProject, code, projectRequestString);
+        var document = await UpdateDocumentAsync(_diagnosticProject, code);
         var symbols = await BuildDocumentSymbolsAsync(document);
         return Payload(symbols, "GetDocumentSymbolsAsync");
     }
 
-    public async Task<byte[]> GetFormattingAsync(string code, string projectRequestString = "")
+    public async Task<byte[]> GetFormattingAsync(string code)
     {
-        var document = await UpdateProjectDocumentAsync(_diagnosticProject, code, projectRequestString);
+        var document = await UpdateDocumentAsync(_diagnosticProject, code);
         var formattedDocument = await Formatter.FormatAsync(document);
         var text = await formattedDocument.GetTextAsync();
         return Payload(text.ToString(), "GetFormattingAsync");
     }
 
-    public async Task<byte[]> GetRangeFormattingAsync(string code, string rangeRequestString, string projectRequestString = "")
+    public async Task<byte[]> GetRangeFormattingAsync(string code, string rangeRequestString)
     {
-        var document = await UpdateProjectDocumentAsync(_diagnosticProject, code, projectRequestString);
+        var document = await UpdateDocumentAsync(_diagnosticProject, code);
         var text = await document.GetTextAsync();
         var range = DeserializeRequest<RangeRequest>(rangeRequestString);
         var span = ToTextSpan(text, range);
@@ -371,9 +367,9 @@ $@"using System;
         return Payload(formattedText.ToString(), "GetRangeFormattingAsync");
     }
 
-    public async Task<byte[]> GetCodeActionsAsync(string code, string rangeRequestString, string projectRequestString = "")
+    public async Task<byte[]> GetCodeActionsAsync(string code, string rangeRequestString)
     {
-        var document = await UpdateProjectDocumentAsync(_diagnosticProject, code, projectRequestString);
+        var document = await UpdateDocumentAsync(_diagnosticProject, code);
         var text = await document.GetTextAsync();
         var source = text.ToString();
         var actions = new List<CodeActionDto>();
@@ -418,9 +414,9 @@ $@"using System;
             .ToArray(), "GetCodeActionsAsync");
     }
 
-    public async Task<byte[]> GetInlayHintsAsync(string code, string rangeRequestString, string projectRequestString = "")
+    public async Task<byte[]> GetInlayHintsAsync(string code, string rangeRequestString)
     {
-        var document = await UpdateProjectDocumentAsync(_diagnosticProject, code, projectRequestString);
+        var document = await UpdateDocumentAsync(_diagnosticProject, code);
         var text = await document.GetTextAsync();
         var range = DeserializeRequest<RangeRequest>(rangeRequestString);
         var span = ToTextSpan(text, range);
@@ -428,9 +424,9 @@ $@"using System;
         return Payload(hints, "GetInlayHintsAsync");
     }
 
-    public async Task<byte[]> GetFoldingRangesAsync(string code, string projectRequestString = "")
+    public async Task<byte[]> GetFoldingRangesAsync(string code)
     {
-        var document = await UpdateProjectDocumentAsync(_diagnosticProject, code, projectRequestString);
+        var document = await UpdateDocumentAsync(_diagnosticProject, code);
         var text = await document.GetTextAsync();
         var root = await document.GetSyntaxRootAsync();
         if (root == null)
@@ -481,26 +477,26 @@ $@"using System;
         return project.UpdateDocumentAsync(code);
     }
 
-    Task<Document> UpdateProjectDocumentAsync(RoslynProject project, string code, string projectRequestString)
+    Task<Document> UpdateDiagnosticDocumentAsync(string code, string diagnosticRequestString)
     {
-        if (string.IsNullOrWhiteSpace(projectRequestString))
+        if (string.IsNullOrWhiteSpace(diagnosticRequestString))
         {
-            return project.UpdateDocumentAsync(code);
+            return _diagnosticProject.UpdateDocumentAsync(code);
         }
 
         try
         {
-            var request = DeserializeRequest<DiagnosticProjectRequest>(projectRequestString);
+            var request = DeserializeRequest<DiagnosticProjectRequest>(diagnosticRequestString);
             var files = (request.Files ?? Array.Empty<DiagnosticProjectFileDto>())
                 .Where(file => !string.IsNullOrWhiteSpace(file.Path))
                 .Select(file => new RoslynProject.SourceFileSnapshot(file.Path, file.Content ?? string.Empty))
                 .ToArray();
-            return project.UpdateProjectDocumentsAsync(code, request.CurrentPath, files);
+            return _diagnosticProject.UpdateProjectDocumentsAsync(code, request.CurrentPath, files);
         }
         catch (Exception e)
         {
-            Console.WriteLine($"Could not deserialize C# project snapshot: {e.Message}");
-            return project.UpdateDocumentAsync(code);
+            Console.WriteLine($"Could not deserialize diagnostic project snapshot: {e.Message}");
+            return _diagnosticProject.UpdateDocumentAsync(code);
         }
     }
 
@@ -549,33 +545,6 @@ $@"using System;
         }
 
         return semanticModel.GetDiagnostics().ToList();
-    }
-
-    async Task<List<Microsoft.CodeAnalysis.Diagnostic>> GetCurrentDocumentDiagnosticsAsync(Document document)
-    {
-        var semanticModel = await document.GetSemanticModelAsync();
-        if (semanticModel == null)
-        {
-            return new List<Microsoft.CodeAnalysis.Diagnostic>();
-        }
-
-        return semanticModel.GetDiagnostics().ToList();
-    }
-
-    async Task<List<Microsoft.CodeAnalysis.Diagnostic>> GetProjectDiagnosticsAsync(Project project)
-    {
-        var diagnostics = new List<Microsoft.CodeAnalysis.Diagnostic>();
-        foreach (var document in project.Documents)
-        {
-            var semanticModel = await document.GetSemanticModelAsync();
-            if (semanticModel == null)
-            {
-                continue;
-            }
-            diagnostics.AddRange(semanticModel.GetDiagnostics());
-        }
-
-        return diagnostics;
     }
 
     async Task<SemanticTokenDto[]> BuildSemanticTokensAsync(Document document)
@@ -931,10 +900,10 @@ $@"using System;
         return symbol.Kind == SymbolKind.Namespace || symbol.IsImplicitlyDeclared;
     }
 
-    MonacoLocation? ToLocation(Location location, Document currentDocument, RoslynProject roslynProject, ISymbol? symbol)
+    MonacoLocation? ToLocation(Location location, Document currentDocument, ISymbol? symbol)
     {
         var document = currentDocument.Project.Solution.GetDocument(location.SourceTree);
-        if (document == null)
+        if (document == null || document.Id != currentDocument.Id)
         {
             return null;
         }
@@ -942,22 +911,21 @@ $@"using System;
         var text = document.GetTextAsync().Result;
         return new MonacoLocation(
             ToRange(text, location.SourceSpan),
-            roslynProject.GetDocumentPath(document),
             symbol?.Name,
             symbol?.Kind.ToString(),
             symbol?.ToDisplayString(SymbolDisplayFormat.MinimallyQualifiedFormat));
     }
 
-    MonacoTextEdit? ToRenameEdit(Location location, Document currentDocument, RoslynProject roslynProject, string newName)
+    MonacoTextEdit? ToRenameEdit(Location location, Document currentDocument, string newName)
     {
         var document = currentDocument.Project.Solution.GetDocument(location.SourceTree);
-        if (document == null)
+        if (document == null || document.Id != currentDocument.Id)
         {
             return null;
         }
 
         var text = document.GetTextAsync().Result;
-        return new MonacoTextEdit(ToRange(text, location.SourceSpan), newName, roslynProject.GetDocumentPath(document));
+        return new MonacoTextEdit(ToRange(text, location.SourceSpan), newName);
     }
 
     async Task<string?> FindNamespaceForMissingSymbolAsync(Project project, string symbolName)
@@ -1107,15 +1075,9 @@ $@"using System;
         };
     }
 
-    DiagnosticDto? ToDiagnosticDto(Microsoft.CodeAnalysis.Diagnostic diagnostic, Project project, RoslynProject roslynProject)
+    DiagnosticDto? ToDiagnosticDto(Microsoft.CodeAnalysis.Diagnostic diagnostic)
     {
         if (!diagnostic.Location.IsInSource)
-        {
-            return null;
-        }
-
-        var document = project.Solution.GetDocument(diagnostic.Location.SourceTree);
-        if (document == null)
         {
             return null;
         }
@@ -1128,7 +1090,6 @@ $@"using System;
 
         return new DiagnosticDto()
         {
-            Path = roslynProject.GetDocumentPath(document),
             Start = lineSpan.StartLinePosition,
             End = lineSpan.EndLinePosition,
             Message = diagnostic.GetMessage(),

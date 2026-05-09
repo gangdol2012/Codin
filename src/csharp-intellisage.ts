@@ -54,8 +54,6 @@ interface RoslynRangeDto {
 }
 
 interface RoslynLocationDto {
-  path?: string;
-  Path?: string;
   range: RoslynRangeDto;
   name?: string;
   kind?: string;
@@ -63,11 +61,8 @@ interface RoslynLocationDto {
 }
 
 interface RoslynTextEditDto {
-  path?: string;
-  Path?: string;
   range: RoslynRangeDto;
   text: string;
-  Text?: string;
 }
 
 interface RoslynRenameInfoDto {
@@ -118,11 +113,6 @@ interface RoslynFoldingRangeDto {
   start: number;
   end: number;
   kind?: string;
-}
-
-interface CSharpCallInfo {
-  name: string;
-  activeParameter: number;
 }
 
 type CSharpSemanticTokenType = typeof CSHARP_SEMANTIC_TOKEN_TYPES[number];
@@ -253,8 +243,6 @@ class CSharpLanguageService {
   private completionCache = new Map<string, CSharpCompletionCacheEntry>();
   private diagnosticCacheKey: string | null = null;
   private diagnosticCacheMarkers: monaco.editor.IMarkerData[] = [];
-  private diagnosticCacheMarkersByUri = new Map<string, monaco.editor.IMarkerData[]>();
-  private diagnosticCacheProjectWide = false;
   private providerDisposables: monaco.IDisposable[] = [];
   private semanticCache = new WeakMap<monaco.editor.ITextModel, { versionId: number; index: CSharpSemanticIndex }>();
 
@@ -375,9 +363,6 @@ class CSharpLanguageService {
     this.lastCompletions.clear();
     this.completionCache.clear();
     this.diagnosticCacheKey = null;
-    this.diagnosticCacheMarkers = [];
-    this.diagnosticCacheMarkersByUri.clear();
-    this.diagnosticCacheProjectWide = false;
   }
 
   private cacheCompletionResult(key: string, entry: CSharpCompletionCacheEntry) {
@@ -411,8 +396,7 @@ class CSharpLanguageService {
   private completionCacheKey(
     model: monaco.editor.ITextModel,
     position: monaco.Position,
-    context: monaco.languages.CompletionContext,
-    projectRequest: CSharpDiagnosticProjectRequest
+    context: monaco.languages.CompletionContext
   ) {
     const triggerCharacter = context.triggerCharacter ?? '';
     return [
@@ -423,7 +407,6 @@ class CSharpLanguageService {
       position.column,
       context.triggerKind,
       triggerCharacter,
-      this.createProjectSnapshotKey(projectRequest),
     ].join(':');
   }
 
@@ -524,14 +507,6 @@ class CSharpLanguageService {
     this.clearCompletionState();
   }
 
-  refreshProject() {
-    this.semanticCache = new WeakMap<monaco.editor.ITextModel, { versionId: number; index: CSharpSemanticIndex }>();
-    this.clearCompletionState();
-    if (this.model && !this.model.isDisposed() && this.model.getLanguageId() === 'csharp') {
-      this.requestDiagnostics(this.model);
-    }
-  }
-
   setupDiagnostics(editor: monaco.editor.IStandaloneCodeEditor) {
     this.clearEditor();
 
@@ -621,7 +596,7 @@ class CSharpLanguageService {
     const projectRequest = this.createDiagnosticProjectRequest(model);
     const cacheKey = this.createDiagnosticCacheKey(model, safeCode, projectRequest);
     if (this.diagnosticCacheKey === cacheKey) {
-      this.applyDiagnosticMarkerMap(model, this.diagnosticCacheMarkersByUri, this.diagnosticCacheProjectWide);
+      monaco.editor.setModelMarkers(model, 'csharp-intellisage', this.diagnosticCacheMarkers);
       return;
     }
 
@@ -635,19 +610,17 @@ class CSharpLanguageService {
         return;
       }
 
-      const { markersByUri, currentMarkers, projectWide } = this.convertDiagnosticResponse(model, diagnostics);
+      const markers = this.convertDiagnostics(model, diagnostics);
       this.diagnosticCacheKey = cacheKey;
-      this.diagnosticCacheMarkers = currentMarkers;
-      this.diagnosticCacheMarkersByUri = markersByUri;
-      this.diagnosticCacheProjectWide = projectWide;
-      this.applyDiagnosticMarkerMap(model, markersByUri, projectWide);
+      this.diagnosticCacheMarkers = markers;
+      monaco.editor.setModelMarkers(model, 'csharp-intellisage', markers);
     } catch {
       if (
         requestSerial === this.diagnosticRequestSerial &&
         !model.isDisposed() &&
         model.getVersionId() === initialModelVersion
       ) {
-        this.applyDiagnosticMarkerMap(model, new Map([[model.uri.toString(), []]]), this.diagnosticCacheProjectWide);
+        monaco.editor.setModelMarkers(model, 'csharp-intellisage', []);
       }
     }
   }
@@ -672,20 +645,14 @@ class CSharpLanguageService {
     context: monaco.languages.CompletionContext
   ): Promise<monaco.languages.CompletionList> {
     const initialModelVersion = model.getVersionId();
-    const projectRequest = this.createDiagnosticProjectRequest(model);
-    const word = model.getWordUntilPosition(position);
-    const fallbackRange = new monaco.Range(position.lineNumber, word.startColumn, position.lineNumber, word.endColumn);
-    const localSuggestions = this.provideLocalCompletionItems(model, position, fallbackRange);
     const runtimeReady = await this.ensureLocalIntelliSageRuntime();
     if (!runtimeReady || !this.intellisage || model.isDisposed() || model.getVersionId() !== initialModelVersion) {
-      return localSuggestions.length
-        ? this.toCompletionList({ suggestions: localSuggestions, lspItems: [] })
-        : this.emptyCompletionList();
+      return this.emptyCompletionList();
     }
 
     const requestSerial = ++this.completionRequestSerial;
     const modelVersion = model.getVersionId();
-    const cacheKey = this.completionCacheKey(model, position, context, projectRequest);
+    const cacheKey = this.completionCacheKey(model, position, context);
     const cached = this.completionCache.get(cacheKey);
     if (cached && this.completionWorkerStateKey === cacheKey) return this.toCompletionList(cached);
 
@@ -697,24 +664,23 @@ class CSharpLanguageService {
     };
 
     try {
-      const response = await this.intellisage('GetCompletionAsync', model.getValue(), request, projectRequest);
+      const response = await this.intellisage('GetCompletionAsync', model.getValue(), request);
       if (requestSerial !== this.completionRequestSerial || model.isDisposed() || model.getVersionId() !== modelVersion) {
         return this.emptyCompletionList();
       }
-      if (!response && !localSuggestions.length) return this.emptyCompletionList();
+      if (!response) return this.emptyCompletionList();
 
-      const items = response ? (response as any).items ?? [] : [];
+      const items = (response as any).items ?? [];
       const validItems = items.filter((item: any) => (item?.label ?? item?.insertText ?? item?.textEdit?.newText ?? item?.textEdit?.NewText) != null);
-      const roslynSuggestions = validItems.map((item: any) => this.convertCompletion(item, fallbackRange));
-      const { suggestions, lspItems } = mergeCompletionSuggestions(roslynSuggestions, validItems, localSuggestions);
-      const entry = { suggestions, lspItems, incomplete: response ? !!(response as any).isIncomplete : false };
+      const word = model.getWordUntilPosition(position);
+      const fallbackRange = new monaco.Range(position.lineNumber, word.startColumn, position.lineNumber, word.endColumn);
+      const suggestions = validItems.map((item: any) => this.convertCompletion(item, fallbackRange));
+      const entry = { suggestions, lspItems: validItems, incomplete: !!(response as any).isIncomplete };
       this.cacheCompletionResult(cacheKey, entry);
       this.completionWorkerStateKey = cacheKey;
       return this.toCompletionList(entry);
     } catch {
-      return localSuggestions.length
-        ? this.toCompletionList({ suggestions: localSuggestions, lspItems: [] })
-        : this.emptyCompletionList();
+      return this.emptyCompletionList();
     }
   }
 
@@ -741,23 +707,20 @@ class CSharpLanguageService {
   ): Promise<monaco.languages.SignatureHelpResult | undefined> {
     if (!this.intellisage) return this.provideLocalSignatureHelp(model, position);
     const req = { Line: position.lineNumber - 1, Column: position.column - 1 };
-    const projectRequest = this.createDiagnosticProjectRequest(model);
     try {
-      const res = await this.intellisage('GetSignatureHelpAsync', model.getValue(), req, projectRequest);
+      const res = await this.intellisage('GetSignatureHelpAsync', model.getValue(), req);
       if (!res) return this.provideLocalSignatureHelp(model, position);
       const result = res as any;
-      const signatures = (result.signatures ?? []).map((sig: any) => ({
-        label: sig.label,
-        documentation: sig.structuredDocumentation?.summaryText ?? '',
-        parameters: (sig.parameters ?? []).map((p: any) => ({
-          label: p.label,
-          documentation: p.documentation ? { value: `**${p.name}**: ${p.documentation}` } : '',
-        })),
-      }));
-      if (!signatures.length) return this.provideLocalSignatureHelp(model, position);
       return {
         value: {
-          signatures,
+          signatures: (result.signatures ?? []).map((sig: any) => ({
+            label: sig.label,
+            documentation: sig.structuredDocumentation?.summaryText ?? '',
+            parameters: (sig.parameters ?? []).map((p: any) => ({
+              label: p.label,
+              documentation: p.documentation ? { value: `**${p.name}**: ${p.documentation}` } : '',
+            })),
+          })),
           activeSignature: result.activeSignature ?? 0,
           activeParameter: result.activeParameter ?? 0,
         },
@@ -773,10 +736,9 @@ class CSharpLanguageService {
     position: monaco.Position
   ): Promise<monaco.languages.Hover | undefined> {
     const req = { Line: position.lineNumber - 1, Column: position.column - 1 };
-    const projectRequest = this.createDiagnosticProjectRequest(model);
     if (this.intellisage) {
       try {
-        const response = await this.intellisage('GetQuickInfoAsync', model.getValue(), req, projectRequest);
+        const response = await this.intellisage('GetQuickInfoAsync', model.getValue(), req);
         if (response && (response as any).markdown) {
           return { contents: [{ value: (response as any).markdown }] };
         }
@@ -805,10 +767,9 @@ class CSharpLanguageService {
     model: monaco.editor.ITextModel,
     cancellationToken: monaco.CancellationToken
   ): Promise<monaco.languages.SemanticTokens | null> {
-    const projectRequest = this.createDiagnosticProjectRequest(model);
     if (this.intellisage) {
       try {
-        const response = await this.intellisage('GetSemanticTokensAsync', model.getValue(), projectRequest);
+        const response = await this.intellisage('GetSemanticTokensAsync', model.getValue());
         if (!cancellationToken.isCancellationRequested && Array.isArray(response)) {
           return { data: this.encodeRoslynSemanticTokens(response as RoslynSemanticTokenDto[]) };
         }
@@ -825,10 +786,9 @@ class CSharpLanguageService {
     model: monaco.editor.ITextModel,
     position: monaco.Position
   ): Promise<monaco.languages.Location[] | undefined> {
-    const projectRequest = this.createDiagnosticProjectRequest(model);
     if (this.intellisage) {
       try {
-        const response = await this.intellisage('GetDefinitionAsync', model.getValue(), this.positionRequest(position), projectRequest);
+        const response = await this.intellisage('GetDefinitionAsync', model.getValue(), this.positionRequest(position));
         const locations = this.convertLocations(model, response);
         if (locations.length) return locations;
       } catch {
@@ -850,10 +810,9 @@ class CSharpLanguageService {
     context: monaco.languages.ReferenceContext
   ): Promise<monaco.languages.Location[] | undefined> {
     let roslynLocations: monaco.languages.Location[] = [];
-    const projectRequest = this.createDiagnosticProjectRequest(model);
     if (this.intellisage) {
       try {
-        const response = await this.intellisage('GetReferencesAsync', model.getValue(), this.positionRequest(position), String(context.includeDeclaration), projectRequest);
+        const response = await this.intellisage('GetReferencesAsync', model.getValue(), this.positionRequest(position), String(context.includeDeclaration));
         roslynLocations = this.convertLocations(model, response);
       } catch {
         // Fall through to the browser-side semantic index.
@@ -882,10 +841,9 @@ class CSharpLanguageService {
   }
 
   private async provideDocumentSymbols(model: monaco.editor.ITextModel): Promise<monaco.languages.DocumentSymbol[]> {
-    const projectRequest = this.createDiagnosticProjectRequest(model);
     if (this.intellisage) {
       try {
-        const response = await this.intellisage('GetDocumentSymbolsAsync', model.getValue(), projectRequest);
+        const response = await this.intellisage('GetDocumentSymbolsAsync', model.getValue());
         const symbols = this.convertDocumentSymbols(response);
         if (symbols.length) return symbols;
       } catch {
@@ -900,10 +858,9 @@ class CSharpLanguageService {
     model: monaco.editor.ITextModel,
     position: monaco.Position
   ): Promise<monaco.languages.RenameLocation> {
-    const projectRequest = this.createDiagnosticProjectRequest(model);
     if (this.intellisage) {
       try {
-        const response = await this.intellisage('GetRenameInfoAsync', model.getValue(), this.positionRequest(position), projectRequest) as RoslynRenameInfoDto | false;
+        const response = await this.intellisage('GetRenameInfoAsync', model.getValue(), this.positionRequest(position)) as RoslynRenameInfoDto | false;
         const range = this.toEditorRange(response && response.range);
         if (response && response.canRename && range) {
           return { range, text: response.text ?? model.getValueInRange(range) };
@@ -940,10 +897,9 @@ class CSharpLanguageService {
 
     let roslynEdits: monaco.languages.IWorkspaceTextEdit[] = [];
     let roslynRejectReason: string | undefined;
-    const projectRequest = this.createDiagnosticProjectRequest(model);
     if (this.intellisage) {
       try {
-        const response = await this.intellisage('GetRenameEditsAsync', model.getValue(), this.positionRequest(position), newName, projectRequest) as RoslynRenameEditsDto | false;
+        const response = await this.intellisage('GetRenameEditsAsync', model.getValue(), this.positionRequest(position), newName) as RoslynRenameEditsDto | false;
         if (response && Array.isArray(response.edits)) {
           roslynEdits = response.edits.flatMap(edit => this.convertWorkspaceEdit(model, edit));
           roslynRejectReason = response.rejectReason ?? undefined;
@@ -979,11 +935,10 @@ class CSharpLanguageService {
     const index = this.getSemanticIndex(model);
     const actions: monaco.languages.CodeAction[] = [];
     const lineText = model.getLineContent(range.startLineNumber);
-    const projectRequest = this.createDiagnosticProjectRequest(model);
 
     if (this.intellisage) {
       try {
-        const response = await this.intellisage('GetCodeActionsAsync', model.getValue(), this.rangeRequest(range), projectRequest);
+        const response = await this.intellisage('GetCodeActionsAsync', model.getValue(), this.rangeRequest(range));
         actions.push(...this.convertCodeActions(model, response, context.markers));
       } catch {
         // Local actions below still cover the common cases.
@@ -1040,10 +995,9 @@ class CSharpLanguageService {
   }
 
   private async provideFoldingRanges(model: monaco.editor.ITextModel): Promise<monaco.languages.FoldingRange[]> {
-    const projectRequest = this.createDiagnosticProjectRequest(model);
     if (this.intellisage) {
       try {
-        const response = await this.intellisage('GetFoldingRangesAsync', model.getValue(), projectRequest);
+        const response = await this.intellisage('GetFoldingRangesAsync', model.getValue());
         const ranges = this.convertFoldingRanges(response);
         if (ranges.length) return ranges;
       } catch {
@@ -1058,10 +1012,9 @@ class CSharpLanguageService {
     model: monaco.editor.ITextModel,
     options: monaco.languages.FormattingOptions
   ): Promise<monaco.languages.TextEdit[]> {
-    const projectRequest = this.createDiagnosticProjectRequest(model);
     if (this.intellisage) {
       try {
-        const formatted = await this.intellisage('GetFormattingAsync', model.getValue(), projectRequest);
+        const formatted = await this.intellisage('GetFormattingAsync', model.getValue());
         if (typeof formatted === 'string' && formatted !== model.getValue()) {
           return [{ range: model.getFullModelRange(), text: formatted }];
         }
@@ -1082,10 +1035,9 @@ class CSharpLanguageService {
     range: monaco.Range,
     options: monaco.languages.FormattingOptions
   ): Promise<monaco.languages.TextEdit[]> {
-    const projectRequest = this.createDiagnosticProjectRequest(model);
     if (this.intellisage) {
       try {
-        const formatted = await this.intellisage('GetRangeFormattingAsync', model.getValue(), this.rangeRequest(range), projectRequest);
+        const formatted = await this.intellisage('GetRangeFormattingAsync', model.getValue(), this.rangeRequest(range));
         if (typeof formatted === 'string' && formatted !== model.getValue()) {
           return [{ range: model.getFullModelRange(), text: formatted }];
         }
@@ -1120,19 +1072,19 @@ class CSharpLanguageService {
     model: monaco.editor.ITextModel,
     range: monaco.Range
   ): Promise<monaco.languages.InlayHintList> {
-    const localHints = this.provideLocalProjectInlayHints(model, range);
-    const projectRequest = this.createDiagnosticProjectRequest(model);
     if (this.intellisage) {
       try {
-        const response = await this.intellisage('GetInlayHintsAsync', model.getValue(), this.rangeRequest(range), projectRequest);
-        const hints = dedupeInlayHints([...this.convertInlayHints(response), ...localHints]);
+        const response = await this.intellisage('GetInlayHintsAsync', model.getValue(), this.rangeRequest(range));
+        const hints = this.convertInlayHints(response);
         if (hints.length) return { hints, dispose() {} };
       } catch {
         // Fall through to the browser-side semantic index.
       }
     }
 
-    return { hints: localHints, dispose() {} };
+    const index = this.getSemanticIndex(model);
+    const hints = index.inlayHints.filter(hint => range.containsPosition(hint.position));
+    return { hints, dispose() {} };
   }
 
   private provideSelectionRanges(
@@ -1147,7 +1099,8 @@ class CSharpLanguageService {
     model: monaco.editor.ITextModel,
     position: monaco.Position
   ): monaco.languages.SignatureHelpResult | undefined {
-    const call = this.projectCallAt(model, position);
+    const index = this.getSemanticIndex(model);
+    const call = index.callAt(position);
     if (!call) return undefined;
     return {
       value: {
@@ -1160,145 +1113,6 @@ class CSharpLanguageService {
       },
       dispose() {},
     };
-  }
-
-  private provideLocalCompletionItems(
-    model: monaco.editor.ITextModel,
-    position: monaco.Position,
-    range: monaco.IRange
-  ): monaco.languages.CompletionItem[] {
-    const index = this.getSemanticIndex(model);
-    const wordStartOffset = model.getOffsetAt({ lineNumber: position.lineNumber, column: range.startColumn });
-    const previous = previousSignificantTokenBeforeOffset(index.tokens, wordStartOffset);
-    const isMemberAccess = previous ? ['.', '?.', '::'].includes(previous.value) : false;
-    const suggestions: monaco.languages.CompletionItem[] = [];
-    const seen = new Set<string>();
-
-    const addSuggestion = (item: monaco.languages.CompletionItem) => {
-      const key = `${String(item.label)}:${item.kind}`;
-      if (seen.has(key)) return;
-      seen.add(key);
-      suggestions.push(item);
-    };
-
-    if (!isMemberAccess) {
-      for (const keyword of CSHARP_KEYWORDS) {
-        addSuggestion({
-          label: keyword,
-          kind: monaco.languages.CompletionItemKind.Keyword,
-          insertText: keyword,
-          range,
-        });
-      }
-      for (const typeName of DEFAULT_TYPE_TO_NAMESPACE.keys()) {
-        addSuggestion({
-          label: typeName,
-          kind: monaco.languages.CompletionItemKind.Class,
-          detail: DEFAULT_TYPE_TO_NAMESPACE.get(typeName),
-          insertText: typeName,
-          range,
-        });
-      }
-    }
-
-    const memberKinds = new Set<CSharpSymbolKind>(['method', 'extensionMethod', 'property', 'field', 'event', 'enumMember']);
-    const globalProjectKinds = new Set<CSharpSymbolKind>([
-      'namespace', 'class', 'record', 'struct', 'interface', 'enum', 'delegate', 'typeParameter',
-      'method', 'extensionMethod', 'constructor',
-    ]);
-
-    for (const entry of this.getProjectSemanticEntries(model)) {
-      for (const declaration of entry.index.globalCompletions()) {
-        if (!this.isProjectVisibleDeclaration(declaration, entry.model === model)) continue;
-        if (isMemberAccess) {
-          if (!memberKinds.has(declaration.kind)) continue;
-        } else if (!globalProjectKinds.has(declaration.kind)) {
-          continue;
-        }
-
-        const path = currentModelPath(entry.model);
-        addSuggestion({
-          label: declaration.name,
-          kind: completionKindForSymbolKind(declaration.kind),
-          detail: entry.model === model ? declaration.detail : `${declaration.detail} - ${path}`,
-          documentation: { value: buildSymbolMarkdown(declaration) },
-          insertText: declaration.name,
-          range,
-        });
-      }
-    }
-
-    return suggestions;
-  }
-
-  private projectCallAt(
-    model: monaco.editor.ITextModel,
-    position: monaco.Position
-  ): { label: string; parameters: string[]; activeParameter: number } | undefined {
-    const index = this.getSemanticIndex(model);
-    const call = findCSharpCallAt(index.tokens, model.getOffsetAt(position));
-    if (!call) return undefined;
-
-    const methods = this.getProjectSemanticEntries(model)
-      .flatMap(entry => entry.index.declarations
-        .filter(declaration => declaration.name === call.name)
-        .filter(declaration => ['method', 'extensionMethod', 'constructor'].includes(declaration.kind))
-        .filter(declaration => this.isProjectVisibleDeclaration(declaration, entry.model === model))
-        .map(declaration => ({ ...entry, declaration })));
-    const preferred = methods.find(entry => entry.model === model)
-      ?? methods.find(entry => entry.declaration.parameters?.length)
-      ?? methods[0];
-    const method = preferred?.declaration;
-    if (!method?.parameters?.length) return undefined;
-
-    return {
-      label: `${method.name}(${method.parameters.join(', ')})`,
-      parameters: method.parameters,
-      activeParameter: Math.min(call.activeParameter, Math.max(0, method.parameters.length - 1)),
-    };
-  }
-
-  private provideLocalProjectInlayHints(
-    model: monaco.editor.ITextModel,
-    range: monaco.Range
-  ): monaco.languages.InlayHint[] {
-    const index = this.getSemanticIndex(model);
-    const hints = index.inlayHints.filter(hint => range.containsPosition(hint.position));
-    const methodsByName = new Map<string, CSharpDeclaration[]>();
-
-    for (const entry of this.getProjectSemanticEntries(model)) {
-      for (const declaration of entry.index.declarations) {
-        if (!['method', 'extensionMethod', 'constructor'].includes(declaration.kind)) continue;
-        if (!declaration.parameters?.length) continue;
-        if (!this.isProjectVisibleDeclaration(declaration, entry.model === model)) continue;
-        const list = methodsByName.get(declaration.name) ?? [];
-        list.push(declaration);
-        methodsByName.set(declaration.name, list);
-      }
-    }
-
-    for (const token of index.tokens) {
-      if (token.kind !== 'identifier' || index.tokens[token.index + 1]?.value !== '(') continue;
-      const method = methodsByName.get(token.value.replace(/^@/, ''))?.[0];
-      if (!method?.parameters?.length) continue;
-      const open = index.tokens[token.index + 1];
-      const closeIndex = findMatchingToken(index.tokens, open.index, '(', ')');
-      if (closeIndex < 0) continue;
-      const argumentStartTokens = collectArgumentStartTokens(index.tokens, open.index, closeIndex);
-      for (let i = 0; i < Math.min(argumentStartTokens.length, method.parameters.length); i += 1) {
-        const paramName = method.parameters[i].split(/\s+/).pop()?.replace(/^@/, '') ?? '';
-        const argument = argumentStartTokens[i];
-        if (!paramName || argument.value.includes(':') || !range.containsPosition(argument.range.getStartPosition())) continue;
-        hints.push({
-          kind: monaco.languages.InlayHintKind.Parameter,
-          label: `${paramName}:`,
-          position: { lineNumber: argument.range.startLineNumber, column: argument.range.startColumn },
-          paddingRight: true,
-        });
-      }
-    }
-
-    return dedupeInlayHints(hints);
   }
 
   private getProjectSemanticEntries(model: monaco.editor.ITextModel): { model: monaco.editor.ITextModel; index: CSharpSemanticIndex }[] {
@@ -1324,17 +1138,7 @@ class CSharpLanguageService {
   }
 
   private isProjectVisibleDeclaration(declaration: CSharpDeclaration, isActiveModel: boolean) {
-    if (isActiveModel) return true;
-    if (['local', 'parameter', 'label'].includes(declaration.kind)) return false;
-    if (this.isLocalScopedDeclaration(declaration)) return false;
-    return true;
-  }
-
-  private isLocalScopedDeclaration(declaration: CSharpDeclaration | CSharpSemanticOccurrence) {
-    if (['local', 'parameter', 'label'].includes(declaration.kind)) return true;
-    return declaration.kind === 'constant'
-      && !!declaration.parent
-      && ['method', 'extensionMethod', 'constructor'].includes(declaration.parent.kind);
+    return isActiveModel || !['local', 'parameter', 'label'].includes(declaration.kind);
   }
 
   private findProjectDeclaration(
@@ -1369,14 +1173,13 @@ class CSharpLanguageService {
     const target = declaration?.declaration ?? symbol;
     const locations: monaco.languages.Location[] = [];
     const seen = new Set<string>();
-    const entries = this.isLocalScopedDeclaration(target)
+    const entries = ['local', 'parameter', 'label'].includes(target.kind)
       ? this.getProjectSemanticEntries(model).filter(entry => entry.model === model)
       : this.getProjectSemanticEntries(model);
 
     for (const entry of entries) {
       for (const reference of entry.index.referencesFor(target, includeDeclaration)) {
         if (entry.index.tokens[reference.token.index] !== reference.token) continue;
-        if (!this.isProjectReferenceCompatible(target, reference)) continue;
         const range = reference.token.range;
         const key = `${entry.model.uri.toString()}:${range.startLineNumber}:${range.startColumn}:${range.endLineNumber}:${range.endColumn}`;
         if (seen.has(key)) continue;
@@ -1386,20 +1189,6 @@ class CSharpLanguageService {
     }
 
     return locations;
-  }
-
-  private isProjectReferenceCompatible(
-    target: CSharpDeclaration | CSharpSemanticOccurrence,
-    reference: CSharpSemanticOccurrence
-  ) {
-    const memberKinds = new Set<CSharpSymbolKind>(['method', 'extensionMethod', 'constructor', 'property', 'field', 'event', 'enumMember']);
-    if (!memberKinds.has(target.kind)) return true;
-
-    const targetDeclaration = target.declaration ?? (target as CSharpDeclaration);
-    const targetParentName = targetDeclaration.parent?.name;
-    const referenceParentName = reference.declaration?.parent?.name;
-    if (!targetParentName || !referenceParentName) return true;
-    return targetParentName === referenceParentName;
   }
 
   private getSemanticIndex(model: monaco.editor.ITextModel): CSharpSemanticIndex {
@@ -1489,17 +1278,14 @@ class CSharpLanguageService {
     if (!Array.isArray(response)) return [];
     return response.flatMap((location: RoslynLocationDto) => {
       const range = this.toEditorRange(location.range);
-      return range ? [{ uri: this.uriForProjectPath(model, location.path ?? location.Path), range }] : [];
+      return range ? [{ uri: model.uri, range }] : [];
     });
   }
 
   private convertWorkspaceEdit(model: monaco.editor.ITextModel, edit: RoslynTextEditDto): monaco.languages.IWorkspaceTextEdit[] {
     const range = this.toEditorRange(edit.range);
-    const resource = this.uriForProjectPath(model, edit.path ?? edit.Path);
-    const targetModel = monaco.editor.getModel(resource);
-    const text = edit.text ?? edit.Text ?? '';
     return range
-      ? [{ resource, textEdit: { range, text }, versionId: targetModel?.getVersionId() }]
+      ? [{ resource: model.uri, textEdit: { range, text: edit.text }, versionId: model.getVersionId() }]
       : [];
   }
 
@@ -1590,18 +1376,14 @@ class CSharpLanguageService {
     return { CurrentPath: currentPath, Files: files };
   }
 
-  private createProjectSnapshotKey(request: CSharpDiagnosticProjectRequest) {
-    return request.Files
-      .map(file => `${file.Path}:${file.Content.length}:${hashString(file.Content)}`)
-      .join('|');
-  }
-
   private createDiagnosticCacheKey(
     model: monaco.editor.ITextModel,
     code: string,
     request: CSharpDiagnosticProjectRequest
   ) {
-    const fileKey = this.createProjectSnapshotKey(request);
+    const fileKey = request.Files
+      .map(file => `${file.Path}:${file.Content.length}:${hashString(file.Content)}`)
+      .join('|');
     return [
       model.uri.toString(),
       model.getVersionId(),
@@ -1612,77 +1394,21 @@ class CSharpLanguageService {
     ].join(':');
   }
 
-  private uriForProjectPath(model: monaco.editor.ITextModel, path: string | undefined) {
-    const normalizedPath = normalizeProjectPath(path ?? '');
-    if (!normalizedPath || normalizedPath === currentModelPath(model)) return model.uri;
-    return monaco.Uri.file(`/codecraft-project/${normalizedPath}`);
-  }
+  private convertDiagnostics(model: monaco.editor.ITextModel, response: unknown): monaco.editor.IMarkerData[] {
+    if (!Array.isArray(response)) return [];
 
-  private modelForProjectPath(model: monaco.editor.ITextModel, path: string | undefined) {
-    const uri = this.uriForProjectPath(model, path);
-    if (uri.toString() === model.uri.toString()) return model;
-    return monaco.editor.getModel(uri) ?? undefined;
-  }
-
-  private convertDiagnosticResponse(
-    model: monaco.editor.ITextModel,
-    response: unknown
-  ): {
-    markersByUri: Map<string, monaco.editor.IMarkerData[]>;
-    currentMarkers: monaco.editor.IMarkerData[];
-    projectWide: boolean;
-  } {
-    const markersByUri = new Map<string, monaco.editor.IMarkerData[]>();
-    if (!Array.isArray(response)) {
-      markersByUri.set(model.uri.toString(), []);
-      return { markersByUri, currentMarkers: [], projectWide: false };
-    }
-
-    const projectWide = response.some((diagnostic: any) => {
-      const path = diagnostic?.path ?? diagnostic?.Path;
-      return typeof path === 'string' && path.trim().length > 0;
-    });
-
-    for (const diagnostic of response as any[]) {
-      const targetModel = this.modelForProjectPath(model, diagnostic?.path ?? diagnostic?.Path);
-      if (!targetModel) continue;
-      const range = this.toMarkerRange(targetModel, diagnostic);
+    return response.flatMap((diagnostic: any) => {
+      const range = this.toMarkerRange(model, diagnostic);
       const message = typeof diagnostic?.message === 'string' ? diagnostic.message : '';
-      if (!range || !message) continue;
-      const marker: monaco.editor.IMarkerData = {
+      if (!range || !message) return [];
+      return [{
         severity: this.toMarkerSeverity(diagnostic.severity),
         message,
         code: typeof diagnostic.id === 'string' && diagnostic.id ? diagnostic.id : undefined,
         source: 'local-roslyn',
         ...range,
-      };
-      const uriKey = targetModel.uri.toString();
-      const markers = markersByUri.get(uriKey) ?? [];
-      markers.push(marker);
-      markersByUri.set(uriKey, markers);
-    }
-
-    const currentMarkers = markersByUri.get(model.uri.toString()) ?? [];
-    if (!markersByUri.has(model.uri.toString())) markersByUri.set(model.uri.toString(), currentMarkers);
-    return { markersByUri, currentMarkers, projectWide };
-  }
-
-  private applyDiagnosticMarkerMap(
-    model: monaco.editor.ITextModel,
-    markersByUri: Map<string, monaco.editor.IMarkerData[]>,
-    projectWide: boolean
-  ) {
-    const targetModels = projectWide
-      ? this.getProjectSemanticEntries(model).map(entry => entry.model)
-      : [model];
-    for (const targetModel of targetModels) {
-      if (targetModel.isDisposed()) continue;
-      monaco.editor.setModelMarkers(
-        targetModel,
-        'csharp-intellisage',
-        markersByUri.get(targetModel.uri.toString()) ?? []
-      );
-    }
+      }];
+    });
   }
 
   private toMarkerRange(model: monaco.editor.ITextModel, diagnostic: any): monaco.IRange | undefined {
@@ -2290,35 +2016,6 @@ function nextSignificantToken(tokens: CSharpToken[], index: number) {
   return undefined;
 }
 
-function previousSignificantTokenBeforeOffset(tokens: CSharpToken[], offset: number) {
-  for (let i = tokens.length - 1; i >= 0; i -= 1) {
-    const token = tokens[i];
-    if (token.endOffset > offset) continue;
-    if (!['comment', 'string', 'preprocessor'].includes(token.kind)) return token;
-  }
-  return undefined;
-}
-
-function findCSharpCallAt(tokens: CSharpToken[], offset: number): CSharpCallInfo | undefined {
-  let depth = 0;
-  let commaCount = 0;
-  let openParen: CSharpToken | undefined;
-  for (let i = tokens.length - 1; i >= 0; i -= 1) {
-    const token = tokens[i];
-    if (token.offset >= offset) continue;
-    if (token.value === ')') depth += 1;
-    if (token.value === '(') {
-      if (depth === 0) { openParen = token; break; }
-      depth -= 1;
-    }
-    if (depth === 0 && token.value === ',') commaCount += 1;
-  }
-  if (!openParen) return undefined;
-  const callee = previousSignificantToken(tokens, openParen.index);
-  if (!callee || callee.kind !== 'identifier') return undefined;
-  return { name: callee.value.replace(/^@/, ''), activeParameter: commaCount };
-}
-
 function findMatchingToken(tokens: CSharpToken[], openIndex: number, open: string, close: string) {
   let depth = 0;
   for (let i = openIndex; i < tokens.length; i += 1) {
@@ -2691,61 +2388,6 @@ function documentSymbolKindFromRoslyn(kind?: string) {
   }
 }
 
-function completionKindForSymbolKind(kind: CSharpSymbolKind) {
-  switch (kind) {
-    case 'namespace': return monaco.languages.CompletionItemKind.Module;
-    case 'class':
-    case 'record': return monaco.languages.CompletionItemKind.Class;
-    case 'struct': return monaco.languages.CompletionItemKind.Struct;
-    case 'interface': return monaco.languages.CompletionItemKind.Interface;
-    case 'enum': return monaco.languages.CompletionItemKind.Enum;
-    case 'delegate': return monaco.languages.CompletionItemKind.Function;
-    case 'method':
-    case 'extensionMethod':
-    case 'constructor': return monaco.languages.CompletionItemKind.Method;
-    case 'property': return monaco.languages.CompletionItemKind.Property;
-    case 'field': return monaco.languages.CompletionItemKind.Field;
-    case 'event': return monaco.languages.CompletionItemKind.Event;
-    case 'enumMember': return monaco.languages.CompletionItemKind.EnumMember;
-    case 'parameter':
-    case 'local': return monaco.languages.CompletionItemKind.Variable;
-    case 'constant': return monaco.languages.CompletionItemKind.Constant;
-    case 'typeParameter': return monaco.languages.CompletionItemKind.TypeParameter;
-    default: return monaco.languages.CompletionItemKind.Text;
-  }
-}
-
-function mergeCompletionSuggestions(
-  roslynSuggestions: monaco.languages.CompletionItem[],
-  roslynItems: any[],
-  localSuggestions: monaco.languages.CompletionItem[]
-): { suggestions: monaco.languages.CompletionItem[]; lspItems: any[] } {
-  const suggestions: monaco.languages.CompletionItem[] = [];
-  const lspItems: any[] = [];
-  const seen = new Set<string>();
-
-  const add = (item: monaco.languages.CompletionItem, lspItem: any = null) => {
-    const range = item.range as monaco.IRange | monaco.languages.CompletionItemRanges | undefined;
-    const insertRange = range && 'insert' in range ? range.insert : range;
-    const key = [
-      typeof item.label === 'string' ? item.label : JSON.stringify(item.label),
-      item.kind,
-      insertRange?.startLineNumber,
-      insertRange?.startColumn,
-      insertRange?.endLineNumber,
-      insertRange?.endColumn,
-    ].join(':');
-    if (seen.has(key)) return;
-    seen.add(key);
-    suggestions.push(item);
-    lspItems.push(lspItem);
-  };
-
-  roslynSuggestions.forEach((item, index) => add(item, roslynItems[index]));
-  localSuggestions.forEach(item => add(item));
-  return { suggestions, lspItems };
-}
-
 function mergeLocations(locations: monaco.languages.Location[]) {
   const seen = new Set<string>();
   return locations.filter(location => {
@@ -2762,17 +2404,6 @@ function mergeWorkspaceTextEdits(edits: monaco.languages.IWorkspaceTextEdit[]) {
   return edits.filter(edit => {
     const range = edit.textEdit.range;
     const key = `${edit.resource.toString()}:${range.startLineNumber}:${range.startColumn}:${range.endLineNumber}:${range.endColumn}:${edit.textEdit.text}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
-}
-
-function dedupeInlayHints(hints: monaco.languages.InlayHint[]) {
-  const seen = new Set<string>();
-  return hints.filter(hint => {
-    const label = typeof hint.label === 'string' ? hint.label : JSON.stringify(hint.label);
-    const key = `${hint.position.lineNumber}:${hint.position.column}:${hint.kind}:${label}`;
     if (seen.has(key)) return false;
     seen.add(key);
     return true;

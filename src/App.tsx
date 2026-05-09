@@ -6334,8 +6334,6 @@ export default function App() {
   const pendingSharedEditorTargetRef = useRef<{ tabId: string; itemId: string } | null>(null);
   const sharedEditorVersionRef = useRef(0);
   const monacoProjectModelUrisRef = useRef<Set<string>>(new Set());
-  const monacoProjectModelDisposablesRef = useRef<Map<string, monaco.IDisposable>>(new Map());
-  const syncingProjectModelsRef = useRef(false);
   const pyodideEnsurePromiseRef = useRef<Promise<void> | null>(null);
   const persistedPyodidePackageMetaLoadPromiseRef = useRef<Promise<void> | null>(null);
   const persistedPyodidePackageMetaLoadedRef = useRef(false);
@@ -6347,35 +6345,6 @@ export default function App() {
   const packageJsonSyncQueuedRef = useRef(false);
   const filesRef = useRef(files);
   filesRef.current = files;
-  const getPathFromSnapshot = (items: FSItem[], id: string | undefined): string => {
-    return getFsItemPath(items, id);
-  };
-  const getProjectRunnableFilesSnapshot = useCallback(() => {
-    const currentFiles = filesRef.current;
-    return currentFiles
-      .filter((item): item is FSItem & { type: 'file' } => (
-        item.type === 'file'
-        && getProjectFileLanguageForRuntime(item) !== null
-      ))
-      .sort((left, right) => getPathFromSnapshot(currentFiles, left.id).localeCompare(getPathFromSnapshot(currentFiles, right.id)));
-  }, []);
-  const toProjectSourceFilesSnapshot = useCallback((projectFiles: FSItem[]): ProjectSourceFile[] => {
-    const currentFiles = filesRef.current;
-    return projectFiles
-      .map((file) => {
-        const language = getProjectFileLanguageForRuntime(file);
-        if (!language) return null;
-        return {
-          id: file.id,
-          name: file.name,
-          path: normalizeProjectPath(getPathFromSnapshot(currentFiles, file.id)),
-          content: file.content || '',
-          language,
-        } satisfies ProjectSourceFile;
-      })
-      .filter((file): file is ProjectSourceFile => file !== null)
-      .sort((left, right) => left.path.localeCompare(right.path));
-  }, []);
   const syncHandlesRef = useRef<Map<string, FileSystemDirectoryHandle>>(new Map());
   const syncLocksRef = useRef<Map<string, Promise<void>>>(new Map());
   const syncInitializedRef = useRef<Set<string>>(new Set());
@@ -6750,11 +6719,11 @@ export default function App() {
     if (editor.getModel?.()?.getLanguageId?.() !== 'csharp') return;
 
     csharpAuthoring.csharpService.setupEditor(editor, () => (
-      toProjectSourceFilesSnapshot(getProjectRunnableFilesSnapshot())
+      toProjectSourceFiles(getProjectRunnableFiles())
         .filter(file => file.language === 'csharp')
         .map(file => ({ path: file.path, content: file.content, language: 'csharp' as const }))
     ));
-  }, [ensureCSharpAuthoringReady, getProjectRunnableFilesSnapshot, toProjectSourceFilesSnapshot]);
+  }, [ensureCSharpAuthoringReady]);
 
   useEffect(() => {
     void refreshCSharpDiagnostics();
@@ -6899,26 +6868,7 @@ export default function App() {
 
       nextModelUris.add(uriKey);
       if (!existingModel) {
-        const model = monaco.editor.createModel(content, language, uri);
-        const disposable = model.onDidChangeContent(() => {
-          if (syncingProjectModelsRef.current || model.isDisposed()) return;
-          const nextContent = model.getValue();
-          setFiles(prev => {
-            let changed = false;
-            const next = prev.map(file => {
-              if (file.id === item.id && file.type === 'file' && (file.content || '') !== nextContent) {
-                changed = true;
-                return { ...file, content: nextContent };
-              }
-              return file;
-            });
-            return changed ? next : prev;
-          });
-          if (model.getLanguageId() === 'csharp') {
-            csharpAuthoringModuleRef.current?.csharpService.refreshProject();
-          }
-        });
-        monacoProjectModelDisposablesRef.current.set(uriKey, disposable);
+        monaco.editor.createModel(content, language, uri);
         continue;
       }
 
@@ -6926,59 +6876,23 @@ export default function App() {
         monaco.editor.setModelLanguage(existingModel, language);
       }
       if (existingModel.getValue() !== content) {
-        syncingProjectModelsRef.current = true;
-        try {
-          existingModel.setValue(content);
-        } finally {
-          syncingProjectModelsRef.current = false;
-        }
-      }
-      if (!monacoProjectModelDisposablesRef.current.has(uriKey)) {
-        const disposable = existingModel.onDidChangeContent(() => {
-          if (syncingProjectModelsRef.current || existingModel.isDisposed()) return;
-          const nextContent = existingModel.getValue();
-          setFiles(prev => {
-            let changed = false;
-            const next = prev.map(file => {
-              if (file.id === item.id && file.type === 'file' && (file.content || '') !== nextContent) {
-                changed = true;
-                return { ...file, content: nextContent };
-              }
-              return file;
-            });
-            return changed ? next : prev;
-          });
-          if (existingModel.getLanguageId() === 'csharp') {
-            csharpAuthoringModuleRef.current?.csharpService.refreshProject();
-          }
-        });
-        monacoProjectModelDisposablesRef.current.set(uriKey, disposable);
+        existingModel.setValue(content);
       }
     }
 
     for (const uriKey of monacoProjectModelUrisRef.current) {
       if (nextModelUris.has(uriKey)) continue;
-      monacoProjectModelDisposablesRef.current.get(uriKey)?.dispose();
-      monacoProjectModelDisposablesRef.current.delete(uriKey);
       monaco.editor.getModel(monaco.Uri.parse(uriKey))?.dispose();
     }
     monacoProjectModelUrisRef.current = nextModelUris;
   }, [files]);
 
   useEffect(() => () => {
-    for (const disposable of monacoProjectModelDisposablesRef.current.values()) {
-      disposable.dispose();
-    }
-    monacoProjectModelDisposablesRef.current.clear();
     for (const uriKey of monacoProjectModelUrisRef.current) {
       monaco.editor.getModel(monaco.Uri.parse(uriKey))?.dispose();
     }
     monacoProjectModelUrisRef.current.clear();
   }, []);
-
-  useEffect(() => {
-    csharpAuthoringModuleRef.current?.csharpService.refreshProject();
-  }, [files]);
 
   function getProjectRunnableFiles() {
     return files
