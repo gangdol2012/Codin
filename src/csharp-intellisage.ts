@@ -58,13 +58,11 @@ interface RoslynLocationDto {
   name?: string;
   kind?: string;
   detail?: string;
-  path?: string | null;
 }
 
 interface RoslynTextEditDto {
   range: RoslynRangeDto;
   text: string;
-  path?: string | null;
 }
 
 interface RoslynRenameInfoDto {
@@ -738,31 +736,17 @@ class CSharpLanguageService {
     position: monaco.Position
   ): Promise<monaco.languages.Hover | undefined> {
     const req = { Line: position.lineNumber - 1, Column: position.column - 1 };
-    const projectRequest = this.createDiagnosticProjectRequest(model);
-    const symbol = this.getSemanticIndex(model).symbolAt(position);
-    const projectDeclaration = symbol ? this.findProjectDeclaration(model, symbol) : undefined;
-    const crossFileMarkdown = projectDeclaration && projectDeclaration.model !== model
-      ? buildSymbolMarkdown(projectDeclaration.declaration)
-      : undefined;
     if (this.intellisage) {
       try {
-        const response = await this.intellisage('GetQuickInfoAsync', model.getValue(), req, projectRequest);
+        const response = await this.intellisage('GetQuickInfoAsync', model.getValue(), req);
         if (response && (response as any).markdown) {
-          const markdown = String((response as any).markdown);
-          const contents = crossFileMarkdown && !markdown.includes(projectDeclaration!.declaration.detail)
-            ? [{ value: crossFileMarkdown }, { value: markdown }]
-            : [{ value: markdown }];
-          return { range: symbol?.token.range, contents };
+          return { contents: [{ value: (response as any).markdown }] };
         }
       } catch {
         try {
           const response = await this.intellisage('GetQuickInfoAsync', req);
           if (response && (response as any).markdown) {
-            const markdown = String((response as any).markdown);
-            const contents = crossFileMarkdown && !markdown.includes(projectDeclaration!.declaration.detail)
-              ? [{ value: crossFileMarkdown }, { value: markdown }]
-              : [{ value: markdown }];
-            return { range: symbol?.token.range, contents };
+            return { contents: [{ value: (response as any).markdown }] };
           }
         } catch {
           // Continue with the in-browser C# language index.
@@ -770,8 +754,9 @@ class CSharpLanguageService {
       }
     }
 
+    const symbol = this.getSemanticIndex(model).symbolAt(position);
     if (!symbol) return undefined;
-    const declaration = projectDeclaration;
+    const declaration = this.findProjectDeclaration(model, symbol);
     return {
       range: symbol.token.range,
       contents: [{ value: buildSymbolMarkdown(declaration?.declaration ?? symbol.declaration ?? symbol) }],
@@ -801,36 +786,22 @@ class CSharpLanguageService {
     model: monaco.editor.ITextModel,
     position: monaco.Position
   ): Promise<monaco.languages.Location[] | undefined> {
-    let roslynLocations: monaco.languages.Location[] = [];
     if (this.intellisage) {
       try {
-        const response = await this.intellisage(
-          'GetDefinitionAsync',
-          model.getValue(),
-          this.positionRequest(position),
-          this.createDiagnosticProjectRequest(model)
-        );
-        roslynLocations = this.convertLocations(model, response);
+        const response = await this.intellisage('GetDefinitionAsync', model.getValue(), this.positionRequest(position));
+        const locations = this.convertLocations(model, response);
+        if (locations.length) return locations;
       } catch {
         // Fall through to the browser-side semantic index.
       }
     }
 
     const symbol = this.getSemanticIndex(model).symbolAt(position);
-    if (!symbol) return roslynLocations.length ? roslynLocations : undefined;
+    if (!symbol) return undefined;
     const declaration = this.findProjectDeclaration(model, symbol);
-    const fallbackLocation = declaration
+    return declaration
       ? [{ uri: declaration.model.uri, range: declaration.declaration.token.range }]
       : [{ uri: model.uri, range: symbol.token.range }];
-
-    if (!roslynLocations.length) return fallbackLocation;
-
-    const clickedLocation = { uri: model.uri, range: symbol.token.range };
-    const roslynOnlyReturnedClickedToken = roslynLocations.every(location => sameLocation(location, clickedLocation));
-    const fallbackIsDifferent = !sameLocation(fallbackLocation[0], clickedLocation);
-    return roslynOnlyReturnedClickedToken && fallbackIsDifferent
-      ? mergeLocations([...fallbackLocation, ...roslynLocations])
-      : roslynLocations;
   }
 
   private async provideReferences(
@@ -841,13 +812,7 @@ class CSharpLanguageService {
     let roslynLocations: monaco.languages.Location[] = [];
     if (this.intellisage) {
       try {
-        const response = await this.intellisage(
-          'GetReferencesAsync',
-          model.getValue(),
-          this.positionRequest(position),
-          String(context.includeDeclaration),
-          this.createDiagnosticProjectRequest(model)
-        );
+        const response = await this.intellisage('GetReferencesAsync', model.getValue(), this.positionRequest(position), String(context.includeDeclaration));
         roslynLocations = this.convertLocations(model, response);
       } catch {
         // Fall through to the browser-side semantic index.
@@ -895,12 +860,7 @@ class CSharpLanguageService {
   ): Promise<monaco.languages.RenameLocation> {
     if (this.intellisage) {
       try {
-        const response = await this.intellisage(
-          'GetRenameInfoAsync',
-          model.getValue(),
-          this.positionRequest(position),
-          this.createDiagnosticProjectRequest(model)
-        ) as RoslynRenameInfoDto | false;
+        const response = await this.intellisage('GetRenameInfoAsync', model.getValue(), this.positionRequest(position)) as RoslynRenameInfoDto | false;
         const range = this.toEditorRange(response && response.range);
         if (response && response.canRename && range) {
           return { range, text: response.text ?? model.getValueInRange(range) };
@@ -939,13 +899,7 @@ class CSharpLanguageService {
     let roslynRejectReason: string | undefined;
     if (this.intellisage) {
       try {
-        const response = await this.intellisage(
-          'GetRenameEditsAsync',
-          model.getValue(),
-          this.positionRequest(position),
-          newName,
-          this.createDiagnosticProjectRequest(model)
-        ) as RoslynRenameEditsDto | false;
+        const response = await this.intellisage('GetRenameEditsAsync', model.getValue(), this.positionRequest(position), newName) as RoslynRenameEditsDto | false;
         if (response && Array.isArray(response.edits)) {
           roslynEdits = response.edits.flatMap(edit => this.convertWorkspaceEdit(model, edit));
           roslynRejectReason = response.rejectReason ?? undefined;
@@ -1324,39 +1278,15 @@ class CSharpLanguageService {
     if (!Array.isArray(response)) return [];
     return response.flatMap((location: RoslynLocationDto) => {
       const range = this.toEditorRange(location.range);
-      if (!range) return [];
-      const targetModel = this.projectModelForPath(location.path);
-      return [{
-        uri: targetModel?.uri ?? this.uriForProjectPath(location.path) ?? model.uri,
-        range: targetModel ? targetModel.validateRange(range) : range,
-      }];
+      return range ? [{ uri: model.uri, range }] : [];
     });
   }
 
   private convertWorkspaceEdit(model: monaco.editor.ITextModel, edit: RoslynTextEditDto): monaco.languages.IWorkspaceTextEdit[] {
     const range = this.toEditorRange(edit.range);
-    const targetModel = this.projectModelForPath(edit.path);
-    const resource = targetModel?.uri ?? this.uriForProjectPath(edit.path) ?? model.uri;
     return range
-      ? [{
-        resource,
-        textEdit: { range: targetModel ? targetModel.validateRange(range) : range, text: edit.text },
-        versionId: targetModel?.getVersionId() ?? (resource.toString() === model.uri.toString() ? model.getVersionId() : undefined),
-      }]
+      ? [{ resource: model.uri, textEdit: { range, text: edit.text }, versionId: model.getVersionId() }]
       : [];
-  }
-
-  private projectModelForPath(path: string | null | undefined): monaco.editor.ITextModel | undefined {
-    const normalizedPath = typeof path === 'string' ? normalizeProjectPath(path) : '';
-    if (!normalizedPath) return undefined;
-    return monaco.editor.getModels().find(candidate => (
-      candidate.getLanguageId() === 'csharp' && currentModelPath(candidate) === normalizedPath
-    ));
-  }
-
-  private uriForProjectPath(path: string | null | undefined): monaco.Uri | undefined {
-    const normalizedPath = typeof path === 'string' ? normalizeProjectPath(path) : '';
-    return normalizedPath ? monaco.Uri.file(`/codecraft-project/${normalizedPath}`) : undefined;
   }
 
   private convertCodeActions(
@@ -2469,16 +2399,6 @@ function mergeLocations(locations: monaco.languages.Location[]) {
   });
 }
 
-function sameLocation(left: monaco.languages.Location, right: monaco.languages.Location) {
-  const leftRange = left.range;
-  const rightRange = right.range;
-  return left.uri.toString() === right.uri.toString()
-    && leftRange.startLineNumber === rightRange.startLineNumber
-    && leftRange.startColumn === rightRange.startColumn
-    && leftRange.endLineNumber === rightRange.endLineNumber
-    && leftRange.endColumn === rightRange.endColumn;
-}
-
 function mergeWorkspaceTextEdits(edits: monaco.languages.IWorkspaceTextEdit[]) {
   const seen = new Set<string>();
   return edits.filter(edit => {
@@ -2505,7 +2425,6 @@ function areReferenceKindsCompatible(target: CSharpSymbolKind, actual?: CSharpSy
   if (target === actual) return true;
   const memberKinds = new Set(['method', 'extensionMethod', 'property', 'field', 'event', 'enumMember']);
   const typeKinds = new Set(['class', 'record', 'struct', 'interface', 'enum', 'delegate', 'typeParameter']);
-  if ((target === 'constructor' && typeKinds.has(actual)) || (typeKinds.has(target) && actual === 'constructor')) return true;
   return (memberKinds.has(target) && memberKinds.has(actual)) || (typeKinds.has(target) && typeKinds.has(actual));
 }
 

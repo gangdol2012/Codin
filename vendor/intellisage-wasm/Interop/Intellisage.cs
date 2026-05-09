@@ -20,9 +20,7 @@ public class MonacoServiceWrapper {
             case "GetSignatureHelpAsync":
                 return await worker.RunAsync(a => a.GetSignatureHelpAsync(args[0], args[1]));
             case "GetQuickInfoAsync":
-                return args.Length > 2
-                    ? await worker.RunAsync(a => a.GetQuickInfoAsync(args[0], args[1], args[2]))
-                    : args.Length > 1
+                return args.Length > 1
                     ? await worker.RunAsync(a => a.GetQuickInfoAsync(args[0], args[1]))
                     : await worker.RunAsync(a => a.GetQuickInfoAsync(args[0]));
             case "GetDiagnosticsAsync":
@@ -32,21 +30,13 @@ public class MonacoServiceWrapper {
             case "GetSemanticTokensAsync":
                 return await worker.RunAsync(a => a.GetSemanticTokensAsync(args[0]));
             case "GetDefinitionAsync":
-                return args.Length > 2
-                    ? await worker.RunAsync(a => a.GetDefinitionAsync(args[0], args[1], args[2]))
-                    : await worker.RunAsync(a => a.GetDefinitionAsync(args[0], args[1]));
+                return await worker.RunAsync(a => a.GetDefinitionAsync(args[0], args[1]));
             case "GetReferencesAsync":
-                return args.Length > 3
-                    ? await worker.RunAsync(a => a.GetReferencesAsync(args[0], args[1], args[2], args[3]))
-                    : await worker.RunAsync(a => a.GetReferencesAsync(args[0], args[1], args[2]));
+                return await worker.RunAsync(a => a.GetReferencesAsync(args[0], args[1], args[2]));
             case "GetRenameInfoAsync":
-                return args.Length > 2
-                    ? await worker.RunAsync(a => a.GetRenameInfoAsync(args[0], args[1], args[2]))
-                    : await worker.RunAsync(a => a.GetRenameInfoAsync(args[0], args[1]));
+                return await worker.RunAsync(a => a.GetRenameInfoAsync(args[0], args[1]));
             case "GetRenameEditsAsync":
-                return args.Length > 3
-                    ? await worker.RunAsync(a => a.GetRenameEditsAsync(args[0], args[1], args[2], args[3]))
-                    : await worker.RunAsync(a => a.GetRenameEditsAsync(args[0], args[1], args[2]));
+                return await worker.RunAsync(a => a.GetRenameEditsAsync(args[0], args[1], args[2]));
             case "GetDocumentSymbolsAsync":
                 return await worker.RunAsync(a => a.GetDocumentSymbolsAsync(args[0]));
             case "GetFormattingAsync":
