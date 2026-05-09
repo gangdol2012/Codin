@@ -6717,9 +6717,14 @@ export default function App() {
     if (editor.getModel?.()?.getLanguageId?.() !== 'csharp') return;
 
     csharpAuthoring.csharpService.setupEditor(editor, () => (
-      toProjectSourceFiles(getProjectRunnableFiles())
-        .filter(file => file.language === 'csharp')
-        .map(file => ({ path: file.path, content: file.content, language: 'csharp' as const }))
+      filesRef.current
+        .filter((file): file is FSItem & { type: 'file' } => file.type === 'file')
+        .filter(file => getProjectFileLanguageForRuntime(file) === 'csharp')
+        .map(file => ({
+          path: normalizeProjectPath(getFsItemPath(filesRef.current, file.id)),
+          content: file.content || '',
+          language: 'csharp' as const,
+        }))
     ));
   }, [ensureCSharpAuthoringReady]);
 
