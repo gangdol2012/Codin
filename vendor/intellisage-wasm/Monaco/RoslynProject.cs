@@ -54,10 +54,36 @@ public class AssemblyMetadataHelper
 public class RoslynProject
 {
     public record NamespaceIncludeResult(string NamespaceName, IReadOnlyList<string> AddedAssemblies, IReadOnlyList<string> MatchedAssemblies, bool Success, string Message);
+    public record SourceFileSnapshot(string Path, string Content);
 
     private List<Assembly> Assemblies = new List<Assembly>();
     public static List<MetadataReference> MetadataReferences = new List<MetadataReference>();
     private static HashSet<string> ReferencedAssemblyNames = new HashSet<string>(StringComparer.Ordinal);
+    private static readonly string[] DefaultUsings =
+    {
+        "System",
+        "System.Collections",
+        "System.Collections.Generic",
+        "System.Text",
+        "System.Linq",
+        "System.Net.Http",
+        "System.Threading.Tasks"
+    };
+
+    private static readonly CSharpParseOptions ParseOptions = CSharpParseOptions.Default
+        .WithKind(SourceCodeKind.Regular)
+        .WithLanguageVersion(LanguageVersion.Preview);
+
+    private static readonly CSharpCompilationOptions CompilationOptions = new CSharpCompilationOptions(
+            OutputKind.ConsoleApplication,
+            usings: DefaultUsings,
+            concurrentBuild: false,
+            optimizationLevel: OptimizationLevel.Debug)
+        .WithPlatform(Platform.AnyCpu);
+
+    private readonly Dictionary<string, DocumentId> _additionalDocumentIds = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, string> _additionalDocumentContents = new(StringComparer.Ordinal);
+    private string _primaryDocumentText = string.Empty;
     private string Uri {get; init;}
     public RoslynProject(string uri)
     {
@@ -149,14 +175,100 @@ public class RoslynProject
         var projectInfo = ProjectInfo
             .Create(ProjectId.CreateNewId(), VersionStamp.Create(), "IntelliSage", "IntelliSage", LanguageNames.CSharp)
             .WithMetadataReferences(MetadataReferences)
-            .WithCompilationOptions(new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary))
-            .WithParseOptions(CSharpParseOptions.Default.WithLanguageVersion(LanguageVersion.LatestMajor));
+            .WithCompilationOptions(CompilationOptions)
+            .WithParseOptions(ParseOptions);
 
         var project = Workspace.AddProject(projectInfo);
 
         UseOnlyOnceDocument = Workspace.AddDocument(project.Id, "Code.cs", SourceText.From(string.Empty));
         DocumentId = UseOnlyOnceDocument.Id;
 
+    }
+
+    public Task<Document> UpdateDocumentAsync(string code)
+    {
+        return UpdateProjectDocumentsAsync(code, null, Array.Empty<SourceFileSnapshot>());
+    }
+
+    public Task<Document> UpdateProjectDocumentsAsync(string code, string? activePath, IEnumerable<SourceFileSnapshot>? files)
+    {
+        var safeCode = code ?? string.Empty;
+        var normalizedActivePath = NormalizeSourcePath(activePath);
+        var nextDocuments = new Dictionary<string, string>(StringComparer.Ordinal);
+
+        foreach (var file in files ?? Array.Empty<SourceFileSnapshot>())
+        {
+            var path = NormalizeSourcePath(file.Path);
+            if (string.IsNullOrWhiteSpace(path) || path.Equals(normalizedActivePath, StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            nextDocuments[path] = file.Content ?? string.Empty;
+        }
+
+        if (safeCode == _primaryDocumentText && DictionariesEqual(_additionalDocumentContents, nextDocuments))
+        {
+            return Task.FromResult(Workspace.CurrentSolution.GetDocument(DocumentId)!);
+        }
+
+        var projectId = DocumentId.ProjectId;
+        var solution = Workspace.CurrentSolution;
+        var nextDocumentIds = new Dictionary<string, DocumentId>(StringComparer.Ordinal);
+
+        if (safeCode != _primaryDocumentText)
+        {
+            solution = solution.WithDocumentText(DocumentId, SourceText.From(safeCode));
+        }
+
+        foreach (var stalePath in _additionalDocumentIds.Keys.Where(path => !nextDocuments.ContainsKey(path)).ToArray())
+        {
+            solution = solution.RemoveDocument(_additionalDocumentIds[stalePath]);
+        }
+
+        foreach (var (path, content) in nextDocuments)
+        {
+            if (_additionalDocumentIds.TryGetValue(path, out var documentId))
+            {
+                nextDocumentIds[path] = documentId;
+                if (!_additionalDocumentContents.TryGetValue(path, out var previousContent) || previousContent != content)
+                {
+                    solution = solution.WithDocumentText(documentId, SourceText.From(content));
+                }
+                continue;
+            }
+
+            var newDocumentId = DocumentId.CreateNewId(projectId, path);
+            nextDocumentIds[path] = newDocumentId;
+            solution = solution.AddDocument(
+                newDocumentId,
+                SourceNameForPath(path),
+                SourceText.From(content),
+                SourceFoldersForPath(path),
+                filePath: path);
+        }
+
+        if (Workspace.TryApplyChanges(solution))
+        {
+            _primaryDocumentText = safeCode;
+            _additionalDocumentIds.Clear();
+            foreach (var (path, documentId) in nextDocumentIds)
+            {
+                _additionalDocumentIds[path] = documentId;
+            }
+
+            _additionalDocumentContents.Clear();
+            foreach (var (path, content) in nextDocuments)
+            {
+                _additionalDocumentContents[path] = content;
+            }
+        }
+        else
+        {
+            Console.WriteLine("Could not apply Roslyn project document snapshot.");
+        }
+
+        return Task.FromResult(Workspace.CurrentSolution.GetDocument(DocumentId)!);
     }
 
     public async Task<NamespaceIncludeResult> IncludeNamespaceAsync(string namespaceName)
@@ -300,6 +412,71 @@ public class RoslynProject
         }
 
         return false;
+    }
+
+    private static bool DictionariesEqual(IReadOnlyDictionary<string, string> left, IReadOnlyDictionary<string, string> right)
+    {
+        if (left.Count != right.Count)
+        {
+            return false;
+        }
+
+        foreach (var (key, value) in left)
+        {
+            if (!right.TryGetValue(key, out var rightValue) || rightValue != value)
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static string NormalizeSourcePath(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return string.Empty;
+        }
+
+        var parts = new List<string>();
+        foreach (var rawPart in path.Replace('\\', '/').Split('/'))
+        {
+            var part = rawPart.Trim();
+            if (part.Length == 0 || part == ".")
+            {
+                continue;
+            }
+
+            if (part == "..")
+            {
+                if (parts.Count > 0)
+                {
+                    parts.RemoveAt(parts.Count - 1);
+                }
+                continue;
+            }
+
+            parts.Add(part);
+        }
+
+        return string.Join("/", parts);
+    }
+
+    private static string SourceNameForPath(string path)
+    {
+        var normalized = NormalizeSourcePath(path);
+        var slash = normalized.LastIndexOf('/');
+        return slash >= 0 ? normalized[(slash + 1)..] : normalized;
+    }
+
+    private static IEnumerable<string> SourceFoldersForPath(string path)
+    {
+        var normalized = NormalizeSourcePath(path);
+        var slash = normalized.LastIndexOf('/');
+        return slash > 0
+            ? normalized[..slash].Split('/', StringSplitOptions.RemoveEmptyEntries)
+            : Array.Empty<string>();
     }
 
     public AdhocWorkspace Workspace { get; set; }

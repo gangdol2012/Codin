@@ -72,6 +72,8 @@ public class MonacoService
     public record TextRange(PositionDto Start, PositionDto End);
     public record PositionRequest(int Line, int Column);
     public record RangeRequest(PositionDto Start, PositionDto End);
+    public record DiagnosticProjectFileDto(string Path, string Content);
+    public record DiagnosticProjectRequest(string? CurrentPath, DiagnosticProjectFileDto[]? Files);
     public record MonacoLocation(TextRange Range, string? Name = null, string? Kind = null, string? Detail = null);
     public record MonacoTextEdit(TextRange Range, string Text);
     public record RenameInfo(bool CanRename, TextRange? Range, string? Text, string? RejectReason);
@@ -172,34 +174,24 @@ $@"using System;
 
     public async Task<byte[]> GetDiagnosticsAsync(string code)
     {
-        var document = await UpdateDocumentAsync(_diagnosticProject, code);
-        var syntaxTree = await document.GetSyntaxTreeAsync();
-        if (syntaxTree == null)
+        return await GetDiagnosticsAsync(code, string.Empty);
+    }
+
+    public async Task<byte[]> GetDiagnosticsAsync(string code, string diagnosticRequestString)
+    {
+        var document = await UpdateDiagnosticDocumentAsync(code, diagnosticRequestString);
+        var semanticModel = await document.GetSemanticModelAsync();
+        if (semanticModel == null)
         {
             return Payload(Array.Empty<DiagnosticDto>(), "GetDiagnosticsAsync");
         }
 
-        var compilation = CSharpCompilation.Create(
-            "Temp",
-            new[] { syntaxTree },
-            options: new CSharpCompilationOptions(
-                OutputKind.DynamicallyLinkedLibrary,
-                concurrentBuild: true,
-                optimizationLevel: OptimizationLevel.Debug),
-            references: RoslynProject.MetadataReferences);
-
-        var diagnostics = compilation.GetDiagnostics().Select(current =>
-        {
-            var lineSpan = current.Location.GetLineSpan();
-            return new DiagnosticDto()
-            {
-                Start = lineSpan.StartLinePosition,
-                End = lineSpan.EndLinePosition,
-                Message = current.GetMessage(),
-                Severity = GetSeverity(current.Severity),
-                Id = current.Id
-            };
-        }).ToList();
+        var diagnostics = semanticModel
+            .GetDiagnostics()
+            .Select(ToDiagnosticDto)
+            .Where(current => current != null)
+            .Cast<DiagnosticDto>()
+            .ToList();
 
         return Payload(diagnostics, "GetDiagnosticsAsync");
     }
@@ -482,14 +474,30 @@ $@"using System;
 
     Task<Document> UpdateDocumentAsync(RoslynProject project, string code)
     {
-        var safeCode = code ?? string.Empty;
-        Solution updatedSolution;
-        do
-        {
-            updatedSolution = project.Workspace.CurrentSolution.WithDocumentText(project.DocumentId, SourceText.From(safeCode));
-        } while (!project.Workspace.TryApplyChanges(updatedSolution));
+        return project.UpdateDocumentAsync(code);
+    }
 
-        return Task.FromResult(project.Workspace.CurrentSolution.GetDocument(project.DocumentId)!);
+    Task<Document> UpdateDiagnosticDocumentAsync(string code, string diagnosticRequestString)
+    {
+        if (string.IsNullOrWhiteSpace(diagnosticRequestString))
+        {
+            return _diagnosticProject.UpdateDocumentAsync(code);
+        }
+
+        try
+        {
+            var request = DeserializeRequest<DiagnosticProjectRequest>(diagnosticRequestString);
+            var files = (request.Files ?? Array.Empty<DiagnosticProjectFileDto>())
+                .Where(file => !string.IsNullOrWhiteSpace(file.Path))
+                .Select(file => new RoslynProject.SourceFileSnapshot(file.Path, file.Content ?? string.Empty))
+                .ToArray();
+            return _diagnosticProject.UpdateProjectDocumentsAsync(code, request.CurrentPath, files);
+        }
+        catch (Exception e)
+        {
+            Console.WriteLine($"Could not deserialize diagnostic project snapshot: {e.Message}");
+            return _diagnosticProject.UpdateDocumentAsync(code);
+        }
     }
 
     T DeserializeRequest<T>(string requestString)
@@ -530,19 +538,13 @@ $@"using System;
 
     async Task<List<Microsoft.CodeAnalysis.Diagnostic>> GetCompilerDiagnosticsAsync(Document document)
     {
-        var syntaxTree = await document.GetSyntaxTreeAsync();
-        if (syntaxTree == null)
+        var semanticModel = await document.GetSemanticModelAsync();
+        if (semanticModel == null)
         {
             return new List<Microsoft.CodeAnalysis.Diagnostic>();
         }
 
-        var compilation = CSharpCompilation.Create(
-            "Temp",
-            new[] { syntaxTree },
-            options: new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary),
-            references: RoslynProject.MetadataReferences);
-
-        return compilation.GetDiagnostics().ToList();
+        return semanticModel.GetDiagnostics().ToList();
     }
 
     async Task<SemanticTokenDto[]> BuildSemanticTokensAsync(Document document)
@@ -1070,6 +1072,29 @@ $@"using System;
             DiagnosticSeverity.Info => 2,
             DiagnosticSeverity.Hidden => 1,
             _ => 1
+        };
+    }
+
+    DiagnosticDto? ToDiagnosticDto(Microsoft.CodeAnalysis.Diagnostic diagnostic)
+    {
+        if (!diagnostic.Location.IsInSource)
+        {
+            return null;
+        }
+
+        var lineSpan = diagnostic.Location.GetLineSpan();
+        if (!lineSpan.IsValid)
+        {
+            return null;
+        }
+
+        return new DiagnosticDto()
+        {
+            Start = lineSpan.StartLinePosition,
+            End = lineSpan.EndLinePosition,
+            Message = diagnostic.GetMessage(),
+            Severity = GetSeverity(diagnostic.Severity),
+            Id = diagnostic.Id
         };
     }
 

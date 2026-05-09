@@ -24,7 +24,9 @@ public class MonacoServiceWrapper {
                     ? await worker.RunAsync(a => a.GetQuickInfoAsync(args[0], args[1]))
                     : await worker.RunAsync(a => a.GetQuickInfoAsync(args[0]));
             case "GetDiagnosticsAsync":
-                return await worker.RunAsync(a => a.GetDiagnosticsAsync(args[0]));
+                return args.Length > 1
+                    ? await worker.RunAsync(a => a.GetDiagnosticsAsync(args[0], args[1]))
+                    : await worker.RunAsync(a => a.GetDiagnosticsAsync(args[0]));
             case "GetSemanticTokensAsync":
                 return await worker.RunAsync(a => a.GetSemanticTokensAsync(args[0]));
             case "GetDefinitionAsync":

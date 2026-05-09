@@ -26,6 +26,14 @@ export interface CSharpProjectFileSnapshot {
 
 type CSharpProjectFilesProvider = () => CSharpProjectFileSnapshot[];
 
+interface CSharpDiagnosticProjectRequest {
+  CurrentPath: string;
+  Files: Array<{
+    Path: string;
+    Content: string;
+  }>;
+}
+
 interface CSharpCompletionCacheEntry {
   suggestions: monaco.languages.CompletionItem[];
   lspItems: any[];
@@ -193,6 +201,15 @@ function normalizeProjectPath(path: string): string {
   return resolved.join('/');
 }
 
+function hashString(value: string): string {
+  let hash = 2166136261;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(36);
+}
+
 function currentModelPath(model: monaco.editor.ITextModel) {
   const uriPath = decodeURIComponent(model.uri.path || '');
   const projectMarker = '/codecraft-project/';
@@ -220,9 +237,12 @@ class CSharpLanguageService {
   private providersRegistered = false;
   private initializationPromise: Promise<void> | null = null;
   private completionRequestSerial = 0;
+  private diagnosticRequestSerial = 0;
   private completionEnvironmentVersion = 0;
   private completionWorkerStateKey: string | null = null;
   private completionCache = new Map<string, CSharpCompletionCacheEntry>();
+  private diagnosticCacheKey: string | null = null;
+  private diagnosticCacheMarkers: monaco.editor.IMarkerData[] = [];
   private providerDisposables: monaco.IDisposable[] = [];
   private semanticCache = new WeakMap<monaco.editor.ITextModel, { versionId: number; index: CSharpSemanticIndex }>();
 
@@ -342,6 +362,7 @@ class CSharpLanguageService {
     this.completionWorkerStateKey = null;
     this.lastCompletions.clear();
     this.completionCache.clear();
+    this.diagnosticCacheKey = null;
   }
 
   private cacheCompletionResult(key: string, entry: CSharpCompletionCacheEntry) {
@@ -477,6 +498,7 @@ class CSharpLanguageService {
   }
 
   clearEditor() {
+    this.diagnosticRequestSerial += 1;
     this.modelChangeListener?.dispose();
     this.modelChangeListener = null;
     this.editorChangeListener?.dispose();
@@ -494,12 +516,13 @@ class CSharpLanguageService {
       this.model = editor.getModel();
 
       if (this.model && this.model.getLanguageId() === 'csharp') {
-        this.debouncedDiagnostics(this.model.getValue());
-        this.modelChangeListener = this.model.onDidChangeContent(() => {
-          if (this.model && this.model.getLanguageId() === 'csharp') {
-            this.semanticCache.delete(this.model);
+        const model = this.model;
+        this.requestDiagnostics(model);
+        this.modelChangeListener = model.onDidChangeContent(() => {
+          if (!model.isDisposed() && model.getLanguageId() === 'csharp') {
+            this.semanticCache.delete(model);
             this.clearCompletionState();
-            this.debouncedDiagnostics(this.model.getValue());
+            this.requestDiagnostics(model);
           }
         });
       } else {
@@ -510,12 +533,6 @@ class CSharpLanguageService {
     updateModel();
     this.editorChangeListener = editor.onDidChangeModel(() => updateModel());
   }
-
-  private static readonly LIBRARY_DIAG_PATTERNS = [
-    /top-level statements/i,
-    /does not contain a static 'Main' method/i,
-    /entry point/i,
-  ];
 
   async includeNamespace(namespaceName: string): Promise<{
     namespaceName?: string;
@@ -544,28 +561,68 @@ class CSharpLanguageService {
     this.clearCompletionState();
 
     if (this.model && this.model.getLanguageId() === 'csharp') {
-      await this.getDiagnostics(this.model.getValue());
+      await this.refreshDiagnosticsNow(this.model);
     }
 
     return response || { success: false, message: `No response while including '${trimmedNamespace}'.` };
   }
 
-  private async getDiagnostics(code: string) {
-    if (!this.intellisage || !this.model) return;
-    const safeCode = (code != null && typeof code === 'string') ? code : '';
-    const diagnostics = await this.intellisage('GetDiagnosticsAsync', safeCode);
-    if (!diagnostics || !this.model) return;
-    const markers = (diagnostics as any[])
-      .filter((d: any) => !CSharpLanguageService.LIBRARY_DIAG_PATTERNS.some(p => p.test(d.message)))
-      .map((d: any) => ({
-        ...d,
-        severity: this.toMarkerSeverity(d.severity),
-        startLineNumber: d.start.line + 1,
-        startColumn: d.start.character + 1,
-        endLineNumber: d.end.line + 1,
-        endColumn: d.end.character + 1,
-      }));
-    monaco.editor.setModelMarkers(this.model, 'csharp-intellisage', markers);
+  private requestDiagnostics(model: monaco.editor.ITextModel) {
+    const requestSerial = ++this.diagnosticRequestSerial;
+    void this.debouncedDiagnostics(model, requestSerial);
+  }
+
+  private refreshDiagnosticsNow(model: monaco.editor.ITextModel) {
+    const requestSerial = ++this.diagnosticRequestSerial;
+    return this.getDiagnostics(model, requestSerial);
+  }
+
+  private async getDiagnostics(model: monaco.editor.ITextModel, requestSerial: number) {
+    if (model.isDisposed() || model.getLanguageId() !== 'csharp') return;
+
+    const initialModelVersion = model.getVersionId();
+    const runtimeReady = await this.ensureLocalIntelliSageRuntime();
+    if (
+      !runtimeReady ||
+      !this.intellisage ||
+      requestSerial !== this.diagnosticRequestSerial ||
+      model.isDisposed() ||
+      model.getVersionId() !== initialModelVersion
+    ) {
+      return;
+    }
+
+    const safeCode = model.getValue();
+    const projectRequest = this.createDiagnosticProjectRequest(model);
+    const cacheKey = this.createDiagnosticCacheKey(model, safeCode, projectRequest);
+    if (this.diagnosticCacheKey === cacheKey) {
+      monaco.editor.setModelMarkers(model, 'csharp-intellisage', this.diagnosticCacheMarkers);
+      return;
+    }
+
+    try {
+      const diagnostics = await this.intellisage('GetDiagnosticsAsync', safeCode, projectRequest);
+      if (
+        requestSerial !== this.diagnosticRequestSerial ||
+        model.isDisposed() ||
+        model.getVersionId() !== initialModelVersion
+      ) {
+        return;
+      }
+
+      const markers = this.convertDiagnostics(model, diagnostics);
+      this.diagnosticCacheKey = cacheKey;
+      this.diagnosticCacheMarkers = markers;
+      monaco.editor.setModelMarkers(model, 'csharp-intellisage', markers);
+    } catch {
+      if (
+        requestSerial === this.diagnosticRequestSerial &&
+        !model.isDisposed() &&
+        model.getVersionId() === initialModelVersion
+      ) {
+        monaco.editor.setModelMarkers(model, 'csharp-intellisage', []);
+      }
+    }
   }
 
   private toMarkerSeverity(severity: unknown): monaco.MarkerSeverity {
@@ -1301,6 +1358,94 @@ class CSharpLanguageService {
             : undefined,
       }];
     });
+  }
+
+  private createDiagnosticProjectRequest(model: monaco.editor.ITextModel): CSharpDiagnosticProjectRequest {
+    const currentPath = currentModelPath(model);
+    const seen = new Set<string>([currentPath]);
+    const files: CSharpDiagnosticProjectRequest['Files'] = [];
+
+    for (const file of this.projectFilesProvider()) {
+      if (file.language !== 'csharp') continue;
+      const path = normalizeProjectPath(file.path);
+      if (!path || seen.has(path)) continue;
+      seen.add(path);
+      files.push({ Path: path, Content: file.content ?? '' });
+    }
+
+    return { CurrentPath: currentPath, Files: files };
+  }
+
+  private createDiagnosticCacheKey(
+    model: monaco.editor.ITextModel,
+    code: string,
+    request: CSharpDiagnosticProjectRequest
+  ) {
+    const fileKey = request.Files
+      .map(file => `${file.Path}:${file.Content.length}:${hashString(file.Content)}`)
+      .join('|');
+    return [
+      model.uri.toString(),
+      model.getVersionId(),
+      code.length,
+      request.CurrentPath,
+      fileKey,
+      this.completionEnvironmentVersion,
+    ].join(':');
+  }
+
+  private convertDiagnostics(model: monaco.editor.ITextModel, response: unknown): monaco.editor.IMarkerData[] {
+    if (!Array.isArray(response)) return [];
+
+    return response.flatMap((diagnostic: any) => {
+      const range = this.toMarkerRange(model, diagnostic);
+      const message = typeof diagnostic?.message === 'string' ? diagnostic.message : '';
+      if (!range || !message) return [];
+      return [{
+        severity: this.toMarkerSeverity(diagnostic.severity),
+        message,
+        code: typeof diagnostic.id === 'string' && diagnostic.id ? diagnostic.id : undefined,
+        source: 'local-roslyn',
+        ...range,
+      }];
+    });
+  }
+
+  private toMarkerRange(model: monaco.editor.ITextModel, diagnostic: any): monaco.IRange | undefined {
+    const start = diagnostic?.start ?? diagnostic?.Start;
+    const end = diagnostic?.end ?? diagnostic?.End;
+    const startLine = start?.line ?? start?.Line;
+    const startCharacter = start?.character ?? start?.Character;
+    const endLine = end?.line ?? end?.Line;
+    const endCharacter = end?.character ?? end?.Character;
+
+    if (
+      typeof startLine !== 'number' ||
+      typeof startCharacter !== 'number' ||
+      typeof endLine !== 'number' ||
+      typeof endCharacter !== 'number'
+    ) {
+      return undefined;
+    }
+
+    const range = model.validateRange(new monaco.Range(
+      startLine + 1,
+      startCharacter + 1,
+      endLine + 1,
+      endCharacter + 1
+    ));
+
+    if (range.startLineNumber !== range.endLineNumber || range.startColumn !== range.endColumn) {
+      return range;
+    }
+
+    const maxColumn = model.getLineMaxColumn(range.endLineNumber);
+    return new monaco.Range(
+      range.startLineNumber,
+      range.startColumn,
+      range.endLineNumber,
+      Math.min(maxColumn, range.endColumn + 1)
+    );
   }
 
   private encodeRoslynSemanticTokens(tokens: RoslynSemanticTokenDto[]) {
