@@ -84,6 +84,7 @@ public class RoslynProject
     private readonly Dictionary<string, DocumentId> _additionalDocumentIds = new(StringComparer.Ordinal);
     private readonly Dictionary<string, string> _additionalDocumentContents = new(StringComparer.Ordinal);
     private string _primaryDocumentText = string.Empty;
+    private string _primaryDocumentPath = "Code.cs";
     private string Uri {get; init;}
     public RoslynProject(string uri)
     {
@@ -194,6 +195,7 @@ public class RoslynProject
     {
         var safeCode = code ?? string.Empty;
         var normalizedActivePath = NormalizeSourcePath(activePath);
+        var primaryDocumentPath = string.IsNullOrWhiteSpace(normalizedActivePath) ? "Code.cs" : normalizedActivePath;
         var nextDocuments = new Dictionary<string, string>(StringComparer.Ordinal);
 
         foreach (var file in files ?? Array.Empty<SourceFileSnapshot>())
@@ -207,7 +209,7 @@ public class RoslynProject
             nextDocuments[path] = file.Content ?? string.Empty;
         }
 
-        if (safeCode == _primaryDocumentText && DictionariesEqual(_additionalDocumentContents, nextDocuments))
+        if (safeCode == _primaryDocumentText && primaryDocumentPath == _primaryDocumentPath && DictionariesEqual(_additionalDocumentContents, nextDocuments))
         {
             return Task.FromResult(Workspace.CurrentSolution.GetDocument(DocumentId)!);
         }
@@ -219,6 +221,12 @@ public class RoslynProject
         if (safeCode != _primaryDocumentText)
         {
             solution = solution.WithDocumentText(DocumentId, SourceText.From(safeCode));
+        }
+
+        if (primaryDocumentPath != _primaryDocumentPath)
+        {
+            solution = solution.WithDocumentName(DocumentId, SourceNameForPath(primaryDocumentPath));
+            solution = solution.WithDocumentFolders(DocumentId, SourceFoldersForPath(primaryDocumentPath));
         }
 
         foreach (var stalePath in _additionalDocumentIds.Keys.Where(path => !nextDocuments.ContainsKey(path)).ToArray())
@@ -251,6 +259,7 @@ public class RoslynProject
         if (Workspace.TryApplyChanges(solution))
         {
             _primaryDocumentText = safeCode;
+            _primaryDocumentPath = primaryDocumentPath;
             _additionalDocumentIds.Clear();
             foreach (var (path, documentId) in nextDocumentIds)
             {
@@ -269,6 +278,16 @@ public class RoslynProject
         }
 
         return Task.FromResult(Workspace.CurrentSolution.GetDocument(DocumentId)!);
+    }
+
+    public string GetDocumentPath(Document document)
+    {
+        if (document.Id == DocumentId)
+        {
+            return _primaryDocumentPath;
+        }
+
+        return NormalizeSourcePath(document.FilePath ?? document.Name);
     }
 
     public async Task<NamespaceIncludeResult> IncludeNamespaceAsync(string namespaceName)

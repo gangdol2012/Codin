@@ -74,8 +74,8 @@ public class MonacoService
     public record RangeRequest(PositionDto Start, PositionDto End);
     public record DiagnosticProjectFileDto(string Path, string Content);
     public record DiagnosticProjectRequest(string? CurrentPath, DiagnosticProjectFileDto[]? Files);
-    public record MonacoLocation(TextRange Range, string? Name = null, string? Kind = null, string? Detail = null);
-    public record MonacoTextEdit(TextRange Range, string Text);
+    public record MonacoLocation(TextRange Range, string? Name = null, string? Kind = null, string? Detail = null, string? Path = null);
+    public record MonacoTextEdit(TextRange Range, string Text, string? Path = null);
     public record RenameInfo(bool CanRename, TextRange? Range, string? Text, string? RejectReason);
     public record CodeActionDto(string Title, string Kind, MonacoTextEdit[] Edits, bool IsPreferred);
     public record DocumentSymbolDto(string Name, string Detail, string Kind, TextRange Range, TextRange SelectionRange, DocumentSymbolDto[] Children);
@@ -163,9 +163,9 @@ $@"using System;
         return Payload(quickInfoResponse, "GetQuickInfoAsync");
     }
 
-    public async Task<byte[]> GetQuickInfoAsync(string code, string quickInfoRequestString)
+    public async Task<byte[]> GetQuickInfoAsync(string code, string quickInfoRequestString, string diagnosticRequestString = "")
     {
-        var document = await UpdateDocumentAsync(_diagnosticProject, code);
+        var document = await UpdateDiagnosticDocumentAsync(code, diagnosticRequestString);
         var quickInfoRequest = DeserializeRequest<QuickInfoRequest>(quickInfoRequestString);
         var quickInfoResponse = await _quickInfoProvider.Handle(quickInfoRequest, document);
 
@@ -203,9 +203,9 @@ $@"using System;
         return Payload(tokens, "GetSemanticTokensAsync");
     }
 
-    public async Task<byte[]> GetDefinitionAsync(string code, string positionRequestString)
+    public async Task<byte[]> GetDefinitionAsync(string code, string positionRequestString, string diagnosticRequestString = "")
     {
-        var document = await UpdateDocumentAsync(_diagnosticProject, code);
+        var document = await UpdateDiagnosticDocumentAsync(code, diagnosticRequestString);
         var symbol = await FindSymbolAsync(document, positionRequestString);
         if (symbol == null)
         {
@@ -213,10 +213,10 @@ $@"using System;
         }
 
         var solution = document.Project.Solution;
-        var sourceSymbol = await SymbolFinder.FindSourceDefinitionAsync(symbol, solution) ?? symbol;
+        var sourceSymbol = await ResolveSourceNavigationSymbolAsync(symbol, solution);
         var locations = sourceSymbol.Locations
             .Where(location => location.IsInSource)
-            .Select(location => ToLocation(location, document, sourceSymbol))
+            .Select(location => ToLocation(location, _diagnosticProject, sourceSymbol))
             .Where(location => location != null)
             .Cast<MonacoLocation>()
             .ToArray();
@@ -224,9 +224,9 @@ $@"using System;
         return Payload(locations, "GetDefinitionAsync");
     }
 
-    public async Task<byte[]> GetReferencesAsync(string code, string positionRequestString, string includeDeclarationString)
+    public async Task<byte[]> GetReferencesAsync(string code, string positionRequestString, string includeDeclarationString, string diagnosticRequestString = "")
     {
-        var document = await UpdateDocumentAsync(_diagnosticProject, code);
+        var document = await UpdateDiagnosticDocumentAsync(code, diagnosticRequestString);
         var symbol = await FindSymbolAsync(document, positionRequestString);
         if (symbol == null)
         {
@@ -235,18 +235,19 @@ $@"using System;
 
         var includeDeclaration = bool.TryParse(includeDeclarationString, out var parsed) && parsed;
         var solution = document.Project.Solution;
+        var sourceSymbol = await ResolveSourceNavigationSymbolAsync(symbol, solution);
         var references = new List<MonacoLocation>();
 
         if (includeDeclaration)
         {
-            references.AddRange(symbol.Locations
+            references.AddRange(sourceSymbol.Locations
                 .Where(location => location.IsInSource)
-                .Select(location => ToLocation(location, document, symbol))
+                .Select(location => ToLocation(location, _diagnosticProject, sourceSymbol))
                 .Where(location => location != null)
                 .Cast<MonacoLocation>());
         }
 
-        foreach (var referencedSymbol in await SymbolFinder.FindReferencesAsync(symbol, solution))
+        foreach (var referencedSymbol in await SymbolFinder.FindReferencesAsync(sourceSymbol, solution))
         {
             foreach (var location in referencedSymbol.Locations)
             {
@@ -255,7 +256,7 @@ $@"using System;
                     continue;
                 }
 
-                var monacoLocation = ToLocation(location.Location, document, referencedSymbol.Definition);
+                var monacoLocation = ToLocation(location.Location, _diagnosticProject, referencedSymbol.Definition);
                 if (monacoLocation != null)
                 {
                     references.Add(monacoLocation);
@@ -264,18 +265,19 @@ $@"using System;
         }
 
         var distinct = references
-            .GroupBy(location => $"{location.Range.Start.Line}:{location.Range.Start.Character}:{location.Range.End.Line}:{location.Range.End.Character}")
+            .GroupBy(location => $"{location.Path}:{location.Range.Start.Line}:{location.Range.Start.Character}:{location.Range.End.Line}:{location.Range.End.Character}")
             .Select(group => group.First())
-            .OrderBy(location => location.Range.Start.Line)
+            .OrderBy(location => location.Path, StringComparer.Ordinal)
+            .ThenBy(location => location.Range.Start.Line)
             .ThenBy(location => location.Range.Start.Character)
             .ToArray();
 
         return Payload(distinct, "GetReferencesAsync");
     }
 
-    public async Task<byte[]> GetRenameInfoAsync(string code, string positionRequestString)
+    public async Task<byte[]> GetRenameInfoAsync(string code, string positionRequestString, string diagnosticRequestString = "")
     {
-        var document = await UpdateDocumentAsync(_diagnosticProject, code);
+        var document = await UpdateDiagnosticDocumentAsync(code, diagnosticRequestString);
         var symbol = await FindSymbolAsync(document, positionRequestString);
         if (symbol == null || IsReservedSymbol(symbol))
         {
@@ -286,7 +288,7 @@ $@"using System;
         return Payload(new RenameInfo(true, tokenRange, symbol.Name, null), "GetRenameInfoAsync");
     }
 
-    public async Task<byte[]> GetRenameEditsAsync(string code, string positionRequestString, string newName)
+    public async Task<byte[]> GetRenameEditsAsync(string code, string positionRequestString, string newName, string diagnosticRequestString = "")
     {
         var sanitizedName = newName.Trim();
         var rawIdentifier = sanitizedName.StartsWith("@", StringComparison.Ordinal) ? sanitizedName[1..] : sanitizedName;
@@ -295,7 +297,7 @@ $@"using System;
             return Payload(new { edits = Array.Empty<MonacoTextEdit>(), rejectReason = "Enter a valid C# identifier." }, "GetRenameEditsAsync");
         }
 
-        var document = await UpdateDocumentAsync(_diagnosticProject, code);
+        var document = await UpdateDiagnosticDocumentAsync(code, diagnosticRequestString);
         var symbol = await FindSymbolAsync(document, positionRequestString);
         if (symbol == null || IsReservedSymbol(symbol))
         {
@@ -303,18 +305,19 @@ $@"using System;
         }
 
         var solution = document.Project.Solution;
+        var sourceSymbol = await ResolveSourceNavigationSymbolAsync(symbol, solution);
         var edits = new List<MonacoTextEdit>();
 
-        foreach (var declaration in symbol.Locations.Where(location => location.IsInSource))
+        foreach (var declaration in sourceSymbol.Locations.Where(location => location.IsInSource))
         {
-            var edit = ToRenameEdit(declaration, document, sanitizedName);
+            var edit = ToRenameEdit(declaration, _diagnosticProject, sanitizedName);
             if (edit != null)
             {
                 edits.Add(edit);
             }
         }
 
-        foreach (var referencedSymbol in await SymbolFinder.FindReferencesAsync(symbol, solution))
+        foreach (var referencedSymbol in await SymbolFinder.FindReferencesAsync(sourceSymbol, solution))
         {
             foreach (var reference in referencedSymbol.Locations)
             {
@@ -323,7 +326,7 @@ $@"using System;
                     continue;
                 }
 
-                var edit = ToRenameEdit(reference.Location, document, sanitizedName);
+                var edit = ToRenameEdit(reference.Location, _diagnosticProject, sanitizedName);
                 if (edit != null)
                 {
                     edits.Add(edit);
@@ -332,9 +335,10 @@ $@"using System;
         }
 
         var distinct = edits
-            .GroupBy(edit => $"{edit.Range.Start.Line}:{edit.Range.Start.Character}:{edit.Range.End.Line}:{edit.Range.End.Character}")
+            .GroupBy(edit => $"{edit.Path}:{edit.Range.Start.Line}:{edit.Range.Start.Character}:{edit.Range.End.Line}:{edit.Range.End.Character}")
             .Select(group => group.First())
-            .OrderByDescending(edit => edit.Range.Start.Line)
+            .OrderByDescending(edit => edit.Path, StringComparer.Ordinal)
+            .ThenByDescending(edit => edit.Range.Start.Line)
             .ThenByDescending(edit => edit.Range.Start.Character)
             .ToArray();
 
@@ -518,7 +522,33 @@ $@"using System;
             return null;
         }
 
-        return await SymbolFinder.FindSymbolAtPositionAsync(semanticModel, position, document.Project.Solution.Workspace);
+        var symbol = await SymbolFinder.FindSymbolAtPositionAsync(semanticModel, position, document.Project.Solution.Workspace);
+        if (symbol != null)
+        {
+            return symbol;
+        }
+
+        var root = await document.GetSyntaxRootAsync();
+        var token = FindIdentifierTokenAtOffset(root, text, position);
+        return token.HasValue ? GetSymbolForToken(semanticModel, token.Value) : null;
+    }
+
+    async Task<ISymbol> ResolveSourceNavigationSymbolAsync(ISymbol symbol, Solution solution)
+    {
+        var sourceSymbol = await SymbolFinder.FindSourceDefinitionAsync(symbol, solution) ?? symbol;
+        if (sourceSymbol.Locations.Any(location => location.IsInSource))
+        {
+            return sourceSymbol;
+        }
+
+        if (sourceSymbol is IMethodSymbol method
+            && (method.MethodKind == MethodKind.Constructor || method.MethodKind == MethodKind.StaticConstructor)
+            && method.ContainingType != null)
+        {
+            return await SymbolFinder.FindSourceDefinitionAsync(method.ContainingType, solution) ?? method.ContainingType;
+        }
+
+        return sourceSymbol;
     }
 
     async Task<TextRange?> GetIdentifierRangeAtRequestAsync(Document document, string positionRequestString)
@@ -527,13 +557,38 @@ $@"using System;
         var text = await document.GetTextAsync();
         var offset = ToOffset(text, request);
         var root = await document.GetSyntaxRootAsync();
-        var token = root?.FindToken(Math.Max(0, Math.Min(offset, text.Length)));
-        if (token == null || !token.Value.IsKind(SyntaxKind.IdentifierToken))
+        var token = FindIdentifierTokenAtOffset(root, text, offset);
+        if (!token.HasValue)
         {
             return null;
         }
 
         return ToRange(text, token.Value.Span);
+    }
+
+    static SyntaxToken? FindIdentifierTokenAtOffset(SyntaxNode? root, SourceText text, int offset)
+    {
+        if (root == null)
+        {
+            return null;
+        }
+
+        foreach (var candidateOffset in new[] { offset, offset - 1 })
+        {
+            if (candidateOffset < 0)
+            {
+                continue;
+            }
+
+            var clampedOffset = Math.Max(0, Math.Min(candidateOffset, text.Length));
+            var token = root.FindToken(clampedOffset);
+            if (token.IsKind(SyntaxKind.IdentifierToken))
+            {
+                return token;
+            }
+        }
+
+        return null;
     }
 
     async Task<List<Microsoft.CodeAnalysis.Diagnostic>> GetCompilerDiagnosticsAsync(Document document)
@@ -900,10 +955,10 @@ $@"using System;
         return symbol.Kind == SymbolKind.Namespace || symbol.IsImplicitlyDeclared;
     }
 
-    MonacoLocation? ToLocation(Location location, Document currentDocument, ISymbol? symbol)
+    MonacoLocation? ToLocation(Location location, RoslynProject project, ISymbol? symbol)
     {
-        var document = currentDocument.Project.Solution.GetDocument(location.SourceTree);
-        if (document == null || document.Id != currentDocument.Id)
+        var document = project.Workspace.CurrentSolution.GetDocument(location.SourceTree);
+        if (document == null)
         {
             return null;
         }
@@ -913,19 +968,20 @@ $@"using System;
             ToRange(text, location.SourceSpan),
             symbol?.Name,
             symbol?.Kind.ToString(),
-            symbol?.ToDisplayString(SymbolDisplayFormat.MinimallyQualifiedFormat));
+            symbol?.ToDisplayString(SymbolDisplayFormat.MinimallyQualifiedFormat),
+            project.GetDocumentPath(document));
     }
 
-    MonacoTextEdit? ToRenameEdit(Location location, Document currentDocument, string newName)
+    MonacoTextEdit? ToRenameEdit(Location location, RoslynProject project, string newName)
     {
-        var document = currentDocument.Project.Solution.GetDocument(location.SourceTree);
-        if (document == null || document.Id != currentDocument.Id)
+        var document = project.Workspace.CurrentSolution.GetDocument(location.SourceTree);
+        if (document == null)
         {
             return null;
         }
 
         var text = document.GetTextAsync().Result;
-        return new MonacoTextEdit(ToRange(text, location.SourceSpan), newName);
+        return new MonacoTextEdit(ToRange(text, location.SourceSpan), newName, project.GetDocumentPath(document));
     }
 
     async Task<string?> FindNamespaceForMissingSymbolAsync(Project project, string symbolName)
