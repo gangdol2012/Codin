@@ -6,7 +6,6 @@ import cssWorker from 'monaco-editor/esm/vs/language/css/css.worker?worker';
 import htmlWorker from 'monaco-editor/esm/vs/language/html/html.worker?worker';
 import tsWorker from 'monaco-editor/esm/vs/language/typescript/ts.worker?worker';
 import { ensureJavaScriptColoringReady, ensurePythonColoringReady } from './python-coloring';
-import { ensureCSharpReady } from './csharp-intellisage';
 
 self.MonacoEnvironment = {
   getWorker(_: string, label: string) {
@@ -21,4 +20,3 @@ self.MonacoEnvironment = {
 loader.config({ monaco });
 ensurePythonColoringReady();
 ensureJavaScriptColoringReady();
-void ensureCSharpReady();

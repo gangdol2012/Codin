@@ -42,6 +42,7 @@ import 'flexlayout-react/style/dark.css';
 import * as Tooltip from '@radix-ui/react-tooltip';
 import * as Separator from '@radix-ui/react-separator';
 import type * as TypeScript from 'typescript';
+import type { CSharpIntelliSageSource } from './csharp-intellisage';
 
 type UserFolder = import('./pyright').UserFolder;
 type PyrightModule = typeof import('./pyright');
@@ -4765,6 +4766,7 @@ interface AppSettings {
   pythonRuntimeLifecycle: RuntimeLifecycle;
   pythonIOMode: RuntimeIOMode;
   csharpExecutionTimeoutMs: number;
+  csharpIntelliSageSource: CSharpIntelliSageSource;
   csharpExecutionMode: CSharpExecutionMode;
   csharpResetScriptContextBeforeRun: boolean;
   csharpIOMode: RuntimeIOMode;
@@ -4843,6 +4845,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   pythonRuntimeLifecycle: 'dispose-after-run',
   pythonIOMode: 'alert-output',
   csharpExecutionTimeoutMs: 0,
+  csharpIntelliSageSource: 'local',
   csharpExecutionMode: 'regular',
   csharpResetScriptContextBeforeRun: false,
   csharpIOMode: 'alert-output',
@@ -5875,6 +5878,10 @@ function normalizeRuntimeLifecycle(value: unknown): RuntimeLifecycle {
   return value === 'keep-warm' ? 'keep-warm' : 'dispose-after-run';
 }
 
+function normalizeCSharpIntelliSageSource(value: unknown): CSharpIntelliSageSource {
+  return value === 'server' ? 'server' : 'local';
+}
+
 function normalizeCxxCStandard(value: unknown): CxxCStandard {
   return value === 'c11' || value === 'c23' ? value : 'c17';
 }
@@ -6228,6 +6235,7 @@ export default function App() {
       pythonExecutionTimeoutMs: normalizeExecutionTimeoutMs(merged.pythonExecutionTimeoutMs),
       pythonRuntimeLifecycle: normalizeRuntimeLifecycle(merged.pythonRuntimeLifecycle),
       csharpExecutionTimeoutMs: normalizeExecutionTimeoutMs(merged.csharpExecutionTimeoutMs),
+      csharpIntelliSageSource: normalizeCSharpIntelliSageSource(merged.csharpIntelliSageSource),
       cxxExecutionTimeoutMs: normalizeExecutionTimeoutMs(merged.cxxExecutionTimeoutMs),
       cxxRuntimeLifecycle: normalizeRuntimeLifecycle(merged.cxxRuntimeLifecycle),
       cxxIOMode: normalizeRuntimeIOMode(merged.cxxIOMode),
@@ -6341,7 +6349,7 @@ export default function App() {
   const assistantRequestRateNextSlotAtRef = useRef(0);
   const [activeSyncIds, setActiveSyncIds] = useState<Set<string>>(new Set());
   const persistedPipIncludesRestoredRef = useRef(false);
-  const persistedCSharpNamespacesRestoredRef = useRef(false);
+  const persistedCSharpNamespacesRestoredRef = useRef<CSharpIntelliSageSource | null>(null);
   const persistedPythonPackageStubsRestoredRef = useRef(false);
 
   const activeProject = projects.find(project => project.id === activeProjectId)
@@ -6654,9 +6662,10 @@ export default function App() {
 
   const ensureCSharpAuthoringReady = useCallback(async () => {
     const csharpAuthoring = await getCSharpAuthoringModule();
-    await csharpAuthoring.ensureCSharpReady();
-    if (persistedCSharpNamespacesRestoredRef.current) return csharpAuthoring;
-    persistedCSharpNamespacesRestoredRef.current = true;
+    const intelliSageSource = settings.csharpIntelliSageSource;
+    await csharpAuthoring.ensureCSharpReady(intelliSageSource);
+    if (persistedCSharpNamespacesRestoredRef.current === intelliSageSource) return csharpAuthoring;
+    persistedCSharpNamespacesRestoredRef.current = intelliSageSource;
 
     for (const namespaceName of loadSavedCSharpNamespaces()) {
       try {
@@ -6666,7 +6675,7 @@ export default function App() {
       }
     }
     return csharpAuthoring;
-  }, [getCSharpAuthoringModule]);
+  }, [getCSharpAuthoringModule, settings.csharpIntelliSageSource]);
 
   const ensureCxxAuthoringReady = useCallback(async () => {
     const cxxAuthoring = await getCxxAuthoringModule();
@@ -6712,6 +6721,10 @@ export default function App() {
         .map(file => ({ path: file.path, content: file.content, language: 'csharp' as const }))
     ));
   }, [ensureCSharpAuthoringReady]);
+
+  useEffect(() => {
+    void refreshCSharpDiagnostics();
+  }, [refreshCSharpDiagnostics]);
 
   const refreshCxxDiagnostics = useCallback(async () => {
     const editor = cxxDiagnosticsEditorRef.current;
@@ -17236,6 +17249,26 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
                         <div className="text-sm font-medium text-white">C#</div>
                         <div className="text-xs text-zinc-500 mt-1">Timeout is best-effort for the WebAssembly runtime. Set timeout to `0` to disable it.</div>
                       </div>
+
+                      <label className="block space-y-2">
+                        <div className="text-xs font-medium uppercase tracking-wide text-zinc-500">IntelliSage Source</div>
+                        <select
+                          value={settings.csharpIntelliSageSource}
+                          onChange={(e) => setSettings(s => ({
+                            ...s,
+                            csharpIntelliSageSource: normalizeCSharpIntelliSageSource(e.target.value),
+                          }))}
+                          className="w-full rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-sm text-white outline-none transition-colors focus:border-indigo-500"
+                        >
+                          <option value="local">Local IntelliSage</option>
+                          <option value="server">IntelliSage Server</option>
+                        </select>
+                        <div className="text-xs text-zinc-500">
+                          {settings.csharpIntelliSageSource === 'local'
+                            ? 'Uses the IntelliSage runtime bundled with CodeCraft.'
+                            : 'Loads the hosted IntelliSage runtime from intellisage.vercel.app.'}
+                        </div>
+                      </label>
 
                       <label className="block space-y-2">
                         <div className="text-xs font-medium uppercase tracking-wide text-zinc-500">Execution Timeout (ms)</div>

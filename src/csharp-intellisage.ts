@@ -3,6 +3,20 @@ import * as monaco from 'monaco-editor';
 const iframeId = `intellisage-${Math.random().toString(36).slice(2)}`;
 
 type IntellisageCall = (method: string, ...args: unknown[]) => Promise<any>;
+export type CSharpIntelliSageSource = 'local' | 'server';
+
+const CSHARP_INTELLISAGE_URLS: Record<CSharpIntelliSageSource, string> = {
+  local: '/intellisage/',
+  server: 'https://intellisage.vercel.app/',
+};
+
+function normalizeCSharpIntelliSageSource(source: unknown): CSharpIntelliSageSource {
+  return source === 'server' ? 'server' : 'local';
+}
+
+export function getCSharpIntelliSageUrl(source: CSharpIntelliSageSource) {
+  return CSHARP_INTELLISAGE_URLS[normalizeCSharpIntelliSageSource(source)];
+}
 
 export interface CSharpProjectFileSnapshot {
   path: string;
@@ -193,6 +207,8 @@ class CSharpLanguageService {
   private model: monaco.editor.ITextModel | null = null;
   private projectFilesProvider: CSharpProjectFilesProvider = () => [];
   private initialized = false;
+  private iframeUrl: string | null = null;
+  private providersRegistered = false;
   private providerDisposables: monaco.IDisposable[] = [];
   private semanticCache = new WeakMap<monaco.editor.ITextModel, { versionId: number; index: CSharpSemanticIndex }>();
 
@@ -200,66 +216,92 @@ class CSharpLanguageService {
   private debouncedCompletions = this.rawProvideCompletionItems.bind(this);
   private debouncedResolve = this.rawResolveCompletionItem.bind(this);
 
-  async initialize(iframeUrl = '/intellisage/') {
-    if (this.initialized) return;
-    this.initialized = true;
-
-    let iframe = document.getElementById(iframeId) as HTMLIFrameElement | null;
-    if (!iframe) {
-      const initPromise = new Promise<void>(res => {
-        const listener = (event: MessageEvent) => {
-          if (event.data?.intellisageInitialized) {
-            res();
-            window.removeEventListener('message', listener);
-          }
-        };
-        window.addEventListener('message', listener);
-      });
-
-      iframe = document.createElement('iframe');
-      iframe.id = iframeId;
-      iframe.width = '0';
-      iframe.height = '0';
-      iframe.style.display = 'none';
-      iframe.setAttribute('credentialless', '');
-      iframe.src = iframeUrl;
-      iframe.title = 'IntelliSage';
-      document.body.appendChild(iframe);
-
-      await new Promise<void>((res, rej) => {
-        iframe!.onload = () => res();
-        iframe!.onerror = () => rej(new Error('IntelliSage iframe failed to load'));
-      });
-
-      await initPromise;
+  async initialize(iframeUrl = CSHARP_INTELLISAGE_URLS.local) {
+    const nextIframeUrl = iframeUrl.trim() || CSHARP_INTELLISAGE_URLS.local;
+    if (this.initialized && this.iframeUrl === nextIframeUrl && this.intellisage) return;
+    if (this.initialized && this.iframeUrl !== nextIframeUrl) {
+      this.disposeIntelliSageRuntime();
     }
 
-    const iframeRef = iframe;
-    this.intellisage = (method: string, ...args: unknown[]) => {
-      if (!iframeRef.contentWindow) return Promise.resolve(false);
-      return new Promise(res => {
-        const id = Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
-        let handled = false;
-        const handleMessage = (event: MessageEvent) => {
-          if (event.data?.intellisage?.id === id && !handled) {
-            handled = true;
-            window.removeEventListener('message', handleMessage);
-            res(event.data.intellisage.payload);
-          }
-        };
-        setTimeout(() => {
-          if (!handled) {
-            handled = true;
-            window.removeEventListener('message', handleMessage);
-            res(false);
-          }
-        }, 10000);
-        window.addEventListener('message', handleMessage);
-        iframeRef.contentWindow!.postMessage({ intellisage: { method, args, id } }, '*');
-      });
-    };
+    this.initialized = true;
+    this.iframeUrl = nextIframeUrl;
 
-    this.registerProviders();
+    try {
+      let iframe = document.getElementById(iframeId) as HTMLIFrameElement | null;
+      if (iframe && iframe.src !== new URL(nextIframeUrl, window.location.href).href) {
+        iframe.remove();
+        iframe = null;
+      }
+
+      if (!iframe) {
+        const initPromise = new Promise<void>(res => {
+          const listener = (event: MessageEvent) => {
+            if (event.data?.intellisageInitialized) {
+              res();
+              window.removeEventListener('message', listener);
+            }
+          };
+          window.addEventListener('message', listener);
+        });
+
+        iframe = document.createElement('iframe');
+        iframe.id = iframeId;
+        iframe.width = '0';
+        iframe.height = '0';
+        iframe.style.display = 'none';
+        iframe.setAttribute('credentialless', '');
+        iframe.src = nextIframeUrl;
+        iframe.title = 'IntelliSage';
+        document.body.appendChild(iframe);
+
+        await new Promise<void>((res, rej) => {
+          iframe!.onload = () => res();
+          iframe!.onerror = () => rej(new Error('IntelliSage iframe failed to load'));
+        });
+
+        await initPromise;
+      }
+
+      const iframeRef = iframe;
+      this.intellisage = (method: string, ...args: unknown[]) => {
+        if (!iframeRef.contentWindow) return Promise.resolve(false);
+        return new Promise(res => {
+          const id = Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
+          let handled = false;
+          const handleMessage = (event: MessageEvent) => {
+            if (event.data?.intellisage?.id === id && !handled) {
+              handled = true;
+              window.removeEventListener('message', handleMessage);
+              res(event.data.intellisage.payload);
+            }
+          };
+          setTimeout(() => {
+            if (!handled) {
+              handled = true;
+              window.removeEventListener('message', handleMessage);
+              res(false);
+            }
+          }, 10000);
+          window.addEventListener('message', handleMessage);
+          iframeRef.contentWindow!.postMessage({ intellisage: { method, args, id } }, '*');
+        });
+      };
+
+      if (!this.providersRegistered) {
+        this.registerProviders();
+        this.providersRegistered = true;
+      }
+    } catch (error) {
+      this.disposeIntelliSageRuntime();
+      throw error;
+    }
+  }
+
+  private disposeIntelliSageRuntime() {
+    document.getElementById(iframeId)?.remove();
+    this.intellisage = null;
+    this.initialized = false;
+    this.iframeUrl = null;
   }
 
   private registerProviders() {
@@ -448,42 +490,10 @@ class CSharpLanguageService {
   private async rawProvideCompletionItems(
     model: monaco.editor.ITextModel,
     position: monaco.Position,
-    context: monaco.languages.CompletionContext
+    _context: monaco.languages.CompletionContext
   ): Promise<monaco.languages.CompletionList> {
-    if (!this.intellisage) return this.provideLocalCompletionItems(model, position);
-    const request: any = {
-      Line: position.lineNumber - 1,
-      Column: position.column - 1,
-      CompletionTrigger: (context.triggerKind as number) + 1,
-      TriggerCharacter: context.triggerCharacter,
-    };
-    try {
-      const response = await this.intellisage('GetCompletionAsync', model.getValue(), request);
-      if (!response) return this.provideLocalCompletionItems(model, position);
-      const items = (response as any).items ?? [];
-      const validItems = items.filter((item: any) => (item?.label ?? item?.insertText ?? item?.textEdit?.newText ?? item?.textEdit?.NewText) != null);
-      const word = model.getWordUntilPosition(position);
-      const fallbackRange = new monaco.Range(position.lineNumber, word.startColumn, position.lineNumber, word.endColumn);
-      const mapped = validItems.map((item: any) => this.convertCompletion(item, fallbackRange));
-      this.lastCompletions.clear();
-      for (let i = 0; i < mapped.length; i++) {
-        this.lastCompletions.set(mapped[i], validItems[i]);
-      }
-      const localSuggestions = this.provideLocalCompletionItems(model, position).suggestions;
-      const seen = new Set(mapped.map(item => completionItemKey(item)));
-      const merged = [
-        ...mapped,
-        ...localSuggestions.filter(item => {
-          const key = completionItemKey(item);
-          if (seen.has(key)) return false;
-          seen.add(key);
-          return true;
-        }),
-      ];
-      return { suggestions: merged.length ? merged : localSuggestions };
-    } catch {
-      return this.provideLocalCompletionItems(model, position);
-    }
+    this.lastCompletions.clear();
+    return this.provideLocalCompletionItems(model, position);
   }
 
   private async rawResolveCompletionItem(
@@ -2185,11 +2195,6 @@ function completionKindForSymbolKind(kind: CSharpSymbolKind) {
   }
 }
 
-function completionItemKey(item: monaco.languages.CompletionItem) {
-  const label = typeof item.label === 'string' ? item.label : item.label.label;
-  return `${label}:${item.kind ?? ''}`;
-}
-
 function mergeLocations(locations: monaco.languages.Location[]) {
   const seen = new Set<string>();
   return locations.filter(location => {
@@ -2469,8 +2474,16 @@ function toPascalCase(value: string) {
 
 export const csharpService = new CSharpLanguageService();
 let _csharpReady: Promise<void> | null = null;
-export function ensureCSharpReady(): Promise<void> {
-  if (!_csharpReady) _csharpReady = csharpService.initialize();
+let _csharpReadySource: CSharpIntelliSageSource = 'local';
+export function ensureCSharpReady(source: CSharpIntelliSageSource = 'local'): Promise<void> {
+  const normalizedSource = normalizeCSharpIntelliSageSource(source);
+  if (!_csharpReady || _csharpReadySource !== normalizedSource) {
+    _csharpReadySource = normalizedSource;
+    _csharpReady = csharpService.initialize(getCSharpIntelliSageUrl(normalizedSource)).catch(error => {
+      if (_csharpReadySource === normalizedSource) _csharpReady = null;
+      throw error;
+    });
+  }
   return _csharpReady;
 }
 export const csharpReady = { then: (fn: () => void) => ensureCSharpReady().then(fn) };
