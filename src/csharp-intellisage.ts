@@ -26,6 +26,15 @@ export interface CSharpProjectFileSnapshot {
 
 type CSharpProjectFilesProvider = () => CSharpProjectFileSnapshot[];
 
+interface CSharpCompletionCacheEntry {
+  suggestions: monaco.languages.CompletionItem[];
+  lspItems: any[];
+  incomplete?: boolean;
+}
+
+const CSHARP_COMPLETION_CACHE_LIMIT = 8;
+const CSHARP_COMPLETION_TRIGGER_FALLBACK = '.';
+
 interface RoslynPositionDto {
   line: number;
   character: number;
@@ -209,6 +218,11 @@ class CSharpLanguageService {
   private initialized = false;
   private iframeUrl: string | null = null;
   private providersRegistered = false;
+  private initializationPromise: Promise<void> | null = null;
+  private completionRequestSerial = 0;
+  private completionEnvironmentVersion = 0;
+  private completionWorkerStateKey: string | null = null;
+  private completionCache = new Map<string, CSharpCompletionCacheEntry>();
   private providerDisposables: monaco.IDisposable[] = [];
   private semanticCache = new WeakMap<monaco.editor.ITextModel, { versionId: number; index: CSharpSemanticIndex }>();
 
@@ -219,12 +233,29 @@ class CSharpLanguageService {
   async initialize(iframeUrl = CSHARP_INTELLISAGE_URLS.local) {
     const nextIframeUrl = iframeUrl.trim() || CSHARP_INTELLISAGE_URLS.local;
     if (this.initialized && this.iframeUrl === nextIframeUrl && this.intellisage) return;
+    if (this.initializationPromise && this.iframeUrl === nextIframeUrl) {
+      return this.initializationPromise;
+    }
+
+    const initPromise = this.initializeRuntime(nextIframeUrl);
+    this.initializationPromise = initPromise;
+    try {
+      await initPromise;
+    } finally {
+      if (this.initializationPromise === initPromise) {
+        this.initializationPromise = null;
+      }
+    }
+  }
+
+  private async initializeRuntime(nextIframeUrl: string) {
     if (this.initialized && this.iframeUrl !== nextIframeUrl) {
       this.disposeIntelliSageRuntime();
     }
 
     this.initialized = true;
     this.iframeUrl = nextIframeUrl;
+    this.clearCompletionState();
 
     try {
       let iframe = document.getElementById(iframeId) as HTMLIFrameElement | null;
@@ -302,6 +333,67 @@ class CSharpLanguageService {
     this.intellisage = null;
     this.initialized = false;
     this.iframeUrl = null;
+    this.clearCompletionState();
+  }
+
+  private clearCompletionState() {
+    this.completionRequestSerial += 1;
+    this.completionEnvironmentVersion += 1;
+    this.completionWorkerStateKey = null;
+    this.lastCompletions.clear();
+    this.completionCache.clear();
+  }
+
+  private cacheCompletionResult(key: string, entry: CSharpCompletionCacheEntry) {
+    if (!entry.suggestions.length) return;
+    this.completionCache.set(key, entry);
+    while (this.completionCache.size > CSHARP_COMPLETION_CACHE_LIMIT) {
+      const oldestKey = this.completionCache.keys().next().value;
+      if (!oldestKey) break;
+      this.completionCache.delete(oldestKey);
+    }
+  }
+
+  private toCompletionList(entry: CSharpCompletionCacheEntry): monaco.languages.CompletionList {
+    this.lastCompletions.clear();
+    const suggestions = entry.suggestions.map(item => ({
+      ...item,
+      additionalTextEdits: item.additionalTextEdits?.map(edit => ({ ...edit })),
+    }));
+    suggestions.forEach((item, index) => {
+      const lspItem = entry.lspItems[index];
+      if (lspItem) this.lastCompletions.set(item, lspItem);
+    });
+    return { suggestions, incomplete: entry.incomplete };
+  }
+
+  private emptyCompletionList(): monaco.languages.CompletionList {
+    this.lastCompletions.clear();
+    return { suggestions: [] };
+  }
+
+  private completionCacheKey(
+    model: monaco.editor.ITextModel,
+    position: monaco.Position,
+    context: monaco.languages.CompletionContext
+  ) {
+    const triggerCharacter = context.triggerCharacter ?? '';
+    return [
+      this.completionEnvironmentVersion,
+      model.uri.toString(),
+      model.getVersionId(),
+      position.lineNumber,
+      position.column,
+      context.triggerKind,
+      triggerCharacter,
+    ].join(':');
+  }
+
+  private async ensureLocalIntelliSageRuntime() {
+    if (!this.intellisage || this.iframeUrl !== CSHARP_INTELLISAGE_URLS.local) {
+      await this.initialize(CSHARP_INTELLISAGE_URLS.local);
+    }
+    return !!this.intellisage && this.iframeUrl === CSHARP_INTELLISAGE_URLS.local;
   }
 
   private registerProviders() {
@@ -390,6 +482,7 @@ class CSharpLanguageService {
     this.editorChangeListener?.dispose();
     this.editorChangeListener = null;
     this.model = null;
+    this.clearCompletionState();
   }
 
   setupDiagnostics(editor: monaco.editor.IStandaloneCodeEditor) {
@@ -405,6 +498,7 @@ class CSharpLanguageService {
         this.modelChangeListener = this.model.onDidChangeContent(() => {
           if (this.model && this.model.getLanguageId() === 'csharp') {
             this.semanticCache.delete(this.model);
+            this.clearCompletionState();
             this.debouncedDiagnostics(this.model.getValue());
           }
         });
@@ -447,6 +541,7 @@ class CSharpLanguageService {
       matchedAssemblies?: string[];
       message?: string;
     } | false;
+    this.clearCompletionState();
 
     if (this.model && this.model.getLanguageId() === 'csharp') {
       await this.getDiagnostics(this.model.getValue());
@@ -490,10 +585,46 @@ class CSharpLanguageService {
   private async rawProvideCompletionItems(
     model: monaco.editor.ITextModel,
     position: monaco.Position,
-    _context: monaco.languages.CompletionContext
+    context: monaco.languages.CompletionContext
   ): Promise<monaco.languages.CompletionList> {
-    this.lastCompletions.clear();
-    return this.provideLocalCompletionItems(model, position);
+    const initialModelVersion = model.getVersionId();
+    const runtimeReady = await this.ensureLocalIntelliSageRuntime();
+    if (!runtimeReady || !this.intellisage || model.isDisposed() || model.getVersionId() !== initialModelVersion) {
+      return this.emptyCompletionList();
+    }
+
+    const requestSerial = ++this.completionRequestSerial;
+    const modelVersion = model.getVersionId();
+    const cacheKey = this.completionCacheKey(model, position, context);
+    const cached = this.completionCache.get(cacheKey);
+    if (cached && this.completionWorkerStateKey === cacheKey) return this.toCompletionList(cached);
+
+    const request: any = {
+      Line: position.lineNumber - 1,
+      Column: position.column - 1,
+      CompletionTrigger: (context.triggerKind as number) + 1,
+      TriggerCharacter: context.triggerCharacter ?? CSHARP_COMPLETION_TRIGGER_FALLBACK,
+    };
+
+    try {
+      const response = await this.intellisage('GetCompletionAsync', model.getValue(), request);
+      if (requestSerial !== this.completionRequestSerial || model.isDisposed() || model.getVersionId() !== modelVersion) {
+        return this.emptyCompletionList();
+      }
+      if (!response) return this.emptyCompletionList();
+
+      const items = (response as any).items ?? [];
+      const validItems = items.filter((item: any) => (item?.label ?? item?.insertText ?? item?.textEdit?.newText ?? item?.textEdit?.NewText) != null);
+      const word = model.getWordUntilPosition(position);
+      const fallbackRange = new monaco.Range(position.lineNumber, word.startColumn, position.lineNumber, word.endColumn);
+      const suggestions = validItems.map((item: any) => this.convertCompletion(item, fallbackRange));
+      const entry = { suggestions, lspItems: validItems, incomplete: !!(response as any).isIncomplete };
+      this.cacheCompletionResult(cacheKey, entry);
+      this.completionWorkerStateKey = cacheKey;
+      return this.toCompletionList(entry);
+    } catch {
+      return this.emptyCompletionList();
+    }
   }
 
   private async rawResolveCompletionItem(
@@ -905,55 +1036,6 @@ class CSharpLanguageService {
   ): monaco.languages.SelectionRange[][] {
     const index = this.getSemanticIndex(model);
     return positions.map(position => index.selectionRangesAt(position));
-  }
-
-  private provideLocalCompletionItems(
-    model: monaco.editor.ITextModel,
-    position: monaco.Position
-  ): monaco.languages.CompletionList {
-    const projectEntries = this.getProjectSemanticEntries(model);
-    const word = model.getWordUntilPosition(position);
-    const range = new monaco.Range(position.lineNumber, word.startColumn, position.lineNumber, word.endColumn);
-    const before = model.getValueInRange(new monaco.Range(position.lineNumber, 1, position.lineNumber, position.column));
-    const suggestions: monaco.languages.CompletionItem[] = [];
-    const seenDeclarations = new Set<string>();
-
-    const add = (label: string, kind: monaco.languages.CompletionItemKind, detail?: string, insertText = label) => {
-      suggestions.push({ label, kind, detail, insertText, range });
-    };
-    const addDeclaration = (declaration: CSharpDeclaration, sourceModel: monaco.editor.ITextModel) => {
-      const key = `${declaration.kind}:${declaration.name}`;
-      if (seenDeclarations.has(key)) return;
-      seenDeclarations.add(key);
-      const sourcePath = sourceModel === model ? '' : currentModelPath(sourceModel);
-      add(
-        declaration.name,
-        completionKindForSymbolKind(declaration.kind),
-        sourcePath ? `${declaration.detail} - ${sourcePath}` : declaration.detail
-      );
-    };
-
-    if (/\.\s*@?[_\p{L}\p{N}]*$/u.test(before)) {
-      for (const entry of projectEntries) {
-        for (const member of entry.index.memberCompletions()) {
-          if (!this.isProjectVisibleDeclaration(member, entry.model === model)) continue;
-          addDeclaration(member, entry.model);
-        }
-      }
-    } else {
-      for (const keyword of CSHARP_COMPLETION_KEYWORDS) add(keyword, monaco.languages.CompletionItemKind.Keyword);
-      for (const entry of projectEntries) {
-        for (const symbol of entry.index.globalCompletions()) {
-          if (!this.isProjectVisibleDeclaration(symbol, entry.model === model)) continue;
-          addDeclaration(symbol, entry.model);
-        }
-      }
-      for (const type of DEFAULT_CSHARP_TYPES) {
-        add(type, monaco.languages.CompletionItemKind.Class, 'System type');
-      }
-    }
-
-    return { suggestions };
   }
 
   private provideLocalSignatureHelp(
@@ -1424,19 +1506,6 @@ const CSHARP_MODIFIER_KEYWORDS = new Set([
   'abstract', 'async', 'const', 'extern', 'file', 'internal', 'new', 'override', 'partial', 'private', 'protected', 'public',
   'readonly', 'required', 'sealed', 'static', 'unsafe', 'virtual', 'volatile',
 ]);
-
-const CSHARP_COMPLETION_KEYWORDS = [
-  'abstract', 'async', 'await', 'base', 'break', 'case', 'catch', 'class', 'const', 'continue', 'default', 'delegate', 'do',
-  'else', 'enum', 'event', 'false', 'finally', 'for', 'foreach', 'if', 'interface', 'internal', 'is', 'lock', 'namespace',
-  'new', 'null', 'override', 'private', 'protected', 'public', 'record', 'return', 'sealed', 'static', 'struct', 'switch',
-  'this', 'throw', 'true', 'try', 'typeof', 'using', 'var', 'virtual', 'void', 'while', 'yield',
-];
-
-const DEFAULT_CSHARP_TYPES = [
-  'Action', 'ArgumentException', 'ArgumentNullException', 'Console', 'DateTime', 'Dictionary', 'Enumerable', 'Exception',
-  'Func', 'Guid', 'IEnumerable', 'IList', 'List', 'Math', 'Nullable', 'Object', 'Random', 'Regex', 'String', 'StringBuilder',
-  'Task', 'Tuple', 'ValueTask',
-];
 
 const DEFAULT_TYPE_TO_NAMESPACE = new Map<string, string>([
   ['Console', 'System'], ['DateTime', 'System'], ['Exception', 'System'], ['Guid', 'System'], ['Math', 'System'], ['Object', 'System'],
@@ -2171,27 +2240,6 @@ function documentSymbolKindFromRoslyn(kind?: string) {
     case 'event': return monaco.languages.SymbolKind.Event;
     case 'enummember': return monaco.languages.SymbolKind.EnumMember;
     default: return monaco.languages.SymbolKind.Variable;
-  }
-}
-
-function completionKindForSymbolKind(kind: CSharpSymbolKind) {
-  switch (kind) {
-    case 'namespace': return monaco.languages.CompletionItemKind.Module;
-    case 'class':
-    case 'record': return monaco.languages.CompletionItemKind.Class;
-    case 'struct': return monaco.languages.CompletionItemKind.Struct;
-    case 'interface': return monaco.languages.CompletionItemKind.Interface;
-    case 'enum': return monaco.languages.CompletionItemKind.Enum;
-    case 'delegate': return monaco.languages.CompletionItemKind.Function;
-    case 'method':
-    case 'extensionMethod':
-    case 'constructor': return monaco.languages.CompletionItemKind.Method;
-    case 'property': return monaco.languages.CompletionItemKind.Property;
-    case 'field': return monaco.languages.CompletionItemKind.Field;
-    case 'event': return monaco.languages.CompletionItemKind.Event;
-    case 'enumMember': return monaco.languages.CompletionItemKind.EnumMember;
-    case 'parameter': return monaco.languages.CompletionItemKind.Variable;
-    default: return monaco.languages.CompletionItemKind.Variable;
   }
 }
 
