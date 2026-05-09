@@ -229,10 +229,6 @@ function currentModelPath(model: monaco.editor.ITextModel) {
   return normalizeProjectPath(uriPath.replace(/^\//, '') || model.uri.toString());
 }
 
-function isCodeCraftProjectModel(model: monaco.editor.ITextModel) {
-  return decodeURIComponent(model.uri.path || '').includes('/codecraft-project/');
-}
-
 class CSharpLanguageService {
   private intellisage: IntellisageCall | null = null;
   private lastCompletions = new Map<monaco.languages.CompletionItem, any>();
@@ -831,9 +827,8 @@ class CSharpLanguageService {
 
     const clickedLocation = { uri: model.uri, range: symbol.token.range };
     const roslynOnlyReturnedClickedToken = roslynLocations.every(location => sameLocation(location, clickedLocation));
-    const fallbackIsCrossFile = fallbackLocation[0].uri.toString() !== model.uri.toString();
     const fallbackIsDifferent = !sameLocation(fallbackLocation[0], clickedLocation);
-    return (fallbackIsCrossFile || roslynOnlyReturnedClickedToken) && fallbackIsDifferent
+    return roslynOnlyReturnedClickedToken && fallbackIsDifferent
       ? mergeLocations([...fallbackLocation, ...roslynLocations])
       : roslynLocations;
   }
@@ -911,7 +906,10 @@ class CSharpLanguageService {
           return { range, text: response.text ?? model.getValueInRange(range) };
         }
         if (response && response.canRename === false) {
-          // The hosted IntelliSage runtime may not have a project snapshot yet, so let the local index decide.
+          return {
+            range: new monaco.Range(position.lineNumber, position.column, position.lineNumber, position.column),
+            text: '',
+          };
         }
       } catch {
         // Fall through to the browser-side semantic index.
@@ -961,7 +959,7 @@ class CSharpLanguageService {
     const symbol = index.symbolAt(position);
     if (!symbol || !isRenameableSymbol(symbol)) {
       if (roslynEdits.length) {
-        return { edits: roslynEdits };
+        return { edits: roslynEdits, rejectReason: roslynRejectReason };
       }
       return { edits: [], rejectReason: 'This C# token cannot be renamed.' };
     }
@@ -972,8 +970,7 @@ class CSharpLanguageService {
       textEdit: { range: ref.range, text: newName },
       versionId: monaco.editor.getModel(ref.uri)?.getVersionId(),
     }));
-    const mergedEdits = mergeWorkspaceTextEdits([...roslynEdits, ...edits]);
-    return { edits: mergedEdits, rejectReason: mergedEdits.length ? undefined : roslynRejectReason };
+    return { edits: mergeWorkspaceTextEdits([...roslynEdits, ...edits]), rejectReason: roslynRejectReason };
   }
 
   private async provideCodeActions(
@@ -1165,8 +1162,6 @@ class CSharpLanguageService {
   }
 
   private getProjectSemanticEntries(model: monaco.editor.ITextModel): { model: monaco.editor.ITextModel; index: CSharpSemanticIndex }[] {
-    this.ensureProjectModelsFromProvider();
-
     const projectPaths = new Set(
       this.projectFilesProvider()
         .map(file => normalizeProjectPath(file.path))
@@ -1174,11 +1169,7 @@ class CSharpLanguageService {
     );
     const candidates = monaco.editor.getModels()
       .filter(candidate => candidate.getLanguageId() === 'csharp')
-      .filter(candidate => {
-        if (candidate === model) return true;
-        const candidatePath = currentModelPath(candidate);
-        return projectPaths.size === 0 || projectPaths.has(candidatePath) || isCodeCraftProjectModel(candidate);
-      });
+      .filter(candidate => projectPaths.size === 0 || projectPaths.has(currentModelPath(candidate)));
     if (!candidates.includes(model)) {
       candidates.push(model);
     }
@@ -1440,20 +1431,9 @@ class CSharpLanguageService {
   }
 
   private createDiagnosticProjectRequest(model: monaco.editor.ITextModel): CSharpDiagnosticProjectRequest {
-    this.ensureProjectModelsFromProvider();
-
     const currentPath = currentModelPath(model);
     const seen = new Set<string>([currentPath]);
     const files: CSharpDiagnosticProjectRequest['Files'] = [];
-
-    for (const candidate of monaco.editor.getModels()) {
-      if (candidate.isDisposed() || candidate.getLanguageId() !== 'csharp') continue;
-      if (candidate !== model && !isCodeCraftProjectModel(candidate)) continue;
-      const path = currentModelPath(candidate);
-      if (!path || seen.has(path)) continue;
-      seen.add(path);
-      files.push({ Path: path, Content: candidate.getValue() });
-    }
 
     for (const file of this.projectFilesProvider()) {
       if (file.language !== 'csharp') continue;
@@ -1464,17 +1444,6 @@ class CSharpLanguageService {
     }
 
     return { CurrentPath: currentPath, Files: files };
-  }
-
-  private ensureProjectModelsFromProvider() {
-    for (const file of this.projectFilesProvider()) {
-      if (file.language !== 'csharp') continue;
-      const path = normalizeProjectPath(file.path);
-      if (!path) continue;
-      const uri = this.uriForProjectPath(path);
-      if (!uri || monaco.editor.getModel(uri)) continue;
-      monaco.editor.createModel(file.content ?? '', 'csharp', uri);
-    }
   }
 
   private createDiagnosticCacheKey(
