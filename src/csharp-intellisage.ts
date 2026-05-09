@@ -40,8 +40,82 @@ interface CSharpCompletionCacheEntry {
   incomplete?: boolean;
 }
 
+export type CSharpIdeDebugLevel = 'info' | 'success' | 'warning' | 'error';
+
+export interface CSharpIdeDebugEvent {
+  id: number;
+  timestamp: string;
+  feature: string;
+  phase: string;
+  level: CSharpIdeDebugLevel;
+  message: string;
+  durationMs?: number;
+  model?: CSharpIdeDebugModelSummary;
+  request?: unknown;
+  response?: unknown;
+  error?: unknown;
+}
+
+export interface CSharpIdeDebugModelSummary {
+  uri: string;
+  path: string;
+  language: string;
+  versionId: number;
+  alternativeVersionId: number;
+  lineCount: number;
+  length: number;
+  hash: string;
+  disposed: boolean;
+}
+
+export interface CSharpIdeDebugProjectFileSummary {
+  path: string;
+  language: string;
+  length: number;
+  lines: number;
+  hash: string;
+  hasMonacoModel: boolean;
+  modelUri?: string;
+  modelVersionId?: number;
+}
+
+export interface CSharpIdeDebugSnapshot {
+  enabled: boolean;
+  generatedAt: string;
+  runtime: {
+    initialized: boolean;
+    iframeUrl: string | null;
+    hasIntelliSageBridge: boolean;
+    providersRegistered: boolean;
+    initializationPending: boolean;
+  };
+  activeModel: CSharpIdeDebugModelSummary | null;
+  project: {
+    providerFileCount: number;
+    csharpFileCount: number;
+    providerError?: string;
+    files: CSharpIdeDebugProjectFileSummary[];
+    lastDiagnosticRequest: unknown;
+  };
+  cache: {
+    completionCacheSize: number;
+    completionEnvironmentVersion: number;
+    completionWorkerStateKey: string | null;
+    diagnosticCacheKey: string | null;
+    diagnosticCacheMarkerCount: number;
+    activeModelSemanticCacheHit: boolean;
+  };
+  events: CSharpIdeDebugEvent[];
+}
+
+export interface CSharpIdeDebugOptions {
+  enabled: boolean;
+  onDidChange?: (snapshot: CSharpIdeDebugSnapshot) => void;
+}
+
 const CSHARP_COMPLETION_CACHE_LIMIT = 8;
 const CSHARP_COMPLETION_TRIGGER_FALLBACK = '.';
+const CSHARP_DEBUG_EVENT_LIMIT = 200;
 
 interface RoslynPositionDto {
   line: number;
@@ -210,6 +284,37 @@ function hashString(value: string): string {
   return (hash >>> 0).toString(36);
 }
 
+function countLines(value: string) {
+  if (!value) return 0;
+  return value.split(/\r\n|\r|\n/).length;
+}
+
+function summarizePrimitive(value: unknown): unknown {
+  if (value == null || typeof value === 'number' || typeof value === 'boolean') return value;
+  if (typeof value === 'string') {
+    return value.length <= 80 && !/[\r\n]/.test(value)
+      ? value
+      : { type: 'string', length: value.length, lines: countLines(value), hash: hashString(value) };
+  }
+  if (Array.isArray(value)) return { type: 'array', length: value.length };
+  if (typeof value === 'object') return { type: 'object', keys: Object.keys(value as Record<string, unknown>).slice(0, 12) };
+  return typeof value;
+}
+
+function summarizeMarkers(markers: monaco.editor.IMarkerData[]) {
+  return markers.reduce<Record<string, number>>((summary, marker) => {
+    const key = marker.severity === monaco.MarkerSeverity.Error
+      ? 'error'
+      : marker.severity === monaco.MarkerSeverity.Warning
+        ? 'warning'
+        : marker.severity === monaco.MarkerSeverity.Info
+          ? 'info'
+          : 'hint';
+    summary[key] = (summary[key] ?? 0) + 1;
+    return summary;
+  }, {});
+}
+
 function currentModelPath(model: monaco.editor.ITextModel) {
   const uriPath = decodeURIComponent(model.uri.path || '');
   const projectMarker = '/codecraft-project/';
@@ -245,10 +350,355 @@ class CSharpLanguageService {
   private diagnosticCacheMarkers: monaco.editor.IMarkerData[] = [];
   private providerDisposables: monaco.IDisposable[] = [];
   private semanticCache = new WeakMap<monaco.editor.ITextModel, { versionId: number; index: CSharpSemanticIndex }>();
+  private debugEnabled = false;
+  private debugEvents: CSharpIdeDebugEvent[] = [];
+  private debugEventSerial = 0;
+  private debugListener: ((snapshot: CSharpIdeDebugSnapshot) => void) | null = null;
+  private debugNotifyTimer: ReturnType<typeof setTimeout> | null = null;
+  private lastDiagnosticProjectRequest: CSharpDiagnosticProjectRequest | null = null;
 
   private debouncedDiagnostics = debounce(this.getDiagnostics.bind(this), 100);
   private debouncedCompletions = this.rawProvideCompletionItems.bind(this);
   private debouncedResolve = this.rawResolveCompletionItem.bind(this);
+
+  configureDebug(options: CSharpIdeDebugOptions) {
+    const wasEnabled = this.debugEnabled;
+    this.debugEnabled = !!options.enabled;
+    this.debugListener = options.onDidChange ?? null;
+
+    if (this.debugEnabled) {
+      this.installDebugApi();
+      this.recordDebugEvent({
+        feature: 'debug',
+        phase: wasEnabled ? 'listener-updated' : 'enabled',
+        level: 'info',
+        message: wasEnabled ? 'C# IDE debug listener updated.' : 'C# IDE debug mode enabled.',
+      });
+    } else {
+      this.removeDebugApi();
+      if (wasEnabled) {
+        this.recordDebugEvent({
+          feature: 'debug',
+          phase: 'disabled',
+          level: 'info',
+          message: 'C# IDE debug mode disabled.',
+        }, true);
+      }
+      this.notifyDebugChanged();
+    }
+  }
+
+  getDebugSnapshot(): CSharpIdeDebugSnapshot {
+    const project = this.readProjectDebugSnapshot();
+    return {
+      enabled: this.debugEnabled,
+      generatedAt: new Date().toISOString(),
+      runtime: {
+        initialized: this.initialized,
+        iframeUrl: this.iframeUrl,
+        hasIntelliSageBridge: !!this.intellisage,
+        providersRegistered: this.providersRegistered,
+        initializationPending: !!this.initializationPromise,
+      },
+      activeModel: this.model ? this.summarizeModel(this.model) : null,
+      project: {
+        providerFileCount: project.providerFileCount,
+        csharpFileCount: project.files.length,
+        providerError: project.providerError,
+        files: project.files,
+        lastDiagnosticRequest: this.summarizeProjectRequest(this.lastDiagnosticProjectRequest),
+      },
+      cache: {
+        completionCacheSize: this.completionCache.size,
+        completionEnvironmentVersion: this.completionEnvironmentVersion,
+        completionWorkerStateKey: this.completionWorkerStateKey,
+        diagnosticCacheKey: this.diagnosticCacheKey,
+        diagnosticCacheMarkerCount: this.diagnosticCacheMarkers.length,
+        activeModelSemanticCacheHit: !!(this.model && this.semanticCache.has(this.model)),
+      },
+      events: [...this.debugEvents],
+    };
+  }
+
+  clearDebugEvents() {
+    this.debugEvents = [];
+    this.recordDebugEvent({
+      feature: 'debug',
+      phase: 'cleared',
+      level: 'info',
+      message: 'C# IDE debug event history cleared.',
+    });
+  }
+
+  private now() {
+    return typeof performance !== 'undefined' ? performance.now() : Date.now();
+  }
+
+  private recordDebugEvent(
+    event: Omit<CSharpIdeDebugEvent, 'id' | 'timestamp' | 'level' | 'message'> & {
+      level?: CSharpIdeDebugLevel;
+      message?: string;
+    },
+    force = false
+  ) {
+    if (!this.debugEnabled && !force) return;
+    const fullEvent: CSharpIdeDebugEvent = {
+      ...event,
+      id: ++this.debugEventSerial,
+      timestamp: new Date().toISOString(),
+      level: event.level ?? 'info',
+      message: event.message ?? `${event.feature}:${event.phase}`,
+    };
+    this.debugEvents = [...this.debugEvents, fullEvent].slice(-CSHARP_DEBUG_EVENT_LIMIT);
+
+    if (this.debugEnabled && typeof console !== 'undefined') {
+      const log = fullEvent.level === 'error'
+        ? console.error
+        : fullEvent.level === 'warning'
+          ? console.warn
+          : console.debug;
+      log.call(console, '[CodeCraft C# IDE]', fullEvent);
+    }
+
+    this.notifyDebugChanged();
+  }
+
+  private notifyDebugChanged() {
+    if (!this.debugListener) return;
+    if (this.debugNotifyTimer) return;
+    this.debugNotifyTimer = setTimeout(() => {
+      this.debugNotifyTimer = null;
+      this.debugListener?.(this.getDebugSnapshot());
+    }, 0);
+  }
+
+  private installDebugApi() {
+    const global = globalThis as any;
+    global.__codecraftCSharpIdeDebug = {
+      getSnapshot: () => this.getDebugSnapshot(),
+      clear: () => this.clearDebugEvents(),
+      service: this,
+    };
+  }
+
+  private removeDebugApi() {
+    const global = globalThis as any;
+    if (global.__codecraftCSharpIdeDebug?.service === this) {
+      delete global.__codecraftCSharpIdeDebug;
+    }
+  }
+
+  private summarizeModel(model: monaco.editor.ITextModel): CSharpIdeDebugModelSummary {
+    const value = model.isDisposed() ? '' : model.getValue();
+    return {
+      uri: model.uri.toString(),
+      path: currentModelPath(model),
+      language: model.getLanguageId(),
+      versionId: model.getVersionId(),
+      alternativeVersionId: model.getAlternativeVersionId(),
+      lineCount: model.isDisposed() ? 0 : model.getLineCount(),
+      length: value.length,
+      hash: hashString(value),
+      disposed: model.isDisposed(),
+    };
+  }
+
+  private readProjectDebugSnapshot(): {
+    providerFileCount: number;
+    providerError?: string;
+    files: CSharpIdeDebugProjectFileSummary[];
+  } {
+    try {
+      const providerFiles = this.projectFilesProvider();
+      return {
+        providerFileCount: providerFiles.length,
+        files: providerFiles
+          .filter(file => file.language === 'csharp')
+          .map(file => {
+            const path = normalizeProjectPath(file.path);
+            const content = file.content ?? '';
+            const matchingModel = monaco.editor.getModels()
+              .find(model => model.getLanguageId() === 'csharp' && currentModelPath(model) === path);
+            return {
+              path,
+              language: file.language,
+              length: content.length,
+              lines: countLines(content),
+              hash: hashString(content),
+              hasMonacoModel: !!matchingModel,
+              modelUri: matchingModel?.uri.toString(),
+              modelVersionId: matchingModel?.getVersionId(),
+            };
+          }),
+      };
+    } catch (error) {
+      return {
+        providerFileCount: 0,
+        providerError: this.summarizeError(error),
+        files: [],
+      };
+    }
+  }
+
+  private summarizeProjectRequest(request: CSharpDiagnosticProjectRequest | null): unknown {
+    if (!request) return null;
+    return {
+      CurrentPath: request.CurrentPath,
+      Files: request.Files.map(file => ({
+        Path: file.Path,
+        length: file.Content.length,
+        lines: countLines(file.Content),
+        hash: hashString(file.Content),
+      })),
+    };
+  }
+
+  private summarizeError(error: unknown) {
+    if (error instanceof Error) {
+      return `${error.name}: ${error.message}`;
+    }
+    return String(error);
+  }
+
+  private summarizeValue(value: unknown, depth = 0): unknown {
+    if (value == null || typeof value === 'number' || typeof value === 'boolean') return value;
+    if (typeof value === 'string') {
+      if (value.length <= 160 && !/[\r\n]/.test(value)) return value;
+      return {
+        type: 'string',
+        length: value.length,
+        lines: countLines(value),
+        hash: hashString(value),
+        preview: value.slice(0, 160),
+      };
+    }
+    if (Array.isArray(value)) {
+      return {
+        type: 'array',
+        length: value.length,
+        sample: depth >= 2 ? undefined : value.slice(0, 5).map(item => this.summarizeValue(item, depth + 1)),
+      };
+    }
+    if (typeof value === 'object') {
+      if (value instanceof monaco.Range) {
+        return {
+          startLineNumber: value.startLineNumber,
+          startColumn: value.startColumn,
+          endLineNumber: value.endLineNumber,
+          endColumn: value.endColumn,
+        };
+      }
+      const record = value as Record<string, unknown>;
+      const result: Record<string, unknown> = {};
+      for (const [key, item] of Object.entries(record).slice(0, 24)) {
+        result[key] = depth >= 2 ? summarizePrimitive(item) : this.summarizeValue(item, depth + 1);
+      }
+      return result;
+    }
+    return typeof value;
+  }
+
+  private summarizeProviderResult(value: unknown): unknown {
+    const result = value as any;
+    if (!result) return result;
+    if (Array.isArray(result)) return { type: 'array', length: result.length };
+    if (result.suggestions) {
+      return { suggestions: result.suggestions.length, incomplete: !!result.incomplete };
+    }
+    if (result.actions) return { actions: result.actions.length };
+    if (result.hints) return { hints: result.hints.length };
+    if (result.edits) return { edits: result.edits.length, rejectReason: result.rejectReason };
+    if (result.value?.signatures) {
+      return {
+        signatures: result.value.signatures.length,
+        activeSignature: result.value.activeSignature,
+        activeParameter: result.value.activeParameter,
+      };
+    }
+    if (result.contents) return { contents: result.contents.length };
+    if (result.data instanceof Uint32Array) return { semanticTokenIntegers: result.data.length };
+    return this.summarizeValue(result);
+  }
+
+  private summarizeIntelliSageResponse(response: unknown): unknown {
+    const result = response as any;
+    if (!result) return result;
+    if (Array.isArray(result)) return { type: 'array', length: result.length, sample: result.slice(0, 3).map(item => this.summarizeValue(item, 1)) };
+    if (typeof result === 'object') {
+      return {
+        keys: Object.keys(result).slice(0, 16),
+        items: Array.isArray(result.items) ? result.items.length : undefined,
+        signatures: Array.isArray(result.signatures) ? result.signatures.length : undefined,
+        edits: Array.isArray(result.edits) ? result.edits.length : undefined,
+        markdownLength: typeof result.markdown === 'string' ? result.markdown.length : undefined,
+        rejectReason: result.rejectReason,
+        value: this.summarizeValue(result, 1),
+      };
+    }
+    return this.summarizeValue(result);
+  }
+
+  private debugProviderCall<T>(
+    feature: string,
+    model: monaco.editor.ITextModel | null | undefined,
+    request: unknown,
+    callback: () => T
+  ): T {
+    if (!this.debugEnabled) return callback();
+    const started = this.now();
+    this.recordDebugEvent({
+      feature,
+      phase: 'provider-start',
+      level: 'info',
+      message: `${feature} provider started.`,
+      model: model ? this.summarizeModel(model) : undefined,
+      request: this.summarizeValue(request),
+    });
+
+    try {
+      const result = callback();
+      if (result && typeof (result as any).then === 'function') {
+        (result as Promise<unknown>).then(
+          response => this.recordDebugEvent({
+            feature,
+            phase: 'provider-end',
+            level: 'success',
+            message: `${feature} provider resolved.`,
+            durationMs: Math.round((this.now() - started) * 10) / 10,
+            response: this.summarizeProviderResult(response),
+          }),
+          error => this.recordDebugEvent({
+            feature,
+            phase: 'provider-error',
+            level: 'error',
+            message: `${feature} provider rejected.`,
+            durationMs: Math.round((this.now() - started) * 10) / 10,
+            error: this.summarizeError(error),
+          })
+        );
+      } else {
+        this.recordDebugEvent({
+          feature,
+          phase: 'provider-end',
+          level: 'success',
+          message: `${feature} provider returned synchronously.`,
+          durationMs: Math.round((this.now() - started) * 10) / 10,
+          response: this.summarizeProviderResult(result),
+        });
+      }
+      return result;
+    } catch (error) {
+      this.recordDebugEvent({
+        feature,
+        phase: 'provider-throw',
+        level: 'error',
+        message: `${feature} provider threw.`,
+        durationMs: Math.round((this.now() - started) * 10) / 10,
+        error: this.summarizeError(error),
+      });
+      throw error;
+    }
+  }
 
   async initialize(iframeUrl = CSHARP_INTELLISAGE_URLS.local) {
     const nextIframeUrl = iframeUrl.trim() || CSHARP_INTELLISAGE_URLS.local;
@@ -316,6 +766,18 @@ class CSharpLanguageService {
       const iframeRef = iframe;
       this.intellisage = (method: string, ...args: unknown[]) => {
         if (!iframeRef.contentWindow) return Promise.resolve(false);
+        const started = this.now();
+        this.recordDebugEvent({
+          feature: method,
+          phase: 'runtime-request',
+          level: 'info',
+          message: `${method} request posted to IntelliSage.`,
+          request: {
+            iframeUrl: this.iframeUrl,
+            args: args.map(arg => this.summarizeValue(arg)),
+          },
+        });
+
         return new Promise(res => {
           const id = Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
           let handled = false;
@@ -323,13 +785,31 @@ class CSharpLanguageService {
             if (event.data?.intellisage?.id === id && !handled) {
               handled = true;
               window.removeEventListener('message', handleMessage);
-              res(event.data.intellisage.payload);
+              const payload = event.data.intellisage.payload;
+              this.recordDebugEvent({
+                feature: method,
+                phase: 'runtime-response',
+                level: payload === false ? 'warning' : 'success',
+                message: payload === false
+                  ? `${method} returned a false payload.`
+                  : `${method} returned from IntelliSage.`,
+                durationMs: Math.round((this.now() - started) * 10) / 10,
+                response: this.summarizeIntelliSageResponse(payload),
+              });
+              res(payload);
             }
           };
           setTimeout(() => {
             if (!handled) {
               handled = true;
               window.removeEventListener('message', handleMessage);
+              this.recordDebugEvent({
+                feature: method,
+                phase: 'runtime-timeout',
+                level: 'error',
+                message: `${method} timed out waiting for IntelliSage.`,
+                durationMs: Math.round((this.now() - started) * 10) / 10,
+              });
               res(false);
             }
           }, 10000);
@@ -349,6 +829,13 @@ class CSharpLanguageService {
   }
 
   private disposeIntelliSageRuntime() {
+    this.recordDebugEvent({
+      feature: 'lifecycle',
+      phase: 'dispose-runtime',
+      level: 'warning',
+      message: 'IntelliSage runtime disposed.',
+      request: { iframeUrl: this.iframeUrl },
+    });
     document.getElementById(iframeId)?.remove();
     this.intellisage = null;
     this.initialized = false;
@@ -363,6 +850,16 @@ class CSharpLanguageService {
     this.lastCompletions.clear();
     this.completionCache.clear();
     this.diagnosticCacheKey = null;
+    this.recordDebugEvent({
+      feature: 'cache',
+      phase: 'clear',
+      level: 'info',
+      message: 'C# completion and diagnostic caches cleared.',
+      request: {
+        completionEnvironmentVersion: this.completionEnvironmentVersion,
+        completionRequestSerial: this.completionRequestSerial,
+      },
+    });
   }
 
   private cacheCompletionResult(key: string, entry: CSharpCompletionCacheEntry) {
@@ -421,43 +918,59 @@ class CSharpLanguageService {
     this.providerDisposables.push(
       monaco.languages.registerCompletionItemProvider('csharp', {
         triggerCharacters: ['.', '(', ',', '<', '[', ' ', '#'],
-        resolveCompletionItem: item => this.debouncedResolve(item),
-        provideCompletionItems: (model, position, context) => this.debouncedCompletions(model, position, context),
+        resolveCompletionItem: item => this.debugProviderCall('completion.resolve', null, { label: item.label }, () => this.debouncedResolve(item)),
+        provideCompletionItems: (model, position, context) => this.debugProviderCall('completion', model, {
+          position,
+          triggerKind: context.triggerKind,
+          triggerCharacter: context.triggerCharacter,
+        }, () => this.debouncedCompletions(model, position, context)),
       }),
       monaco.languages.registerSignatureHelpProvider('csharp', {
         signatureHelpTriggerCharacters: ['(', ','],
         signatureHelpRetriggerCharacters: [')'],
-        provideSignatureHelp: (model, position) => this.provideSignatureHelp(model, position),
+        provideSignatureHelp: (model, position) => this.debugProviderCall('signatureHelp', model, { position }, () => this.provideSignatureHelp(model, position)),
       }),
       monaco.languages.registerHoverProvider('csharp', {
-        provideHover: (model, position) => this.provideHover(model, position),
+        provideHover: (model, position) => this.debugProviderCall('hover', model, { position }, () => this.provideHover(model, position)),
       }),
       monaco.languages.registerDocumentSemanticTokensProvider('csharp', {
         getLegend: () => CSHARP_SEMANTIC_LEGEND,
         provideDocumentSemanticTokens: (model, _lastResultId, cancellationToken) => {
           if (cancellationToken.isCancellationRequested || model.isDisposed()) return null;
-          return this.provideDocumentSemanticTokens(model, cancellationToken);
+          return this.debugProviderCall('semanticTokens', model, {
+            cancellationRequested: cancellationToken.isCancellationRequested,
+          }, () => this.provideDocumentSemanticTokens(model, cancellationToken));
         },
         releaseDocumentSemanticTokens() {},
       }),
       monaco.languages.registerDefinitionProvider('csharp', {
-        provideDefinition: (model, position) => this.provideDefinition(model, position),
+        provideDefinition: (model, position) => this.debugProviderCall('definition', model, { position }, () => this.provideDefinition(model, position)),
       }),
       monaco.languages.registerReferenceProvider('csharp', {
-        provideReferences: (model, position, context) => this.provideReferences(model, position, context),
+        provideReferences: (model, position, context) => this.debugProviderCall('references', model, {
+          position,
+          includeDeclaration: context.includeDeclaration,
+        }, () => this.provideReferences(model, position, context)),
       }),
       monaco.languages.registerDocumentHighlightProvider('csharp', {
-        provideDocumentHighlights: (model, position) => this.provideDocumentHighlights(model, position),
+        provideDocumentHighlights: (model, position) => this.debugProviderCall('documentHighlights', model, { position }, () => this.provideDocumentHighlights(model, position)),
       }),
       monaco.languages.registerDocumentSymbolProvider('csharp', {
-        provideDocumentSymbols: model => this.provideDocumentSymbols(model),
+        provideDocumentSymbols: model => this.debugProviderCall('documentSymbols', model, {}, () => this.provideDocumentSymbols(model)),
       }),
       monaco.languages.registerRenameProvider('csharp', {
-        resolveRenameLocation: (model, position) => this.resolveRenameLocation(model, position),
-        provideRenameEdits: (model, position, newName) => this.provideRenameEdits(model, position, newName),
+        resolveRenameLocation: (model, position) => this.debugProviderCall('rename.resolve', model, { position }, () => this.resolveRenameLocation(model, position)),
+        provideRenameEdits: (model, position, newName) => this.debugProviderCall('rename.edits', model, {
+          position,
+          newName,
+        }, () => this.provideRenameEdits(model, position, newName)),
       }),
       monaco.languages.registerCodeActionProvider('csharp', {
-        provideCodeActions: (model, range, context) => this.provideCodeActions(model, range, context),
+        provideCodeActions: (model, range, context) => this.debugProviderCall('codeActions', model, {
+          range,
+          markerCount: context.markers.length,
+          only: context.only,
+        }, () => this.provideCodeActions(model, range, context)),
       }, {
         providedCodeActionKinds: [
           'quickfix',
@@ -466,23 +979,30 @@ class CSharpLanguageService {
         ],
       }),
       monaco.languages.registerFoldingRangeProvider('csharp', {
-        provideFoldingRanges: model => this.provideFoldingRanges(model),
+        provideFoldingRanges: model => this.debugProviderCall('foldingRanges', model, {}, () => this.provideFoldingRanges(model)),
       }),
       monaco.languages.registerDocumentFormattingEditProvider('csharp', {
-        provideDocumentFormattingEdits: (model, options) => this.provideDocumentFormattingEdits(model, options),
+        provideDocumentFormattingEdits: (model, options) => this.debugProviderCall('formatDocument', model, options, () => this.provideDocumentFormattingEdits(model, options)),
       }),
       monaco.languages.registerDocumentRangeFormattingEditProvider('csharp', {
-        provideDocumentRangeFormattingEdits: (model, range, options) => this.provideDocumentRangeFormattingEdits(model, range, options),
+        provideDocumentRangeFormattingEdits: (model, range, options) => this.debugProviderCall('formatRange', model, {
+          range,
+          options,
+        }, () => this.provideDocumentRangeFormattingEdits(model, range, options)),
       }),
       monaco.languages.registerOnTypeFormattingEditProvider('csharp', {
         autoFormatTriggerCharacters: [';', '}', '\n'],
-        provideOnTypeFormattingEdits: (model, position, ch, options) => this.provideOnTypeFormattingEdits(model, position, ch, options),
+        provideOnTypeFormattingEdits: (model, position, ch, options) => this.debugProviderCall('formatOnType', model, {
+          position,
+          ch,
+          options,
+        }, () => this.provideOnTypeFormattingEdits(model, position, ch, options)),
       }),
       monaco.languages.registerInlayHintsProvider('csharp', {
-        provideInlayHints: (model, range) => this.provideInlayHints(model, range),
+        provideInlayHints: (model, range) => this.debugProviderCall('inlayHints', model, { range }, () => this.provideInlayHints(model, range)),
       }),
       monaco.languages.registerSelectionRangeProvider('csharp', {
-        provideSelectionRanges: (model, positions) => this.provideSelectionRanges(model, positions),
+        provideSelectionRanges: (model, positions) => this.debugProviderCall('selectionRanges', model, { positions }, () => this.provideSelectionRanges(model, positions)),
       })
     );
   }
@@ -494,10 +1014,27 @@ class CSharpLanguageService {
     if (projectFilesProvider) {
       this.projectFilesProvider = projectFilesProvider;
     }
+    this.recordDebugEvent({
+      feature: 'lifecycle',
+      phase: 'setup-editor',
+      level: 'info',
+      message: 'C# language service bound to editor.',
+      model: editor.getModel() ? this.summarizeModel(editor.getModel()!) : undefined,
+      request: {
+        hasProjectFilesProvider: !!projectFilesProvider,
+      },
+    });
     this.setupDiagnostics(editor);
   }
 
   clearEditor() {
+    this.recordDebugEvent({
+      feature: 'lifecycle',
+      phase: 'clear-editor',
+      level: 'warning',
+      message: 'C# language service editor binding cleared.',
+      model: this.model ? this.summarizeModel(this.model) : undefined,
+    });
     this.diagnosticRequestSerial += 1;
     this.modelChangeListener?.dispose();
     this.modelChangeListener = null;
@@ -517,15 +1054,36 @@ class CSharpLanguageService {
 
       if (this.model && this.model.getLanguageId() === 'csharp') {
         const model = this.model;
+        this.recordDebugEvent({
+          feature: 'diagnostics',
+          phase: 'model-attached',
+          level: 'info',
+          message: 'C# diagnostics attached to model.',
+          model: this.summarizeModel(model),
+        });
         this.requestDiagnostics(model);
         this.modelChangeListener = model.onDidChangeContent(() => {
           if (!model.isDisposed() && model.getLanguageId() === 'csharp') {
             this.semanticCache.delete(model);
             this.clearCompletionState();
+            this.recordDebugEvent({
+              feature: 'model',
+              phase: 'content-changed',
+              level: 'info',
+              message: 'C# model content changed.',
+              model: this.summarizeModel(model),
+            });
             this.requestDiagnostics(model);
           }
         });
       } else {
+        this.recordDebugEvent({
+          feature: 'diagnostics',
+          phase: 'model-detached',
+          level: 'warning',
+          message: 'C# diagnostics detached because the active model is not C#.',
+          model: this.model ? this.summarizeModel(this.model) : undefined,
+        });
         this.model = null;
       }
     };
@@ -569,6 +1127,14 @@ class CSharpLanguageService {
 
   private requestDiagnostics(model: monaco.editor.ITextModel) {
     const requestSerial = ++this.diagnosticRequestSerial;
+    this.recordDebugEvent({
+      feature: 'diagnostics',
+      phase: 'schedule',
+      level: 'info',
+      message: 'C# diagnostics scheduled.',
+      model: this.summarizeModel(model),
+      request: { requestSerial },
+    });
     void this.debouncedDiagnostics(model, requestSerial);
   }
 
@@ -578,9 +1144,18 @@ class CSharpLanguageService {
   }
 
   private async getDiagnostics(model: monaco.editor.ITextModel, requestSerial: number) {
+    const started = this.now();
     if (model.isDisposed() || model.getLanguageId() !== 'csharp') return;
 
     const initialModelVersion = model.getVersionId();
+    this.recordDebugEvent({
+      feature: 'diagnostics',
+      phase: 'start',
+      level: 'info',
+      message: 'C# diagnostics started.',
+      model: this.summarizeModel(model),
+      request: { requestSerial, initialModelVersion },
+    });
     const runtimeReady = await this.ensureLocalIntelliSageRuntime();
     if (
       !runtimeReady ||
@@ -589,24 +1164,75 @@ class CSharpLanguageService {
       model.isDisposed() ||
       model.getVersionId() !== initialModelVersion
     ) {
+      this.recordDebugEvent({
+        feature: 'diagnostics',
+        phase: 'skip',
+        level: 'warning',
+        message: 'C# diagnostics skipped after readiness/version checks.',
+        durationMs: Math.round((this.now() - started) * 10) / 10,
+        request: {
+          runtimeReady,
+          hasIntelliSageBridge: !!this.intellisage,
+          requestSerial,
+          currentDiagnosticRequestSerial: this.diagnosticRequestSerial,
+          modelDisposed: model.isDisposed(),
+          modelVersionId: model.isDisposed() ? null : model.getVersionId(),
+          initialModelVersion,
+        },
+      });
       return;
     }
 
     const safeCode = model.getValue();
     const projectRequest = this.createDiagnosticProjectRequest(model);
+    this.lastDiagnosticProjectRequest = projectRequest;
     const cacheKey = this.createDiagnosticCacheKey(model, safeCode, projectRequest);
     if (this.diagnosticCacheKey === cacheKey) {
       monaco.editor.setModelMarkers(model, 'csharp-intellisage', this.diagnosticCacheMarkers);
+      this.recordDebugEvent({
+        feature: 'diagnostics',
+        phase: 'cache-hit',
+        level: 'success',
+        message: 'C# diagnostics reused cached markers.',
+        model: this.summarizeModel(model),
+        durationMs: Math.round((this.now() - started) * 10) / 10,
+        request: {
+          cacheKey,
+          markerCount: this.diagnosticCacheMarkers.length,
+          project: this.summarizeProjectRequest(projectRequest),
+        },
+      });
       return;
     }
 
     try {
+      this.recordDebugEvent({
+        feature: 'diagnostics',
+        phase: 'runtime-call',
+        level: 'info',
+        message: 'C# diagnostics calling IntelliSage.',
+        model: this.summarizeModel(model),
+        request: {
+          cacheKey,
+          codeLength: safeCode.length,
+          codeHash: hashString(safeCode),
+          project: this.summarizeProjectRequest(projectRequest),
+        },
+      });
       const diagnostics = await this.intellisage('GetDiagnosticsAsync', safeCode, projectRequest);
       if (
         requestSerial !== this.diagnosticRequestSerial ||
         model.isDisposed() ||
         model.getVersionId() !== initialModelVersion
       ) {
+        this.recordDebugEvent({
+          feature: 'diagnostics',
+          phase: 'discard-stale-response',
+          level: 'warning',
+          message: 'C# diagnostics response discarded because the model/request changed.',
+          durationMs: Math.round((this.now() - started) * 10) / 10,
+          response: this.summarizeIntelliSageResponse(diagnostics),
+        });
         return;
       }
 
@@ -614,7 +1240,27 @@ class CSharpLanguageService {
       this.diagnosticCacheKey = cacheKey;
       this.diagnosticCacheMarkers = markers;
       monaco.editor.setModelMarkers(model, 'csharp-intellisage', markers);
-    } catch {
+      this.recordDebugEvent({
+        feature: 'diagnostics',
+        phase: 'end',
+        level: 'success',
+        message: 'C# diagnostics applied markers.',
+        durationMs: Math.round((this.now() - started) * 10) / 10,
+        response: {
+          diagnosticPayload: this.summarizeIntelliSageResponse(diagnostics),
+          markerCount: markers.length,
+          severities: summarizeMarkers(markers),
+        },
+      });
+    } catch (error) {
+      this.recordDebugEvent({
+        feature: 'diagnostics',
+        phase: 'error',
+        level: 'error',
+        message: 'C# diagnostics failed.',
+        durationMs: Math.round((this.now() - started) * 10) / 10,
+        error: this.summarizeError(error),
+      });
       if (
         requestSerial === this.diagnosticRequestSerial &&
         !model.isDisposed() &&

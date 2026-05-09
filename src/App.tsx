@@ -25,7 +25,10 @@ import {
   Copy,
   CopyPlus,
   ClipboardPaste,
-  Pencil
+  Pencil,
+  Bug,
+  Activity,
+  Database
 } from 'lucide-react';
 import Editor, { DiffEditor } from '@monaco-editor/react';
 import { configureMonacoSuggestionAcceptance } from './monaco-suggest';
@@ -42,7 +45,7 @@ import 'flexlayout-react/style/dark.css';
 import * as Tooltip from '@radix-ui/react-tooltip';
 import * as Separator from '@radix-ui/react-separator';
 import type * as TypeScript from 'typescript';
-import type { CSharpIntelliSageSource } from './csharp-intellisage';
+import type { CSharpIdeDebugSnapshot, CSharpIntelliSageSource } from './csharp-intellisage';
 
 const APP_VERSION = __APP_VERSION__;
 
@@ -4769,6 +4772,7 @@ interface AppSettings {
   pythonIOMode: RuntimeIOMode;
   csharpExecutionTimeoutMs: number;
   csharpIntelliSageSource: CSharpIntelliSageSource;
+  csharpIdeDebugMode: boolean;
   csharpExecutionMode: CSharpExecutionMode;
   csharpResetScriptContextBeforeRun: boolean;
   csharpIOMode: RuntimeIOMode;
@@ -4848,6 +4852,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   pythonIOMode: 'alert-output',
   csharpExecutionTimeoutMs: 0,
   csharpIntelliSageSource: 'local',
+  csharpIdeDebugMode: false,
   csharpExecutionMode: 'regular',
   csharpResetScriptContextBeforeRun: false,
   csharpIOMode: 'alert-output',
@@ -6238,6 +6243,7 @@ export default function App() {
       pythonRuntimeLifecycle: normalizeRuntimeLifecycle(merged.pythonRuntimeLifecycle),
       csharpExecutionTimeoutMs: normalizeExecutionTimeoutMs(merged.csharpExecutionTimeoutMs),
       csharpIntelliSageSource: normalizeCSharpIntelliSageSource(merged.csharpIntelliSageSource),
+      csharpIdeDebugMode: !!merged.csharpIdeDebugMode,
       cxxExecutionTimeoutMs: normalizeExecutionTimeoutMs(merged.cxxExecutionTimeoutMs),
       cxxRuntimeLifecycle: normalizeRuntimeLifecycle(merged.cxxRuntimeLifecycle),
       cxxIOMode: normalizeRuntimeIOMode(merged.cxxIOMode),
@@ -6297,6 +6303,7 @@ export default function App() {
   const [settingsCSharpNamespaceStatus, setSettingsCSharpNamespaceStatus] = useState('');
   const [settingsUserDataBusy, setSettingsUserDataBusy] = useState(false);
   const [settingsUserDataStatus, setSettingsUserDataStatus] = useState('');
+  const [csharpIdeDebugSnapshot, setCSharpIdeDebugSnapshot] = useState<CSharpIdeDebugSnapshot | null>(null);
   const [showAssistantApiKey, setShowAssistantApiKey] = useState(false);
   const [syncMeta, setSyncMeta] = useState<SyncMeta[]>(loadSyncMeta);
   const pendingEdit = pendingEdits[0] ?? null;
@@ -6679,6 +6686,48 @@ export default function App() {
     }
     return csharpAuthoring;
   }, [getCSharpAuthoringModule, settings.csharpIntelliSageSource]);
+
+  useEffect(() => {
+    let disposed = false;
+
+    if (!settings.csharpIdeDebugMode) {
+      csharpAuthoringModuleRef.current?.csharpService.configureDebug({ enabled: false });
+      setCSharpIdeDebugSnapshot(null);
+      return () => {
+        disposed = true;
+      };
+    }
+
+    void getCSharpAuthoringModule().then(csharpAuthoring => {
+      if (disposed) return;
+      csharpAuthoring.csharpService.configureDebug({
+        enabled: true,
+        onDidChange: snapshot => {
+          if (!disposed) setCSharpIdeDebugSnapshot(snapshot);
+        },
+      });
+      setCSharpIdeDebugSnapshot(csharpAuthoring.csharpService.getDebugSnapshot());
+    });
+
+    return () => {
+      disposed = true;
+      csharpAuthoringModuleRef.current?.csharpService.configureDebug({ enabled: false });
+    };
+  }, [getCSharpAuthoringModule, settings.csharpIdeDebugMode]);
+
+  const copyCSharpIdeDebugSnapshot = useCallback(async () => {
+    if (!csharpIdeDebugSnapshot) return;
+    try {
+      await navigator.clipboard?.writeText(JSON.stringify(csharpIdeDebugSnapshot, null, 2));
+    } catch (error) {
+      console.warn('Failed to copy C# IDE debug snapshot:', error);
+    }
+  }, [csharpIdeDebugSnapshot]);
+
+  const clearCSharpIdeDebugEvents = useCallback(() => {
+    csharpAuthoringModuleRef.current?.csharpService.clearDebugEvents();
+    setCSharpIdeDebugSnapshot(csharpAuthoringModuleRef.current?.csharpService.getDebugSnapshot() ?? null);
+  }, []);
 
   const ensureCxxAuthoringReady = useCallback(async () => {
     const cxxAuthoring = await getCxxAuthoringModule();
@@ -15873,6 +15922,121 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
               ) : (
                 <div className="h-full w-full bg-[rgb(28,28,28)]" />
               )}
+              {settings.csharpIdeDebugMode && getProjectFileLanguageForRuntime(tabItem) === 'csharp' ? (
+                <div className="absolute right-3 bottom-3 z-20 w-[min(760px,calc(100%-1.5rem))] max-h-[52%] overflow-hidden rounded-xl border border-indigo-400/30 bg-zinc-950/95 shadow-2xl backdrop-blur">
+                  <div className="flex items-center justify-between gap-3 border-b border-white/10 px-3 py-2">
+                    <div className="flex items-center gap-2 min-w-0">
+                      <Bug size={14} className="text-indigo-300 shrink-0" />
+                      <div className="min-w-0">
+                        <div className="text-xs font-semibold text-white">C# IDE Debug</div>
+                        <div className="text-[10px] text-zinc-500 truncate">
+                          {csharpIdeDebugSnapshot?.activeModel?.path ?? getPath(tabItem.id)}
+                        </div>
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-1.5 shrink-0">
+                      <button
+                        type="button"
+                        onClick={copyCSharpIdeDebugSnapshot}
+                        disabled={!csharpIdeDebugSnapshot}
+                        className="inline-flex items-center gap-1 rounded-lg border border-white/10 bg-white/5 px-2 py-1 text-[10px] text-zinc-300 transition-colors hover:bg-white/10 disabled:opacity-50"
+                      >
+                        <Copy size={11} /> Copy JSON
+                      </button>
+                      <button
+                        type="button"
+                        onClick={clearCSharpIdeDebugEvents}
+                        className="rounded-lg border border-white/10 bg-white/5 px-2 py-1 text-[10px] text-zinc-300 transition-colors hover:bg-white/10"
+                      >
+                        Clear
+                      </button>
+                    </div>
+                  </div>
+
+                  {csharpIdeDebugSnapshot ? (
+                    <div className="max-h-[calc(52vh-2.5rem)] overflow-y-auto p-3 custom-scrollbar">
+                      <div className="grid grid-cols-2 lg:grid-cols-4 gap-2 text-[10px]">
+                        <div className="rounded-lg border border-white/10 bg-white/5 px-2 py-1.5">
+                          <div className="flex items-center gap-1 text-zinc-500"><Activity size={10} /> Runtime</div>
+                          <div className="mt-1 text-zinc-200">
+                            {csharpIdeDebugSnapshot.runtime.hasIntelliSageBridge ? 'Bridge ready' : 'Bridge missing'}
+                          </div>
+                        </div>
+                        <div className="rounded-lg border border-white/10 bg-white/5 px-2 py-1.5">
+                          <div className="flex items-center gap-1 text-zinc-500"><FileCode size={10} /> C# Files</div>
+                          <div className="mt-1 text-zinc-200">
+                            {csharpIdeDebugSnapshot.project.csharpFileCount}/{csharpIdeDebugSnapshot.project.providerFileCount}
+                          </div>
+                        </div>
+                        <div className="rounded-lg border border-white/10 bg-white/5 px-2 py-1.5">
+                          <div className="flex items-center gap-1 text-zinc-500"><Database size={10} /> Cache</div>
+                          <div className="mt-1 text-zinc-200">
+                            C {csharpIdeDebugSnapshot.cache.completionCacheSize} · D {csharpIdeDebugSnapshot.cache.diagnosticCacheMarkerCount}
+                          </div>
+                        </div>
+                        <div className="rounded-lg border border-white/10 bg-white/5 px-2 py-1.5">
+                          <div className="flex items-center gap-1 text-zinc-500"><History size={10} /> Events</div>
+                          <div className="mt-1 text-zinc-200">{csharpIdeDebugSnapshot.events.length}</div>
+                        </div>
+                      </div>
+
+                      <div className="mt-3 rounded-lg border border-white/10 bg-black/30 px-2 py-1.5 text-[10px]">
+                        <div className="text-zinc-500">Project Snapshot</div>
+                        <div className="mt-1 space-y-1">
+                          {csharpIdeDebugSnapshot.project.files.slice(0, 8).map(file => (
+                            <div key={file.path} className="flex items-center justify-between gap-2 text-zinc-300">
+                              <span className="truncate">{file.path}</span>
+                              <span className="shrink-0 text-zinc-500">
+                                {file.lines} lines · {file.hash}{file.hasMonacoModel ? ' · model' : ''}
+                              </span>
+                            </div>
+                          ))}
+                          {csharpIdeDebugSnapshot.project.files.length > 8 ? (
+                            <div className="text-zinc-500">
+                              +{csharpIdeDebugSnapshot.project.files.length - 8} more C# files
+                            </div>
+                          ) : null}
+                          {csharpIdeDebugSnapshot.project.providerError ? (
+                            <div className="text-red-300">{csharpIdeDebugSnapshot.project.providerError}</div>
+                          ) : null}
+                        </div>
+                      </div>
+
+                      <div className="mt-3 space-y-2">
+                        {csharpIdeDebugSnapshot.events.slice(-10).reverse().map(event => (
+                          <div key={event.id} className="rounded-lg border border-white/10 bg-black/30 px-2 py-1.5">
+                            <div className="flex items-center justify-between gap-2 text-[10px]">
+                              <div className="min-w-0">
+                                <span className={cn(
+                                  "font-semibold",
+                                  event.level === 'error' ? 'text-red-300' :
+                                    event.level === 'warning' ? 'text-amber-300' :
+                                      event.level === 'success' ? 'text-emerald-300' :
+                                        'text-indigo-300'
+                                )}>
+                                  {event.feature}
+                                </span>
+                                <span className="text-zinc-500"> · {event.phase}</span>
+                              </div>
+                              <div className="shrink-0 text-zinc-500">
+                                {event.durationMs != null ? `${event.durationMs}ms` : new Date(event.timestamp).toLocaleTimeString()}
+                              </div>
+                            </div>
+                            <div className="mt-1 text-[10px] text-zinc-300">{event.message}</div>
+                            {(event.request || event.response || event.error) ? (
+                              <pre className="mt-1 max-h-24 overflow-auto rounded bg-black/40 p-1.5 text-[10px] leading-snug text-zinc-500 custom-scrollbar">
+                                {JSON.stringify(event.error ?? event.response ?? event.request, null, 2)}
+                              </pre>
+                            ) : null}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="p-3 text-xs text-zinc-400">Waiting for the C# language service to load.</div>
+                  )}
+                </div>
+              ) : null}
             </div>
           )}
         </div>
@@ -17317,6 +17481,28 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
                             : 'Loads the hosted IntelliSage runtime from intellisage.vercel.app.'}
                         </div>
                       </label>
+
+                      <div className="flex items-center justify-between gap-4 rounded-xl border border-white/10 bg-black/20 px-4 py-3">
+                        <div>
+                          <div className="text-sm font-medium text-white">C# IDE Debug Mode</div>
+                          <div className="text-xs text-zinc-500">
+                            Records provider calls, IntelliSage requests, project snapshots, caches, timing, and failures.
+                          </div>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => setSettings(s => ({ ...s, csharpIdeDebugMode: !s.csharpIdeDebugMode }))}
+                          className={cn(
+                            "w-10 h-5 rounded-full transition-all relative shrink-0",
+                            settings.csharpIdeDebugMode ? "bg-indigo-600" : "bg-zinc-700"
+                          )}
+                        >
+                          <div className={cn(
+                            "absolute top-1 w-3 h-3 bg-white rounded-full transition-all",
+                            settings.csharpIdeDebugMode ? "right-1" : "left-1"
+                          )} />
+                        </button>
+                      </div>
 
                       <label className="block space-y-2">
                         <div className="text-xs font-medium uppercase tracking-wide text-zinc-500">Execution Timeout (ms)</div>
