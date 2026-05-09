@@ -44,6 +44,8 @@ import * as Separator from '@radix-ui/react-separator';
 import type * as TypeScript from 'typescript';
 import type { CSharpIntelliSageSource } from './csharp-intellisage';
 
+const APP_VERSION = __APP_VERSION__;
+
 type UserFolder = import('./pyright').UserFolder;
 type PyrightModule = typeof import('./pyright');
 type CSharpAuthoringModule = typeof import('./csharp-intellisage');
@@ -18205,7 +18207,8 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
 
               </div>
 
-              <div className="p-6 border-t border-white/5 bg-white/2 flex justify-end">
+              <div className="p-6 border-t border-white/5 bg-white/2 flex items-center justify-between gap-4">
+                <div className="text-xs text-zinc-500">Version {APP_VERSION}</div>
                 <button
                   onClick={() => setIsSettingsOpen(false)}
                   className="px-6 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-sm font-semibold transition-all shadow-lg shadow-indigo-900/20"

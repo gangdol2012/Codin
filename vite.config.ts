@@ -1,11 +1,14 @@
 import tailwindcss from '@tailwindcss/vite';
 import react from '@vitejs/plugin-react';
+import fs from 'node:fs';
 import https from 'node:https';
 import path from 'path';
 import { defineConfig } from 'vite';
 
 const mavenProxyPrefix = '/__codecraft_maven/';
 const mavenBaseUrl = 'https://repo.maven.apache.org/maven2/';
+const packageJson = JSON.parse(fs.readFileSync(new URL('./package.json', import.meta.url), 'utf8')) as { version?: unknown };
+const appVersion = typeof packageJson.version === 'string' ? packageJson.version : '0.0.0';
 
 function codecraftMavenProxy() {
   function middleware(req: any, res: any, next: () => void) {
@@ -55,6 +58,9 @@ function codecraftMavenProxy() {
 export default defineConfig(() => {
   return {
     plugins: [codecraftMavenProxy(), react(), tailwindcss()],
+    define: {
+      __APP_VERSION__: JSON.stringify(appVersion),
+    },
     resolve: {
       alias: {
         '@': path.resolve(__dirname, '.'),
