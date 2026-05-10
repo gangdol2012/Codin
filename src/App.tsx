@@ -8300,21 +8300,6 @@ export default function App() {
     });
   };
 
-  const requestRuntimeInteractionInOutputPanel = (
-    language: RuntimeInteractionLanguage,
-    kind: RuntimeInteractionKind,
-    message: string,
-    defaultValue = ''
-  ) => requestOutputPanelInteraction(language, kind, message, defaultValue, kind === 'stdin' || kind === 'prompt'
-    ? {
-      transcriptPrompt: kind === 'stdin' ? message : undefined,
-      inputMode: 'single-line',
-      placeholder: 'Type input and press Enter',
-      submitLabel: kind === 'prompt' ? 'Submit' : 'Send',
-      cancelLabel: 'Cancel',
-    }
-    : undefined);
-
   const getVisibleOutputInteractionMessage = (
     interaction: OutputPanelInteraction,
     transcriptLineIndex = outputInteractionBufferedLines.length
@@ -8448,21 +8433,24 @@ export default function App() {
     defaultValue = ''
   ) => {
     if (ioMode === 'interactive-output-panel') {
-      return requestRuntimeInteractionInOutputPanel(language, kind, message, defaultValue);
+      return requestOutputPanelInteraction(language, kind, message, defaultValue, kind === 'stdin'
+        ? {
+          inputMode: 'single-line',
+          placeholder: 'Type input and press Enter',
+          submitLabel: 'Send',
+          cancelLabel: 'Cancel',
+        }
+        : undefined);
     }
 
-    try {
-      if (kind === 'alert') {
-        window.alert(message);
-        return undefined;
-      }
-      if (kind === 'confirm') {
-        return window.confirm(message);
-      }
-      return window.prompt(message, defaultValue) ?? null;
-    } catch {
-      return requestRuntimeInteractionInOutputPanel(language, kind, message, defaultValue);
+    if (kind === 'alert') {
+      window.alert(message);
+      return undefined;
     }
+    if (kind === 'confirm') {
+      return window.confirm(message);
+    }
+    return window.prompt(message, defaultValue) ?? null;
   };
 
   const requestPythonInteractiveOutputInput = async (promptText = '') => {
@@ -8486,14 +8474,9 @@ export default function App() {
     return String(response ?? '');
   };
 
-  const requestPythonPromptInput = async (promptText = '') => {
+  const requestPythonInput = (promptText = '') => {
     const normalizedPrompt = typeof promptText === 'string' ? promptText : String(promptText ?? '');
-    let value: string | null;
-    try {
-      value = window.prompt(normalizedPrompt || 'Python input:', '');
-    } catch {
-      return requestPythonInteractiveOutputInput(normalizedPrompt || 'Python stdin> ');
-    }
+    const value = window.prompt(normalizedPrompt || 'Python input:', '');
     if (value === null) {
       throw new Error('Python input cancelled.');
     }
@@ -11355,12 +11338,9 @@ for _name in (
         await installPyodideInlineInputOverride(pyodide, requestPythonInteractiveOutputInput);
       } else {
         pyodide.setStdin({
-          stdin: () => {
-            throw new Error('Python stdin must be read through the CodeCraft input bridge.');
-          },
+          stdin: () => requestPythonInput(''),
           isatty: true
         });
-        await installPyodideInlineInputOverride(pyodide, requestPythonPromptInput);
       }
 
       const projectRoot = '/codecraft_project';
@@ -11468,12 +11448,9 @@ finally:
         await installPyodideInlineInputOverride(pyodide, requestPythonInteractiveOutputInput);
       } else {
         pyodide.setStdin({
-          stdin: () => {
-            throw new Error('Python stdin must be read through the CodeCraft input bridge.');
-          },
+          stdin: () => requestPythonInput(''),
           isatty: true
         });
-        await installPyodideInlineInputOverride(pyodide, requestPythonPromptInput);
       }
 
       installPyodideExecutionTimeoutGuard(pyodide, timeoutMs);
@@ -11763,29 +11740,7 @@ finally:
       return String(response ?? '');
     }
 
-    let value: string | null;
-    try {
-      value = window.prompt(promptText || `${label} stdin:`, '');
-    } catch {
-      selectDockPanel('output');
-      const response = await requestOutputPanelInteraction(
-        runtimeLanguage,
-        'stdin',
-        '',
-        '',
-        {
-          transcriptPrompt: promptText || `${label} stdin> `,
-          inputMode: 'single-line',
-          placeholder: 'Type input and press Enter',
-          submitLabel: 'Send',
-          cancelLabel: 'Cancel',
-        }
-      );
-      if (response === null) {
-        throw new Error(`${label} input cancelled.`);
-      }
-      return String(response ?? '');
-    }
+    const value = window.prompt(promptText || `${label} stdin:`, '');
     if (value === null) {
       throw new Error(`${label} input cancelled.`);
     }
@@ -11917,29 +11872,7 @@ finally:
       return String(response ?? '');
     }
 
-    let value: string | null;
-    try {
-      value = window.prompt(promptText || 'Java stdin:', '');
-    } catch {
-      selectDockPanel('output');
-      const response = await requestOutputPanelInteraction(
-        'java',
-        'stdin',
-        '',
-        '',
-        {
-          transcriptPrompt: promptText || 'Java stdin> ',
-          inputMode: 'single-line',
-          placeholder: 'Type input and press Enter',
-          submitLabel: 'Send',
-          cancelLabel: 'Cancel',
-        }
-      );
-      if (response === null) {
-        throw new Error('Java input cancelled.');
-      }
-      return String(response ?? '');
-    }
+    const value = window.prompt(promptText || 'Java stdin:', '');
     if (value === null) {
       throw new Error('Java input cancelled.');
     }

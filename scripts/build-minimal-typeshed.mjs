@@ -18,7 +18,7 @@ const FULL_COPY = join(ROOT, 'public/typeshed-full.zip');
 
 // Essential modules - minimal set to reduce memory (~50 files vs 5300)
 const INCLUDE = new Set([
-  'stdlib/builtins.pyi', 'stdlib/typing.pyi', 'stdlib/sys/__init__.pyi', 'stdlib/types.pyi',
+  'stdlib/builtins.pyi', 'stdlib/typing.pyi', 'stdlib/sys.pyi', 'stdlib/types.pyi',
   'stdlib/abc.pyi', 'stdlib/io.pyi', 'stdlib/codecs.pyi', 'stdlib/re.pyi',
   'stdlib/math.pyi',
   'stdlib/json/__init__.pyi', 'stdlib/dataclasses.pyi', 'stdlib/functools.pyi',
