@@ -20,6 +20,10 @@ public class MonacoServiceWrapper {
             case "GetSignatureHelpAsync":
                 return await worker.RunAsync(a => a.GetSignatureHelpAsync(args[0], args[1]));
             case "GetQuickInfoAsync":
+                if (args.Length > 2)
+                {
+                    return await worker.RunAsync(a => a.GetQuickInfoAsync(args[0], args[1], args[2]));
+                }
                 return args.Length > 1
                     ? await worker.RunAsync(a => a.GetQuickInfoAsync(args[0], args[1]))
                     : await worker.RunAsync(a => a.GetQuickInfoAsync(args[0]));

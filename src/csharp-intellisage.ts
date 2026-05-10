@@ -1859,7 +1859,13 @@ class CSharpLanguageService {
       model.getVersionId() === initialModelVersion
     ) {
       try {
-        const response = await this.intellisage('GetQuickInfoAsync', model.getValue(), this.positionRequest(position));
+        const projectRequest = this.createDiagnosticProjectRequest(model);
+        const response = await this.intellisage(
+          'GetQuickInfoAsync',
+          model.getValue(),
+          this.positionRequest(position),
+          projectRequest
+        );
         if (cancellationToken?.isCancellationRequested || model.isDisposed() || model.getVersionId() !== initialModelVersion) {
           return undefined;
         }

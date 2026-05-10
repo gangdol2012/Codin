@@ -165,7 +165,12 @@ $@"using System;
 
     public async Task<byte[]> GetQuickInfoAsync(string code, string quickInfoRequestString)
     {
-        var document = await UpdateDocumentAsync(_diagnosticProject, code);
+        return await GetQuickInfoAsync(code, quickInfoRequestString, string.Empty);
+    }
+
+    public async Task<byte[]> GetQuickInfoAsync(string code, string quickInfoRequestString, string diagnosticRequestString)
+    {
+        var document = await UpdateDiagnosticDocumentAsync(code, diagnosticRequestString);
         var quickInfoRequest = DeserializeRequest<QuickInfoRequest>(quickInfoRequestString);
         var quickInfoResponse = await _quickInfoProvider.Handle(quickInfoRequest, document);
 
