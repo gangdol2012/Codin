@@ -46,14 +46,46 @@ export interface CSharpIdeDebugEvent {
   id: number;
   timestamp: string;
   feature: string;
+  featureKey?: string;
+  featureLabel?: string;
+  category?: string;
   phase: string;
   level: CSharpIdeDebugLevel;
   message: string;
+  callId?: string;
   durationMs?: number;
   model?: CSharpIdeDebugModelSummary;
   request?: unknown;
   response?: unknown;
   error?: unknown;
+  environment?: unknown;
+}
+
+export interface CSharpIdeDebugFeatureSnapshot {
+  key: string;
+  label: string;
+  category: string;
+  description: string;
+  eventCount: number;
+  providerCallCount: number;
+  runtimeCallCount: number;
+  successCount: number;
+  warningCount: number;
+  errorCount: number;
+  inFlightCount: number;
+  firstEventAt: string | null;
+  lastEventAt: string | null;
+  averageDurationMs: number | null;
+  maxDurationMs: number | null;
+  lastDurationMs: number | null;
+  levels: Record<CSharpIdeDebugLevel, number>;
+  phases: Record<string, number>;
+  lastModel?: CSharpIdeDebugModelSummary;
+  lastRequest?: unknown;
+  lastResponse?: unknown;
+  lastError?: unknown;
+  lastEnvironment?: unknown;
+  events: CSharpIdeDebugEvent[];
 }
 
 export interface CSharpIdeDebugModelSummary {
@@ -105,6 +137,7 @@ export interface CSharpIdeDebugSnapshot {
     diagnosticCacheMarkerCount: number;
     activeModelSemanticCacheHit: boolean;
   };
+  features: CSharpIdeDebugFeatureSnapshot[];
   events: CSharpIdeDebugEvent[];
 }
 
@@ -115,7 +148,192 @@ export interface CSharpIdeDebugOptions {
 
 const CSHARP_COMPLETION_CACHE_LIMIT = 8;
 const CSHARP_COMPLETION_TRIGGER_FALLBACK = '.';
-const CSHARP_DEBUG_EVENT_LIMIT = 200;
+const CSHARP_DEBUG_EVENT_LIMIT = 500;
+const CSHARP_DEBUG_FEATURE_EVENT_LIMIT = 120;
+
+interface CSharpIdeDebugFeatureDescriptor {
+  key: string;
+  label: string;
+  category: string;
+  description: string;
+  order: number;
+}
+
+const CSHARP_DEBUG_FEATURE_DESCRIPTORS: CSharpIdeDebugFeatureDescriptor[] = [
+  {
+    key: 'diagnostics',
+    label: 'Diagnostics',
+    category: 'Analysis',
+    description: 'Marker production, project snapshot submission, diagnostic caching, and IntelliSage diagnostic responses.',
+    order: 10,
+  },
+  {
+    key: 'completion',
+    label: 'Completion',
+    category: 'Authoring',
+    description: 'Completion trigger context, cache state, LSP item conversion, completion resolve, and IntelliSage completion payloads.',
+    order: 20,
+  },
+  {
+    key: 'signatureHelp',
+    label: 'Signature Help',
+    category: 'Authoring',
+    description: 'Call-site position, active signature/parameter selection, Roslyn response shape, and local fallback results.',
+    order: 30,
+  },
+  {
+    key: 'hover',
+    label: 'Hover',
+    category: 'Navigation',
+    description: 'Quick info requests, markdown response shape, local semantic-index fallback, and symbol lookup state.',
+    order: 40,
+  },
+  {
+    key: 'definition',
+    label: 'Definition',
+    category: 'Navigation',
+    description: 'Go-to-definition requests, returned location counts, local declaration lookup, and model/path context.',
+    order: 50,
+  },
+  {
+    key: 'references',
+    label: 'References',
+    category: 'Navigation',
+    description: 'Find-references requests, include-declaration mode, Roslyn/local merged locations, and cross-model matching context.',
+    order: 60,
+  },
+  {
+    key: 'rename',
+    label: 'Rename',
+    category: 'Refactor',
+    description: 'Rename validation, resolve-location results, workspace edit counts, reject reasons, and merged Roslyn/local edits.',
+    order: 70,
+  },
+  {
+    key: 'codeActions',
+    label: 'Code Actions',
+    category: 'Refactor',
+    description: 'Quick fix/refactor requests, marker context, action counts, edit counts, and preferred action detection.',
+    order: 80,
+  },
+  {
+    key: 'semanticTokens',
+    label: 'Semantic Tokens',
+    category: 'Analysis',
+    description: 'Semantic token provider calls, Roslyn token payload sizes, encoded token counts, cancellation, and local fallback.',
+    order: 90,
+  },
+  {
+    key: 'documentSymbols',
+    label: 'Symbols',
+    category: 'Outline',
+    description: 'Document symbol requests, Roslyn symbol tree conversion, local outline fallback, and symbol counts.',
+    order: 100,
+  },
+  {
+    key: 'documentHighlights',
+    label: 'Highlights',
+    category: 'Navigation',
+    description: 'Document highlight calls, read/write highlight counts, and semantic occurrence lookup state.',
+    order: 110,
+  },
+  {
+    key: 'inlayHints',
+    label: 'Inlay Hints',
+    category: 'Editor UI',
+    description: 'Inlay hint range requests, Roslyn hint payloads, local hint fallback, and hint count summaries.',
+    order: 120,
+  },
+  {
+    key: 'foldingRanges',
+    label: 'Folding',
+    category: 'Editor UI',
+    description: 'Folding range requests, region/comment range conversion, and local folding fallback.',
+    order: 130,
+  },
+  {
+    key: 'formatting',
+    label: 'Formatting',
+    category: 'Editor UI',
+    description: 'Document/range/on-type formatting calls, formatting options, changed text summaries, and fallback formatter output.',
+    order: 140,
+  },
+  {
+    key: 'selectionRanges',
+    label: 'Selection Ranges',
+    category: 'Editor UI',
+    description: 'Selection range provider calls, requested positions, and local syntax-range expansion results.',
+    order: 150,
+  },
+  {
+    key: 'namespaces',
+    label: 'Namespaces',
+    category: 'Runtime',
+    description: 'Namespace include requests, restored namespace state, matched assemblies, and include failures.',
+    order: 160,
+  },
+  {
+    key: 'runtime',
+    label: 'Runtime Bridge',
+    category: 'Runtime',
+    description: 'IntelliSage iframe lifecycle, postMessage requests, response timing, false payloads, and timeouts.',
+    order: 170,
+  },
+  {
+    key: 'lifecycle',
+    label: 'Lifecycle',
+    category: 'Runtime',
+    description: 'Editor binding, active model changes, cache clears, model content changes, and debug mode transitions.',
+    order: 180,
+  },
+];
+
+const CSHARP_DEBUG_FEATURE_ALIASES = new Map<string, string>([
+  ['diagnostics', 'diagnostics'],
+  ['getdiagnosticsasync', 'diagnostics'],
+  ['completion', 'completion'],
+  ['completion.resolve', 'completion'],
+  ['getcompletionasync', 'completion'],
+  ['getcompletionresolveasync', 'completion'],
+  ['signaturehelp', 'signatureHelp'],
+  ['getsignaturehelpasync', 'signatureHelp'],
+  ['hover', 'hover'],
+  ['getquickinfoasync', 'hover'],
+  ['definition', 'definition'],
+  ['getdefinitionasync', 'definition'],
+  ['references', 'references'],
+  ['getreferencesasync', 'references'],
+  ['rename.resolve', 'rename'],
+  ['rename.edits', 'rename'],
+  ['getrenameinfoasync', 'rename'],
+  ['getrenameeditsasync', 'rename'],
+  ['codeactions', 'codeActions'],
+  ['getcodeactionsasync', 'codeActions'],
+  ['semantictokens', 'semanticTokens'],
+  ['getsemantictokensasync', 'semanticTokens'],
+  ['documentsymbols', 'documentSymbols'],
+  ['getdocumentsymbolsasync', 'documentSymbols'],
+  ['documenthighlights', 'documentHighlights'],
+  ['inlayhints', 'inlayHints'],
+  ['getinlayhintsasync', 'inlayHints'],
+  ['foldingranges', 'foldingRanges'],
+  ['getfoldingrangesasync', 'foldingRanges'],
+  ['formatdocument', 'formatting'],
+  ['formatrange', 'formatting'],
+  ['formatontype', 'formatting'],
+  ['getformattingasync', 'formatting'],
+  ['getrangeformattingasync', 'formatting'],
+  ['selectionranges', 'selectionRanges'],
+  ['includenamespaceasync', 'namespaces'],
+  ['lifecycle', 'lifecycle'],
+  ['cache', 'lifecycle'],
+  ['model', 'lifecycle'],
+  ['debug', 'lifecycle'],
+]);
+
+const csharpDebugDescriptorByKey = new Map(
+  CSHARP_DEBUG_FEATURE_DESCRIPTORS.map(descriptor => [descriptor.key, descriptor])
+);
 
 interface RoslynPositionDto {
   line: number;
@@ -315,6 +533,23 @@ function summarizeMarkers(markers: monaco.editor.IMarkerData[]) {
   }, {});
 }
 
+function getCSharpDebugFeatureDescriptor(feature: string, explicitKey?: string): CSharpIdeDebugFeatureDescriptor {
+  const aliasKey = explicitKey
+    ?? CSHARP_DEBUG_FEATURE_ALIASES.get(feature.toLowerCase())
+    ?? 'runtime';
+  return csharpDebugDescriptorByKey.get(aliasKey)
+    ?? csharpDebugDescriptorByKey.get('runtime')!;
+}
+
+function createEmptyCSharpDebugLevelCounts(): Record<CSharpIdeDebugLevel, number> {
+  return {
+    info: 0,
+    success: 0,
+    warning: 0,
+    error: 0,
+  };
+}
+
 function currentModelPath(model: monaco.editor.ITextModel) {
   const uriPath = decodeURIComponent(model.uri.path || '');
   const projectMarker = '/codecraft-project/';
@@ -416,6 +651,7 @@ class CSharpLanguageService {
         diagnosticCacheMarkerCount: this.diagnosticCacheMarkers.length,
         activeModelSemanticCacheHit: !!(this.model && this.semanticCache.has(this.model)),
       },
+      features: this.getDebugFeatureSnapshots(),
       events: [...this.debugEvents],
     };
   }
@@ -442,12 +678,16 @@ class CSharpLanguageService {
     force = false
   ) {
     if (!this.debugEnabled && !force) return;
+    const descriptor = getCSharpDebugFeatureDescriptor(event.feature, event.featureKey);
     const fullEvent: CSharpIdeDebugEvent = {
       ...event,
       id: ++this.debugEventSerial,
       timestamp: new Date().toISOString(),
       level: event.level ?? 'info',
       message: event.message ?? `${event.feature}:${event.phase}`,
+      featureKey: descriptor.key,
+      featureLabel: descriptor.label,
+      category: descriptor.category,
     };
     this.debugEvents = [...this.debugEvents, fullEvent].slice(-CSHARP_DEBUG_EVENT_LIMIT);
 
@@ -461,6 +701,110 @@ class CSharpLanguageService {
     }
 
     this.notifyDebugChanged();
+  }
+
+  private getDebugFeatureSnapshots(): CSharpIdeDebugFeatureSnapshot[] {
+    const snapshots = new Map<string, CSharpIdeDebugFeatureSnapshot>();
+
+    const ensureSnapshot = (descriptor: CSharpIdeDebugFeatureDescriptor) => {
+      let snapshot = snapshots.get(descriptor.key);
+      if (!snapshot) {
+        snapshot = {
+          key: descriptor.key,
+          label: descriptor.label,
+          category: descriptor.category,
+          description: descriptor.description,
+          eventCount: 0,
+          providerCallCount: 0,
+          runtimeCallCount: 0,
+          successCount: 0,
+          warningCount: 0,
+          errorCount: 0,
+          inFlightCount: 0,
+          firstEventAt: null,
+          lastEventAt: null,
+          averageDurationMs: null,
+          maxDurationMs: null,
+          lastDurationMs: null,
+          levels: createEmptyCSharpDebugLevelCounts(),
+          phases: {},
+          events: [],
+        };
+        snapshots.set(descriptor.key, snapshot);
+      }
+      return snapshot;
+    };
+
+    for (const descriptor of CSHARP_DEBUG_FEATURE_DESCRIPTORS) {
+      ensureSnapshot(descriptor);
+    }
+
+    const durationSums = new Map<string, { total: number; count: number; max: number }>();
+    const inFlight = new Map<string, Set<string>>();
+
+    for (const event of this.debugEvents) {
+      const descriptor = getCSharpDebugFeatureDescriptor(event.feature, event.featureKey);
+      const snapshot = ensureSnapshot(descriptor);
+      snapshot.eventCount += 1;
+      snapshot.levels[event.level] += 1;
+      snapshot.phases[event.phase] = (snapshot.phases[event.phase] ?? 0) + 1;
+      snapshot.successCount = snapshot.levels.success;
+      snapshot.warningCount = snapshot.levels.warning;
+      snapshot.errorCount = snapshot.levels.error;
+      snapshot.firstEventAt ??= event.timestamp;
+      snapshot.lastEventAt = event.timestamp;
+      snapshot.events = [...snapshot.events, event].slice(-CSHARP_DEBUG_FEATURE_EVENT_LIMIT);
+
+      if (event.phase === 'provider-start') snapshot.providerCallCount += 1;
+      if (event.phase === 'runtime-request') snapshot.runtimeCallCount += 1;
+
+      if (event.callId) {
+        const set = inFlight.get(descriptor.key) ?? new Set<string>();
+        if (event.phase === 'provider-start' || event.phase === 'runtime-request') {
+          set.add(event.callId);
+        }
+        if (
+          event.phase === 'provider-end' ||
+          event.phase === 'provider-error' ||
+          event.phase === 'provider-throw' ||
+          event.phase === 'runtime-response' ||
+          event.phase === 'runtime-timeout'
+        ) {
+          set.delete(event.callId);
+        }
+        inFlight.set(descriptor.key, set);
+      }
+
+      if (typeof event.durationMs === 'number') {
+        const current = durationSums.get(descriptor.key) ?? { total: 0, count: 0, max: 0 };
+        current.total += event.durationMs;
+        current.count += 1;
+        current.max = Math.max(current.max, event.durationMs);
+        durationSums.set(descriptor.key, current);
+        snapshot.lastDurationMs = event.durationMs;
+        snapshot.maxDurationMs = current.max;
+        snapshot.averageDurationMs = Math.round((current.total / current.count) * 10) / 10;
+      }
+
+      if (event.model) snapshot.lastModel = event.model;
+      if (event.request !== undefined) snapshot.lastRequest = event.request;
+      if (event.response !== undefined) snapshot.lastResponse = event.response;
+      if (event.error !== undefined) snapshot.lastError = event.error;
+      if (event.environment !== undefined) snapshot.lastEnvironment = event.environment;
+    }
+
+    for (const [key, calls] of inFlight) {
+      const snapshot = snapshots.get(key);
+      if (snapshot) snapshot.inFlightCount = calls.size;
+    }
+
+    return [...snapshots.values()]
+      .filter(snapshot => snapshot.eventCount > 0 || CSHARP_DEBUG_FEATURE_DESCRIPTORS.some(descriptor => descriptor.key === snapshot.key))
+      .sort((left, right) => {
+        const leftOrder = csharpDebugDescriptorByKey.get(left.key)?.order ?? 999;
+        const rightOrder = csharpDebugDescriptorByKey.get(right.key)?.order ?? 999;
+        return leftOrder - rightOrder || left.label.localeCompare(right.label);
+      });
   }
 
   private notifyDebugChanged() {
@@ -553,6 +897,37 @@ class CSharpLanguageService {
     };
   }
 
+  private createDebugEnvironmentSnapshot(model?: monaco.editor.ITextModel | null) {
+    const project = this.readProjectDebugSnapshot();
+    return {
+      runtime: {
+        initialized: this.initialized,
+        iframeUrl: this.iframeUrl,
+        hasIntelliSageBridge: !!this.intellisage,
+        providersRegistered: this.providersRegistered,
+        initializationPending: !!this.initializationPromise,
+      },
+      activeModel: this.model ? this.summarizeModel(this.model) : null,
+      requestModel: model ? this.summarizeModel(model) : null,
+      project: {
+        providerFileCount: project.providerFileCount,
+        csharpFileCount: project.files.length,
+        providerError: project.providerError,
+        files: project.files,
+      },
+      cache: {
+        completionRequestSerial: this.completionRequestSerial,
+        diagnosticRequestSerial: this.diagnosticRequestSerial,
+        completionCacheSize: this.completionCache.size,
+        completionEnvironmentVersion: this.completionEnvironmentVersion,
+        completionWorkerStateKey: this.completionWorkerStateKey,
+        diagnosticCacheKey: this.diagnosticCacheKey,
+        diagnosticCacheMarkerCount: this.diagnosticCacheMarkers.length,
+        activeModelSemanticCacheHit: !!(this.model && this.semanticCache.has(this.model)),
+      },
+    };
+  }
+
   private summarizeError(error: unknown) {
     if (error instanceof Error) {
       return `${error.name}: ${error.message}`;
@@ -601,21 +976,61 @@ class CSharpLanguageService {
   private summarizeProviderResult(value: unknown): unknown {
     const result = value as any;
     if (!result) return result;
-    if (Array.isArray(result)) return { type: 'array', length: result.length };
-    if (result.suggestions) {
-      return { suggestions: result.suggestions.length, incomplete: !!result.incomplete };
+    if (Array.isArray(result)) {
+      return {
+        type: 'array',
+        length: result.length,
+        sample: result.slice(0, 8).map(item => this.summarizeValue(item, 1)),
+      };
     }
-    if (result.actions) return { actions: result.actions.length };
-    if (result.hints) return { hints: result.hints.length };
-    if (result.edits) return { edits: result.edits.length, rejectReason: result.rejectReason };
+    if (result.suggestions) {
+      return {
+        suggestions: result.suggestions.length,
+        incomplete: !!result.incomplete,
+        labels: result.suggestions.slice(0, 12).map((item: monaco.languages.CompletionItem) => (
+          typeof item.label === 'string' ? item.label : item.label?.label
+        )),
+        kinds: result.suggestions.slice(0, 12).map((item: monaco.languages.CompletionItem) => item.kind),
+      };
+    }
+    if (result.actions) {
+      return {
+        actions: result.actions.length,
+        titles: result.actions.slice(0, 12).map((action: monaco.languages.CodeAction) => action.title),
+        kinds: result.actions.slice(0, 12).map((action: monaco.languages.CodeAction) => action.kind),
+      };
+    }
+    if (result.hints) {
+      return {
+        hints: result.hints.length,
+        labels: result.hints.slice(0, 12).map((hint: monaco.languages.InlayHint) => hint.label),
+      };
+    }
+    if (result.edits) {
+      return {
+        edits: result.edits.length,
+        rejectReason: result.rejectReason,
+        resources: result.edits.slice(0, 12).map((edit: monaco.languages.IWorkspaceTextEdit) => edit.resource?.toString()),
+      };
+    }
     if (result.value?.signatures) {
       return {
         signatures: result.value.signatures.length,
         activeSignature: result.value.activeSignature,
         activeParameter: result.value.activeParameter,
+        labels: result.value.signatures.slice(0, 8).map((signature: monaco.languages.SignatureInformation) => signature.label),
       };
     }
-    if (result.contents) return { contents: result.contents.length };
+    if (result.contents) {
+      return {
+        contents: result.contents.length,
+        markdownPreview: result.contents
+          .map((content: monaco.IMarkdownString | { value?: string }) => content?.value)
+          .filter(Boolean)
+          .join('\n')
+          .slice(0, 500),
+      };
+    }
     if (result.data instanceof Uint32Array) return { semanticTokenIntegers: result.data.length };
     return this.summarizeValue(result);
   }
@@ -628,9 +1043,19 @@ class CSharpLanguageService {
       return {
         keys: Object.keys(result).slice(0, 16),
         items: Array.isArray(result.items) ? result.items.length : undefined,
+        itemLabels: Array.isArray(result.items)
+          ? result.items.slice(0, 12).map((item: any) => item?.label ?? item?.insertText ?? item?.textEdit?.newText ?? item?.textEdit?.NewText)
+          : undefined,
         signatures: Array.isArray(result.signatures) ? result.signatures.length : undefined,
+        signatureLabels: Array.isArray(result.signatures)
+          ? result.signatures.slice(0, 8).map((signature: any) => signature?.label)
+          : undefined,
         edits: Array.isArray(result.edits) ? result.edits.length : undefined,
+        editRanges: Array.isArray(result.edits)
+          ? result.edits.slice(0, 8).map((edit: any) => this.summarizeValue(edit?.range ?? edit?.Range, 1))
+          : undefined,
         markdownLength: typeof result.markdown === 'string' ? result.markdown.length : undefined,
+        markdownPreview: typeof result.markdown === 'string' ? result.markdown.slice(0, 500) : undefined,
         rejectReason: result.rejectReason,
         value: this.summarizeValue(result, 1),
       };
@@ -646,13 +1071,16 @@ class CSharpLanguageService {
   ): T {
     if (!this.debugEnabled) return callback();
     const started = this.now();
+    const callId = `${feature}:${this.debugEventSerial + 1}:${Math.random().toString(36).slice(2, 8)}`;
     this.recordDebugEvent({
       feature,
       phase: 'provider-start',
       level: 'info',
       message: `${feature} provider started.`,
+      callId,
       model: model ? this.summarizeModel(model) : undefined,
       request: this.summarizeValue(request),
+      environment: this.createDebugEnvironmentSnapshot(model),
     });
 
     try {
@@ -664,16 +1092,20 @@ class CSharpLanguageService {
             phase: 'provider-end',
             level: 'success',
             message: `${feature} provider resolved.`,
+            callId,
             durationMs: Math.round((this.now() - started) * 10) / 10,
             response: this.summarizeProviderResult(response),
+            environment: this.createDebugEnvironmentSnapshot(model),
           }),
           error => this.recordDebugEvent({
             feature,
             phase: 'provider-error',
             level: 'error',
             message: `${feature} provider rejected.`,
+            callId,
             durationMs: Math.round((this.now() - started) * 10) / 10,
             error: this.summarizeError(error),
+            environment: this.createDebugEnvironmentSnapshot(model),
           })
         );
       } else {
@@ -682,8 +1114,10 @@ class CSharpLanguageService {
           phase: 'provider-end',
           level: 'success',
           message: `${feature} provider returned synchronously.`,
+          callId,
           durationMs: Math.round((this.now() - started) * 10) / 10,
           response: this.summarizeProviderResult(result),
+          environment: this.createDebugEnvironmentSnapshot(model),
         });
       }
       return result;
@@ -693,8 +1127,10 @@ class CSharpLanguageService {
         phase: 'provider-throw',
         level: 'error',
         message: `${feature} provider threw.`,
+        callId,
         durationMs: Math.round((this.now() - started) * 10) / 10,
         error: this.summarizeError(error),
+        environment: this.createDebugEnvironmentSnapshot(model),
       });
       throw error;
     }
@@ -767,15 +1203,18 @@ class CSharpLanguageService {
       this.intellisage = (method: string, ...args: unknown[]) => {
         if (!iframeRef.contentWindow) return Promise.resolve(false);
         const started = this.now();
+        const callId = `${method}:${this.debugEventSerial + 1}:${Math.random().toString(36).slice(2, 8)}`;
         this.recordDebugEvent({
           feature: method,
           phase: 'runtime-request',
           level: 'info',
           message: `${method} request posted to IntelliSage.`,
+          callId,
           request: {
             iframeUrl: this.iframeUrl,
             args: args.map(arg => this.summarizeValue(arg)),
           },
+          environment: this.createDebugEnvironmentSnapshot(this.model),
         });
 
         return new Promise(res => {
@@ -793,8 +1232,10 @@ class CSharpLanguageService {
                 message: payload === false
                   ? `${method} returned a false payload.`
                   : `${method} returned from IntelliSage.`,
+                callId,
                 durationMs: Math.round((this.now() - started) * 10) / 10,
                 response: this.summarizeIntelliSageResponse(payload),
+                environment: this.createDebugEnvironmentSnapshot(this.model),
               });
               res(payload);
             }
@@ -808,7 +1249,9 @@ class CSharpLanguageService {
                 phase: 'runtime-timeout',
                 level: 'error',
                 message: `${method} timed out waiting for IntelliSage.`,
+                callId,
                 durationMs: Math.round((this.now() - started) * 10) / 10,
+                environment: this.createDebugEnvironmentSnapshot(this.model),
               });
               res(false);
             }
@@ -1134,6 +1577,7 @@ class CSharpLanguageService {
       message: 'C# diagnostics scheduled.',
       model: this.summarizeModel(model),
       request: { requestSerial },
+      environment: this.createDebugEnvironmentSnapshot(model),
     });
     void this.debouncedDiagnostics(model, requestSerial);
   }
@@ -1155,6 +1599,7 @@ class CSharpLanguageService {
       message: 'C# diagnostics started.',
       model: this.summarizeModel(model),
       request: { requestSerial, initialModelVersion },
+      environment: this.createDebugEnvironmentSnapshot(model),
     });
     const runtimeReady = await this.ensureLocalIntelliSageRuntime();
     if (
@@ -1179,6 +1624,7 @@ class CSharpLanguageService {
           modelVersionId: model.isDisposed() ? null : model.getVersionId(),
           initialModelVersion,
         },
+        environment: this.createDebugEnvironmentSnapshot(model),
       });
       return;
     }
@@ -1201,6 +1647,7 @@ class CSharpLanguageService {
           markerCount: this.diagnosticCacheMarkers.length,
           project: this.summarizeProjectRequest(projectRequest),
         },
+        environment: this.createDebugEnvironmentSnapshot(model),
       });
       return;
     }
@@ -1218,6 +1665,7 @@ class CSharpLanguageService {
           codeHash: hashString(safeCode),
           project: this.summarizeProjectRequest(projectRequest),
         },
+        environment: this.createDebugEnvironmentSnapshot(model),
       });
       const diagnostics = await this.intellisage('GetDiagnosticsAsync', safeCode, projectRequest);
       if (
@@ -1232,6 +1680,7 @@ class CSharpLanguageService {
           message: 'C# diagnostics response discarded because the model/request changed.',
           durationMs: Math.round((this.now() - started) * 10) / 10,
           response: this.summarizeIntelliSageResponse(diagnostics),
+          environment: this.createDebugEnvironmentSnapshot(model),
         });
         return;
       }
@@ -1251,6 +1700,7 @@ class CSharpLanguageService {
           markerCount: markers.length,
           severities: summarizeMarkers(markers),
         },
+        environment: this.createDebugEnvironmentSnapshot(model),
       });
     } catch (error) {
       this.recordDebugEvent({
@@ -1260,6 +1710,7 @@ class CSharpLanguageService {
         message: 'C# diagnostics failed.',
         durationMs: Math.round((this.now() - started) * 10) / 10,
         error: this.summarizeError(error),
+        environment: this.createDebugEnvironmentSnapshot(model),
       });
       if (
         requestSerial === this.diagnosticRequestSerial &&
