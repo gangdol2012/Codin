@@ -74,7 +74,7 @@ public class MonacoService
     public record RangeRequest(PositionDto Start, PositionDto End);
     public record DiagnosticProjectFileDto(string Path, string Content);
     public record DiagnosticProjectRequest(string? CurrentPath, DiagnosticProjectFileDto[]? Files);
-    public record MonacoLocation(TextRange Range, string? Name = null, string? Kind = null, string? Detail = null);
+    public record MonacoLocation(TextRange Range, string? Path = null, string? Name = null, string? Kind = null, string? Detail = null);
     public record MonacoTextEdit(TextRange Range, string Text);
     public record RenameInfo(bool CanRename, TextRange? Range, string? Text, string? RejectReason);
     public record CodeActionDto(string Title, string Kind, MonacoTextEdit[] Edits, bool IsPreferred);
@@ -210,7 +210,13 @@ $@"using System;
 
     public async Task<byte[]> GetDefinitionAsync(string code, string positionRequestString)
     {
-        var document = await UpdateDocumentAsync(_diagnosticProject, code);
+        return await GetDefinitionAsync(code, positionRequestString, string.Empty);
+    }
+
+    public async Task<byte[]> GetDefinitionAsync(string code, string positionRequestString, string diagnosticRequestString)
+    {
+        var currentPath = TryReadCurrentPath(diagnosticRequestString);
+        var document = await UpdateDiagnosticDocumentAsync(code, diagnosticRequestString);
         var symbol = await FindSymbolAsync(document, positionRequestString);
         if (symbol == null)
         {
@@ -221,7 +227,7 @@ $@"using System;
         var sourceSymbol = await SymbolFinder.FindSourceDefinitionAsync(symbol, solution) ?? symbol;
         var locations = sourceSymbol.Locations
             .Where(location => location.IsInSource)
-            .Select(location => ToLocation(location, document, sourceSymbol))
+            .Select(location => ToLocation(location, document, sourceSymbol, currentPath))
             .Where(location => location != null)
             .Cast<MonacoLocation>()
             .ToArray();
@@ -502,6 +508,24 @@ $@"using System;
         {
             Console.WriteLine($"Could not deserialize diagnostic project snapshot: {e.Message}");
             return _diagnosticProject.UpdateDocumentAsync(code);
+        }
+    }
+
+    string? TryReadCurrentPath(string diagnosticRequestString)
+    {
+        if (string.IsNullOrWhiteSpace(diagnosticRequestString))
+        {
+            return null;
+        }
+
+        try
+        {
+            var request = DeserializeRequest<DiagnosticProjectRequest>(diagnosticRequestString);
+            return NormalizeLocationPath(request.CurrentPath);
+        }
+        catch
+        {
+            return null;
         }
     }
 
@@ -905,17 +929,21 @@ $@"using System;
         return symbol.Kind == SymbolKind.Namespace || symbol.IsImplicitlyDeclared;
     }
 
-    MonacoLocation? ToLocation(Location location, Document currentDocument, ISymbol? symbol)
+    MonacoLocation? ToLocation(Location location, Document currentDocument, ISymbol? symbol, string? currentPath = null)
     {
         var document = currentDocument.Project.Solution.GetDocument(location.SourceTree);
-        if (document == null || document.Id != currentDocument.Id)
+        if (document == null)
         {
             return null;
         }
 
         var text = document.GetTextAsync().Result;
+        var path = document.Id == currentDocument.Id
+            ? NormalizeLocationPath(currentPath)
+            : NormalizeLocationPath(document.FilePath);
         return new MonacoLocation(
             ToRange(text, location.SourceSpan),
+            path,
             symbol?.Name,
             symbol?.Kind.ToString(),
             symbol?.ToDisplayString(SymbolDisplayFormat.MinimallyQualifiedFormat));
@@ -952,6 +980,39 @@ $@"using System;
 
         var match = MissingSymbolRegex.Match(diagnostic.GetMessage());
         return match.Success ? match.Groups[1].Value : null;
+    }
+
+    static string? NormalizeLocationPath(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return null;
+        }
+
+        var parts = path.Replace('\\', '/')
+            .Split('/', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        var resolved = new List<string>();
+
+        foreach (var part in parts)
+        {
+            if (part == ".")
+            {
+                continue;
+            }
+
+            if (part == "..")
+            {
+                if (resolved.Count > 0)
+                {
+                    resolved.RemoveAt(resolved.Count - 1);
+                }
+                continue;
+            }
+
+            resolved.Add(part);
+        }
+
+        return resolved.Count == 0 ? null : string.Join("/", resolved);
     }
 
     static bool HasUsing(string source, string namespaceName)

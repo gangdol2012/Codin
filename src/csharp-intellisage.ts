@@ -347,6 +347,7 @@ interface RoslynRangeDto {
 
 interface RoslynLocationDto {
   range: RoslynRangeDto;
+  path?: string;
   name?: string;
   kind?: string;
   detail?: string;
@@ -497,6 +498,12 @@ function normalizeProjectPath(path: string): string {
     resolved.push(part);
   }
   return resolved.join('/');
+}
+
+const CODECRAFT_MONACO_PROJECT_ROOT = '/codecraft-project';
+
+function projectModelUriForPath(path: string) {
+  return monaco.Uri.file(`${CODECRAFT_MONACO_PROJECT_ROOT}/${normalizeProjectPath(path)}`);
 }
 
 function hashString(value: string): string {
@@ -1913,7 +1920,13 @@ class CSharpLanguageService {
   ): Promise<monaco.languages.Location[] | undefined> {
     if (this.intellisage) {
       try {
-        const response = await this.intellisage('GetDefinitionAsync', model.getValue(), this.positionRequest(position));
+        const projectRequest = this.createDiagnosticProjectRequest(model);
+        const response = await this.intellisage(
+          'GetDefinitionAsync',
+          model.getValue(),
+          this.positionRequest(position),
+          projectRequest
+        );
         const locations = this.convertLocations(model, response);
         if (locations.length) return locations;
       } catch {
@@ -2240,15 +2253,44 @@ class CSharpLanguageService {
     };
   }
 
+  private getCSharpProjectFileSnapshots(): CSharpProjectFileSnapshot[] {
+    return this.projectFilesProvider()
+      .filter(file => file.language === 'csharp')
+      .map(file => ({
+        path: normalizeProjectPath(file.path),
+        content: file.content ?? '',
+        language: 'csharp' as const,
+      }))
+      .filter(file => !!file.path);
+  }
+
+  private modelForProjectFile(file: CSharpProjectFileSnapshot): monaco.editor.ITextModel | undefined {
+    const path = normalizeProjectPath(file.path);
+    if (!path) return undefined;
+
+    const existing = monaco.editor.getModels()
+      .find(candidate => candidate.getLanguageId() === 'csharp' && currentModelPath(candidate) === path);
+    if (existing) return existing;
+
+    const uri = projectModelUriForPath(path);
+    return monaco.editor.getModel(uri)
+      ?? monaco.editor.createModel(file.content ?? '', 'csharp', uri);
+  }
+
   private getProjectSemanticEntries(model: monaco.editor.ITextModel): { model: monaco.editor.ITextModel; index: CSharpSemanticIndex }[] {
-    const projectPaths = new Set(
-      this.projectFilesProvider()
-        .map(file => normalizeProjectPath(file.path))
-        .filter(Boolean)
-    );
+    const projectFiles = this.getCSharpProjectFileSnapshots();
+    const projectPaths = new Set(projectFiles.map(file => file.path));
     const candidates = monaco.editor.getModels()
       .filter(candidate => candidate.getLanguageId() === 'csharp')
       .filter(candidate => projectPaths.size === 0 || projectPaths.has(currentModelPath(candidate)));
+
+    for (const file of projectFiles) {
+      const fileModel = this.modelForProjectFile(file);
+      if (fileModel && !candidates.includes(fileModel)) {
+        candidates.push(fileModel);
+      }
+    }
+
     if (!candidates.includes(model)) {
       candidates.push(model);
     }
@@ -2399,11 +2441,28 @@ class CSharpLanguageService {
     };
   }
 
+  private uriForLocation(model: monaco.editor.ITextModel, location: RoslynLocationDto): monaco.Uri {
+    const path = normalizeProjectPath(location.path ?? '');
+    if (!path || path === currentModelPath(model)) return model.uri;
+
+    const existing = monaco.editor.getModels()
+      .find(candidate => candidate.getLanguageId() === 'csharp' && currentModelPath(candidate) === path);
+    if (existing) return existing.uri;
+
+    const projectFile = this.getCSharpProjectFileSnapshots().find(file => file.path === path);
+    if (projectFile) {
+      const projectModel = this.modelForProjectFile(projectFile);
+      if (projectModel) return projectModel.uri;
+    }
+
+    return projectModelUriForPath(path);
+  }
+
   private convertLocations(model: monaco.editor.ITextModel, response: unknown): monaco.languages.Location[] {
     if (!Array.isArray(response)) return [];
     return response.flatMap((location: RoslynLocationDto) => {
       const range = this.toEditorRange(location.range);
-      return range ? [{ uri: model.uri, range }] : [];
+      return range ? [{ uri: this.uriForLocation(model, location), range }] : [];
     });
   }
 

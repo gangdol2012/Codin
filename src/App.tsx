@@ -5068,6 +5068,29 @@ function getMonacoProjectModelPath(path: string) {
   return getMonacoProjectModelUri(path).toString();
 }
 
+function getProjectPathFromMonacoUri(uri: monaco.Uri) {
+  const uriPath = decodeURIComponent(uri.path || '');
+  const projectMarker = `${CODECRAFT_MONACO_PROJECT_ROOT}/`;
+  const projectIndex = uriPath.indexOf(projectMarker);
+  return projectIndex >= 0
+    ? normalizeProjectPath(uriPath.slice(projectIndex + projectMarker.length))
+    : '';
+}
+
+function isMonacoRangeLike(value: unknown): value is monaco.IRange {
+  const candidate = value as Partial<monaco.IRange> | null;
+  return typeof candidate?.startLineNumber === 'number'
+    && typeof candidate.startColumn === 'number'
+    && typeof candidate.endLineNumber === 'number'
+    && typeof candidate.endColumn === 'number';
+}
+
+function isMonacoPositionLike(value: unknown): value is monaco.IPosition {
+  const candidate = value as Partial<monaco.IPosition> | null;
+  return typeof candidate?.lineNumber === 'number'
+    && typeof candidate.column === 'number';
+}
+
 function getRuntimeProjectModuleSpecifier(path: string) {
   return `${CODECRAFT_RUNTIME_PROJECT_ROOT}/${encodeProjectPathForSpecifier(path)}`;
 }
@@ -6352,6 +6375,11 @@ export default function App() {
   const [syncMeta, setSyncMeta] = useState<SyncMeta[]>(loadSyncMeta);
   const pendingEdit = pendingEdits[0] ?? null;
   const editorRef = useRef<any>(null);
+  const pendingEditorNavigationRef = useRef<{
+    uri: string;
+    itemId: string;
+    selectionOrPosition?: monaco.IRange | monaco.IPosition;
+  } | null>(null);
   const pythonDiagnosticsEditorRef = useRef<any>(null);
   const csharpDiagnosticsEditorRef = useRef<any>(null);
   const cxxDiagnosticsEditorRef = useRef<any>(null);
@@ -6785,6 +6813,22 @@ export default function App() {
     return javaAuthoring;
   }, [getJavaAuthoringModule]);
 
+  const getCSharpProjectFileSnapshots = useCallback(() => {
+    const currentFiles = filesRef.current;
+    return currentFiles
+      .filter((item): item is FSItem & { type: 'file' } => (
+        item.type === 'file'
+        && getProjectRuntimeLanguageForFile(item) === 'csharp'
+      ))
+      .map(file => ({
+        path: normalizeProjectPath(getFsItemPath(currentFiles, file.id)),
+        content: file.content || '',
+        language: 'csharp' as const,
+      }))
+      .filter(file => !!file.path)
+      .sort((left, right) => left.path.localeCompare(right.path));
+  }, []);
+
   const refreshPythonDiagnostics = useCallback(async () => {
     const editor = pythonDiagnosticsEditorRef.current;
     if (!editor) return;
@@ -6811,12 +6855,8 @@ export default function App() {
     if (editorRef.current !== editor) return;
     if (editor.getModel?.()?.getLanguageId?.() !== 'csharp') return;
 
-    csharpAuthoring.csharpService.setupEditor(editor, () => (
-      toProjectSourceFiles(getProjectRunnableFiles())
-        .filter(file => file.language === 'csharp')
-        .map(file => ({ path: file.path, content: file.content, language: 'csharp' as const }))
-    ));
-  }, [ensureCSharpAuthoringReady]);
+    csharpAuthoring.csharpService.setupEditor(editor, getCSharpProjectFileSnapshots);
+  }, [ensureCSharpAuthoringReady, getCSharpProjectFileSnapshots]);
 
   useEffect(() => {
     void refreshCSharpDiagnostics();
@@ -6899,10 +6939,34 @@ export default function App() {
     }
   }, [clearCSharpEditorBinding, clearCxxEditorBinding, clearJavaEditorBinding, clearPyrightEditorBinding, refreshCSharpDiagnostics, refreshCxxDiagnostics, refreshJavaDiagnostics, refreshPythonDiagnostics, resetSharedEditorOptions]);
 
+  const applyPendingEditorNavigation = useCallback((editor: any) => {
+    const pending = pendingEditorNavigationRef.current;
+    if (!pending) return;
+
+    const modelUri = editor.getModel?.()?.uri?.toString?.();
+    if (modelUri !== pending.uri) return;
+
+    const target = pending.selectionOrPosition;
+    if (isMonacoRangeLike(target)) {
+      editor.setSelection?.(target);
+      editor.revealRangeInCenter?.(target);
+    } else if (isMonacoPositionLike(target)) {
+      editor.setPosition?.(target);
+      editor.revealPositionInCenter?.(target);
+    }
+
+    editor.focus?.();
+    pendingEditorNavigationRef.current = null;
+  }, []);
+
   const handleEditorMount = useCallback((editor: any) => {
     bindLanguageServicesToEditor(editor);
+    applyPendingEditorNavigation(editor);
     editor.onDidFocusEditorText(() => bindLanguageServicesToEditor(editor));
-    editor.onDidChangeModel(() => bindLanguageServicesToEditor(editor));
+    editor.onDidChangeModel(() => {
+      bindLanguageServicesToEditor(editor);
+      applyPendingEditorNavigation(editor);
+    });
     editor.onDidDispose(() => {
       if (pythonDiagnosticsEditorRef.current === editor) {
         clearPyrightEditorBinding();
@@ -6932,7 +6996,7 @@ export default function App() {
         );
       }
     });
-  }, [bindLanguageServicesToEditor, clearCSharpEditorBinding, clearCxxEditorBinding, clearJavaEditorBinding, clearPyrightEditorBinding, createSharedEditorTarget]);
+  }, [applyPendingEditorNavigation, bindLanguageServicesToEditor, clearCSharpEditorBinding, clearCxxEditorBinding, clearJavaEditorBinding, clearPyrightEditorBinding, createSharedEditorTarget]);
 
   const disposeMountedSharedEditor = useCallback(() => {
     const editor = editorRef.current;
@@ -7300,6 +7364,36 @@ export default function App() {
     if (!item) return;
     openEditorTabWithItem(item);
   };
+
+  useEffect(() => {
+    const disposable = monaco.editor.registerEditorOpener({
+      openCodeEditor: (_source, resource, selectionOrPosition) => {
+        const targetPath = getProjectPathFromMonacoUri(resource);
+        if (!targetPath) return false;
+
+        const currentFiles = filesRef.current;
+        const targetItem = currentFiles.find(item => (
+          item.type === 'file'
+          && normalizeProjectPath(getFsItemPath(currentFiles, item.id)) === targetPath
+        ));
+        if (!targetItem || targetItem.type !== 'file') return false;
+
+        pendingEditorNavigationRef.current = {
+          uri: resource.toString(),
+          itemId: targetItem.id,
+          selectionOrPosition,
+        };
+        openEditorTabWithItem(targetItem);
+        queueMicrotask(() => {
+          const editor = editorRef.current;
+          if (editor) applyPendingEditorNavigation(editor);
+        });
+        return true;
+      },
+    });
+
+    return () => disposable.dispose();
+  }, [applyPendingEditorNavigation, openEditorTabWithItem]);
 
   const readDirRecursive = async (dirHandle: FileSystemDirectoryHandle, parentId: string, existingFiles: FSItem[]): Promise<FSItem[]> => {
     const items: FSItem[] = [];
