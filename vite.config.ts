@@ -9,7 +9,6 @@ const mavenProxyPrefix = '/__codecraft_maven/';
 const mavenBaseUrl = 'https://repo.maven.apache.org/maven2/';
 const packageJson = JSON.parse(fs.readFileSync(new URL('./package.json', import.meta.url), 'utf8')) as { version?: unknown };
 const appVersion = typeof packageJson.version === 'string' ? packageJson.version : '0.0.0';
-const appBuildId = process.env.VERCEL_GIT_COMMIT_SHA || process.env.VERCEL_DEPLOYMENT_ID || appVersion;
 
 function codecraftMavenProxy() {
   function middleware(req: any, res: any, next: () => void) {
@@ -61,7 +60,6 @@ export default defineConfig(() => {
     plugins: [codecraftMavenProxy(), react(), tailwindcss()],
     define: {
       __APP_VERSION__: JSON.stringify(appVersion),
-      __APP_BUILD_ID__: JSON.stringify(appBuildId),
     },
     resolve: {
       alias: {
