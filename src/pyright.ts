@@ -302,7 +302,7 @@ function buildUncompressedZip(files: Map<string, Uint8Array>): ArrayBuffer {
 // --- Typeshed on-demand inclusion ---
 
 const CORE_TYPESHED_FILES = new Set([
-  'stdlib/builtins.pyi', 'stdlib/typing.pyi', 'stdlib/sys.pyi', 'stdlib/types.pyi',
+  'stdlib/builtins.pyi', 'stdlib/typing.pyi', 'stdlib/sys/__init__.pyi', 'stdlib/types.pyi',
   'stdlib/abc.pyi', 'stdlib/io.pyi', 'stdlib/codecs.pyi', 'stdlib/re.pyi',
   'stdlib/math.pyi',
   'stdlib/json/__init__.pyi', 'stdlib/dataclasses.pyi', 'stdlib/functools.pyi',
