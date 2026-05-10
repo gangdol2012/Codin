@@ -57,6 +57,7 @@ interface LoadedClangPackage {
 
 let wasmerSdkPromise: Promise<any> | null = null;
 let clangPackagePromise: Promise<LoadedClangPackage> | null = null;
+const configuredLocalClangPackageUrl = String(import.meta.env.VITE_CODECRAFT_CLANG_WEBC_URL || '').trim();
 
 function disposeMaybe(value: unknown) {
   const candidate = value as {
@@ -155,22 +156,23 @@ async function loadClangPackage(onStatus?: (message: string) => void): Promise<L
     clangPackagePromise = (async () => {
       const sdk = await loadWasmerSdk();
 
-      try {
-        onStatus?.('Looking for local C/C++ compiler package...');
-        const local = await fetch('/clang.webc', { cache: 'force-cache' });
-        if (local.ok) {
-          const bytes = new Uint8Array(await local.arrayBuffer());
-          if (bytes.byteLength > 0) {
-            onStatus?.('Loading local Clang compiler package...');
-            return {
-              sdk,
-              clang: await sdk.Wasmer.fromFile(bytes),
-              source: 'local' as const,
-            };
+      if (configuredLocalClangPackageUrl) {
+        try {
+          onStatus?.('Loading configured local C/C++ compiler package...');
+          const local = await fetch(configuredLocalClangPackageUrl, { cache: 'force-cache' });
+          if (local.ok) {
+            const bytes = new Uint8Array(await local.arrayBuffer());
+            if (bytes.byteLength > 0) {
+              return {
+                sdk,
+                clang: await sdk.Wasmer.fromFile(bytes),
+                source: 'local' as const,
+              };
+            }
           }
+        } catch {
+          // Fall through to the registry package.
         }
-      } catch {
-        // Fall through to the registry package.
       }
 
       onStatus?.('Downloading Clang compiler package from Wasmer registry...');

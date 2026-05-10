@@ -11571,7 +11571,15 @@ finally:
         chunks.push(`Return value: ${String(returnValue)}`);
       }
 
-      setOutput(chunks.join('\n') || 'C# executed successfully with no output.');
+      const finalOutput = chunks.join('\n');
+      if (useInteractiveWorker) {
+        setOutput(prev => {
+          if (!finalOutput) return prev || 'C# executed successfully with no output.';
+          return prev ? `${prev}${prev.endsWith('\n') ? '' : '\n'}${finalOutput}` : finalOutput;
+        });
+      } else {
+        setOutput(finalOutput || 'C# executed successfully with no output.');
+      }
     } catch (err) {
       setExecutionStartupStatus('');
       setOutput(`C# Error: ${err instanceof Error ? err.message : String(err)}`);
@@ -11638,7 +11646,15 @@ finally:
       }
 
       setExecutionStartupStatus('');
-      setOutput(chunks.join('\n') || 'C# project executed successfully with no output.');
+      const finalOutput = chunks.join('\n');
+      if (useInteractiveWorker) {
+        setOutput(prev => {
+          if (!finalOutput) return prev || 'C# project executed successfully with no output.';
+          return prev ? `${prev}${prev.endsWith('\n') ? '' : '\n'}${finalOutput}` : finalOutput;
+        });
+      } else {
+        setOutput(finalOutput || 'C# project executed successfully with no output.');
+      }
     } catch (err) {
       setExecutionStartupStatus('');
       setOutput(`C# Error: ${err instanceof Error ? err.message : String(err)}`);

@@ -1,4 +1,5 @@
-import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { dirname, extname, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -15,6 +16,7 @@ const vendorProject = resolve(vendorRoot, 'BrowserCSharp.csproj');
 const vendorPublishOut = resolve(vendorRoot, 'publish-out');
 const vendorFramework = resolve(vendorPublishOut, 'wwwroot', '_framework');
 const vendorDll = resolve(vendorFramework, '_bin', 'BrowserCSharp.dll');
+const vendorBuildFramework = resolve(vendorRoot, 'bin', 'Release', 'netstandard2.1', 'wwwroot', '_framework');
 
 const npmFramework = resolve(root, 'node_modules', 'browser-csharp', 'out', '_framework');
 const target = resolve(root, 'public', '_framework');
@@ -66,8 +68,73 @@ function hasRequiredMethods(dllPath) {
   return requiredBrowserCSharpMethods.every(method => dll.includes(method));
 }
 
+function addBootResourceEntries(entries, frameworkDir, resources, relativeDir = '') {
+  if (!resources || typeof resources !== 'object') {
+    return;
+  }
+
+  for (const [name, expectedHash] of Object.entries(resources)) {
+    if (typeof expectedHash !== 'string') {
+      continue;
+    }
+
+    entries.push({
+      expectedHash,
+      filePath: resolve(frameworkDir, relativeDir, name),
+      name,
+    });
+  }
+}
+
+function frameworkIntegrityFailures(frameworkDir) {
+  const bootFile = resolve(frameworkDir, 'blazor.boot.json');
+  if (!existsSync(bootFile)) {
+    return [`${bootFile} is missing.`];
+  }
+
+  let boot;
+  try {
+    boot = JSON.parse(readFileSync(bootFile, 'utf8'));
+  } catch (error) {
+    return [`${bootFile} could not be parsed: ${error instanceof Error ? error.message : String(error)}`];
+  }
+
+  const resources = boot.resources || {};
+  const entries = [];
+  addBootResourceEntries(entries, frameworkDir, resources.assembly, '_bin');
+  addBootResourceEntries(entries, frameworkDir, resources.pdb, '_bin');
+  addBootResourceEntries(entries, frameworkDir, resources.runtime, 'wasm');
+
+  if (resources.satelliteResources && typeof resources.satelliteResources === 'object') {
+    for (const satelliteGroup of Object.values(resources.satelliteResources)) {
+      addBootResourceEntries(entries, frameworkDir, satelliteGroup, '_bin');
+    }
+  }
+
+  const failures = [];
+  for (const entry of entries) {
+    if (!existsSync(entry.filePath)) {
+      failures.push(`${entry.name} is listed in blazor.boot.json but missing from ${frameworkDir}.`);
+      continue;
+    }
+
+    const actualHash = `sha256-${createHash('sha256').update(readFileSync(entry.filePath)).digest('base64')}`;
+    if (actualHash !== entry.expectedHash) {
+      failures.push(`${entry.name} hash mismatch: manifest has ${entry.expectedHash}, file is ${actualHash}.`);
+    }
+  }
+
+  return failures;
+}
+
+function frameworkHasValidIntegrity(frameworkDir) {
+  return frameworkIntegrityFailures(frameworkDir).length === 0;
+}
+
 function vendorBuildIsFresh() {
-  return existsSync(vendorDll) && statSync(vendorDll).mtimeMs >= latestSourceMtime();
+  return existsSync(vendorDll)
+    && statSync(vendorDll).mtimeMs >= latestSourceMtime()
+    && frameworkHasValidIntegrity(vendorFramework);
 }
 
 function dotnetWorks(command) {
@@ -124,6 +191,7 @@ async function ensureDotnet() {
 async function publishVendorRuntime() {
   const dotnet = await ensureDotnet();
   console.log('Publishing vendored Browser C# runtime...');
+  rmSync(vendorPublishOut, { recursive: true, force: true });
   const result = spawnSync(
     dotnet,
     ['publish', vendorProject, '-c', 'Release', '-o', vendorPublishOut],
@@ -159,8 +227,15 @@ try {
   );
 }
 
+function isUsableVendorFramework(frameworkDir) {
+  const dll = resolve(frameworkDir, '_bin', 'BrowserCSharp.dll');
+  return existsSync(dll) && hasRequiredMethods(dll) && frameworkHasValidIntegrity(frameworkDir);
+}
+
 const source =
-  existsSync(vendorDll) ? vendorFramework : npmFramework;
+  isUsableVendorFramework(vendorFramework) ? vendorFramework
+    : isUsableVendorFramework(vendorBuildFramework) ? vendorBuildFramework
+      : npmFramework;
 
 if (!existsSync(source)) {
   console.warn(
@@ -170,6 +245,16 @@ if (!existsSync(source)) {
 }
 
 const sourceDll = resolve(source, '_bin', 'BrowserCSharp.dll');
+const sourceIntegrityFailures = frameworkIntegrityFailures(source);
+if (sourceIntegrityFailures.length > 0) {
+  const message = `Browser C# runtime at ${source} does not match blazor.boot.json:\n- ${sourceIntegrityFailures.join('\n- ')}`;
+  if (!bestEffort) {
+    throw new Error(message);
+  }
+
+  console.warn(`${message}\nC# runtime loading may fail until the runtime is rebuilt.`);
+}
+
 if (!hasRequiredMethods(sourceDll)) {
   const message = `Browser C# runtime at ${source} is missing required CodeCraft methods: ${requiredBrowserCSharpMethods.join(', ')}.`;
   if (!bestEffort) {
