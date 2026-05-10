@@ -1,21 +1,13 @@
 import * as monaco from 'monaco-editor';
 
-const iframeId = `intellisage-${Math.random().toString(36).slice(2)}`;
+const iframeId = `roslyn-${Math.random().toString(36).slice(2)}`;
 
-type IntellisageCall = (method: string, ...args: unknown[]) => Promise<any>;
-export type CSharpIntelliSageSource = 'local' | 'server';
+type RoslynBridgeCall = (method: string, ...args: unknown[]) => Promise<any>;
 
-const CSHARP_INTELLISAGE_URLS: Record<CSharpIntelliSageSource, string> = {
-  local: '/intellisage/',
-  server: 'https://intellisage.vercel.app/',
-};
+const CSHARP_ROSLYN_URL = '/roslyn/';
 
-function normalizeCSharpIntelliSageSource(source: unknown): CSharpIntelliSageSource {
-  return source === 'server' ? 'server' : 'local';
-}
-
-export function getCSharpIntelliSageUrl(source: CSharpIntelliSageSource) {
-  return CSHARP_INTELLISAGE_URLS[normalizeCSharpIntelliSageSource(source)];
+export function getCSharpRoslynUrl() {
+  return CSHARP_ROSLYN_URL;
 }
 
 export interface CSharpProjectFileSnapshot {
@@ -38,6 +30,15 @@ interface CSharpCompletionCacheEntry {
   suggestions: monaco.languages.CompletionItem[];
   lspItems: any[];
   incomplete?: boolean;
+}
+
+interface RoslynResponseCacheEntry {
+  method: string;
+  value: unknown;
+  createdAt: number;
+  lastAccessed: number;
+  hits: number;
+  weight: number;
 }
 
 export type CSharpIdeDebugLevel = 'info' | 'success' | 'warning' | 'error';
@@ -117,7 +118,7 @@ export interface CSharpIdeDebugSnapshot {
   runtime: {
     initialized: boolean;
     iframeUrl: string | null;
-    hasIntelliSageBridge: boolean;
+    hasRoslynBridge: boolean;
     providersRegistered: boolean;
     initializationPending: boolean;
   };
@@ -135,6 +136,12 @@ export interface CSharpIdeDebugSnapshot {
     completionWorkerStateKey: string | null;
     diagnosticCacheKey: string | null;
     diagnosticCacheMarkerCount: number;
+    roslynResponseCacheSize: number;
+    roslynResponseCacheWeight: number;
+    roslynResponseCacheHits: number;
+    roslynResponseCacheMisses: number;
+    roslynResponseInFlightCount: number;
+    roslynCacheVersion: number;
     activeModelSemanticCacheHit: boolean;
   };
   features: CSharpIdeDebugFeatureSnapshot[];
@@ -150,6 +157,27 @@ const CSHARP_COMPLETION_CACHE_LIMIT = 8;
 const CSHARP_COMPLETION_TRIGGER_FALLBACK = '.';
 const CSHARP_DEBUG_EVENT_LIMIT = 500;
 const CSHARP_DEBUG_FEATURE_EVENT_LIMIT = 120;
+const CSHARP_ROSLYN_RESPONSE_CACHE_LIMIT = 180;
+const CSHARP_ROSLYN_RESPONSE_CACHE_MAX_WEIGHT = 8 * 1024 * 1024;
+const CSHARP_ROSLYN_RESPONSE_CACHE_MAX_ENTRY_WEIGHT = 1.5 * 1024 * 1024;
+const CSHARP_ROSLYN_RESPONSE_CACHE_TTL_MS = 5 * 60 * 1000;
+
+const CSHARP_ROSLYN_CACHEABLE_METHODS = new Set([
+  'GetDiagnosticsAsync',
+  'GetSignatureHelpAsync',
+  'GetQuickInfoAsync',
+  'GetSemanticTokensAsync',
+  'GetDefinitionAsync',
+  'GetReferencesAsync',
+  'GetDocumentSymbolsAsync',
+  'GetRenameInfoAsync',
+  'GetRenameEditsAsync',
+  'GetCodeActionsAsync',
+  'GetFoldingRangesAsync',
+  'GetFormattingAsync',
+  'GetRangeFormattingAsync',
+  'GetInlayHintsAsync',
+]);
 
 interface CSharpIdeDebugFeatureDescriptor {
   key: string;
@@ -164,14 +192,14 @@ const CSHARP_DEBUG_FEATURE_DESCRIPTORS: CSharpIdeDebugFeatureDescriptor[] = [
     key: 'diagnostics',
     label: 'Diagnostics',
     category: 'Analysis',
-    description: 'Marker production, project snapshot submission, diagnostic caching, and IntelliSage diagnostic responses.',
+    description: 'Marker production, project snapshot submission, diagnostic caching, and Roslyn diagnostic responses.',
     order: 10,
   },
   {
     key: 'completion',
     label: 'Completion',
     category: 'Authoring',
-    description: 'Completion trigger context, cache state, LSP item conversion, completion resolve, and IntelliSage completion payloads.',
+    description: 'Completion trigger context, cache state, LSP item conversion, completion resolve, and Roslyn completion payloads.',
     order: 20,
   },
   {
@@ -276,7 +304,7 @@ const CSHARP_DEBUG_FEATURE_DESCRIPTORS: CSharpIdeDebugFeatureDescriptor[] = [
     key: 'runtime',
     label: 'Runtime Bridge',
     category: 'Runtime',
-    description: 'IntelliSage iframe lifecycle, postMessage requests, response timing, false payloads, and timeouts.',
+    description: 'Roslyn iframe lifecycle, postMessage requests, response timing, false payloads, and timeouts.',
     order: 170,
   },
   {
@@ -581,7 +609,7 @@ function currentModelPath(model: monaco.editor.ITextModel) {
 }
 
 class CSharpLanguageService {
-  private intellisage: IntellisageCall | null = null;
+  private roslyn: RoslynBridgeCall | null = null;
   private lastCompletions = new Map<monaco.languages.CompletionItem, any>();
   private model: monaco.editor.ITextModel | null = null;
   private projectFilesProvider: CSharpProjectFilesProvider = () => [];
@@ -596,6 +624,12 @@ class CSharpLanguageService {
   private completionCache = new Map<string, CSharpCompletionCacheEntry>();
   private diagnosticCacheKey: string | null = null;
   private diagnosticCacheMarkers: monaco.editor.IMarkerData[] = [];
+  private roslynResponseCache = new Map<string, RoslynResponseCacheEntry>();
+  private roslynInFlightRequests = new Map<string, Promise<unknown>>();
+  private roslynResponseCacheWeight = 0;
+  private roslynResponseCacheHits = 0;
+  private roslynResponseCacheMisses = 0;
+  private roslynCacheVersion = 0;
   private providerDisposables: monaco.IDisposable[] = [];
   private semanticCache = new WeakMap<monaco.editor.ITextModel, { versionId: number; index: CSharpSemanticIndex }>();
   private debugEnabled = false;
@@ -644,7 +678,7 @@ class CSharpLanguageService {
       runtime: {
         initialized: this.initialized,
         iframeUrl: this.iframeUrl,
-        hasIntelliSageBridge: !!this.intellisage,
+        hasRoslynBridge: !!this.roslyn,
         providersRegistered: this.providersRegistered,
         initializationPending: !!this.initializationPromise,
       },
@@ -662,6 +696,12 @@ class CSharpLanguageService {
         completionWorkerStateKey: this.completionWorkerStateKey,
         diagnosticCacheKey: this.diagnosticCacheKey,
         diagnosticCacheMarkerCount: this.diagnosticCacheMarkers.length,
+        roslynResponseCacheSize: this.roslynResponseCache.size,
+        roslynResponseCacheWeight: this.roslynResponseCacheWeight,
+        roslynResponseCacheHits: this.roslynResponseCacheHits,
+        roslynResponseCacheMisses: this.roslynResponseCacheMisses,
+        roslynResponseInFlightCount: this.roslynInFlightRequests.size,
+        roslynCacheVersion: this.roslynCacheVersion,
         activeModelSemanticCacheHit: !!(this.model && this.semanticCache.has(this.model)),
       },
       features: this.getDebugFeatureSnapshots(),
@@ -916,7 +956,7 @@ class CSharpLanguageService {
       runtime: {
         initialized: this.initialized,
         iframeUrl: this.iframeUrl,
-        hasIntelliSageBridge: !!this.intellisage,
+        hasRoslynBridge: !!this.roslyn,
         providersRegistered: this.providersRegistered,
         initializationPending: !!this.initializationPromise,
       },
@@ -936,6 +976,12 @@ class CSharpLanguageService {
         completionWorkerStateKey: this.completionWorkerStateKey,
         diagnosticCacheKey: this.diagnosticCacheKey,
         diagnosticCacheMarkerCount: this.diagnosticCacheMarkers.length,
+        roslynResponseCacheSize: this.roslynResponseCache.size,
+        roslynResponseCacheWeight: this.roslynResponseCacheWeight,
+        roslynResponseCacheHits: this.roslynResponseCacheHits,
+        roslynResponseCacheMisses: this.roslynResponseCacheMisses,
+        roslynResponseInFlightCount: this.roslynInFlightRequests.size,
+        roslynCacheVersion: this.roslynCacheVersion,
         activeModelSemanticCacheHit: !!(this.model && this.semanticCache.has(this.model)),
       },
     };
@@ -1048,7 +1094,7 @@ class CSharpLanguageService {
     return this.summarizeValue(result);
   }
 
-  private summarizeIntelliSageResponse(response: unknown): unknown {
+  private summarizeRoslynResponse(response: unknown): unknown {
     const result = response as any;
     if (!result) return result;
     if (Array.isArray(result)) return { type: 'array', length: result.length, sample: result.slice(0, 3).map(item => this.summarizeValue(item, 1)) };
@@ -1149,9 +1195,9 @@ class CSharpLanguageService {
     }
   }
 
-  async initialize(iframeUrl = CSHARP_INTELLISAGE_URLS.local) {
-    const nextIframeUrl = iframeUrl.trim() || CSHARP_INTELLISAGE_URLS.local;
-    if (this.initialized && this.iframeUrl === nextIframeUrl && this.intellisage) return;
+  async initialize(iframeUrl = CSHARP_ROSLYN_URL) {
+    const nextIframeUrl = iframeUrl.trim() || CSHARP_ROSLYN_URL;
+    if (this.initialized && this.iframeUrl === nextIframeUrl && this.roslyn) return;
     if (this.initializationPromise && this.iframeUrl === nextIframeUrl) {
       return this.initializationPromise;
     }
@@ -1169,7 +1215,7 @@ class CSharpLanguageService {
 
   private async initializeRuntime(nextIframeUrl: string) {
     if (this.initialized && this.iframeUrl !== nextIframeUrl) {
-      this.disposeIntelliSageRuntime();
+      this.disposeRoslynRuntime();
     }
 
     this.initialized = true;
@@ -1186,7 +1232,7 @@ class CSharpLanguageService {
       if (!iframe) {
         const initPromise = new Promise<void>(res => {
           const listener = (event: MessageEvent) => {
-            if (event.data?.intellisageInitialized) {
+            if (event.data?.roslynInitialized) {
               res();
               window.removeEventListener('message', listener);
             }
@@ -1201,19 +1247,19 @@ class CSharpLanguageService {
         iframe.style.display = 'none';
         iframe.setAttribute('credentialless', '');
         iframe.src = nextIframeUrl;
-        iframe.title = 'IntelliSage';
+        iframe.title = 'Roslyn';
         document.body.appendChild(iframe);
 
         await new Promise<void>((res, rej) => {
           iframe!.onload = () => res();
-          iframe!.onerror = () => rej(new Error('IntelliSage iframe failed to load'));
+          iframe!.onerror = () => rej(new Error('Roslyn iframe failed to load'));
         });
 
         await initPromise;
       }
 
       const iframeRef = iframe;
-      this.intellisage = (method: string, ...args: unknown[]) => {
+      this.roslyn = (method: string, ...args: unknown[]) => {
         if (!iframeRef.contentWindow) return Promise.resolve(false);
         const started = this.now();
         const callId = `${method}:${this.debugEventSerial + 1}:${Math.random().toString(36).slice(2, 8)}`;
@@ -1221,7 +1267,7 @@ class CSharpLanguageService {
           feature: method,
           phase: 'runtime-request',
           level: 'info',
-          message: `${method} request posted to IntelliSage.`,
+          message: `${method} request posted to Roslyn.`,
           callId,
           request: {
             iframeUrl: this.iframeUrl,
@@ -1234,20 +1280,20 @@ class CSharpLanguageService {
           const id = Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
           let handled = false;
           const handleMessage = (event: MessageEvent) => {
-            if (event.data?.intellisage?.id === id && !handled) {
+            if (event.data?.roslyn?.id === id && !handled) {
               handled = true;
               window.removeEventListener('message', handleMessage);
-              const payload = event.data.intellisage.payload;
+              const payload = event.data.roslyn.payload;
               this.recordDebugEvent({
                 feature: method,
                 phase: 'runtime-response',
                 level: payload === false ? 'warning' : 'success',
                 message: payload === false
                   ? `${method} returned a false payload.`
-                  : `${method} returned from IntelliSage.`,
+                  : `${method} returned from Roslyn.`,
                 callId,
                 durationMs: Math.round((this.now() - started) * 10) / 10,
-                response: this.summarizeIntelliSageResponse(payload),
+                response: this.summarizeRoslynResponse(payload),
                 environment: this.createDebugEnvironmentSnapshot(this.model),
               });
               res(payload);
@@ -1261,7 +1307,7 @@ class CSharpLanguageService {
                 feature: method,
                 phase: 'runtime-timeout',
                 level: 'error',
-                message: `${method} timed out waiting for IntelliSage.`,
+                message: `${method} timed out waiting for Roslyn.`,
                 callId,
                 durationMs: Math.round((this.now() - started) * 10) / 10,
                 environment: this.createDebugEnvironmentSnapshot(this.model),
@@ -1270,7 +1316,7 @@ class CSharpLanguageService {
             }
           }, 10000);
           window.addEventListener('message', handleMessage);
-          iframeRef.contentWindow!.postMessage({ intellisage: { method, args, id } }, '*');
+          iframeRef.contentWindow!.postMessage({ roslyn: { method, args, id } }, '*');
         });
       };
 
@@ -1279,24 +1325,25 @@ class CSharpLanguageService {
         this.providersRegistered = true;
       }
     } catch (error) {
-      this.disposeIntelliSageRuntime();
+      this.disposeRoslynRuntime();
       throw error;
     }
   }
 
-  private disposeIntelliSageRuntime() {
+  private disposeRoslynRuntime() {
     this.recordDebugEvent({
       feature: 'lifecycle',
       phase: 'dispose-runtime',
       level: 'warning',
-      message: 'IntelliSage runtime disposed.',
+      message: 'Roslyn runtime disposed.',
       request: { iframeUrl: this.iframeUrl },
     });
     document.getElementById(iframeId)?.remove();
-    this.intellisage = null;
+    this.roslyn = null;
     this.initialized = false;
     this.iframeUrl = null;
     this.clearCompletionState();
+    this.clearRoslynResponseCache('runtime-disposed');
   }
 
   private clearCompletionState() {
@@ -1316,6 +1363,182 @@ class CSharpLanguageService {
         completionRequestSerial: this.completionRequestSerial,
       },
     });
+  }
+
+  private clearRoslynResponseCache(reason: string) {
+    if (!this.roslynResponseCache.size && !this.roslynInFlightRequests.size) {
+      this.roslynCacheVersion += 1;
+      return;
+    }
+
+    this.roslynResponseCache.clear();
+    this.roslynInFlightRequests.clear();
+    this.roslynResponseCacheWeight = 0;
+    this.roslynCacheVersion += 1;
+    this.recordDebugEvent({
+      feature: 'cache',
+      phase: 'roslyn-clear',
+      level: 'info',
+      message: 'C# Roslyn response cache cleared.',
+      request: {
+        reason,
+        roslynCacheVersion: this.roslynCacheVersion,
+      },
+    });
+  }
+
+  private roslynResponseCacheKey(method: string, args: unknown[]) {
+    return [
+      this.roslynCacheVersion,
+      method,
+      ...args.map(arg => this.cacheKeyForValue(arg)),
+    ].join('|');
+  }
+
+  private cacheKeyForValue(value: unknown, depth = 0): string {
+    if (value === null) return 'null';
+    if (value === undefined) return 'undefined';
+    if (typeof value === 'string') return `s:${value.length}:${hashString(value)}`;
+    if (typeof value === 'number' || typeof value === 'boolean') return `${typeof value}:${String(value)}`;
+    if (Array.isArray(value)) {
+      if (depth > 4) return `array:${value.length}`;
+      return `array:${value.length}:[${value.map(item => this.cacheKeyForValue(item, depth + 1)).join(',')}]`;
+    }
+    if (typeof value === 'object') {
+      if (depth > 4) return `object:${Object.keys(value as Record<string, unknown>).sort().join(',')}`;
+      const record = value as Record<string, unknown>;
+      return `object:{${Object.keys(record).sort().map(key => `${key}:${this.cacheKeyForValue(record[key], depth + 1)}`).join(',')}}`;
+    }
+    return typeof value;
+  }
+
+  private estimateCacheWeight(value: unknown): number {
+    if (typeof value === 'string') return value.length * 2;
+    if (value == null || typeof value === 'number' || typeof value === 'boolean') return 32;
+    try {
+      const serialized = JSON.stringify(value);
+      return (serialized?.length ?? 1024) * 2;
+    } catch {
+      return 2048;
+    }
+  }
+
+  private storeRoslynResponseCacheEntry(key: string, method: string, value: unknown) {
+    const weight = Math.max(key.length * 2, this.estimateCacheWeight(value));
+    if (weight > CSHARP_ROSLYN_RESPONSE_CACHE_MAX_ENTRY_WEIGHT) return;
+
+    const existing = this.roslynResponseCache.get(key);
+    if (existing) {
+      this.roslynResponseCacheWeight -= existing.weight;
+    }
+
+    const now = Date.now();
+    this.roslynResponseCache.set(key, {
+      method,
+      value,
+      createdAt: now,
+      lastAccessed: now,
+      hits: existing?.hits ?? 0,
+      weight,
+    });
+    this.roslynResponseCacheWeight += weight;
+    this.trimRoslynResponseCache(now);
+  }
+
+  private trimRoslynResponseCache(now = Date.now()) {
+    for (const [key, entry] of this.roslynResponseCache) {
+      if (now - entry.createdAt <= CSHARP_ROSLYN_RESPONSE_CACHE_TTL_MS) continue;
+      this.roslynResponseCache.delete(key);
+      this.roslynResponseCacheWeight -= entry.weight;
+    }
+
+    while (
+      this.roslynResponseCache.size > CSHARP_ROSLYN_RESPONSE_CACHE_LIMIT ||
+      this.roslynResponseCacheWeight > CSHARP_ROSLYN_RESPONSE_CACHE_MAX_WEIGHT
+    ) {
+      let oldestKey: string | null = null;
+      let oldestAccess = Number.POSITIVE_INFINITY;
+      for (const [key, entry] of this.roslynResponseCache) {
+        if (entry.lastAccessed < oldestAccess) {
+          oldestAccess = entry.lastAccessed;
+          oldestKey = key;
+        }
+      }
+      if (!oldestKey) break;
+      const oldest = this.roslynResponseCache.get(oldestKey);
+      this.roslynResponseCache.delete(oldestKey);
+      if (oldest) this.roslynResponseCacheWeight -= oldest.weight;
+    }
+
+    if (this.roslynResponseCacheWeight < 0) this.roslynResponseCacheWeight = 0;
+  }
+
+  private async callRoslyn<T = unknown>(method: string, ...args: unknown[]): Promise<T | false> {
+    if (!this.roslyn) return false;
+    if (!CSHARP_ROSLYN_CACHEABLE_METHODS.has(method)) {
+      return this.roslyn(method, ...args) as Promise<T | false>;
+    }
+
+    const key = this.roslynResponseCacheKey(method, args);
+    const now = Date.now();
+    const cached = this.roslynResponseCache.get(key);
+    if (cached && now - cached.createdAt <= CSHARP_ROSLYN_RESPONSE_CACHE_TTL_MS) {
+      cached.lastAccessed = now;
+      cached.hits += 1;
+      this.roslynResponseCache.delete(key);
+      this.roslynResponseCache.set(key, cached);
+      this.roslynResponseCacheHits += 1;
+      this.recordDebugEvent({
+        feature: 'cache',
+        phase: 'roslyn-hit',
+        level: 'success',
+        message: `${method} reused a cached Roslyn response.`,
+        request: {
+          method,
+          hits: cached.hits,
+          cacheSize: this.roslynResponseCache.size,
+          inFlightCount: this.roslynInFlightRequests.size,
+        },
+        response: this.summarizeRoslynResponse(cached.value),
+      });
+      return cached.value as T;
+    }
+
+    if (cached) {
+      this.roslynResponseCache.delete(key);
+      this.roslynResponseCacheWeight -= cached.weight;
+    }
+
+    const inFlight = this.roslynInFlightRequests.get(key);
+    if (inFlight) {
+      this.roslynResponseCacheHits += 1;
+      this.recordDebugEvent({
+        feature: 'cache',
+        phase: 'roslyn-join',
+        level: 'info',
+        message: `${method} joined an in-flight Roslyn request.`,
+        request: {
+          method,
+          inFlightCount: this.roslynInFlightRequests.size,
+        },
+      });
+      return await inFlight as T | false;
+    }
+
+    this.roslynResponseCacheMisses += 1;
+    const requestVersion = this.roslynCacheVersion;
+    const request = this.roslyn(method, ...args) as Promise<T | false>;
+    const trackedRequest = request.then(response => {
+      if (response !== false && this.roslynCacheVersion === requestVersion) {
+        this.storeRoslynResponseCacheEntry(key, method, response);
+      }
+      return response;
+    }).finally(() => {
+      this.roslynInFlightRequests.delete(key);
+    });
+
+    this.roslynInFlightRequests.set(key, trackedRequest);
+    return await trackedRequest;
   }
 
   private cacheCompletionResult(key: string, entry: CSharpCompletionCacheEntry) {
@@ -1363,18 +1586,11 @@ class CSharpLanguageService {
     ].join(':');
   }
 
-  private async ensureLocalIntelliSageRuntime() {
-    if (!this.intellisage || this.iframeUrl !== CSHARP_INTELLISAGE_URLS.local) {
-      await this.initialize(CSHARP_INTELLISAGE_URLS.local);
+  private async ensureLocalRoslynRuntime() {
+    if (!this.roslyn || this.iframeUrl !== CSHARP_ROSLYN_URL) {
+      await this.initialize(CSHARP_ROSLYN_URL);
     }
-    return !!this.intellisage && this.iframeUrl === CSHARP_INTELLISAGE_URLS.local;
-  }
-
-  private async ensureIntelliSageRuntime() {
-    if (!this.intellisage || !this.iframeUrl) {
-      await this.initialize(getCSharpIntelliSageUrl(_csharpReadySource));
-    }
-    return !!this.intellisage;
+    return !!this.roslyn && this.iframeUrl === CSHARP_ROSLYN_URL;
   }
 
   private registerProviders() {
@@ -1566,7 +1782,7 @@ class CSharpLanguageService {
     message?: string;
   }> {
     await ensureCSharpReady();
-    if (!this.intellisage) {
+    if (!this.roslyn) {
       return { success: false, message: 'C# authoring runtime is not ready.' };
     }
 
@@ -1575,7 +1791,7 @@ class CSharpLanguageService {
       return { success: false, message: 'Namespace is required.' };
     }
 
-    const response = await this.intellisage('IncludeNamespaceAsync', trimmedNamespace) as {
+    const response = await this.callRoslyn('IncludeNamespaceAsync', trimmedNamespace) as {
       namespaceName?: string;
       success?: boolean;
       addedAssemblies?: string[];
@@ -1583,6 +1799,7 @@ class CSharpLanguageService {
       message?: string;
     } | false;
     this.clearCompletionState();
+    this.clearRoslynResponseCache('namespace-included');
 
     if (this.model && this.model.getLanguageId() === 'csharp') {
       await this.refreshDiagnosticsNow(this.model);
@@ -1624,10 +1841,10 @@ class CSharpLanguageService {
       request: { requestSerial, initialModelVersion },
       environment: this.createDebugEnvironmentSnapshot(model),
     });
-    const runtimeReady = await this.ensureLocalIntelliSageRuntime();
+    const runtimeReady = await this.ensureLocalRoslynRuntime();
     if (
       !runtimeReady ||
-      !this.intellisage ||
+      !this.roslyn ||
       requestSerial !== this.diagnosticRequestSerial ||
       model.isDisposed() ||
       model.getVersionId() !== initialModelVersion
@@ -1640,7 +1857,7 @@ class CSharpLanguageService {
         durationMs: Math.round((this.now() - started) * 10) / 10,
         request: {
           runtimeReady,
-          hasIntelliSageBridge: !!this.intellisage,
+          hasRoslynBridge: !!this.roslyn,
           requestSerial,
           currentDiagnosticRequestSerial: this.diagnosticRequestSerial,
           modelDisposed: model.isDisposed(),
@@ -1657,7 +1874,7 @@ class CSharpLanguageService {
     this.lastDiagnosticProjectRequest = projectRequest;
     const cacheKey = this.createDiagnosticCacheKey(model, safeCode, projectRequest);
     if (this.diagnosticCacheKey === cacheKey) {
-      monaco.editor.setModelMarkers(model, 'csharp-intellisage', this.diagnosticCacheMarkers);
+      monaco.editor.setModelMarkers(model, 'csharp-roslyn', this.diagnosticCacheMarkers);
       this.recordDebugEvent({
         feature: 'diagnostics',
         phase: 'cache-hit',
@@ -1680,7 +1897,7 @@ class CSharpLanguageService {
         feature: 'diagnostics',
         phase: 'runtime-call',
         level: 'info',
-        message: 'C# diagnostics calling IntelliSage.',
+        message: 'C# diagnostics calling Roslyn.',
         model: this.summarizeModel(model),
         request: {
           cacheKey,
@@ -1690,7 +1907,7 @@ class CSharpLanguageService {
         },
         environment: this.createDebugEnvironmentSnapshot(model),
       });
-      const diagnostics = await this.intellisage('GetDiagnosticsAsync', safeCode, projectRequest);
+      const diagnostics = await this.callRoslyn('GetDiagnosticsAsync', safeCode, projectRequest);
       if (
         requestSerial !== this.diagnosticRequestSerial ||
         model.isDisposed() ||
@@ -1702,7 +1919,7 @@ class CSharpLanguageService {
           level: 'warning',
           message: 'C# diagnostics response discarded because the model/request changed.',
           durationMs: Math.round((this.now() - started) * 10) / 10,
-          response: this.summarizeIntelliSageResponse(diagnostics),
+          response: this.summarizeRoslynResponse(diagnostics),
           environment: this.createDebugEnvironmentSnapshot(model),
         });
         return;
@@ -1711,7 +1928,7 @@ class CSharpLanguageService {
       const markers = this.convertDiagnostics(model, diagnostics);
       this.diagnosticCacheKey = cacheKey;
       this.diagnosticCacheMarkers = markers;
-      monaco.editor.setModelMarkers(model, 'csharp-intellisage', markers);
+      monaco.editor.setModelMarkers(model, 'csharp-roslyn', markers);
       this.recordDebugEvent({
         feature: 'diagnostics',
         phase: 'end',
@@ -1719,7 +1936,7 @@ class CSharpLanguageService {
         message: 'C# diagnostics applied markers.',
         durationMs: Math.round((this.now() - started) * 10) / 10,
         response: {
-          diagnosticPayload: this.summarizeIntelliSageResponse(diagnostics),
+          diagnosticPayload: this.summarizeRoslynResponse(diagnostics),
           markerCount: markers.length,
           severities: summarizeMarkers(markers),
         },
@@ -1740,7 +1957,7 @@ class CSharpLanguageService {
         !model.isDisposed() &&
         model.getVersionId() === initialModelVersion
       ) {
-        monaco.editor.setModelMarkers(model, 'csharp-intellisage', []);
+        monaco.editor.setModelMarkers(model, 'csharp-roslyn', []);
       }
     }
   }
@@ -1765,8 +1982,8 @@ class CSharpLanguageService {
     context: monaco.languages.CompletionContext
   ): Promise<monaco.languages.CompletionList> {
     const initialModelVersion = model.getVersionId();
-    const runtimeReady = await this.ensureLocalIntelliSageRuntime();
-    if (!runtimeReady || !this.intellisage || model.isDisposed() || model.getVersionId() !== initialModelVersion) {
+    const runtimeReady = await this.ensureLocalRoslynRuntime();
+    if (!runtimeReady || !this.roslyn || model.isDisposed() || model.getVersionId() !== initialModelVersion) {
       return this.emptyCompletionList();
     }
 
@@ -1774,7 +1991,12 @@ class CSharpLanguageService {
     const modelVersion = model.getVersionId();
     const cacheKey = this.completionCacheKey(model, position, context);
     const cached = this.completionCache.get(cacheKey);
-    if (cached && this.completionWorkerStateKey === cacheKey) return this.toCompletionList(cached);
+    if (cached) {
+      this.completionCache.delete(cacheKey);
+      this.completionCache.set(cacheKey, cached);
+      this.completionWorkerStateKey = cacheKey;
+      return this.toCompletionList(cached);
+    }
 
     const request: any = {
       Line: position.lineNumber - 1,
@@ -1784,7 +2006,7 @@ class CSharpLanguageService {
     };
 
     try {
-      const response = await this.intellisage('GetCompletionAsync', model.getValue(), request);
+      const response = await this.callRoslyn('GetCompletionAsync', model.getValue(), request);
       if (requestSerial !== this.completionRequestSerial || model.isDisposed() || model.getVersionId() !== modelVersion) {
         return this.emptyCompletionList();
       }
@@ -1808,9 +2030,9 @@ class CSharpLanguageService {
     item: monaco.languages.CompletionItem
   ): Promise<monaco.languages.CompletionItem> {
     const lspItem = this.lastCompletions.get(item);
-    if (!lspItem || !this.intellisage) return item;
+    if (!lspItem || !this.roslyn) return item;
     try {
-      const response = await this.intellisage('GetCompletionResolveAsync', { Item: lspItem });
+      const response = await this.callRoslyn('GetCompletionResolveAsync', { Item: lspItem });
       if (!response) return item;
       const resolved = (response as any).item;
       if (!resolved) return item;
@@ -1825,10 +2047,11 @@ class CSharpLanguageService {
     model: monaco.editor.ITextModel,
     position: monaco.Position
   ): Promise<monaco.languages.SignatureHelpResult | undefined> {
-    if (!this.intellisage) return this.provideLocalSignatureHelp(model, position);
+    const runtimeReady = await this.ensureLocalRoslynRuntime();
+    if (!runtimeReady || !this.roslyn) return this.provideLocalSignatureHelp(model, position);
     const req = { Line: position.lineNumber - 1, Column: position.column - 1 };
     try {
-      const res = await this.intellisage('GetSignatureHelpAsync', model.getValue(), req);
+      const res = await this.callRoslyn('GetSignatureHelpAsync', model.getValue(), req);
       if (!res) return this.provideLocalSignatureHelp(model, position);
       const result = res as any;
       return {
@@ -1857,17 +2080,17 @@ class CSharpLanguageService {
     cancellationToken?: monaco.CancellationToken
   ): Promise<monaco.languages.Hover | undefined> {
     const initialModelVersion = model.getVersionId();
-    const runtimeReady = await this.ensureIntelliSageRuntime();
+    const runtimeReady = await this.ensureLocalRoslynRuntime();
     if (
       runtimeReady &&
-      this.intellisage &&
+      this.roslyn &&
       !cancellationToken?.isCancellationRequested &&
       !model.isDisposed() &&
       model.getVersionId() === initialModelVersion
     ) {
       try {
         const projectRequest = this.createDiagnosticProjectRequest(model);
-        const response = await this.intellisage(
+        const response = await this.callRoslyn(
           'GetQuickInfoAsync',
           model.getValue(),
           this.positionRequest(position),
@@ -1899,9 +2122,10 @@ class CSharpLanguageService {
     model: monaco.editor.ITextModel,
     cancellationToken: monaco.CancellationToken
   ): Promise<monaco.languages.SemanticTokens | null> {
-    if (this.intellisage) {
+    const runtimeReady = await this.ensureLocalRoslynRuntime();
+    if (runtimeReady && this.roslyn) {
       try {
-        const response = await this.intellisage('GetSemanticTokensAsync', model.getValue());
+        const response = await this.callRoslyn('GetSemanticTokensAsync', model.getValue());
         if (!cancellationToken.isCancellationRequested && Array.isArray(response)) {
           return { data: this.encodeRoslynSemanticTokens(response as RoslynSemanticTokenDto[]) };
         }
@@ -1918,10 +2142,11 @@ class CSharpLanguageService {
     model: monaco.editor.ITextModel,
     position: monaco.Position
   ): Promise<monaco.languages.Location[] | undefined> {
-    if (this.intellisage) {
+    const runtimeReady = await this.ensureLocalRoslynRuntime();
+    if (runtimeReady && this.roslyn) {
       try {
         const projectRequest = this.createDiagnosticProjectRequest(model);
-        const response = await this.intellisage(
+        const response = await this.callRoslyn(
           'GetDefinitionAsync',
           model.getValue(),
           this.positionRequest(position),
@@ -1948,9 +2173,10 @@ class CSharpLanguageService {
     context: monaco.languages.ReferenceContext
   ): Promise<monaco.languages.Location[] | undefined> {
     let roslynLocations: monaco.languages.Location[] = [];
-    if (this.intellisage) {
+    const runtimeReady = await this.ensureLocalRoslynRuntime();
+    if (runtimeReady && this.roslyn) {
       try {
-        const response = await this.intellisage('GetReferencesAsync', model.getValue(), this.positionRequest(position), String(context.includeDeclaration));
+        const response = await this.callRoslyn('GetReferencesAsync', model.getValue(), this.positionRequest(position), String(context.includeDeclaration));
         roslynLocations = this.convertLocations(model, response);
       } catch {
         // Fall through to the browser-side semantic index.
@@ -1979,9 +2205,10 @@ class CSharpLanguageService {
   }
 
   private async provideDocumentSymbols(model: monaco.editor.ITextModel): Promise<monaco.languages.DocumentSymbol[]> {
-    if (this.intellisage) {
+    const runtimeReady = await this.ensureLocalRoslynRuntime();
+    if (runtimeReady && this.roslyn) {
       try {
-        const response = await this.intellisage('GetDocumentSymbolsAsync', model.getValue());
+        const response = await this.callRoslyn('GetDocumentSymbolsAsync', model.getValue());
         const symbols = this.convertDocumentSymbols(response);
         if (symbols.length) return symbols;
       } catch {
@@ -1996,9 +2223,10 @@ class CSharpLanguageService {
     model: monaco.editor.ITextModel,
     position: monaco.Position
   ): Promise<monaco.languages.RenameLocation> {
-    if (this.intellisage) {
+    const runtimeReady = await this.ensureLocalRoslynRuntime();
+    if (runtimeReady && this.roslyn) {
       try {
-        const response = await this.intellisage('GetRenameInfoAsync', model.getValue(), this.positionRequest(position)) as RoslynRenameInfoDto | false;
+        const response = await this.callRoslyn('GetRenameInfoAsync', model.getValue(), this.positionRequest(position)) as RoslynRenameInfoDto | false;
         const range = this.toEditorRange(response && response.range);
         if (response && response.canRename && range) {
           return { range, text: response.text ?? model.getValueInRange(range) };
@@ -2035,9 +2263,10 @@ class CSharpLanguageService {
 
     let roslynEdits: monaco.languages.IWorkspaceTextEdit[] = [];
     let roslynRejectReason: string | undefined;
-    if (this.intellisage) {
+    const runtimeReady = await this.ensureLocalRoslynRuntime();
+    if (runtimeReady && this.roslyn) {
       try {
-        const response = await this.intellisage('GetRenameEditsAsync', model.getValue(), this.positionRequest(position), newName) as RoslynRenameEditsDto | false;
+        const response = await this.callRoslyn('GetRenameEditsAsync', model.getValue(), this.positionRequest(position), newName) as RoslynRenameEditsDto | false;
         if (response && Array.isArray(response.edits)) {
           roslynEdits = response.edits.flatMap(edit => this.convertWorkspaceEdit(model, edit));
           roslynRejectReason = response.rejectReason ?? undefined;
@@ -2074,9 +2303,10 @@ class CSharpLanguageService {
     const actions: monaco.languages.CodeAction[] = [];
     const lineText = model.getLineContent(range.startLineNumber);
 
-    if (this.intellisage) {
+    const runtimeReady = await this.ensureLocalRoslynRuntime();
+    if (runtimeReady && this.roslyn) {
       try {
-        const response = await this.intellisage('GetCodeActionsAsync', model.getValue(), this.rangeRequest(range));
+        const response = await this.callRoslyn('GetCodeActionsAsync', model.getValue(), this.rangeRequest(range));
         actions.push(...this.convertCodeActions(model, response, context.markers));
       } catch {
         // Local actions below still cover the common cases.
@@ -2133,9 +2363,10 @@ class CSharpLanguageService {
   }
 
   private async provideFoldingRanges(model: monaco.editor.ITextModel): Promise<monaco.languages.FoldingRange[]> {
-    if (this.intellisage) {
+    const runtimeReady = await this.ensureLocalRoslynRuntime();
+    if (runtimeReady && this.roslyn) {
       try {
-        const response = await this.intellisage('GetFoldingRangesAsync', model.getValue());
+        const response = await this.callRoslyn('GetFoldingRangesAsync', model.getValue());
         const ranges = this.convertFoldingRanges(response);
         if (ranges.length) return ranges;
       } catch {
@@ -2150,9 +2381,10 @@ class CSharpLanguageService {
     model: monaco.editor.ITextModel,
     options: monaco.languages.FormattingOptions
   ): Promise<monaco.languages.TextEdit[]> {
-    if (this.intellisage) {
+    const runtimeReady = await this.ensureLocalRoslynRuntime();
+    if (runtimeReady && this.roslyn) {
       try {
-        const formatted = await this.intellisage('GetFormattingAsync', model.getValue());
+        const formatted = await this.callRoslyn('GetFormattingAsync', model.getValue());
         if (typeof formatted === 'string' && formatted !== model.getValue()) {
           return [{ range: model.getFullModelRange(), text: formatted }];
         }
@@ -2173,9 +2405,10 @@ class CSharpLanguageService {
     range: monaco.Range,
     options: monaco.languages.FormattingOptions
   ): Promise<monaco.languages.TextEdit[]> {
-    if (this.intellisage) {
+    const runtimeReady = await this.ensureLocalRoslynRuntime();
+    if (runtimeReady && this.roslyn) {
       try {
-        const formatted = await this.intellisage('GetRangeFormattingAsync', model.getValue(), this.rangeRequest(range));
+        const formatted = await this.callRoslyn('GetRangeFormattingAsync', model.getValue(), this.rangeRequest(range));
         if (typeof formatted === 'string' && formatted !== model.getValue()) {
           return [{ range: model.getFullModelRange(), text: formatted }];
         }
@@ -2210,9 +2443,10 @@ class CSharpLanguageService {
     model: monaco.editor.ITextModel,
     range: monaco.Range
   ): Promise<monaco.languages.InlayHintList> {
-    if (this.intellisage) {
+    const runtimeReady = await this.ensureLocalRoslynRuntime();
+    if (runtimeReady && this.roslyn) {
       try {
-        const response = await this.intellisage('GetInlayHintsAsync', model.getValue(), this.rangeRequest(range));
+        const response = await this.callRoslyn('GetInlayHintsAsync', model.getValue(), this.rangeRequest(range));
         const hints = this.convertInlayHints(response);
         if (hints.length) return { hints, dispose() {} };
       } catch {
@@ -3884,13 +4118,10 @@ function toPascalCase(value: string) {
 
 export const csharpService = new CSharpLanguageService();
 let _csharpReady: Promise<void> | null = null;
-let _csharpReadySource: CSharpIntelliSageSource = 'local';
-export function ensureCSharpReady(source: CSharpIntelliSageSource = 'local'): Promise<void> {
-  const normalizedSource = normalizeCSharpIntelliSageSource(source);
-  if (!_csharpReady || _csharpReadySource !== normalizedSource) {
-    _csharpReadySource = normalizedSource;
-    _csharpReady = csharpService.initialize(getCSharpIntelliSageUrl(normalizedSource)).catch(error => {
-      if (_csharpReadySource === normalizedSource) _csharpReady = null;
+export function ensureCSharpReady(): Promise<void> {
+  if (!_csharpReady) {
+    _csharpReady = csharpService.initialize(CSHARP_ROSLYN_URL).catch(error => {
+      _csharpReady = null;
       throw error;
     });
   }

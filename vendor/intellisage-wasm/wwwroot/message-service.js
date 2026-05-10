@@ -3,7 +3,7 @@ function registerService(monacoService) {
   if (window !== window.top) {
     window.parent.postMessage(
       {
-        intellisageInitialized: true
+        roslynInitialized: true
       },
       "*"
     );
@@ -33,12 +33,12 @@ function registerService(monacoService) {
   // Thin message layer to communicate with parent
   // Proxy for invoking on DotNet
   window.addEventListener("message", (e) => {
-    if (e.data?.intellisage) {
-      const { method, args, id } = e.data.intellisage;
+    if (e.data?.roslyn) {
+      const { method, args, id } = e.data.roslyn;
       methods[method] = (payload) => {
         e.source.postMessage(
           {
-            intellisage: {
+            roslyn: {
               method,
               id,
               payload,
