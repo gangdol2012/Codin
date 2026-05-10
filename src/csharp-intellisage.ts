@@ -407,6 +407,12 @@ interface RoslynFoldingRangeDto {
   kind?: string;
 }
 
+interface RoslynHoverDto {
+  markdown?: string;
+  contents?: string | { value?: string } | Array<string | { value?: string }>;
+  range?: RoslynRangeDto;
+}
+
 type CSharpSemanticTokenType = typeof CSHARP_SEMANTIC_TOKEN_TYPES[number];
 type CSharpSemanticTokenModifier = typeof CSHARP_SEMANTIC_TOKEN_MODIFIERS[number];
 
@@ -1357,6 +1363,13 @@ class CSharpLanguageService {
     return !!this.intellisage && this.iframeUrl === CSHARP_INTELLISAGE_URLS.local;
   }
 
+  private async ensureIntelliSageRuntime() {
+    if (!this.intellisage || !this.iframeUrl) {
+      await this.initialize(getCSharpIntelliSageUrl(_csharpReadySource));
+    }
+    return !!this.intellisage;
+  }
+
   private registerProviders() {
     this.providerDisposables.push(
       monaco.languages.registerCompletionItemProvider('csharp', {
@@ -1374,7 +1387,10 @@ class CSharpLanguageService {
         provideSignatureHelp: (model, position) => this.debugProviderCall('signatureHelp', model, { position }, () => this.provideSignatureHelp(model, position)),
       }),
       monaco.languages.registerHoverProvider('csharp', {
-        provideHover: (model, position) => this.debugProviderCall('hover', model, { position }, () => this.provideHover(model, position)),
+        provideHover: (model, position, cancellationToken) => this.debugProviderCall('hover', model, {
+          position,
+          cancellationRequested: cancellationToken.isCancellationRequested,
+        }, () => this.provideHover(model, position, cancellationToken)),
       }),
       monaco.languages.registerDocumentSemanticTokensProvider('csharp', {
         getLegend: () => CSHARP_SEMANTIC_LEGEND,
@@ -1830,27 +1846,33 @@ class CSharpLanguageService {
 
   private async provideHover(
     model: monaco.editor.ITextModel,
-    position: monaco.Position
+    position: monaco.Position,
+    cancellationToken?: monaco.CancellationToken
   ): Promise<monaco.languages.Hover | undefined> {
-    const req = { Line: position.lineNumber - 1, Column: position.column - 1 };
-    if (this.intellisage) {
+    const initialModelVersion = model.getVersionId();
+    const runtimeReady = await this.ensureIntelliSageRuntime();
+    if (
+      runtimeReady &&
+      this.intellisage &&
+      !cancellationToken?.isCancellationRequested &&
+      !model.isDisposed() &&
+      model.getVersionId() === initialModelVersion
+    ) {
       try {
-        const response = await this.intellisage('GetQuickInfoAsync', model.getValue(), req);
-        if (response && (response as any).markdown) {
-          return { contents: [{ value: (response as any).markdown }] };
+        const response = await this.intellisage('GetQuickInfoAsync', model.getValue(), this.positionRequest(position));
+        if (cancellationToken?.isCancellationRequested || model.isDisposed() || model.getVersionId() !== initialModelVersion) {
+          return undefined;
         }
+        const hover = this.convertRoslynHover(response);
+        if (hover) return hover;
       } catch {
-        try {
-          const response = await this.intellisage('GetQuickInfoAsync', req);
-          if (response && (response as any).markdown) {
-            return { contents: [{ value: (response as any).markdown }] };
-          }
-        } catch {
-          // Continue with the in-browser C# language index.
-        }
+        // Continue with the in-browser C# language index.
       }
     }
 
+    if (cancellationToken?.isCancellationRequested || model.isDisposed() || model.getVersionId() !== initialModelVersion) {
+      return undefined;
+    }
     const symbol = this.getSemanticIndex(model).symbolAt(position);
     if (!symbol) return undefined;
     const declaration = this.findProjectDeclaration(model, symbol);
@@ -2423,6 +2445,39 @@ class CSharpLanguageService {
       tags: [],
       children: (symbol.children ?? []).flatMap(child => this.convertDocumentSymbol(child)),
     }];
+  }
+
+  private convertRoslynHover(response: unknown): monaco.languages.Hover | undefined {
+    if (!response || typeof response !== 'object') return undefined;
+    const hover = response as RoslynHoverDto;
+    const markdown = this.extractHoverMarkdown(hover);
+    if (!markdown) return undefined;
+
+    const range = this.toEditorRange(hover.range);
+    return {
+      ...(range ? { range } : {}),
+      contents: [{ value: markdown }],
+    };
+  }
+
+  private extractHoverMarkdown(hover: RoslynHoverDto): string {
+    if (typeof hover.markdown === 'string' && hover.markdown.trim()) {
+      return hover.markdown.trim();
+    }
+
+    const contents = hover.contents;
+    if (typeof contents === 'string') return contents.trim();
+    if (Array.isArray(contents)) {
+      return contents
+        .map(content => typeof content === 'string' ? content : content?.value)
+        .filter((value): value is string => typeof value === 'string' && !!value.trim())
+        .map(value => value.trim())
+        .join('\n\n');
+    }
+    if (contents && typeof contents.value === 'string') {
+      return contents.value.trim();
+    }
+    return '';
   }
 
   private convertInlayHints(response: unknown): monaco.languages.InlayHint[] {

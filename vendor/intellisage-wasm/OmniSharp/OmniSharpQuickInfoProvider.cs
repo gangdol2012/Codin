@@ -32,6 +32,7 @@ using System.Text;
 using System.Threading.Tasks;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.QuickInfo;
+using Microsoft.CodeAnalysis.Text;
 using Microsoft.Extensions.Logging;
 using OmniSharp.Extensions;
 using OmniSharp.Mef;
@@ -40,6 +41,10 @@ using OmniSharp.Options;
 using OmniSharp.Roslyn.CSharp.Helpers;
 
 #nullable enable
+
+public record QuickInfoPositionDto(int Line, int Character);
+public record QuickInfoRangeDto(QuickInfoPositionDto Start, QuickInfoPositionDto End);
+public record QuickInfoHoverResponse(string Markdown, QuickInfoRangeDto? Range);
 
 public class OmniSharpQuickInfoProvider
 {
@@ -66,21 +71,18 @@ public class OmniSharpQuickInfoProvider
         _logger = loggerFactory?.CreateLogger<OmniSharpQuickInfoProvider>();
     }
 
-    public async Task<QuickInfoResponse> Handle(QuickInfoRequest request, Document document)
+    public async Task<QuickInfoHoverResponse?> Handle(QuickInfoRequest request, Document document)
     {
-
-        var response = new QuickInfoResponse();
-
         if (document is null)
         {
-            return response;
+            return null;
         }
 
         var quickInfoService = QuickInfoService.GetService(document);
         if (quickInfoService is null)
         {
             _logger?.LogWarning($"QuickInfo service was null for {document.FilePath}");
-            return response;
+            return null;
         }
 
         var sourceText = await document.GetTextAsync();
@@ -90,7 +92,7 @@ public class OmniSharpQuickInfoProvider
         if (quickInfo is null)
         {
             _logger?.LogTrace($"No QuickInfo found for {document.FilePath}:{request.Line},{request.Column}");
-            return response;
+            return null;
         }
 
         var finalTextBuilder = new StringBuilder();
@@ -137,9 +139,9 @@ public class OmniSharpQuickInfoProvider
             }
         }
 
-        response.Markdown = finalTextBuilder.ToString().Trim();
-
-        return response;
+        return new QuickInfoHoverResponse(
+            finalTextBuilder.ToString().Trim(),
+            ToRange(sourceText, quickInfo.Span));
 
         void appendSection(QuickInfoSection section, MarkdownFormat format)
         {
@@ -150,5 +152,13 @@ public class OmniSharpQuickInfoProvider
             }
             MarkdownHelpers.TaggedTextToMarkdown(section.TaggedParts, finalTextBuilder, _formattingOptions, format, out lastSectionHadLineBreak);
         }
+    }
+
+    private static QuickInfoRangeDto ToRange(SourceText text, TextSpan span)
+    {
+        var lineSpan = text.Lines.GetLinePositionSpan(span);
+        return new QuickInfoRangeDto(
+            new QuickInfoPositionDto(lineSpan.Start.Line, lineSpan.Start.Character),
+            new QuickInfoPositionDto(lineSpan.End.Line, lineSpan.End.Character));
     }
 }
