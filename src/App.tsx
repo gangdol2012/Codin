@@ -49,13 +49,14 @@ import type {
   CSharpIdeDebugEvent,
   CSharpIdeDebugFeatureSnapshot,
   CSharpIdeDebugSnapshot,
-} from './csharp-roslyn';
+  CSharpIntelliSageSource,
+} from './csharp-intellisage';
 
 const APP_VERSION = __APP_VERSION__;
 
 type UserFolder = import('./pyright').UserFolder;
 type PyrightModule = typeof import('./pyright');
-type CSharpAuthoringModule = typeof import('./csharp-roslyn');
+type CSharpAuthoringModule = typeof import('./csharp-intellisage');
 type BrowserCSharpModule = typeof import('./browser-csharp-api');
 type CxxAuthoringModule = typeof import('./cpp-authoring');
 type CxxRuntimeModule = typeof import('./cpp-wasm');
@@ -78,7 +79,7 @@ const loadPyrightModule = () => {
 };
 
 const loadCSharpAuthoringModule = () => {
-  if (!csharpAuthoringModulePromise) csharpAuthoringModulePromise = import('./csharp-roslyn');
+  if (!csharpAuthoringModulePromise) csharpAuthoringModulePromise = import('./csharp-intellisage');
   return csharpAuthoringModulePromise;
 };
 
@@ -4775,6 +4776,7 @@ interface AppSettings {
   pythonRuntimeLifecycle: RuntimeLifecycle;
   pythonIOMode: RuntimeIOMode;
   csharpExecutionTimeoutMs: number;
+  csharpIntelliSageSource: CSharpIntelliSageSource;
   csharpIdeDebugMode: boolean;
   csharpExecutionMode: CSharpExecutionMode;
   csharpResetScriptContextBeforeRun: boolean;
@@ -4854,6 +4856,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   pythonRuntimeLifecycle: 'dispose-after-run',
   pythonIOMode: 'alert-output',
   csharpExecutionTimeoutMs: 0,
+  csharpIntelliSageSource: 'local',
   csharpIdeDebugMode: false,
   csharpExecutionMode: 'regular',
   csharpResetScriptContextBeforeRun: false,
@@ -5910,6 +5913,10 @@ function normalizeRuntimeLifecycle(value: unknown): RuntimeLifecycle {
   return value === 'keep-warm' ? 'keep-warm' : 'dispose-after-run';
 }
 
+function normalizeCSharpIntelliSageSource(value: unknown): CSharpIntelliSageSource {
+  return value === 'server' ? 'server' : 'local';
+}
+
 function formatCSharpDebugDuration(value: number | null | undefined) {
   if (typeof value !== 'number') return 'n/a';
   return `${value.toFixed(value >= 100 ? 0 : 1)}ms`;
@@ -6289,8 +6296,6 @@ export default function App() {
     delete cleanedMerged.assistantCursorAutoCreatePr;
     delete cleanedMerged.projectRunMode;
     delete cleanedMerged.projectRunCustomFileIds;
-    delete cleanedMerged.csharpIntelliSageSource;
-    delete cleanedMerged.csharpRoslynSource;
     const assistantProvider = isAssistantProvider(merged.assistantProvider)
       ? merged.assistantProvider
       : DEFAULT_SETTINGS.assistantProvider;
@@ -6303,6 +6308,7 @@ export default function App() {
       pythonExecutionTimeoutMs: normalizeExecutionTimeoutMs(merged.pythonExecutionTimeoutMs),
       pythonRuntimeLifecycle: normalizeRuntimeLifecycle(merged.pythonRuntimeLifecycle),
       csharpExecutionTimeoutMs: normalizeExecutionTimeoutMs(merged.csharpExecutionTimeoutMs),
+      csharpIntelliSageSource: normalizeCSharpIntelliSageSource(merged.csharpIntelliSageSource),
       csharpIdeDebugMode: !!merged.csharpIdeDebugMode,
       cxxExecutionTimeoutMs: normalizeExecutionTimeoutMs(merged.cxxExecutionTimeoutMs),
       cxxRuntimeLifecycle: normalizeRuntimeLifecycle(merged.cxxRuntimeLifecycle),
@@ -6425,7 +6431,7 @@ export default function App() {
   const assistantRequestRateNextSlotAtRef = useRef(0);
   const [activeSyncIds, setActiveSyncIds] = useState<Set<string>>(new Set());
   const persistedPipIncludesRestoredRef = useRef(false);
-  const persistedCSharpNamespacesRestoredRef = useRef(false);
+  const persistedCSharpNamespacesRestoredRef = useRef<CSharpIntelliSageSource | null>(null);
   const persistedPythonPackageStubsRestoredRef = useRef(false);
 
   const activeProject = projects.find(project => project.id === activeProjectId)
@@ -6738,9 +6744,10 @@ export default function App() {
 
   const ensureCSharpAuthoringReady = useCallback(async () => {
     const csharpAuthoring = await getCSharpAuthoringModule();
-    await csharpAuthoring.ensureCSharpReady();
-    if (persistedCSharpNamespacesRestoredRef.current) return csharpAuthoring;
-    persistedCSharpNamespacesRestoredRef.current = true;
+    const intelliSageSource = settings.csharpIntelliSageSource;
+    await csharpAuthoring.ensureCSharpReady(intelliSageSource);
+    if (persistedCSharpNamespacesRestoredRef.current === intelliSageSource) return csharpAuthoring;
+    persistedCSharpNamespacesRestoredRef.current = intelliSageSource;
 
     for (const namespaceName of loadSavedCSharpNamespaces()) {
       try {
@@ -6750,7 +6757,7 @@ export default function App() {
       }
     }
     return csharpAuthoring;
-  }, [getCSharpAuthoringModule]);
+  }, [getCSharpAuthoringModule, settings.csharpIntelliSageSource]);
 
   useEffect(() => {
     let disposed = false;
@@ -16043,7 +16050,7 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
                 <div className="rounded-lg border border-white/10 bg-white/5 px-2 py-1.5">
                   <div className="flex items-center gap-1 text-zinc-500"><Activity size={10} /> Runtime</div>
                   <div className="mt-1 text-zinc-200">
-                    {snapshot.runtime.hasRoslynBridge ? 'Bridge ready' : snapshot.runtime.initializationPending ? 'Initializing' : 'Bridge missing'}
+                    {snapshot.runtime.hasIntelliSageBridge ? 'Bridge ready' : snapshot.runtime.initializationPending ? 'Initializing' : 'Bridge missing'}
                   </div>
                 </div>
                 <div className="rounded-lg border border-white/10 bg-white/5 px-2 py-1.5">
@@ -17780,11 +17787,31 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
                         <div className="text-xs text-zinc-500 mt-1">Timeout is best-effort for the WebAssembly runtime. Set timeout to `0` to disable it.</div>
                       </div>
 
+                      <label className="block space-y-2">
+                        <div className="text-xs font-medium uppercase tracking-wide text-zinc-500">IntelliSage Source</div>
+                        <select
+                          value={settings.csharpIntelliSageSource}
+                          onChange={(e) => setSettings(s => ({
+                            ...s,
+                            csharpIntelliSageSource: normalizeCSharpIntelliSageSource(e.target.value),
+                          }))}
+                          className="w-full rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-sm text-white outline-none transition-colors focus:border-indigo-500"
+                        >
+                          <option value="local">Local IntelliSage</option>
+                          <option value="server">IntelliSage Server</option>
+                        </select>
+                        <div className="text-xs text-zinc-500">
+                          {settings.csharpIntelliSageSource === 'local'
+                            ? 'Uses the IntelliSage runtime bundled with CodeCraft.'
+                            : 'Loads the hosted IntelliSage runtime from intellisage.vercel.app.'}
+                        </div>
+                      </label>
+
                       <div className="flex items-center justify-between gap-4 rounded-xl border border-white/10 bg-black/20 px-4 py-3">
                         <div>
                           <div className="text-sm font-medium text-white">C# IDE Debug Mode</div>
                           <div className="text-xs text-zinc-500">
-                            Records provider calls, Roslyn requests, project snapshots, caches, timing, and failures.
+                            Records provider calls, IntelliSage requests, project snapshots, caches, timing, and failures.
                           </div>
                         </div>
                         <button

@@ -173,7 +173,7 @@ public class RoslynProject
 
 
         var projectInfo = ProjectInfo
-            .Create(ProjectId.CreateNewId(), VersionStamp.Create(), "CodeCraft C# Roslyn", "CodeCraft C# Roslyn", LanguageNames.CSharp)
+            .Create(ProjectId.CreateNewId(), VersionStamp.Create(), "IntelliSage", "IntelliSage", LanguageNames.CSharp)
             .WithMetadataReferences(MetadataReferences)
             .WithCompilationOptions(CompilationOptions)
             .WithParseOptions(ParseOptions);
