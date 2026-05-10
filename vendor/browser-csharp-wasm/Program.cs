@@ -636,7 +636,17 @@ internal static class __CodeCraftEntry
 			public override void Write(string value)
 			{
 				if (String.IsNullOrEmpty(value)) return;
-				jsRuntime.InvokeVoidAsync("CodeCraftCSharp.writeOutput", stream, value);
+				if (jsRuntime is IJSInProcessRuntime syncRuntime)
+				{
+					syncRuntime.InvokeVoid("CodeCraftCSharp.writeOutput", stream, value);
+					return;
+				}
+
+				jsRuntime
+					.InvokeVoidAsync("CodeCraftCSharp.writeOutput", stream, value)
+					.AsTask()
+					.GetAwaiter()
+					.GetResult();
 			}
 
 			public override void WriteLine(string value)

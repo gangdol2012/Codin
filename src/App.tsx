@@ -9501,6 +9501,11 @@ self.onmessage = async (event) => {
     const workerUrl = URL.createObjectURL(new Blob([workerSource], { type: 'text/javascript' }));
     const worker = new Worker(workerUrl);
     let streamOutput = '';
+    const appendJavaScriptOutputLine = (message: string) => {
+      const separator = streamOutput && !streamOutput.endsWith('\n') ? '\n' : '';
+      streamOutput = `${streamOutput}${separator}${message}`;
+      setOutput(streamOutput);
+    };
     const applyJavaScriptStreamChunk = (chunk: string) => {
       const normalizedChunk = chunk.replace(/\r\n/g, '\n');
       let nextOutput = streamOutput;
@@ -9575,11 +9580,11 @@ self.onmessage = async (event) => {
             return;
           }
           if (message.type === 'log' && typeof message.message === 'string') {
-            setOutput(prev => prev + (prev ? '\n' : '') + message.message);
+            appendJavaScriptOutputLine(message.message);
             return;
           }
           if (message.type === 'result' && typeof message.message === 'string') {
-            setOutput(prev => prev + (prev ? '\n' : '') + message.message);
+            appendJavaScriptOutputLine(message.message);
             return;
           }
           if (message.type === 'error' && typeof message.message === 'string') {
@@ -10933,6 +10938,7 @@ json.dumps(sorted(_imports))
 
     const worker = getCSharpInteractiveWorker();
     let settled = false;
+    let streamedOutput = '';
 
     const finish = (callback: () => void) => {
       if (settled) return;
@@ -10952,6 +10958,7 @@ json.dumps(sorted(_imports))
     worker.onmessage = (event) => {
       const message = event.data || {};
       if ((message.type === 'stdout' || message.type === 'stderr') && typeof message.text === 'string') {
+        streamedOutput += message.text;
         setOutput(prev => prev + message.text);
         return;
       }
@@ -10982,7 +10989,15 @@ json.dumps(sorted(_imports))
         return;
       }
       if (message.type === 'done') {
-        finish(() => resolve(message.result));
+        finish(() => {
+          const resultPayload = message.result && typeof message.result === 'object'
+            ? { ...message.result }
+            : { result: message.result };
+          resolve({
+            ...resultPayload,
+            __codecraftStreamOutput: streamedOutput,
+          });
+        });
         return;
       }
       if (message.type === 'error') {
@@ -10996,6 +11011,36 @@ json.dumps(sorted(_imports))
 
     worker.postMessage({ type: 'run', ...payload });
   });
+
+  const installCSharpMainThreadIOBridge = () => {
+    let streamedOutput = '';
+    const globalScope = window as any;
+    const previousBridge = globalScope.CodeCraftCSharp;
+    const bridgeBase = previousBridge && typeof previousBridge === 'object' ? previousBridge : {};
+
+    globalScope.CodeCraftCSharp = {
+      ...bridgeBase,
+      writeOutput(stream: unknown, text: unknown) {
+        void stream;
+        const chunk = String(text ?? '');
+        if (!chunk) return;
+        streamedOutput += chunk;
+        setOutput(prev => prev + chunk);
+      },
+      requestInput(prompt: unknown) {
+        const message = String(prompt ?? '').trim();
+        const value = window.prompt(message || 'C# stdin:', '');
+        if (value === null) {
+          throw new Error('C# input cancelled.');
+        }
+        return value;
+      },
+    };
+
+    return {
+      getStreamedOutput: () => streamedOutput,
+    };
+  };
 
   const installPyodideExecutionTimeoutGuard = (pyodide: any, timeoutMs: number) => {
     const normalizedTimeout = normalizeExecutionTimeoutMs(timeoutMs);
@@ -11499,6 +11544,7 @@ finally:
       setExecutionStartupStatus(`Compiling and executing C# (WebAssembly, ${modeLabel})...`);
 
       const useInteractiveWorker = settings.csharpIOMode === 'interactive-output-panel';
+      const mainThreadIOBridge = useInteractiveWorker ? null : installCSharpMainThreadIOBridge();
       const csharpModule = useInteractiveWorker ? null : await getBrowserCSharpModule();
       if (!useInteractiveWorker) {
         await ensureCSharpRuntime();
@@ -11531,12 +11577,12 @@ finally:
               await BrowserCSharp.clearScriptContext(contextId);
             } catch { }
           }
-          return BrowserCSharp.executeScriptInContext(code, contextId);
+          return BrowserCSharp.executeScriptInContextInteractive(code, contextId);
         }
         if (settings.csharpExecutionMode === 'script') {
-          return BrowserCSharp.ExecuteScript(code);
+          return BrowserCSharp.executeScriptInteractive(code);
         }
-        return BrowserCSharp.executeRegular(code);
+        return BrowserCSharp.executeRegularInteractive(code);
       };
 
       setExecutionStartupStatus('');
@@ -11563,6 +11609,9 @@ finally:
       const stdOut = (result.stdOut || '').trim();
       const stdErr = (result.stdErr || '').trim();
       const returnValue = result.result;
+      const streamedOutput = typeof result.__codecraftStreamOutput === 'string'
+        ? result.__codecraftStreamOutput
+        : mainThreadIOBridge?.getStreamedOutput() ?? '';
 
       const chunks: string[] = [];
       if (stdErr) chunks.push(stdErr);
@@ -11571,7 +11620,13 @@ finally:
         chunks.push(`Return value: ${String(returnValue)}`);
       }
 
-      setOutput(chunks.join('\n') || 'C# executed successfully with no output.');
+      if (streamedOutput.length > 0) {
+        if (chunks.length > 0) {
+          setOutput(prev => [prev.trimEnd(), chunks.join('\n')].filter(Boolean).join('\n'));
+        }
+      } else {
+        setOutput(chunks.join('\n') || 'C# executed successfully with no output.');
+      }
     } catch (err) {
       setExecutionStartupStatus('');
       setOutput(`C# Error: ${err instanceof Error ? err.message : String(err)}`);
@@ -11591,6 +11646,7 @@ finally:
       setExecutionStartupStatus(`Compiling C# project (${projectFiles.length} file${projectFiles.length === 1 ? '' : 's'})...`);
 
       const useInteractiveWorker = settings.csharpIOMode === 'interactive-output-panel';
+      const mainThreadIOBridge = useInteractiveWorker ? null : installCSharpMainThreadIOBridge();
       const csharpModule = useInteractiveWorker ? null : await getBrowserCSharpModule();
       if (!useInteractiveWorker) {
         await ensureCSharpRuntime();
@@ -11611,7 +11667,7 @@ finally:
             contents: projectFiles.map(file => file.content),
             entryPath: entryFile.path,
           })
-          : BrowserCSharp!.executeRegularProject(
+          : BrowserCSharp!.executeRegularProjectInteractive(
             projectFiles.map(file => file.path),
             projectFiles.map(file => file.content),
             entryFile.path
@@ -11629,6 +11685,9 @@ finally:
       const stdOut = (result.stdOut || '').trim();
       const stdErr = (result.stdErr || '').trim();
       const returnValue = result.result;
+      const streamedOutput = typeof result.__codecraftStreamOutput === 'string'
+        ? result.__codecraftStreamOutput
+        : mainThreadIOBridge?.getStreamedOutput() ?? '';
 
       const chunks: string[] = [];
       if (stdErr) chunks.push(stdErr);
@@ -11638,7 +11697,13 @@ finally:
       }
 
       setExecutionStartupStatus('');
-      setOutput(chunks.join('\n') || 'C# project executed successfully with no output.');
+      if (streamedOutput.length > 0) {
+        if (chunks.length > 0) {
+          setOutput(prev => [prev.trimEnd(), chunks.join('\n')].filter(Boolean).join('\n'));
+        }
+      } else {
+        setOutput(chunks.join('\n') || 'C# project executed successfully with no output.');
+      }
     } catch (err) {
       setExecutionStartupStatus('');
       setOutput(`C# Error: ${err instanceof Error ? err.message : String(err)}`);
@@ -14551,7 +14616,7 @@ json.dumps({
                 setTerminalOutput(prev => [...prev, `[Tier 3] Native extensions detected. Loading in-browser C compiler (Clang via Wasmer ~100MB)...`]);
                 try {
                   if (!crossOriginIsolated) {
-                    throw new Error('SharedArrayBuffer not available. Restart the dev server for Cross-Origin-Isolation headers to take effect, then hard-refresh (Ctrl+Shift+R).');
+                    throw new Error('SharedArrayBuffer not available. Ensure Cross-Origin-Isolation headers are active on the deployed site, then hard-refresh.');
                   }
                   const compiledFiles: { baseName: string; wasmBytes: Uint8Array }[] = [];
                   {
@@ -16389,7 +16454,7 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
                 title="output-preview"
                 srcDoc={outputPreviewHtml}
                 className="w-full h-full border-none bg-white rounded-md"
-                sandbox="allow-scripts"
+                sandbox="allow-scripts allow-forms allow-modals allow-popups allow-downloads"
               />
             ) : (
               <div className="min-h-full flex flex-col justify-end gap-2">

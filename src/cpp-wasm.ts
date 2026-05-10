@@ -140,7 +140,7 @@ async function loadWasmerSdk() {
   if (!wasmerSdkPromise) {
     wasmerSdkPromise = (async () => {
       if (!crossOriginIsolated) {
-        throw new Error('SharedArrayBuffer is not available. Restart the dev server so the Cross-Origin-Opener-Policy and Cross-Origin-Embedder-Policy headers are active, then hard-refresh.');
+        throw new Error('SharedArrayBuffer is not available. Ensure the deployed site is serving Cross-Origin-Opener-Policy and Cross-Origin-Embedder-Policy headers, then hard-refresh.');
       }
       const sdk = await import('@wasmer/sdk') as any;
       await sdk.init({});
