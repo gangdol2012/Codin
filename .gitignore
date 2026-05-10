@@ -3,3 +3,5 @@ dist
 .idea
 public/*
 !public/coi-serviceworker.js
+!public/ecj.jar
+!public/favicon.ico
