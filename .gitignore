@@ -1,4 +1,5 @@
 node_modules
 dist
 .idea
-public
+public/*
+!public/coi-serviceworker.js
