@@ -593,10 +593,10 @@ function currentModelPath(model: monaco.editor.ITextModel) {
   return normalizeProjectPath(uriPath.replace(/^\//, '') || model.uri.toString());
 }
 
-// CodeCraft C# completion hardening start
-const CSHARP_COMPLETION_HARDENING_VERSION = '2026-05-12';
+// CodeCraft C# contextual completion fix start
+const CSHARP_CONTEXTUAL_COMPLETION_FIX_VERSION = '2026-05-12-contextual-v2';
 
-const CSHARP_LSP_TO_MONACO_COMPLETION_KIND = new Map<number, monaco.languages.CompletionItemKind>([
+const CSHARP_LSP_COMPLETION_KIND_TO_MONACO = new Map<number, monaco.languages.CompletionItemKind>([
   [1, monaco.languages.CompletionItemKind.Text],
   [2, monaco.languages.CompletionItemKind.Method],
   [3, monaco.languages.CompletionItemKind.Function],
@@ -624,7 +624,7 @@ const CSHARP_LSP_TO_MONACO_COMPLETION_KIND = new Map<number, monaco.languages.Co
   [25, monaco.languages.CompletionItemKind.TypeParameter],
 ]);
 
-const CSHARP_COMPLETION_KIND_BY_NAME = new Map<string, monaco.languages.CompletionItemKind>([
+const CSHARP_COMPLETION_KIND_NAME_TO_MONACO = new Map<string, monaco.languages.CompletionItemKind>([
   ['text', monaco.languages.CompletionItemKind.Text],
   ['method', monaco.languages.CompletionItemKind.Method],
   ['function', monaco.languages.CompletionItemKind.Function],
@@ -646,181 +646,135 @@ const CSHARP_COMPLETION_KIND_BY_NAME = new Map<string, monaco.languages.Completi
   ['reference', monaco.languages.CompletionItemKind.Reference],
   ['folder', monaco.languages.CompletionItemKind.Folder],
   ['enummember', monaco.languages.CompletionItemKind.EnumMember],
-  ['enumMember', monaco.languages.CompletionItemKind.EnumMember],
   ['constant', monaco.languages.CompletionItemKind.Constant],
   ['struct', monaco.languages.CompletionItemKind.Struct],
   ['event', monaco.languages.CompletionItemKind.Event],
   ['operator', monaco.languages.CompletionItemKind.Operator],
   ['typeparameter', monaco.languages.CompletionItemKind.TypeParameter],
-  ['typeparameter', monaco.languages.CompletionItemKind.TypeParameter],
 ]);
 
-function csharpOptionalString(value: unknown): string | undefined {
+const csharpCompletionInflightByService = new WeakMap<object, Map<string, Promise<CSharpCompletionCacheEntry | null>>>();
+
+function csharpCompletionInflightFor(service: object) {
+  let inflight = csharpCompletionInflightByService.get(service);
+  if (!inflight) {
+    inflight = new Map<string, Promise<CSharpCompletionCacheEntry | null>>();
+    csharpCompletionInflightByService.set(service, inflight);
+  }
+  return inflight;
+}
+
+function csharpCompletionOptionalString(value: unknown): string | undefined {
   if (value == null) return undefined;
   if (typeof value === 'string') return value;
   if (typeof value === 'number' || typeof value === 'boolean') return String(value);
   if (typeof value === 'object') {
     const record = value as Record<string, unknown>;
-    const nested = record.label ?? record.Label ?? record.name ?? record.Name ?? record.value ?? record.Value;
-    return csharpOptionalString(nested);
+    return csharpCompletionOptionalString(record.label ?? record.Label ?? record.name ?? record.Name ?? record.value ?? record.Value);
   }
   return undefined;
 }
 
-function csharpRequiredCompletionLabel(item: any): string {
-  return csharpOptionalString(item?.label ?? item?.Label ?? item?.insertText ?? item?.InsertText ?? item?.textEdit?.newText ?? item?.TextEdit?.NewText) ?? '';
+function csharpCompletionLabel(item: any): string {
+  return csharpCompletionOptionalString(
+    item?.label ?? item?.Label ?? item?.insertText ?? item?.InsertText ?? item?.textEdit?.newText ?? item?.TextEdit?.NewText
+  ) ?? '';
 }
 
-function csharpStringArray(value: unknown): string[] | undefined {
-  if (!Array.isArray(value)) return undefined;
-  const normalized = value
-    .map(entry => csharpOptionalString(entry))
-    .filter((entry): entry is string => !!entry);
-  return normalized.length > 0 ? normalized : undefined;
+function csharpCompletionItemsFromResponse(response: any): any[] {
+  const items = Array.isArray(response)
+    ? response
+    : response?.items ?? response?.Items ?? response?.completions ?? response?.Completions ?? response?.suggestions ?? response?.Suggestions ?? [];
+  return Array.isArray(items) ? items : [];
 }
 
-function csharpNormalizeDocumentation(value: unknown): string | monaco.IMarkdownString | undefined {
-  if (value == null) return undefined;
-  if (typeof value === 'string') return value ? { value } : undefined;
-  if (Array.isArray(value)) {
-    const joined = value
-      .map(entry => typeof entry === 'string' ? entry : csharpOptionalString((entry as any)?.value ?? (entry as any)?.Value))
-      .filter(Boolean)
-      .join('\n\n');
-    return joined ? { value: joined } : undefined;
-  }
-  if (typeof value === 'object') {
-    const record = value as Record<string, unknown>;
-    const markdown = csharpOptionalString(record.value ?? record.Value ?? record.markdown ?? record.Markdown ?? record.contents ?? record.Contents);
-    if (markdown) return { value: markdown };
-  }
-  return undefined;
+function csharpCompletionResponseIsIncomplete(response: any): boolean {
+  return !!(response?.isIncomplete ?? response?.IsIncomplete ?? response?.incomplete ?? response?.Incomplete);
 }
 
-function csharpNormalizeCompletionKind(kind: unknown): monaco.languages.CompletionItemKind {
-  if (typeof kind === 'number' && Number.isFinite(kind)) {
-    const lspKind = CSHARP_LSP_TO_MONACO_COMPLETION_KIND.get(kind);
-    if (lspKind !== undefined) return lspKind;
+function csharpResolvedCompletionItem(response: any, fallback: any): any {
+  return response?.item ?? response?.Item ?? response?.completionItem ?? response?.CompletionItem ?? response ?? fallback;
+}
 
-    const monacoValues = Object.values(monaco.languages.CompletionItemKind)
-      .filter((value): value is number => typeof value === 'number');
-    if (monacoValues.includes(kind)) return kind as monaco.languages.CompletionItemKind;
+function csharpProtocolCompletionTriggerKind(context: monaco.languages.CompletionContext): 1 | 2 | 3 {
+  return context.triggerKind === monaco.languages.CompletionTriggerKind.TriggerCharacter
+    ? 2
+    : context.triggerKind === monaco.languages.CompletionTriggerKind.TriggerForIncompleteCompletions
+      ? 3
+      : 1;
+}
+
+function csharpProtocolCompletionTriggerCharacter(
+  context: monaco.languages.CompletionContext,
+  triggerKind: 1 | 2 | 3
+): string | undefined {
+  if (triggerKind !== 2) return undefined;
+  return typeof context.triggerCharacter === 'string' && context.triggerCharacter.length > 0
+    ? context.triggerCharacter
+    : CSHARP_COMPLETION_TRIGGER_FALLBACK;
+}
+
+function csharpCompletionNormalizeKind(kind: unknown): monaco.languages.CompletionItemKind {
+  const numericKind = typeof kind === 'number' ? kind : Number.NaN;
+  if (Number.isFinite(numericKind)) {
+    if (numericKind === 0) return monaco.languages.CompletionItemKind.Text;
+    const mapped = CSHARP_LSP_COMPLETION_KIND_TO_MONACO.get(numericKind);
+    if (mapped !== undefined) return mapped;
   }
 
-  const byName = csharpOptionalString(kind)?.replace(/[\s_-]/g, '').toLowerCase();
-  if (byName) {
-    const namedKind = CSHARP_COMPLETION_KIND_BY_NAME.get(byName);
-    if (namedKind !== undefined) return namedKind;
+  const normalizedName = csharpCompletionOptionalString(kind)?.replace(/[\s_-]/g, '').toLowerCase();
+  if (normalizedName) {
+    const mapped = CSHARP_COMPLETION_KIND_NAME_TO_MONACO.get(normalizedName);
+    if (mapped !== undefined) return mapped;
   }
 
   return monaco.languages.CompletionItemKind.Property;
 }
 
-function csharpPositionComponent(value: unknown, fallback = 0): number {
-  return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
+function csharpCompletionTextEdit(item: any): any {
+  return item?.textEdit ?? item?.TextEdit;
 }
 
-function csharpRangeFromProtocol(value: any): monaco.IRange | undefined {
-  if (!value || typeof value !== 'object') return undefined;
+function csharpCompletionInsertText(item: any, label: string): string {
+  const textEdit = csharpCompletionTextEdit(item);
+  return csharpCompletionOptionalString(textEdit?.newText ?? textEdit?.NewText ?? item?.insertText ?? item?.InsertText ?? item?.text ?? item?.Text) ?? label;
+}
 
-  const rawRange = value.range ?? value.Range ?? value.insert ?? value.Insert ?? value.replace ?? value.Replace ?? value;
-  const start = rawRange.start ?? rawRange.Start;
-  const end = rawRange.end ?? rawRange.End;
+function csharpCompletionInsertTextRules(item: any): monaco.languages.CompletionItemInsertTextRule | undefined {
+  const rawFormat = item?.insertTextFormat ?? item?.InsertTextFormat;
+  const normalized = typeof rawFormat === 'string' ? rawFormat.toLowerCase() : rawFormat;
+  return normalized === 2 || normalized === 'snippet'
+    ? monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet
+    : undefined;
+}
 
-  let startLineNumber: number | undefined;
-  let startColumn: number | undefined;
-  let endLineNumber: number | undefined;
-  let endColumn: number | undefined;
-
-  if (start && end) {
-    startLineNumber = csharpPositionComponent(start.line ?? start.Line) + 1;
-    startColumn = csharpPositionComponent(start.character ?? start.Character) + 1;
-    endLineNumber = csharpPositionComponent(end.line ?? end.Line) + 1;
-    endColumn = csharpPositionComponent(end.character ?? end.Character) + 1;
-  } else if (
-    typeof rawRange.startLineNumber === 'number' &&
-    typeof rawRange.startColumn === 'number' &&
-    typeof rawRange.endLineNumber === 'number' &&
-    typeof rawRange.endColumn === 'number'
-  ) {
-    startLineNumber = rawRange.startLineNumber;
-    startColumn = rawRange.startColumn;
-    endLineNumber = rawRange.endLineNumber;
-    endColumn = rawRange.endColumn;
-  } else if (
-    typeof rawRange.startLine === 'number' &&
-    typeof rawRange.startColumn === 'number' &&
-    typeof rawRange.endLine === 'number' &&
-    typeof rawRange.endColumn === 'number'
-  ) {
-    startLineNumber = rawRange.startLine + 1;
-    startColumn = rawRange.startColumn + 1;
-    endLineNumber = rawRange.endLine + 1;
-    endColumn = rawRange.endColumn + 1;
+function csharpCompletionDocumentation(value: unknown): string | monaco.IMarkdownString | undefined {
+  if (value == null) return undefined;
+  if (typeof value === 'string') return value ? { value } : undefined;
+  if (Array.isArray(value)) {
+    const joined = value
+      .map(entry => typeof entry === 'string' ? entry : csharpCompletionOptionalString((entry as any)?.value ?? (entry as any)?.Value))
+      .filter((entry): entry is string => !!entry)
+      .join('\n\n');
+    return joined ? { value: joined } : undefined;
   }
-
-  if (
-    startLineNumber === undefined ||
-    startColumn === undefined ||
-    endLineNumber === undefined ||
-    endColumn === undefined
-  ) {
-    return undefined;
+  if (typeof value === 'object') {
+    const record = value as Record<string, unknown>;
+    const text = csharpCompletionOptionalString(record.value ?? record.Value ?? record.markdown ?? record.Markdown ?? record.contents ?? record.Contents);
+    return text ? { value: text } : undefined;
   }
-
-  const range = {
-    startLineNumber,
-    startColumn,
-    endLineNumber,
-    endColumn,
-  };
-
-  return csharpIsValidMonacoRange(range) ? range : undefined;
+  return undefined;
 }
 
-function csharpIsValidMonacoRange(range: any): range is monaco.IRange {
-  if (!range) return false;
-  if (
-    !Number.isFinite(range.startLineNumber) ||
-    !Number.isFinite(range.startColumn) ||
-    !Number.isFinite(range.endLineNumber) ||
-    !Number.isFinite(range.endColumn)
-  ) {
-    return false;
-  }
-  if (range.startLineNumber < 1 || range.startColumn < 1 || range.endLineNumber < 1 || range.endColumn < 1) return false;
-  if (range.endLineNumber < range.startLineNumber) return false;
-  if (range.endLineNumber === range.startLineNumber && range.endColumn < range.startColumn) return false;
-  return true;
-}
-
-function csharpCompletionItemInsertRange(range: monaco.languages.CompletionItem['range']): monaco.IRange | undefined {
-  if (!range) return undefined;
-  const candidate = (range as monaco.languages.CompletionItemRanges).insert
-    ?? (range as monaco.languages.CompletionItemRanges).replace
-    ?? range;
-  return csharpIsValidMonacoRange(candidate) ? candidate : undefined;
-}
-
-function csharpNormalizeTextEdit(value: any, fallbackRange: monaco.IRange): { range: monaco.IRange; text: string } | undefined {
-  if (!value || typeof value !== 'object') return undefined;
-  const range = csharpRangeFromProtocol(value) ?? fallbackRange;
-  const text = csharpOptionalString(value.newText ?? value.NewText ?? value.text ?? value.Text);
-  return typeof text === 'string' ? { range, text } : undefined;
-}
-
-function csharpNormalizeAdditionalTextEdits(value: unknown): monaco.editor.ISingleEditOperation[] | undefined {
+function csharpCompletionStringArray(value: unknown): string[] | undefined {
   if (!Array.isArray(value)) return undefined;
-  const edits = value.flatMap((entry): monaco.editor.ISingleEditOperation[] => {
-    const range = csharpRangeFromProtocol(entry);
-    const text = csharpOptionalString((entry as any)?.newText ?? (entry as any)?.NewText ?? (entry as any)?.text ?? (entry as any)?.Text);
-    if (!range || typeof text !== 'string') return [];
-    return [{ range, text }];
-  });
-  return edits.length > 0 ? edits : undefined;
+  const strings = value
+    .map(entry => csharpCompletionOptionalString(entry))
+    .filter((entry): entry is string => !!entry);
+  return strings.length > 0 ? strings : undefined;
 }
 
-function csharpNormalizeCompletionTags(value: unknown): monaco.languages.CompletionItemTag[] | undefined {
+function csharpCompletionTags(value: unknown): monaco.languages.CompletionItemTag[] | undefined {
   if (!Array.isArray(value)) return undefined;
   const tags = value
     .map(entry => typeof entry === 'number' ? entry : Number(entry))
@@ -828,104 +782,39 @@ function csharpNormalizeCompletionTags(value: unknown): monaco.languages.Complet
   return tags.length > 0 ? tags : undefined;
 }
 
-function csharpExtractCompletionItems(response: any): any[] {
-  const items = Array.isArray(response)
-    ? response
-    : response?.items ?? response?.Items ?? response?.completions ?? response?.Completions ?? response?.suggestions ?? response?.Suggestions ?? [];
-  return Array.isArray(items) ? items : [];
+function csharpCompletionAdditionalTextEdits(
+  value: unknown,
+  toEditorRange: (edit: any) => monaco.IRange | undefined
+): monaco.editor.ISingleEditOperation[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const edits: monaco.editor.ISingleEditOperation[] = [];
+  for (const edit of value) {
+    const range = toEditorRange(edit);
+    const text = csharpCompletionOptionalString((edit as any)?.newText ?? (edit as any)?.NewText ?? (edit as any)?.text ?? (edit as any)?.Text);
+    if (!range || typeof text !== 'string') continue;
+    edits.push({ range, text });
+  }
+  return edits.length > 0 ? edits : undefined;
 }
 
-function csharpExtractResolvedCompletionItem(response: any, fallback: any): any {
-  return response?.item ?? response?.Item ?? response?.completionItem ?? response?.CompletionItem ?? response ?? fallback;
+function csharpCompletionIsValidRange(range: any): range is monaco.IRange {
+  if (!range) return false;
+  return Number.isFinite(range.startLineNumber)
+    && Number.isFinite(range.startColumn)
+    && Number.isFinite(range.endLineNumber)
+    && Number.isFinite(range.endColumn)
+    && range.startLineNumber >= 1
+    && range.startColumn >= 1
+    && range.endLineNumber >= range.startLineNumber
+    && (range.endLineNumber !== range.startLineNumber || range.endColumn >= range.startColumn);
 }
 
-function csharpCompletionResponseIncomplete(response: any): boolean {
-  return !!(response?.isIncomplete ?? response?.IsIncomplete ?? response?.incomplete ?? response?.Incomplete);
+function csharpCompletionItemIsUsable(item: monaco.languages.CompletionItem | null): item is monaco.languages.CompletionItem {
+  if (!item) return false;
+  const label = csharpCompletionOptionalString(item.label);
+  return !!label && typeof item.insertText === 'string' && csharpCompletionIsValidRange(item.range);
 }
-
-function csharpToLspCompletionTriggerKind(kind: unknown): 1 | 2 | 3 {
-  return kind === monaco.languages.CompletionTriggerKind.TriggerCharacter
-    ? 2
-    : kind === monaco.languages.CompletionTriggerKind.TriggerForIncompleteCompletions
-      ? 3
-      : 1;
-}
-
-function csharpCompletionTriggerCharacter(context: monaco.languages.CompletionContext, lspTriggerKind: 1 | 2 | 3): string | undefined {
-  const triggerCharacter = typeof context?.triggerCharacter === 'string' ? context.triggerCharacter : undefined;
-  if (triggerCharacter) return triggerCharacter;
-  return lspTriggerKind === 2 ? CSHARP_COMPLETION_TRIGGER_FALLBACK : undefined;
-}
-
-function csharpCompletionCacheKey(
-  modelPath: string,
-  code: string,
-  offset: number,
-  triggerKind: number,
-  triggerCharacter: string | undefined,
-  environmentVersion: number,
-  workerStateKey: string | null
-) {
-  return [
-    modelPath,
-    environmentVersion,
-    workerStateKey ?? '',
-    code.length,
-    hashString(code),
-    offset,
-    triggerKind,
-    triggerCharacter ?? '',
-  ].join('|');
-}
-
-function csharpSingleInsertionLengthAtCompletionOffset(
-  model: monaco.editor.ITextModel,
-  snapshot: CSharpCompletionRequestSnapshot
-): number | null {
-  const currentCode = model.getValue();
-  if (currentCode === snapshot.code) return 0;
-
-  const before = snapshot.code.slice(0, snapshot.offset);
-  const after = snapshot.code.slice(snapshot.offset);
-  if (!currentCode.startsWith(before) || !currentCode.endsWith(after)) return null;
-
-  const insertedLength = currentCode.length - snapshot.code.length;
-  if (insertedLength < 0) return null;
-
-  const insertedText = currentCode.slice(snapshot.offset, snapshot.offset + insertedLength);
-  return /[\r\n]/.test(insertedText) ? null : insertedLength;
-}
-
-function csharpLiveCompletionContext(
-  model: monaco.editor.ITextModel,
-  snapshot: CSharpCompletionRequestSnapshot,
-  fallbackRange: monaco.Range
-): { fallbackRange: monaco.Range; lateContext: CSharpLateCompletionContext | null } {
-  if (model.isDisposed()) return { fallbackRange, lateContext: null };
-
-  const insertedLength = csharpSingleInsertionLengthAtCompletionOffset(model, snapshot);
-  if (insertedLength == null) return { fallbackRange, lateContext: null };
-
-  const position = model.getPositionAt(snapshot.offset + insertedLength);
-  const word = model.getWordUntilPosition(position);
-  const liveRange = new monaco.Range(
-    position.lineNumber,
-    Math.min(word.startColumn, position.column),
-    position.lineNumber,
-    Math.max(word.endColumn, position.column)
-  );
-
-  return {
-    fallbackRange: liveRange,
-    lateContext: insertedLength > 0 ? { insertedLength, fallbackRange: liveRange } : null,
-  };
-}
-
-function csharpIsUsableCompletionItem(item: monaco.languages.CompletionItem): boolean {
-  const label = typeof item.label === 'string' ? item.label : csharpOptionalString(item.label);
-  return !!label && typeof item.insertText === 'string' && csharpIsValidMonacoRange(csharpCompletionItemInsertRange(item.range));
-}
-// CodeCraft C# completion hardening end
+// CodeCraft C# contextual completion fix end
 
 class CSharpLanguageService {
   private omnisharp: OmniSharpCall | null = null;
@@ -1839,7 +1728,7 @@ class CSharpLanguageService {
   private registerProviders() {
     this.providerDisposables.push(
       monaco.languages.registerCompletionItemProvider('csharp', {
-        triggerCharacters: ['.', '#', ':', '<', '['],
+        triggerCharacters: ['.', '(', ',', '<', '[', ' ', '#', ':'],
         resolveCompletionItem: item => this.debugProviderCall('completion.resolve', null, { label: item.label }, () => this.debouncedResolve(item)),
         provideCompletionItems: (model, position, context) => this.debugProviderCall('completion', model, {
           position,
@@ -2225,182 +2114,81 @@ class CSharpLanguageService {
     position: monaco.Position,
     context: monaco.languages.CompletionContext
   ): Promise<monaco.languages.CompletionList> {
-    if (!this.omnisharp || model.isDisposed()) {
-      return { suggestions: [] };
+    const snapshot = this.createCompletionSnapshot(model, position);
+    const cacheKey = this.completionCacheKey(model, position, context);
+    const cached = this.completionCache.get(cacheKey);
+    if (cached && this.completionWorkerStateKey === cacheKey) return this.toCompletionList(cached);
+
+    const runtimeReady = await this.ensureLocalOmniSharpRuntime();
+    if (!runtimeReady || !this.omnisharp || model.isDisposed()) {
+      return this.emptyCompletionList();
     }
 
-    const callId = 'completion-' + (++this.completionRequestSerial);
-    const startedAt = this.now();
-    const code = model.getValue();
-    const offset = model.getOffsetAt(position);
-    const word = model.getWordUntilPosition(position);
-    const fallbackRange = new monaco.Range(
-      position.lineNumber,
-      word.startColumn,
-      position.lineNumber,
-      Math.max(word.endColumn, position.column)
-    );
-    const lspTriggerKind = csharpToLspCompletionTriggerKind(context?.triggerKind);
-    const triggerCharacter = csharpCompletionTriggerCharacter(context, lspTriggerKind);
-    const request = {
+    const triggerKind = csharpProtocolCompletionTriggerKind(context);
+    const triggerCharacter = csharpProtocolCompletionTriggerCharacter(context, triggerKind);
+    const request: any = {
       Line: Math.max(0, position.lineNumber - 1),
       Column: Math.max(0, position.column - 1),
-      CompletionTrigger: lspTriggerKind,
-      TriggerCharacter: triggerCharacter,
+      CompletionTrigger: triggerKind,
     };
-    const snapshot: CSharpCompletionRequestSnapshot = {
-      code,
-      modelVersionId: model.getVersionId(),
-      offset,
-      structuralVersion: this.completionStructuralVersion,
-    };
-    const cacheKey = csharpCompletionCacheKey(
-      currentModelPath(model),
-      code,
-      offset,
-      lspTriggerKind,
-      triggerCharacter,
-      this.completionEnvironmentVersion,
-      this.completionWorkerStateKey
-    );
+    if (triggerCharacter) request.TriggerCharacter = triggerCharacter;
 
-    this.recordDebugEvent({
-      feature: 'completion',
-      phase: 'provider-start',
-      callId,
-      model: this.summarizeModel(model),
-      request: {
-        ...request,
-        offset,
-        cacheKey,
-        hardeningVersion: CSHARP_COMPLETION_HARDENING_VERSION,
-      },
-    });
+    const inflight = csharpCompletionInflightFor(this);
+    let entryPromise = inflight.get(cacheKey);
 
-    const cached = this.completionCache.get(cacheKey);
-    if (cached && cached.completionSnapshot?.modelVersionId === snapshot.modelVersionId) {
-      this.lastCompletions.clear();
-      this.lastCompletionContexts.clear();
-      for (let index = 0; index < cached.suggestions.length; index += 1) {
-        const suggestion = cached.suggestions[index];
-        const lspItem = cached.lspItems[index];
-        if (!suggestion || !lspItem) continue;
-        this.lastCompletions.set(suggestion, lspItem);
-        if (cached.completionSnapshot && cached.lateContext) {
-          this.lastCompletionContexts.set(suggestion, {
-            snapshot: cached.completionSnapshot,
-            lateContext: cached.lateContext,
-          });
+    if (!entryPromise) {
+      const requestSerial = ++this.completionRequestSerial;
+      snapshot.structuralVersion = this.completionStructuralVersion;
+
+      entryPromise = (async (): Promise<CSharpCompletionCacheEntry | null> => {
+        const response = await this.omnisharp!('GetCompletionAsync', snapshot.code, request);
+        if (!response) return null;
+
+        const isCurrentRequest = (
+          requestSerial === this.completionRequestSerial &&
+          !model.isDisposed() &&
+          model.getVersionId() === snapshot.modelVersionId
+        );
+        const lateContext = isCurrentRequest ? null : this.getLateCompletionContext(model, snapshot);
+        if (!isCurrentRequest && !lateContext) {
+          return null;
         }
-      }
-      this.recordDebugEvent({
-        feature: 'completion',
-        phase: 'provider-end',
-        level: 'success',
-        callId,
-        durationMs: Math.round((this.now() - startedAt) * 10) / 10,
-        response: {
-          cacheHit: true,
-          itemCount: cached.suggestions.length,
-          incomplete: !!cached.incomplete,
-        },
+
+        const rawItems = csharpCompletionItemsFromResponse(response);
+        const fallbackRange = lateContext?.fallbackRange ?? this.getCompletionFilterRangeAtPosition(model, position);
+        const suggestions: monaco.languages.CompletionItem[] = [];
+        const lspItems: any[] = [];
+
+        for (const rawItem of rawItems) {
+          const suggestion = this.convertCompletion(model, rawItem, fallbackRange, snapshot, lateContext);
+          if (!csharpCompletionItemIsUsable(suggestion)) continue;
+          suggestions.push(suggestion);
+          lspItems.push(rawItem);
+        }
+
+        return {
+          suggestions,
+          lspItems,
+          incomplete: csharpCompletionResponseIsIncomplete(response),
+          completionSnapshot: lateContext ? snapshot : undefined,
+          lateContext,
+        };
+      })().finally(() => {
+        inflight.delete(cacheKey);
       });
-      return { suggestions: cached.suggestions, incomplete: !!cached.incomplete };
+
+      inflight.set(cacheKey, entryPromise);
     }
 
     try {
-      const response = await this.omnisharp('GetCompletionAsync', code, request);
-      if (!response || model.isDisposed()) {
-        this.recordDebugEvent({
-          feature: 'completion',
-          phase: 'provider-end',
-          level: 'warning',
-          callId,
-          durationMs: Math.round((this.now() - startedAt) * 10) / 10,
-          message: 'C# completion provider returned no usable response.',
-          response: summarizePrimitive(response),
-        });
-        return { suggestions: [] };
-      }
+      const entry = await entryPromise;
+      if (!entry || model.isDisposed()) return this.emptyCompletionList();
 
-      const rawItems = csharpExtractCompletionItems(response)
-        .filter((item: any) => csharpRequiredCompletionLabel(item));
-      if (rawItems.length === 0) {
-        const incomplete = csharpCompletionResponseIncomplete(response);
-        this.recordDebugEvent({
-          feature: 'completion',
-          phase: 'provider-end',
-          level: incomplete ? 'warning' : 'success',
-          callId,
-          durationMs: Math.round((this.now() - startedAt) * 10) / 10,
-          response: { itemCount: 0, incomplete, cacheHit: false },
-        });
-        return { suggestions: [], incomplete };
-      }
-
-      const liveContext = csharpLiveCompletionContext(model, snapshot, fallbackRange);
-      const suggestions: monaco.languages.CompletionItem[] = [];
-      const lspItems: any[] = [];
-
-      this.lastCompletions.clear();
-      this.lastCompletionContexts.clear();
-
-      for (const rawItem of rawItems) {
-        const completion = this.convertCompletion(rawItem, liveContext.fallbackRange);
-        if (!csharpIsUsableCompletionItem(completion)) continue;
-        suggestions.push(completion);
-        lspItems.push(rawItem);
-        this.lastCompletions.set(completion, rawItem);
-        if (liveContext.lateContext) {
-          this.lastCompletionContexts.set(completion, {
-            snapshot,
-            lateContext: liveContext.lateContext,
-          });
-        }
-      }
-
-      const incomplete = csharpCompletionResponseIncomplete(response);
-      this.completionCache.set(cacheKey, {
-        suggestions,
-        lspItems,
-        incomplete,
-        completionSnapshot: snapshot,
-        lateContext: liveContext.lateContext,
-      });
-
-      while (this.completionCache.size > CSHARP_COMPLETION_CACHE_LIMIT) {
-        const oldestKey = this.completionCache.keys().next().value;
-        if (oldestKey === undefined) break;
-        this.completionCache.delete(oldestKey);
-      }
-
-      this.recordDebugEvent({
-        feature: 'completion',
-        phase: 'provider-end',
-        level: 'success',
-        callId,
-        durationMs: Math.round((this.now() - startedAt) * 10) / 10,
-        response: {
-          cacheHit: false,
-          rawItemCount: rawItems.length,
-          itemCount: suggestions.length,
-          incomplete,
-          lateInsertedLength: liveContext.lateContext?.insertedLength ?? 0,
-        },
-      });
-
-      return { suggestions, incomplete };
-    } catch (error) {
-      this.recordDebugEvent({
-        feature: 'completion',
-        phase: 'provider-error',
-        level: 'error',
-        callId,
-        durationMs: Math.round((this.now() - startedAt) * 10) / 10,
-        message: 'C# completion provider failed.',
-        error: summarizePrimitive(error),
-      });
-      return { suggestions: [] };
+      this.cacheCompletionResult(cacheKey, entry);
+      this.completionWorkerStateKey = cacheKey;
+      return this.toCompletionList(entry);
+    } catch {
+      return this.emptyCompletionList();
     }
   }
 
@@ -2408,73 +2196,24 @@ class CSharpLanguageService {
     item: monaco.languages.CompletionItem
   ): Promise<monaco.languages.CompletionItem> {
     const lspItem = this.lastCompletions.get(item);
+    const completionContext = this.lastCompletionContexts.get(item);
     if (!lspItem || !this.omnisharp) return item;
-
-    const callId = 'completion.resolve-' + Math.random().toString(36).slice(2);
-    const startedAt = this.now();
-    this.recordDebugEvent({
-      feature: 'completion.resolve',
-      phase: 'provider-start',
-      callId,
-      request: {
-        label: csharpOptionalString(item.label),
-        hasCachedLspItem: true,
-      },
-    });
-
     try {
       const response = await this.omnisharp('GetCompletionResolveAsync', { Item: lspItem });
-      if (!response) {
-        this.recordDebugEvent({
-          feature: 'completion.resolve',
-          phase: 'provider-end',
-          level: 'warning',
-          callId,
-          durationMs: Math.round((this.now() - startedAt) * 10) / 10,
-          message: 'C# completion resolve returned no response.',
-        });
-        return item;
-      }
-
-      const resolved = csharpExtractResolvedCompletionItem(response, lspItem);
-      const fallbackRange = csharpCompletionItemInsertRange(item.range) ?? new monaco.Range(1, 1, 1, 1);
-      const converted = this.convertCompletion(resolved, fallbackRange);
-      const result = {
-        ...item,
-        ...converted,
-        range: item.range,
-        sortText: item.sortText ?? converted.sortText,
-        filterText: converted.filterText ?? item.filterText,
-        preselect: item.preselect ?? converted.preselect,
-        insertText: converted.insertText || item.insertText,
-        documentation: converted.documentation ?? item.documentation,
-        additionalTextEdits: converted.additionalTextEdits ?? item.additionalTextEdits,
-      };
-
-      this.recordDebugEvent({
-        feature: 'completion.resolve',
-        phase: 'provider-end',
-        level: 'success',
-        callId,
-        durationMs: Math.round((this.now() - startedAt) * 10) / 10,
-        response: {
-          label: csharpOptionalString(result.label),
-          hasDocumentation: !!result.documentation,
-          additionalTextEditCount: result.additionalTextEdits?.length ?? 0,
-        },
-      });
-
-      return result;
-    } catch (error) {
-      this.recordDebugEvent({
-        feature: 'completion.resolve',
-        phase: 'provider-error',
-        level: 'error',
-        callId,
-        durationMs: Math.round((this.now() - startedAt) * 10) / 10,
-        message: 'C# completion resolve failed.',
-        error: summarizePrimitive(error),
-      });
+      if (!response) return item;
+      const resolved = csharpResolvedCompletionItem(response, lspItem);
+      if (!resolved) return item;
+      const fallbackRange = this.toEditorRange((item.range as monaco.languages.CompletionItemRanges | undefined)?.insert ?? item.range);
+      return fallbackRange && this.model && !this.model.isDisposed()
+        ? this.convertCompletion(
+          this.model,
+          resolved,
+          fallbackRange,
+          completionContext?.snapshot,
+          completionContext?.lateContext
+        ) ?? item
+        : item;
+    } catch {
       return item;
     }
   }
@@ -3067,29 +2806,35 @@ class CSharpLanguageService {
     snapshot?: CSharpCompletionRequestSnapshot,
     lateContext?: CSharpLateCompletionContext | null
   ): monaco.languages.CompletionItem | null {
-    const label = csharpRequiredCompletionLabel(item);
-    const textEdit = csharpNormalizeTextEdit(item?.textEdit ?? item?.TextEdit, fallbackRange);
-    const insertText = textEdit?.text
-      ?? csharpOptionalString(item?.insertText ?? item?.InsertText ?? item?.text ?? item?.Text)
-      ?? label;
-    const range = textEdit?.range ?? fallbackRange;
-    const insertTextFormat = Number(item?.insertTextFormat ?? item?.InsertTextFormat ?? 1);
+    const label = csharpCompletionLabel(item);
+    if (!label) return null;
+
+    const textEdit = csharpCompletionTextEdit(item);
+    const insertText = csharpCompletionInsertText(item, label);
+    const itemRange = this.toEditorRange(textEdit);
+    const range = itemRange && snapshot && lateContext
+      ? this.mapMainCompletionRangeToCurrent(model, itemRange, snapshot, lateContext)
+      : itemRange ?? fallbackRange;
+
+    if (!csharpCompletionIsValidRange(range)) return null;
+
     const completion: monaco.languages.CompletionItem = {
       label,
-      kind: csharpNormalizeCompletionKind(item?.kind ?? item?.Kind),
-      detail: csharpOptionalString(item?.detail ?? item?.Detail),
-      documentation: csharpNormalizeDocumentation(item?.documentation ?? item?.Documentation),
-      commitCharacters: csharpStringArray(item?.commitCharacters ?? item?.CommitCharacters),
+      kind: csharpCompletionNormalizeKind(item?.kind ?? item?.Kind),
+      detail: csharpCompletionOptionalString(item?.detail ?? item?.Detail),
+      documentation: csharpCompletionDocumentation(item?.documentation ?? item?.Documentation),
+      commitCharacters: csharpCompletionStringArray(item?.commitCharacters ?? item?.CommitCharacters),
       preselect: !!(item?.preselect ?? item?.Preselect),
-      filterText: csharpOptionalString(item?.filterText ?? item?.FilterText),
+      filterText: csharpCompletionOptionalString(item?.filterText ?? item?.FilterText),
       insertText,
-      insertTextRules: insertTextFormat === 2
-        ? monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet
-        : undefined,
+      insertTextRules: csharpCompletionInsertTextRules(item),
       range,
-      tags: csharpNormalizeCompletionTags(item?.tags ?? item?.Tags),
-      sortText: csharpOptionalString(item?.sortText ?? item?.SortText) ?? label,
-      additionalTextEdits: csharpNormalizeAdditionalTextEdits(item?.additionalTextEdits ?? item?.AdditionalTextEdits),
+      tags: csharpCompletionTags(item?.tags ?? item?.Tags),
+      sortText: csharpCompletionOptionalString(item?.sortText ?? item?.SortText) ?? label,
+      additionalTextEdits: csharpCompletionAdditionalTextEdits(
+        item?.additionalTextEdits ?? item?.AdditionalTextEdits,
+        edit => this.toEditorRange(edit)
+      ),
     };
 
     const data = item?.data ?? item?.Data;
