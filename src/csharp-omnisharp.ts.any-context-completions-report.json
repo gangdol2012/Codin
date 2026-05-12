@@ -2,7 +2,7 @@
   "target": "src/csharp-omnisharp.ts",
   "dryRun": false,
   "changed": true,
-  "timestamp": "2026-05-12T14:39:11.842Z",
+  "timestamp": "2026-05-12T14:38:57.371Z",
   "touchedScopes": [
     "completion helper block",
     "completion trigger characters",
@@ -12,10 +12,14 @@
   ],
   "guarantees": {
     "roslynAuthoritative": true,
-    "noLocalFallbackSuggestions": true,
+    "localFallbackSuggestions": false,
+    "primaryRequestMode": "CompletionTrigger.Invoke for full grammar-context list",
+    "retryMode": "TriggerCharacter only when Invoke returns no items",
     "monacoIconKindMapping": "LSP CompletionItemKind -> Monaco CompletionItemKind",
+    "insertReplaceRangesPreserved": true,
     "runtimeWarmupPath": "ensureLocalOmniSharpRuntime()",
     "requestCoalescing": true,
-    "existingCompletionCacheKept": true
+    "completionCacheKept": true,
+    "nonCompletionCodeTouched": false
   }
 }
