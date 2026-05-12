@@ -2,7 +2,7 @@
   "target": "src/csharp-omnisharp.ts",
   "dryRun": false,
   "changed": true,
-  "timestamp": "2026-05-12T14:39:11.842Z",
+  "timestamp": "2026-05-12T13:00:23.199Z",
   "touchedScopes": [
     "completion helper block",
     "completion trigger characters",
