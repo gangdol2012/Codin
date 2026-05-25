@@ -1,6 +1,8 @@
 node_modules
 dist
 .idea
+tools/**/bin/
+tools/**/obj/
 public/*
 !public/coi-serviceworker.js
 !public/ecj.jar

@@ -1,7 +1,7 @@
 {
   "mainAssemblyName": "OmniSharpWasm",
   "resources": {
-    "hash": "sha256-ZOSgrDOqrFE7l0pTmrDeUb3pfg03r+a/eERL7SyKoaI=",
+    "hash": "sha256-xO2JLP5gixD5j+2OS9spDS7tuJetKu5qrweuOAd/A4o=",
     "jsModuleNative": {
       "dotnet.native.8.0.24.utvdj08j35.js": "sha256-4g0GzvOXSwZvTLca4PrWJkoeltz+V9IF/hEFDcnVros="
     },
@@ -35,7 +35,7 @@
       "Microsoft.CodeAnalysis.Elfie.dll": "sha256-jsDhisVwFXs4Y/cANbZEkl2JmWrZAfMe+RjSsPdCiUE=",
       "Microsoft.CodeAnalysis.Features.dll": "sha256-SBUiE71DK2L6LS0uw4ka1rxisQl/4xGZI/YmmBKqxdg=",
       "Microsoft.CodeAnalysis.Scripting.dll": "sha256-6DAPA5Wxi58FsH9kjuaFmrriWZdw0D6z33NopcqxtxQ=",
-      "Microsoft.CodeAnalysis.Workspaces.dll": "sha256-hMDohF9E0L8PnFk79cy0SALJWhAR5aZxwqj2/ArcDjs=",
+      "Microsoft.CodeAnalysis.Workspaces.dll": "sha256-Wz10pGLtJpigxwK5eC8ShrCbGqk9/6fndjbsA0F7wU0=",
       "Microsoft.CSharp.dll": "sha256-mUrkjr9w7tVB4KnD2Kl+zw/+kRIXhUKl3WPj5IXargc=",
       "Microsoft.DiaSymReader.dll": "sha256-fz51QzIf9MJnW5TlakoyyTXBHIL8xg1PbLYRywqNqtw=",
       "Microsoft.Extensions.Caching.Abstractions.dll": "sha256-SchZjU/Rxpo3WIvJHdizlvnxKoIKgFyAjGVc6e3/Rlk=",
@@ -62,7 +62,7 @@
       "OmniSharp.Roslyn.CSharp.dll": "sha256-T1CsWZ98Id5aRCiuga0lxjdsO+QRp347/rhBNhg3teU=",
       "OmniSharp.Roslyn.dll": "sha256-6pFVMqi++4rnewM8LlhpPng0UnOnKn31v3bJP6wSv7Q=",
       "OmniSharp.Shared.dll": "sha256-ZhvudqE9rTl7TfXYeFCkvxmpYsegPn2SlMpfAIA68fc=",
-      "OmniSharpWasm.dll": "sha256-L9lhUW+IJKdWJDDuL0TrXkjKAYWO/uF0mjZspXzu2ic=",
+      "OmniSharpWasm.dll": "sha256-Smf2vkNjtcaPgLwMlUxLK6tXchY3QVFttYW6KYmYijg=",
       "Serialize.Linq.dll": "sha256-+AZxaCS9+h8qGP5HE6g/GSOp0lRHdd8w2jXDjBNw6rM=",
       "System.Collections.Concurrent.dll": "sha256-AjVLgmkk/YLCdpu3UkEldU0Mq3aQ6HaxhCzP/HcenPc=",
       "System.Collections.dll": "sha256-+3HyuCOQBpDK6bNTkyxr+3NAaR1xItwpGwQqMyB1BzA=",

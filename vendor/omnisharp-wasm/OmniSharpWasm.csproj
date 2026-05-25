@@ -35,4 +35,15 @@
     <None Remove="publish/**" />
   </ItemGroup>
 
+  <Target Name="PatchRoslynPersistentStorageForBrowser" AfterTargets="Publish">
+    <PropertyGroup>
+      <RoslynWorkspacesAssembly>$(PublishDir)wwwroot/_framework/Microsoft.CodeAnalysis.Workspaces.dll</RoslynWorkspacesAssembly>
+      <RoslynBrowserStoragePatcher>$(MSBuildProjectDirectory)/../../tools/RoslynBrowserStoragePatcher/RoslynBrowserStoragePatcher.csproj</RoslynBrowserStoragePatcher>
+    </PropertyGroup>
+
+    <Exec
+      Condition="Exists('$(RoslynWorkspacesAssembly)')"
+      Command="dotnet run --project &quot;$(RoslynBrowserStoragePatcher)&quot; -- &quot;$(RoslynWorkspacesAssembly)&quot;" />
+  </Target>
+
 </Project>
