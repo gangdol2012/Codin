@@ -622,9 +622,9 @@ function currentModelPath(model: monaco.editor.ITextModel) {
 }
 
 // CodeCraft C# OmniSharp-only completion start
-const CSHARP_CONTEXTUAL_COMPLETION_FIX_VERSION = '2026-05-25-omnisharp-only-v4';
+const CSHARP_CONTEXTUAL_COMPLETION_FIX_VERSION = '2026-06-01-bracket-trigger-guard';
 
-const CSHARP_CONTEXTUAL_COMPLETION_TRIGGER_CHARACTERS = ['(', ',', '<', '[', ' ', '#', ':', '=', '{', '}', '?', '@'];
+const CSHARP_CONTEXTUAL_COMPLETION_TRIGGER_CHARACTERS = [',', ' ', '#', ':', '=', '?', '@'];
 
 const CSHARP_LSP_COMPLETION_KIND_TO_MONACO = new Map<number, monaco.languages.CompletionItemKind>([
   [1, monaco.languages.CompletionItemKind.Text],
