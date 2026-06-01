@@ -7106,6 +7106,9 @@ export default function App() {
   const getPath = (id: string | undefined): string => {
     return getFsItemPath(files, id);
   };
+  const activePath = activeItem ? getPath(activeItem.id) : '';
+  const activePathSegments = activePath.split('/').filter(Boolean);
+  const activePathLabel = activePath || 'No selection';
 
   const searchResults = useMemo<WorkspaceSearchResult[]>(() => {
     const rawQuery = searchQuery.trim();
@@ -17251,8 +17254,8 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
     <div className="flex flex-col h-screen w-full bg-[rgb(28,28,28)] text-zinc-300 overflow-hidden font-sans">
       {/* Global Top Header */}
       <Tooltip.Provider delayDuration={400}>
-        <header className="h-12 border-b border-white/10 bg-[rgb(28,28,28)] flex items-center justify-between px-3 shrink-0 w-full z-10">
-          <div className="flex items-center gap-1 overflow-hidden">
+        <header className="h-12 border-b border-white/10 bg-[rgb(28,28,28)] flex items-center justify-between gap-3 px-3 shrink-0 w-full z-10">
+          <div className="flex min-w-0 flex-1 items-center gap-1 overflow-hidden">
             {/* Logo */}
             <div className="flex items-center gap-2 font-semibold text-white shrink-0 pr-2">
               <div className="w-6 h-6 bg-indigo-600 rounded-md flex items-center justify-center">
@@ -17264,10 +17267,49 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
             <Separator.Root orientation="vertical" className="h-5 w-px bg-zinc-800 mx-1 shrink-0" />
 
             {/* Breadcrumbs */}
-            <nav className="flex items-center gap-1.5 text-sm text-zinc-500 overflow-hidden">
-              <button onClick={() => setActiveFileId('')} className="hover:text-zinc-200 transition-colors shrink-0 text-xs">src</button>
-              <ChevronRight size={12} className="shrink-0 text-zinc-700" />
-              <span className="text-zinc-300 truncate text-xs">{activeItem ? getPath(activeItem.id) : 'No selection'}</span>
+            <nav
+              aria-label="Current path"
+              title={activePathLabel}
+              className="flex min-w-0 flex-1 items-center gap-1 overflow-hidden text-xs text-zinc-500"
+            >
+              <button
+                type="button"
+                onClick={() => setActiveFileId('')}
+                className="max-w-28 shrink-0 truncate rounded px-1 py-0.5 text-zinc-500 transition-colors hover:bg-white/5 hover:text-zinc-200"
+              >
+                Workspace
+              </button>
+              {activePathSegments.length > 0 ? (
+                activePathSegments.map((segment, index) => {
+                  const isLast = index === activePathSegments.length - 1;
+                  const segmentPath = activePathSegments.slice(0, index + 1).join('/');
+                  return (
+                    <React.Fragment key={segmentPath}>
+                      <ChevronRight
+                        size={12}
+                        className={cn("shrink-0 text-zinc-700", !isLast && "hidden md:block")}
+                      />
+                      <span
+                        className={cn(
+                          "min-w-0 truncate rounded px-1 py-0.5",
+                          isLast
+                            ? "flex-1 text-zinc-200"
+                            : "hidden max-w-24 shrink-0 text-zinc-500 md:inline"
+                        )}
+                      >
+                        {segment}
+                      </span>
+                    </React.Fragment>
+                  );
+                })
+              ) : (
+                <>
+                  <ChevronRight size={12} className="shrink-0 text-zinc-700" />
+                  <span className="min-w-0 flex-1 truncate px-1 py-0.5 text-zinc-600">
+                    No selection
+                  </span>
+                </>
+              )}
             </nav>
           </div>
 
@@ -17310,11 +17352,11 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
                   <button
                     type="button"
                     onClick={() => setIsProjectMenuOpen(open => !open)}
-                    className="inline-flex items-center gap-1.5 h-8 max-w-[180px] px-2.5 rounded-md text-xs text-zinc-300 hover:text-zinc-100 hover:bg-zinc-800 border border-zinc-800 transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-zinc-600"
+                    className="inline-flex h-8 w-8 items-center justify-center gap-1.5 rounded-md border border-zinc-800 px-0 text-xs text-zinc-300 transition-colors hover:bg-zinc-800 hover:text-zinc-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-zinc-600 md:w-auto md:max-w-[180px] md:justify-start md:px-2.5"
                   >
                     <Folder size={14} className="shrink-0 text-amber-400" />
-                    <span className="truncate">{activeProject.name}</span>
-                    <ChevronDown size={12} className="shrink-0 text-zinc-500" />
+                    <span className="hidden truncate md:inline">{activeProject.name}</span>
+                    <ChevronDown size={12} className="hidden shrink-0 text-zinc-500 md:block" />
                   </button>
                 </Tooltip.Trigger>
                 <Tooltip.Portal>
@@ -17461,28 +17503,28 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
               onClick={handleRun}
               disabled={!canRunCurrentFile}
               className={cn(
-                "inline-flex items-center gap-1.5 h-8 px-3 rounded-md text-xs font-medium transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-emerald-600",
+                "inline-flex h-8 w-8 items-center justify-center gap-1.5 rounded-md px-0 text-xs font-medium transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-emerald-600 md:w-auto md:px-3",
                 !canRunCurrentFile
                   ? "border border-zinc-800 text-zinc-600 cursor-not-allowed"
                   : "bg-emerald-700 hover:bg-emerald-600 text-white border border-emerald-600"
               )}
             >
               {isRunning ? <Cpu className="animate-spin" size={13} /> : <Play size={13} />}
-              Run
+              <span className="hidden md:inline">Run</span>
             </button>
 
             <button
               onClick={handleProjectRun}
               disabled={!canRunProject}
               className={cn(
-                "inline-flex items-center gap-1.5 h-8 px-3 rounded-md text-xs font-medium transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-indigo-600",
+                "inline-flex h-8 w-8 items-center justify-center gap-1.5 rounded-md px-0 text-xs font-medium transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-indigo-600 md:w-auto md:px-3",
                 !canRunProject
                   ? "border border-zinc-800 text-zinc-600 cursor-not-allowed"
                   : "bg-indigo-700 hover:bg-indigo-600 text-white border border-indigo-600"
               )}
             >
               {isRunning ? <Cpu className="animate-spin" size={13} /> : <Folder size={13} />}
-              Project Run
+              <span className="hidden md:inline">Project Run</span>
             </button>
 
             <Separator.Root orientation="vertical" className="h-5 w-px bg-zinc-800 mx-2 shrink-0" />
