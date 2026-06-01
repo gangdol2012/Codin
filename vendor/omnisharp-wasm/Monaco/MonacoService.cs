@@ -21,6 +21,8 @@ public class MonacoService
     OmniSharpCompletionService _completionService = null!;
     OmniSharpSignatureHelpService _signatureService = null!;
     OmniSharpQuickInfoProvider _quickInfoProvider = null!;
+    readonly SemaphoreSlim _completionGate = new(1, 1);
+    readonly SemaphoreSlim _diagnosticGate = new(1, 1);
 
     readonly JsonSerializerOptions jsonOptions = new JsonSerializerOptions
     {
@@ -129,38 +131,50 @@ $@"using System;
 
     public async Task<byte[]> GetCompletionAsync(string code, string completionRequestString)
     {
-        var completionRequest = DeserializeRequest<CompletionRequest>(completionRequestString);
-        var document = await UpdateDocumentAsync(_completionProject, code);
-        var completionResponse = await _completionService.Handle(completionRequest, document);
+        return await RunCompletionAsync(async () =>
+        {
+            var completionRequest = DeserializeRequest<CompletionRequest>(completionRequestString);
+            var document = await UpdateDocumentAsync(_completionProject, code);
+            var completionResponse = await _completionService.Handle(completionRequest, document);
 
-        return Payload(completionResponse, "GetCompletionAsync");
+            return Payload(completionResponse, "GetCompletionAsync");
+        });
     }
 
     public async Task<byte[]> GetCompletionResolveAsync(string completionResolveRequestString)
     {
-        var completionResolveRequest = DeserializeRequest<CompletionResolveRequest>(completionResolveRequestString);
-        var document = _completionProject.Workspace.CurrentSolution.GetDocument(_completionProject.DocumentId)!;
-        var completionResponse = await _completionService.Handle(completionResolveRequest, document);
+        return await RunCompletionAsync(async () =>
+        {
+            var completionResolveRequest = DeserializeRequest<CompletionResolveRequest>(completionResolveRequestString);
+            var document = _completionProject.Workspace.CurrentSolution.GetDocument(_completionProject.DocumentId)!;
+            var completionResponse = await _completionService.Handle(completionResolveRequest, document);
 
-        return Payload(completionResponse, "GetCompletionResolveAsync");
+            return Payload(completionResponse, "GetCompletionResolveAsync");
+        });
     }
 
     public async Task<byte[]> GetSignatureHelpAsync(string code, string signatureHelpRequestString)
     {
-        var signatureHelpRequest = DeserializeRequest<SignatureHelpRequest>(signatureHelpRequestString);
-        var document = await UpdateDocumentAsync(_completionProject, code);
-        var signatureHelpResponse = await _signatureService.Handle(signatureHelpRequest, document);
+        return await RunCompletionAsync(async () =>
+        {
+            var signatureHelpRequest = DeserializeRequest<SignatureHelpRequest>(signatureHelpRequestString);
+            var document = await UpdateDocumentAsync(_completionProject, code);
+            var signatureHelpResponse = await _signatureService.Handle(signatureHelpRequest, document);
 
-        return Payload(signatureHelpResponse, "GetSignatureHelpAsync");
+            return Payload(signatureHelpResponse, "GetSignatureHelpAsync");
+        });
     }
 
     public async Task<byte[]> GetQuickInfoAsync(string quickInfoRequestString)
     {
-        var document = _diagnosticProject.Workspace.CurrentSolution.GetDocument(_diagnosticProject.DocumentId)!;
-        var quickInfoRequest = DeserializeRequest<QuickInfoRequest>(quickInfoRequestString);
-        var quickInfoResponse = await _quickInfoProvider.Handle(quickInfoRequest, document);
+        return await RunDiagnosticAsync(async () =>
+        {
+            var document = _diagnosticProject.Workspace.CurrentSolution.GetDocument(_diagnosticProject.DocumentId)!;
+            var quickInfoRequest = DeserializeRequest<QuickInfoRequest>(quickInfoRequestString);
+            var quickInfoResponse = await _quickInfoProvider.Handle(quickInfoRequest, document);
 
-        return Payload(quickInfoResponse, "GetQuickInfoAsync");
+            return Payload(quickInfoResponse, "GetQuickInfoAsync");
+        });
     }
 
     public async Task<byte[]> GetQuickInfoAsync(string code, string quickInfoRequestString)
@@ -170,11 +184,14 @@ $@"using System;
 
     public async Task<byte[]> GetQuickInfoAsync(string code, string quickInfoRequestString, string diagnosticRequestString)
     {
-        var document = await UpdateDiagnosticDocumentAsync(code, diagnosticRequestString);
-        var quickInfoRequest = DeserializeRequest<QuickInfoRequest>(quickInfoRequestString);
-        var quickInfoResponse = await _quickInfoProvider.Handle(quickInfoRequest, document);
+        return await RunDiagnosticAsync(async () =>
+        {
+            var document = await UpdateDiagnosticDocumentAsync(code, diagnosticRequestString);
+            var quickInfoRequest = DeserializeRequest<QuickInfoRequest>(quickInfoRequestString);
+            var quickInfoResponse = await _quickInfoProvider.Handle(quickInfoRequest, document);
 
-        return Payload(quickInfoResponse, "GetQuickInfoAsync");
+            return Payload(quickInfoResponse, "GetQuickInfoAsync");
+        });
     }
 
     public async Task<byte[]> GetDiagnosticsAsync(string code)
@@ -184,28 +201,34 @@ $@"using System;
 
     public async Task<byte[]> GetDiagnosticsAsync(string code, string diagnosticRequestString)
     {
-        var document = await UpdateDiagnosticDocumentAsync(code, diagnosticRequestString);
-        var semanticModel = await document.GetSemanticModelAsync();
-        if (semanticModel == null)
+        return await RunDiagnosticAsync(async () =>
         {
-            return Payload(Array.Empty<DiagnosticDto>(), "GetDiagnosticsAsync");
-        }
+            var document = await UpdateDiagnosticDocumentAsync(code, diagnosticRequestString);
+            var semanticModel = await document.GetSemanticModelAsync();
+            if (semanticModel == null)
+            {
+                return Payload(Array.Empty<DiagnosticDto>(), "GetDiagnosticsAsync");
+            }
 
-        var diagnostics = semanticModel
-            .GetDiagnostics()
-            .Select(ToDiagnosticDto)
-            .Where(current => current != null)
-            .Cast<DiagnosticDto>()
-            .ToList();
+            var diagnostics = semanticModel
+                .GetDiagnostics()
+                .Select(ToDiagnosticDto)
+                .Where(current => current != null)
+                .Cast<DiagnosticDto>()
+                .ToList();
 
-        return Payload(diagnostics, "GetDiagnosticsAsync");
+            return Payload(diagnostics, "GetDiagnosticsAsync");
+        });
     }
 
     public async Task<byte[]> GetSemanticTokensAsync(string code)
     {
-        var document = await UpdateDocumentAsync(_diagnosticProject, code);
-        var tokens = await BuildSemanticTokensAsync(document);
-        return Payload(tokens, "GetSemanticTokensAsync");
+        return await RunDiagnosticAsync(async () =>
+        {
+            var document = await UpdateDocumentAsync(_diagnosticProject, code);
+            var tokens = await BuildSemanticTokensAsync(document);
+            return Payload(tokens, "GetSemanticTokensAsync");
+        });
     }
 
     public async Task<byte[]> GetDefinitionAsync(string code, string positionRequestString)
@@ -215,272 +238,338 @@ $@"using System;
 
     public async Task<byte[]> GetDefinitionAsync(string code, string positionRequestString, string diagnosticRequestString)
     {
-        var currentPath = TryReadCurrentPath(diagnosticRequestString);
-        var document = await UpdateDiagnosticDocumentAsync(code, diagnosticRequestString);
-        var symbol = await FindSymbolAsync(document, positionRequestString);
-        if (symbol == null)
+        return await RunDiagnosticAsync(async () =>
         {
-            return Payload(Array.Empty<MonacoLocation>(), "GetDefinitionAsync");
-        }
+            var currentPath = TryReadCurrentPath(diagnosticRequestString);
+            var document = await UpdateDiagnosticDocumentAsync(code, diagnosticRequestString);
+            var symbol = await FindSymbolAsync(document, positionRequestString);
+            if (symbol == null)
+            {
+                return Payload(Array.Empty<MonacoLocation>(), "GetDefinitionAsync");
+            }
 
-        var solution = document.Project.Solution;
-        var sourceSymbol = await SymbolFinder.FindSourceDefinitionAsync(symbol, solution) ?? symbol;
-        var locations = sourceSymbol.Locations
-            .Where(location => location.IsInSource)
-            .Select(location => ToLocation(location, document, sourceSymbol, currentPath))
-            .Where(location => location != null)
-            .Cast<MonacoLocation>()
-            .ToArray();
+            var solution = document.Project.Solution;
+            var sourceSymbol = await SymbolFinder.FindSourceDefinitionAsync(symbol, solution) ?? symbol;
+            var locations = sourceSymbol.Locations
+                .Where(location => location.IsInSource)
+                .Select(location => ToLocation(location, document, sourceSymbol, currentPath))
+                .Where(location => location != null)
+                .Cast<MonacoLocation>()
+                .ToArray();
 
-        return Payload(locations, "GetDefinitionAsync");
+            return Payload(locations, "GetDefinitionAsync");
+        });
     }
 
     public async Task<byte[]> GetReferencesAsync(string code, string positionRequestString, string includeDeclarationString)
     {
-        var document = await UpdateDocumentAsync(_diagnosticProject, code);
-        var symbol = await FindSymbolAsync(document, positionRequestString);
-        if (symbol == null)
+        return await RunDiagnosticAsync(async () =>
         {
-            return Payload(Array.Empty<MonacoLocation>(), "GetReferencesAsync");
-        }
-
-        var includeDeclaration = bool.TryParse(includeDeclarationString, out var parsed) && parsed;
-        var solution = document.Project.Solution;
-        var references = new List<MonacoLocation>();
-
-        if (includeDeclaration)
-        {
-            references.AddRange(symbol.Locations
-                .Where(location => location.IsInSource)
-                .Select(location => ToLocation(location, document, symbol))
-                .Where(location => location != null)
-                .Cast<MonacoLocation>());
-        }
-
-        foreach (var referencedSymbol in await SymbolFinder.FindReferencesAsync(symbol, solution))
-        {
-            foreach (var location in referencedSymbol.Locations)
+            var document = await UpdateDocumentAsync(_diagnosticProject, code);
+            var symbol = await FindSymbolAsync(document, positionRequestString);
+            if (symbol == null)
             {
-                if (!location.Location.IsInSource)
-                {
-                    continue;
-                }
+                return Payload(Array.Empty<MonacoLocation>(), "GetReferencesAsync");
+            }
 
-                var monacoLocation = ToLocation(location.Location, document, referencedSymbol.Definition);
-                if (monacoLocation != null)
+            var includeDeclaration = bool.TryParse(includeDeclarationString, out var parsed) && parsed;
+            var solution = document.Project.Solution;
+            var references = new List<MonacoLocation>();
+
+            if (includeDeclaration)
+            {
+                references.AddRange(symbol.Locations
+                    .Where(location => location.IsInSource)
+                    .Select(location => ToLocation(location, document, symbol))
+                    .Where(location => location != null)
+                    .Cast<MonacoLocation>());
+            }
+
+            foreach (var referencedSymbol in await SymbolFinder.FindReferencesAsync(symbol, solution))
+            {
+                foreach (var location in referencedSymbol.Locations)
                 {
-                    references.Add(monacoLocation);
+                    if (!location.Location.IsInSource)
+                    {
+                        continue;
+                    }
+
+                    var monacoLocation = ToLocation(location.Location, document, referencedSymbol.Definition);
+                    if (monacoLocation != null)
+                    {
+                        references.Add(monacoLocation);
+                    }
                 }
             }
-        }
 
-        var distinct = references
-            .GroupBy(location => $"{location.Range.Start.Line}:{location.Range.Start.Character}:{location.Range.End.Line}:{location.Range.End.Character}")
-            .Select(group => group.First())
-            .OrderBy(location => location.Range.Start.Line)
-            .ThenBy(location => location.Range.Start.Character)
-            .ToArray();
+            var distinct = references
+                .GroupBy(location => $"{location.Range.Start.Line}:{location.Range.Start.Character}:{location.Range.End.Line}:{location.Range.End.Character}")
+                .Select(group => group.First())
+                .OrderBy(location => location.Range.Start.Line)
+                .ThenBy(location => location.Range.Start.Character)
+                .ToArray();
 
-        return Payload(distinct, "GetReferencesAsync");
+            return Payload(distinct, "GetReferencesAsync");
+        });
     }
 
     public async Task<byte[]> GetRenameInfoAsync(string code, string positionRequestString)
     {
-        var document = await UpdateDocumentAsync(_diagnosticProject, code);
-        var symbol = await FindSymbolAsync(document, positionRequestString);
-        if (symbol == null || IsReservedSymbol(symbol))
+        return await RunDiagnosticAsync(async () =>
         {
-            return Payload(new RenameInfo(false, null, null, "This C# token cannot be renamed."), "GetRenameInfoAsync");
-        }
+            var document = await UpdateDocumentAsync(_diagnosticProject, code);
+            var symbol = await FindSymbolAsync(document, positionRequestString);
+            if (symbol == null || IsReservedSymbol(symbol))
+            {
+                return Payload(new RenameInfo(false, null, null, "This C# token cannot be renamed."), "GetRenameInfoAsync");
+            }
 
-        var tokenRange = await GetIdentifierRangeAtRequestAsync(document, positionRequestString);
-        return Payload(new RenameInfo(true, tokenRange, symbol.Name, null), "GetRenameInfoAsync");
+            var tokenRange = await GetIdentifierRangeAtRequestAsync(document, positionRequestString);
+            return Payload(new RenameInfo(true, tokenRange, symbol.Name, null), "GetRenameInfoAsync");
+        });
     }
 
     public async Task<byte[]> GetRenameEditsAsync(string code, string positionRequestString, string newName)
     {
-        var sanitizedName = newName.Trim();
-        var rawIdentifier = sanitizedName.StartsWith("@", StringComparison.Ordinal) ? sanitizedName[1..] : sanitizedName;
-        if (string.IsNullOrWhiteSpace(rawIdentifier) || !SyntaxFacts.IsValidIdentifier(rawIdentifier))
+        return await RunDiagnosticAsync(async () =>
         {
-            return Payload(new { edits = Array.Empty<MonacoTextEdit>(), rejectReason = "Enter a valid C# identifier." }, "GetRenameEditsAsync");
-        }
-
-        var document = await UpdateDocumentAsync(_diagnosticProject, code);
-        var symbol = await FindSymbolAsync(document, positionRequestString);
-        if (symbol == null || IsReservedSymbol(symbol))
-        {
-            return Payload(new { edits = Array.Empty<MonacoTextEdit>(), rejectReason = "This C# token cannot be renamed." }, "GetRenameEditsAsync");
-        }
-
-        var solution = document.Project.Solution;
-        var edits = new List<MonacoTextEdit>();
-
-        foreach (var declaration in symbol.Locations.Where(location => location.IsInSource))
-        {
-            var edit = ToRenameEdit(declaration, document, sanitizedName);
-            if (edit != null)
+            var sanitizedName = newName.Trim();
+            var rawIdentifier = sanitizedName.StartsWith("@", StringComparison.Ordinal) ? sanitizedName[1..] : sanitizedName;
+            if (string.IsNullOrWhiteSpace(rawIdentifier) || !SyntaxFacts.IsValidIdentifier(rawIdentifier))
             {
-                edits.Add(edit);
+                return Payload(new { edits = Array.Empty<MonacoTextEdit>(), rejectReason = "Enter a valid C# identifier." }, "GetRenameEditsAsync");
             }
-        }
 
-        foreach (var referencedSymbol in await SymbolFinder.FindReferencesAsync(symbol, solution))
-        {
-            foreach (var reference in referencedSymbol.Locations)
+            var document = await UpdateDocumentAsync(_diagnosticProject, code);
+            var symbol = await FindSymbolAsync(document, positionRequestString);
+            if (symbol == null || IsReservedSymbol(symbol))
             {
-                if (!reference.Location.IsInSource)
-                {
-                    continue;
-                }
+                return Payload(new { edits = Array.Empty<MonacoTextEdit>(), rejectReason = "This C# token cannot be renamed." }, "GetRenameEditsAsync");
+            }
 
-                var edit = ToRenameEdit(reference.Location, document, sanitizedName);
+            var solution = document.Project.Solution;
+            var edits = new List<MonacoTextEdit>();
+
+            foreach (var declaration in symbol.Locations.Where(location => location.IsInSource))
+            {
+                var edit = ToRenameEdit(declaration, document, sanitizedName);
                 if (edit != null)
                 {
                     edits.Add(edit);
                 }
             }
-        }
 
-        var distinct = edits
-            .GroupBy(edit => $"{edit.Range.Start.Line}:{edit.Range.Start.Character}:{edit.Range.End.Line}:{edit.Range.End.Character}")
-            .Select(group => group.First())
-            .OrderByDescending(edit => edit.Range.Start.Line)
-            .ThenByDescending(edit => edit.Range.Start.Character)
-            .ToArray();
+            foreach (var referencedSymbol in await SymbolFinder.FindReferencesAsync(symbol, solution))
+            {
+                foreach (var reference in referencedSymbol.Locations)
+                {
+                    if (!reference.Location.IsInSource)
+                    {
+                        continue;
+                    }
 
-        return Payload(new { edits = distinct, rejectReason = (string?)null }, "GetRenameEditsAsync");
+                    var edit = ToRenameEdit(reference.Location, document, sanitizedName);
+                    if (edit != null)
+                    {
+                        edits.Add(edit);
+                    }
+                }
+            }
+
+            var distinct = edits
+                .GroupBy(edit => $"{edit.Range.Start.Line}:{edit.Range.Start.Character}:{edit.Range.End.Line}:{edit.Range.End.Character}")
+                .Select(group => group.First())
+                .OrderByDescending(edit => edit.Range.Start.Line)
+                .ThenByDescending(edit => edit.Range.Start.Character)
+                .ToArray();
+
+            return Payload(new { edits = distinct, rejectReason = (string?)null }, "GetRenameEditsAsync");
+        });
     }
 
     public async Task<byte[]> GetDocumentSymbolsAsync(string code)
     {
-        var document = await UpdateDocumentAsync(_diagnosticProject, code);
-        var symbols = await BuildDocumentSymbolsAsync(document);
-        return Payload(symbols, "GetDocumentSymbolsAsync");
+        return await RunDiagnosticAsync(async () =>
+        {
+            var document = await UpdateDocumentAsync(_diagnosticProject, code);
+            var symbols = await BuildDocumentSymbolsAsync(document);
+            return Payload(symbols, "GetDocumentSymbolsAsync");
+        });
     }
 
     public async Task<byte[]> GetFormattingAsync(string code)
     {
-        var document = await UpdateDocumentAsync(_diagnosticProject, code);
-        var formattedDocument = await Formatter.FormatAsync(document);
-        var text = await formattedDocument.GetTextAsync();
-        return Payload(text.ToString(), "GetFormattingAsync");
+        return await RunDiagnosticAsync(async () =>
+        {
+            var document = await UpdateDocumentAsync(_diagnosticProject, code);
+            var formattedDocument = await Formatter.FormatAsync(document);
+            var text = await formattedDocument.GetTextAsync();
+            return Payload(text.ToString(), "GetFormattingAsync");
+        });
     }
 
     public async Task<byte[]> GetRangeFormattingAsync(string code, string rangeRequestString)
     {
-        var document = await UpdateDocumentAsync(_diagnosticProject, code);
-        var text = await document.GetTextAsync();
-        var range = DeserializeRequest<RangeRequest>(rangeRequestString);
-        var span = ToTextSpan(text, range);
-        var formattedDocument = await Formatter.FormatAsync(document, span);
-        var formattedText = await formattedDocument.GetTextAsync();
-        return Payload(formattedText.ToString(), "GetRangeFormattingAsync");
+        return await RunDiagnosticAsync(async () =>
+        {
+            var document = await UpdateDocumentAsync(_diagnosticProject, code);
+            var text = await document.GetTextAsync();
+            var range = DeserializeRequest<RangeRequest>(rangeRequestString);
+            var span = ToTextSpan(text, range);
+            var formattedDocument = await Formatter.FormatAsync(document, span);
+            var formattedText = await formattedDocument.GetTextAsync();
+            return Payload(formattedText.ToString(), "GetRangeFormattingAsync");
+        });
     }
 
     public async Task<byte[]> GetCodeActionsAsync(string code, string rangeRequestString)
     {
-        var document = await UpdateDocumentAsync(_diagnosticProject, code);
-        var text = await document.GetTextAsync();
-        var source = text.ToString();
-        var actions = new List<CodeActionDto>();
-        var range = DeserializeRequest<RangeRequest>(rangeRequestString);
-        var requestSpan = ToTextSpan(text, range);
-        var diagnostics = await GetCompilerDiagnosticsAsync(document);
-
-        foreach (var diagnostic in diagnostics.Where(d => d.Location.SourceSpan.IntersectsWith(requestSpan) || requestSpan.Length == 0))
+        return await RunDiagnosticAsync(async () =>
         {
-            var missingName = TryGetMissingSymbolName(diagnostic);
-            if (string.IsNullOrWhiteSpace(missingName))
+            var document = await UpdateDocumentAsync(_diagnosticProject, code);
+            var text = await document.GetTextAsync();
+            var source = text.ToString();
+            var actions = new List<CodeActionDto>();
+            var range = DeserializeRequest<RangeRequest>(rangeRequestString);
+            var requestSpan = ToTextSpan(text, range);
+            var diagnostics = await GetCompilerDiagnosticsAsync(document);
+
+            foreach (var diagnostic in diagnostics.Where(d => d.Location.SourceSpan.IntersectsWith(requestSpan) || requestSpan.Length == 0))
             {
-                continue;
+                var missingName = TryGetMissingSymbolName(diagnostic);
+                if (string.IsNullOrWhiteSpace(missingName))
+                {
+                    continue;
+                }
+
+                var namespaceName = await FindNamespaceForMissingSymbolAsync(document.Project, missingName);
+                if (string.IsNullOrWhiteSpace(namespaceName) || HasUsing(source, namespaceName))
+                {
+                    continue;
+                }
+
+                actions.Add(new CodeActionDto(
+                    $"Add using {namespaceName}",
+                    "quickfix",
+                    new[] { new MonacoTextEdit(new TextRange(new PositionDto(0, 0), new PositionDto(0, 0)), $"using {namespaceName};\n") },
+                    true));
             }
 
-            var namespaceName = await FindNamespaceForMissingSymbolAsync(document.Project, missingName);
-            if (string.IsNullOrWhiteSpace(namespaceName) || HasUsing(source, namespaceName))
+            var organized = OrganizeUsings(source);
+            if (!string.Equals(organized, source, StringComparison.Ordinal))
             {
-                continue;
+                actions.Add(new CodeActionDto(
+                    "Organize C# usings",
+                    "source.organizeImports",
+                    new[] { new MonacoTextEdit(ToRange(text, TextSpan.FromBounds(0, text.Length)), organized) },
+                    false));
             }
 
-            actions.Add(new CodeActionDto(
-                $"Add using {namespaceName}",
-                "quickfix",
-                new[] { new MonacoTextEdit(new TextRange(new PositionDto(0, 0), new PositionDto(0, 0)), $"using {namespaceName};\n") },
-                true));
-        }
-
-        var organized = OrganizeUsings(source);
-        if (!string.Equals(organized, source, StringComparison.Ordinal))
-        {
-            actions.Add(new CodeActionDto(
-                "Organize C# usings",
-                "source.organizeImports",
-                new[] { new MonacoTextEdit(ToRange(text, TextSpan.FromBounds(0, text.Length)), organized) },
-                false));
-        }
-
-        return Payload(actions
-            .GroupBy(action => action.Title)
-            .Select(group => group.First())
-            .ToArray(), "GetCodeActionsAsync");
+            return Payload(actions
+                .GroupBy(action => action.Title)
+                .Select(group => group.First())
+                .ToArray(), "GetCodeActionsAsync");
+        });
     }
 
     public async Task<byte[]> GetInlayHintsAsync(string code, string rangeRequestString)
     {
-        var document = await UpdateDocumentAsync(_diagnosticProject, code);
-        var text = await document.GetTextAsync();
-        var range = DeserializeRequest<RangeRequest>(rangeRequestString);
-        var span = ToTextSpan(text, range);
-        var hints = await BuildInlayHintsAsync(document, span);
-        return Payload(hints, "GetInlayHintsAsync");
+        return await RunDiagnosticAsync(async () =>
+        {
+            var document = await UpdateDocumentAsync(_diagnosticProject, code);
+            var text = await document.GetTextAsync();
+            var range = DeserializeRequest<RangeRequest>(rangeRequestString);
+            var span = ToTextSpan(text, range);
+            var hints = await BuildInlayHintsAsync(document, span);
+            return Payload(hints, "GetInlayHintsAsync");
+        });
     }
 
     public async Task<byte[]> GetFoldingRangesAsync(string code)
     {
-        var document = await UpdateDocumentAsync(_diagnosticProject, code);
-        var text = await document.GetTextAsync();
-        var root = await document.GetSyntaxRootAsync();
-        if (root == null)
+        return await RunDiagnosticAsync(async () =>
         {
-            return Payload(Array.Empty<FoldingRangeDto>(), "GetFoldingRangesAsync");
-        }
+            var document = await UpdateDocumentAsync(_diagnosticProject, code);
+            var text = await document.GetTextAsync();
+            var root = await document.GetSyntaxRootAsync();
+            if (root == null)
+            {
+                return Payload(Array.Empty<FoldingRangeDto>(), "GetFoldingRangesAsync");
+            }
 
-        var ranges = root.DescendantNodesAndSelf()
-            .Select(node => ToFoldingRange(text, node))
-            .Where(range => range != null)
-            .Cast<FoldingRangeDto>()
-            .GroupBy(range => $"{range.Start}:{range.End}:{range.Kind}")
-            .Select(group => group.First())
-            .OrderBy(range => range.Start)
-            .ThenBy(range => range.End)
-            .ToArray();
+            var ranges = root.DescendantNodesAndSelf()
+                .Select(node => ToFoldingRange(text, node))
+                .Where(range => range != null)
+                .Cast<FoldingRangeDto>()
+                .GroupBy(range => $"{range.Start}:{range.End}:{range.Kind}")
+                .Select(group => group.First())
+                .OrderBy(range => range.Start)
+                .ThenBy(range => range.End)
+                .ToArray();
 
-        return Payload(ranges, "GetFoldingRangesAsync");
+            return Payload(ranges, "GetFoldingRangesAsync");
+        });
     }
 
     public async Task<byte[]> IncludeNamespaceAsync(string namespaceName)
     {
-        var completionResult = await _completionProject.IncludeNamespaceAsync(namespaceName);
-        var diagnosticResult = await _diagnosticProject.IncludeNamespaceAsync(namespaceName);
-
-        var response = new
+        await _completionGate.WaitAsync();
+        await _diagnosticGate.WaitAsync();
+        try
         {
-            namespaceName = completionResult.NamespaceName,
-            success = completionResult.Success || diagnosticResult.Success,
-            addedAssemblies = completionResult.AddedAssemblies
-                .Concat(diagnosticResult.AddedAssemblies)
-                .Distinct(StringComparer.Ordinal)
-                .ToArray(),
-            matchedAssemblies = completionResult.MatchedAssemblies
-                .Concat(diagnosticResult.MatchedAssemblies)
-                .Distinct(StringComparer.Ordinal)
-                .ToArray(),
-            message = completionResult.AddedAssemblies.Count > 0
-                ? completionResult.Message
-                : diagnosticResult.Message
-        };
+            var completionResult = await _completionProject.IncludeNamespaceAsync(namespaceName);
+            var diagnosticResult = await _diagnosticProject.IncludeNamespaceAsync(namespaceName);
 
-        return Payload(response, "IncludeNamespaceAsync");
+            var response = new
+            {
+                namespaceName = completionResult.NamespaceName,
+                success = completionResult.Success || diagnosticResult.Success,
+                addedAssemblies = completionResult.AddedAssemblies
+                    .Concat(diagnosticResult.AddedAssemblies)
+                    .Distinct(StringComparer.Ordinal)
+                    .ToArray(),
+                matchedAssemblies = completionResult.MatchedAssemblies
+                    .Concat(diagnosticResult.MatchedAssemblies)
+                    .Distinct(StringComparer.Ordinal)
+                    .ToArray(),
+                message = completionResult.AddedAssemblies.Count > 0
+                    ? completionResult.Message
+                    : diagnosticResult.Message
+            };
+
+            return Payload(response, "IncludeNamespaceAsync");
+        }
+        finally
+        {
+            _diagnosticGate.Release();
+            _completionGate.Release();
+        }
+    }
+
+    async Task<byte[]> RunCompletionAsync(Func<Task<byte[]>> action)
+    {
+        await _completionGate.WaitAsync();
+        try
+        {
+            return await action();
+        }
+        finally
+        {
+            _completionGate.Release();
+        }
+    }
+
+    async Task<byte[]> RunDiagnosticAsync(Func<Task<byte[]>> action)
+    {
+        await _diagnosticGate.WaitAsync();
+        try
+        {
+            return await action();
+        }
+        finally
+        {
+            _diagnosticGate.Release();
+        }
     }
 
     Task<Document> UpdateDocumentAsync(OmniSharpProject project, string code)

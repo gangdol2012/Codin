@@ -48,9 +48,25 @@ interface CSharpCompletionRequestSnapshot {
   structuralVersion: number;
 }
 
+interface CSharpModelTextSnapshot {
+  code: string;
+  modelVersionId: number;
+  alternativeVersionId: number;
+  length: number;
+  hash: string;
+  uri: string;
+}
+
 interface CSharpLateCompletionContext {
   insertedLength: number;
   filterRange: monaco.Range;
+}
+
+interface CSharpSerializedProjectRequest {
+  request: CSharpDiagnosticProjectRequest;
+  serialized: string;
+  fileKey: string;
+  currentPath: string;
 }
 
 export type CSharpIdeDebugLevel = 'info' | 'success' | 'warning' | 'error';
@@ -159,9 +175,11 @@ export interface CSharpIdeDebugOptions {
   onDidChange?: (snapshot: CSharpIdeDebugSnapshot) => void;
 }
 
-const CSHARP_COMPLETION_CACHE_LIMIT = 8;
+const CSHARP_COMPLETION_CACHE_LIMIT = 32;
+const CSHARP_RUNTIME_RESPONSE_CACHE_LIMIT = 64;
 const CSHARP_DEBUG_EVENT_LIMIT = 500;
 const CSHARP_DEBUG_FEATURE_EVENT_LIMIT = 120;
+const CSHARP_STALE_COMPLETION_RESPONSE = Symbol('stale-csharp-completion-response');
 
 interface CSharpIdeDebugFeatureDescriptor {
   key: string;
@@ -525,6 +543,17 @@ function hashString(value: string): string {
     hash = Math.imul(hash, 16777619);
   }
   return (hash >>> 0).toString(36);
+}
+
+function stableCacheKey(value: unknown): string {
+  if (value == null || typeof value === 'number' || typeof value === 'boolean') return String(value);
+  if (typeof value === 'string') return value.length > 160 ? `${value.length}:${hashString(value)}` : value;
+  if (Array.isArray(value)) return `[${value.map(stableCacheKey).join(',')}]`;
+  if (typeof value === 'object') {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record).sort().map(key => `${key}:${stableCacheKey(record[key])}`).join(',')}}`;
+  }
+  return typeof value;
 }
 
 function countLines(value: string) {
@@ -949,6 +978,7 @@ class CSharpLanguageService {
     snapshot: CSharpCompletionRequestSnapshot;
     lateContext: CSharpLateCompletionContext;
   }>();
+  private completionResolveResponseCache = new WeakMap<object, Promise<unknown>>();
   private editor: monaco.editor.IStandaloneCodeEditor | null = null;
   private model: monaco.editor.ITextModel | null = null;
   private projectFilesProvider: CSharpProjectFilesProvider = () => [];
@@ -962,10 +992,15 @@ class CSharpLanguageService {
   private completionEnvironmentVersion = 0;
   private completionWorkerStateKey: string | null = null;
   private completionCache = new Map<string, CSharpCompletionCacheEntry>();
+  private runtimeResponseCache = new Map<string, Promise<unknown> | unknown>();
   private diagnosticCacheKey: string | null = null;
   private diagnosticCacheMarkers: monaco.editor.IMarkerData[] = [];
   private providerDisposables: monaco.IDisposable[] = [];
   private semanticCache = new WeakMap<monaco.editor.ITextModel, { versionId: number; index: CSharpSemanticIndex }>();
+  private modelTextCache = new WeakMap<monaco.editor.ITextModel, CSharpModelTextSnapshot>();
+  private projectRequestCache: CSharpSerializedProjectRequest | null = null;
+  private projectFileHashCache = new Map<string, { content: string; hash: string; length: number }>();
+  private completionDispatchTail: Promise<void> = Promise.resolve();
   private debugEnabled = false;
   private debugEvents: CSharpIdeDebugEvent[] = [];
   private debugEventSerial = 0;
@@ -1214,7 +1249,8 @@ class CSharpLanguageService {
   }
 
   private summarizeModel(model: monaco.editor.ITextModel): CSharpIdeDebugModelSummary {
-    const value = model.isDisposed() ? '' : model.getValue();
+    const snapshot = model.isDisposed() ? null : this.getModelTextSnapshot(model);
+    const value = snapshot?.code ?? '';
     return {
       uri: model.uri.toString(),
       path: currentModelPath(model),
@@ -1222,8 +1258,8 @@ class CSharpLanguageService {
       versionId: model.getVersionId(),
       alternativeVersionId: model.getAlternativeVersionId(),
       lineCount: model.isDisposed() ? 0 : model.getLineCount(),
-      length: value.length,
-      hash: hashString(value),
+      length: snapshot?.length ?? value.length,
+      hash: snapshot?.hash ?? hashString(value),
       disposed: model.isDisposed(),
     };
   }
@@ -1671,16 +1707,25 @@ class CSharpLanguageService {
     this.clearCompletionState();
   }
 
-  private clearCompletionState(options?: { structural?: boolean }) {
+  private clearCompletionState(options?: {
+    structural?: boolean;
+    preserveEnvironment?: boolean;
+    preserveResultCaches?: boolean;
+  }) {
     this.completionRequestSerial += 1;
     if (options?.structural !== false) {
       this.completionStructuralVersion += 1;
     }
-    this.completionEnvironmentVersion += 1;
+    if (!options?.preserveEnvironment) {
+      this.completionEnvironmentVersion += 1;
+    }
     this.completionWorkerStateKey = null;
     this.lastCompletions.clear();
     this.lastCompletionContexts.clear();
-    this.completionCache.clear();
+    if (!options?.preserveResultCaches) {
+      this.completionCache.clear();
+      this.runtimeResponseCache.clear();
+    }
     this.diagnosticCacheKey = null;
     this.recordDebugEvent({
       feature: 'cache',
@@ -1731,6 +1776,84 @@ class CSharpLanguageService {
     return { suggestions: [] };
   }
 
+  private getModelTextSnapshot(model: monaco.editor.ITextModel): CSharpModelTextSnapshot {
+    const modelVersionId = model.getVersionId();
+    const alternativeVersionId = model.getAlternativeVersionId();
+    const cached = this.modelTextCache.get(model);
+    if (
+      cached &&
+      cached.modelVersionId === modelVersionId &&
+      cached.alternativeVersionId === alternativeVersionId
+    ) {
+      return cached;
+    }
+
+    const code = model.getValue();
+    const snapshot: CSharpModelTextSnapshot = {
+      code,
+      modelVersionId,
+      alternativeVersionId,
+      length: code.length,
+      hash: hashString(code),
+      uri: model.uri.toString(),
+    };
+    this.modelTextCache.set(model, snapshot);
+    return snapshot;
+  }
+
+  private clearModelRuntimeState(model: monaco.editor.ITextModel) {
+    this.modelTextCache.delete(model);
+    this.semanticCache.delete(model);
+    this.projectRequestCache = null;
+    this.runtimeResponseCache.clear();
+  }
+
+  private cacheRuntimeResponse(key: string, value: Promise<unknown> | unknown) {
+    this.runtimeResponseCache.set(key, value);
+    while (this.runtimeResponseCache.size > CSHARP_RUNTIME_RESPONSE_CACHE_LIMIT) {
+      const oldestKey = this.runtimeResponseCache.keys().next().value;
+      if (!oldestKey) break;
+      this.runtimeResponseCache.delete(oldestKey);
+    }
+  }
+
+  private async cachedOmniSharpModelCall(
+    method: string,
+    model: monaco.editor.ITextModel,
+    snapshot: CSharpModelTextSnapshot,
+    cacheParts: unknown[],
+    ...args: unknown[]
+  ): Promise<unknown> {
+    if (!this.omnisharp) return false;
+    const environmentVersion = this.completionEnvironmentVersion;
+    const key = [
+      environmentVersion,
+      method,
+      snapshot.uri,
+      snapshot.modelVersionId,
+      snapshot.length,
+      snapshot.hash,
+      ...cacheParts.map(part => stableCacheKey(part)),
+    ].join(':');
+
+    const cached = this.runtimeResponseCache.get(key);
+    if (cached) return cached;
+
+    const promise = this.omnisharp(method, snapshot.code, ...args).then(response => {
+      if (response === false || this.completionEnvironmentVersion !== environmentVersion) {
+        this.runtimeResponseCache.delete(key);
+      } else {
+        this.cacheRuntimeResponse(key, response);
+      }
+      return response;
+    }, error => {
+      this.runtimeResponseCache.delete(key);
+      throw error;
+    });
+    this.cacheRuntimeResponse(key, promise);
+    return promise;
+  }
+
   private completionCacheKey(
     model: monaco.editor.ITextModel,
     position: monaco.Position,
@@ -1752,9 +1875,10 @@ class CSharpLanguageService {
     model: monaco.editor.ITextModel,
     position: monaco.Position
   ): CSharpCompletionRequestSnapshot {
+    const snapshot = this.getModelTextSnapshot(model);
     return {
-      code: model.getValue(),
-      modelVersionId: model.getVersionId(),
+      code: snapshot.code,
+      modelVersionId: snapshot.modelVersionId,
       offset: model.getOffsetAt(position),
       structuralVersion: this.completionStructuralVersion,
     };
@@ -1793,7 +1917,7 @@ class CSharpLanguageService {
       return null;
     }
 
-    const currentCode = model.getValue();
+    const currentCode = this.getModelTextSnapshot(model).code;
     if (currentCode.length <= snapshot.code.length) return null;
 
     const insertedLength = currentCode.length - snapshot.code.length;
@@ -1839,6 +1963,48 @@ class CSharpLanguageService {
       selection.endLineNumber === position.lineNumber &&
       selection.endColumn === position.column
     );
+  }
+
+  private shouldDispatchCompletionRequest(
+    model: monaco.editor.ITextModel,
+    snapshot: CSharpCompletionRequestSnapshot,
+    requestSerial: number
+  ) {
+    if (!this.omnisharp || model.isDisposed() || requestSerial !== this.completionRequestSerial) return false;
+    if (model.getVersionId() === snapshot.modelVersionId) return true;
+    return !!this.getLateCompletionContext(model, snapshot);
+  }
+
+  private enqueueCompletionRuntimeCall(
+    model: monaco.editor.ITextModel,
+    snapshot: CSharpCompletionRequestSnapshot,
+    request: unknown,
+    requestSerial: number,
+    callId: string
+  ): Promise<unknown | typeof CSHARP_STALE_COMPLETION_RESPONSE> {
+    const run = this.completionDispatchTail.then(async () => {
+      if (!this.shouldDispatchCompletionRequest(model, snapshot, requestSerial)) {
+        this.recordDebugEvent({
+          feature: 'completion',
+          phase: 'skip-stale-before-runtime',
+          level: 'warning',
+          callId,
+          message: 'C# completion request skipped before OmniSharp because a newer editor state superseded it.',
+          request: {
+            requestSerial,
+            currentCompletionRequestSerial: this.completionRequestSerial,
+            snapshotModelVersionId: snapshot.modelVersionId,
+            modelVersionId: model.isDisposed() ? null : model.getVersionId(),
+          },
+        });
+        return CSHARP_STALE_COMPLETION_RESPONSE;
+      }
+
+      return this.omnisharp!('GetCompletionAsync', snapshot.code, request);
+    });
+
+    this.completionDispatchTail = run.then(() => undefined, () => undefined);
+    return run;
   }
 
   private async ensureLocalOmniSharpRuntime() {
@@ -2023,8 +2189,12 @@ class CSharpLanguageService {
         this.modelChangeListener = model.onDidChangeContent(event => {
           if (!model.isDisposed() && model.getLanguageId() === 'csharp') {
             const shouldTriggerMemberCompletion = this.shouldTriggerMemberCompletionAfterChange(model, event);
-            this.semanticCache.delete(model);
-            this.clearCompletionState({ structural: false });
+            this.clearModelRuntimeState(model);
+            this.clearCompletionState({
+              structural: false,
+              preserveEnvironment: true,
+              preserveResultCaches: true,
+            });
             this.recordDebugEvent({
               feature: 'model',
               phase: 'content-changed',
@@ -2148,10 +2318,10 @@ class CSharpLanguageService {
       return;
     }
 
-    const safeCode = model.getValue();
-    const projectRequest = this.createDiagnosticProjectRequest(model);
-    this.lastDiagnosticProjectRequest = projectRequest;
-    const cacheKey = this.createDiagnosticCacheKey(model, safeCode, projectRequest);
+    const modelSnapshot = this.getModelTextSnapshot(model);
+    const projectRequest = this.createSerializedDiagnosticProjectRequest(model);
+    this.lastDiagnosticProjectRequest = projectRequest.request;
+    const cacheKey = this.createDiagnosticCacheKey(modelSnapshot, projectRequest);
     if (this.diagnosticCacheKey === cacheKey) {
       monaco.editor.setModelMarkers(model, 'csharp-omnisharp', this.diagnosticCacheMarkers);
       this.recordDebugEvent({
@@ -2164,7 +2334,7 @@ class CSharpLanguageService {
         request: {
           cacheKey,
           markerCount: this.diagnosticCacheMarkers.length,
-          project: this.summarizeProjectRequest(projectRequest),
+          project: this.summarizeProjectRequest(projectRequest.request),
         },
         environment: this.createDebugEnvironmentSnapshot(model),
       });
@@ -2180,13 +2350,13 @@ class CSharpLanguageService {
         model: this.summarizeModel(model),
         request: {
           cacheKey,
-          codeLength: safeCode.length,
-          codeHash: hashString(safeCode),
-          project: this.summarizeProjectRequest(projectRequest),
+          codeLength: modelSnapshot.length,
+          codeHash: modelSnapshot.hash,
+          project: this.summarizeProjectRequest(projectRequest.request),
         },
         environment: this.createDebugEnvironmentSnapshot(model),
       });
-      const diagnostics = await this.omnisharp('GetDiagnosticsAsync', safeCode, projectRequest);
+      const diagnostics = await this.omnisharp('GetDiagnosticsAsync', modelSnapshot.code, projectRequest.serialized);
       if (
         requestSerial !== this.diagnosticRequestSerial ||
         model.isDisposed() ||
@@ -2334,7 +2504,10 @@ class CSharpLanguageService {
 
     if (!entryPromise) {
       entryPromise = (async (): Promise<CSharpCompletionCacheEntry | null> => {
-        const response = await this.omnisharp!('GetCompletionAsync', snapshot.code, request);
+        const response = await this.enqueueCompletionRuntimeCall(model, snapshot, request, requestSerial, callId);
+        if (response === CSHARP_STALE_COMPLETION_RESPONSE) {
+          return null;
+        }
 
         const isCurrentRequest = (
           requestSerial === this.completionRequestSerial &&
@@ -2426,7 +2599,7 @@ class CSharpLanguageService {
     });
 
     try {
-      const response = await this.omnisharp('GetCompletionResolveAsync', { Item: lspItem });
+      const response = await this.getCompletionResolveResponse(lspItem);
       if (!response) {
         this.recordDebugEvent({
           feature: 'completion.resolve',
@@ -2480,14 +2653,35 @@ class CSharpLanguageService {
     }
   }
 
+  private getCompletionResolveResponse(lspItem: any): Promise<unknown> {
+    if (!this.omnisharp) return Promise.resolve(false);
+    if (!lspItem || typeof lspItem !== 'object') {
+      return this.omnisharp('GetCompletionResolveAsync', { Item: lspItem });
+    }
+
+    const cached = this.completionResolveResponseCache.get(lspItem);
+    if (cached) return cached;
+
+    const request = this.omnisharp('GetCompletionResolveAsync', { Item: lspItem }).then(response => {
+      if (!response) this.completionResolveResponseCache.delete(lspItem);
+      return response;
+    }, error => {
+      this.completionResolveResponseCache.delete(lspItem);
+      throw error;
+    });
+    this.completionResolveResponseCache.set(lspItem, request);
+    return request;
+  }
+
   private async provideSignatureHelp(
     model: monaco.editor.ITextModel,
     position: monaco.Position
   ): Promise<monaco.languages.SignatureHelpResult | undefined> {
     if (!this.omnisharp) return this.provideLocalSignatureHelp(model, position);
     const req = { Line: position.lineNumber - 1, Column: position.column - 1 };
+    const snapshot = this.getModelTextSnapshot(model);
     try {
-      const res = await this.omnisharp('GetSignatureHelpAsync', model.getValue(), req);
+      const res = await this.cachedOmniSharpModelCall('GetSignatureHelpAsync', model, snapshot, [req], req);
       if (!res) return this.provideLocalSignatureHelp(model, position);
       const result = res as any;
       return {
@@ -2525,12 +2719,16 @@ class CSharpLanguageService {
       model.getVersionId() === initialModelVersion
     ) {
       try {
-        const projectRequest = this.createDiagnosticProjectRequest(model);
-        const response = await this.omnisharp(
+        const snapshot = this.getModelTextSnapshot(model);
+        const projectRequest = this.createSerializedDiagnosticProjectRequest(model);
+        const positionRequest = this.positionRequest(position);
+        const response = await this.cachedOmniSharpModelCall(
           'GetQuickInfoAsync',
-          model.getValue(),
-          this.positionRequest(position),
-          projectRequest
+          model,
+          snapshot,
+          [positionRequest, projectRequest.fileKey, projectRequest.currentPath],
+          positionRequest,
+          projectRequest.serialized
         );
         if (cancellationToken?.isCancellationRequested || model.isDisposed() || model.getVersionId() !== initialModelVersion) {
           return undefined;
@@ -2560,7 +2758,8 @@ class CSharpLanguageService {
   ): Promise<monaco.languages.SemanticTokens | null> {
     if (this.omnisharp) {
       try {
-        const response = await this.omnisharp('GetSemanticTokensAsync', model.getValue());
+        const snapshot = this.getModelTextSnapshot(model);
+        const response = await this.cachedOmniSharpModelCall('GetSemanticTokensAsync', model, snapshot, []);
         if (!cancellationToken.isCancellationRequested && Array.isArray(response)) {
           return { data: this.encodeOmniSharpSemanticTokens(response as OmniSharpSemanticTokenDto[]) };
         }
@@ -2579,12 +2778,16 @@ class CSharpLanguageService {
   ): Promise<monaco.languages.Location[] | undefined> {
     if (this.omnisharp) {
       try {
-        const projectRequest = this.createDiagnosticProjectRequest(model);
-        const response = await this.omnisharp(
+        const snapshot = this.getModelTextSnapshot(model);
+        const projectRequest = this.createSerializedDiagnosticProjectRequest(model);
+        const positionRequest = this.positionRequest(position);
+        const response = await this.cachedOmniSharpModelCall(
           'GetDefinitionAsync',
-          model.getValue(),
-          this.positionRequest(position),
-          projectRequest
+          model,
+          snapshot,
+          [positionRequest, projectRequest.fileKey, projectRequest.currentPath],
+          positionRequest,
+          projectRequest.serialized
         );
         const locations = this.convertLocations(model, response);
         if (locations.length) return locations;
@@ -2609,7 +2812,17 @@ class CSharpLanguageService {
     let omnisharpLocations: monaco.languages.Location[] = [];
     if (this.omnisharp) {
       try {
-        const response = await this.omnisharp('GetReferencesAsync', model.getValue(), this.positionRequest(position), String(context.includeDeclaration));
+        const snapshot = this.getModelTextSnapshot(model);
+        const positionRequest = this.positionRequest(position);
+        const includeDeclaration = String(context.includeDeclaration);
+        const response = await this.cachedOmniSharpModelCall(
+          'GetReferencesAsync',
+          model,
+          snapshot,
+          [positionRequest, includeDeclaration],
+          positionRequest,
+          includeDeclaration
+        );
         omnisharpLocations = this.convertLocations(model, response);
       } catch {
         // Fall through to the browser-side semantic index.
@@ -2640,7 +2853,8 @@ class CSharpLanguageService {
   private async provideDocumentSymbols(model: monaco.editor.ITextModel): Promise<monaco.languages.DocumentSymbol[]> {
     if (this.omnisharp) {
       try {
-        const response = await this.omnisharp('GetDocumentSymbolsAsync', model.getValue());
+        const snapshot = this.getModelTextSnapshot(model);
+        const response = await this.cachedOmniSharpModelCall('GetDocumentSymbolsAsync', model, snapshot, []);
         const symbols = this.convertDocumentSymbols(response);
         if (symbols.length) return symbols;
       } catch {
@@ -2657,7 +2871,15 @@ class CSharpLanguageService {
   ): Promise<monaco.languages.RenameLocation> {
     if (this.omnisharp) {
       try {
-        const response = await this.omnisharp('GetRenameInfoAsync', model.getValue(), this.positionRequest(position)) as OmniSharpRenameInfoDto | false;
+        const snapshot = this.getModelTextSnapshot(model);
+        const positionRequest = this.positionRequest(position);
+        const response = await this.cachedOmniSharpModelCall(
+          'GetRenameInfoAsync',
+          model,
+          snapshot,
+          [positionRequest],
+          positionRequest
+        ) as OmniSharpRenameInfoDto | false;
         const range = this.toEditorRange(response && response.range);
         if (response && response.canRename && range) {
           return { range, text: response.text ?? model.getValueInRange(range) };
@@ -2696,7 +2918,16 @@ class CSharpLanguageService {
     let omnisharpRejectReason: string | undefined;
     if (this.omnisharp) {
       try {
-        const response = await this.omnisharp('GetRenameEditsAsync', model.getValue(), this.positionRequest(position), newName) as OmniSharpRenameEditsDto | false;
+        const snapshot = this.getModelTextSnapshot(model);
+        const positionRequest = this.positionRequest(position);
+        const response = await this.cachedOmniSharpModelCall(
+          'GetRenameEditsAsync',
+          model,
+          snapshot,
+          [positionRequest, newName],
+          positionRequest,
+          newName
+        ) as OmniSharpRenameEditsDto | false;
         if (response && Array.isArray(response.edits)) {
           omnisharpEdits = response.edits.flatMap(edit => this.convertWorkspaceEdit(model, edit));
           omnisharpRejectReason = response.rejectReason ?? undefined;
@@ -2735,7 +2966,15 @@ class CSharpLanguageService {
 
     if (this.omnisharp) {
       try {
-        const response = await this.omnisharp('GetCodeActionsAsync', model.getValue(), this.rangeRequest(range));
+        const snapshot = this.getModelTextSnapshot(model);
+        const rangeRequest = this.rangeRequest(range);
+        const response = await this.cachedOmniSharpModelCall(
+          'GetCodeActionsAsync',
+          model,
+          snapshot,
+          [rangeRequest],
+          rangeRequest
+        );
         actions.push(...this.convertCodeActions(model, response, context.markers));
       } catch {
         // Local actions below still cover the common cases.
@@ -2754,8 +2993,9 @@ class CSharpLanguageService {
     }
 
     if (/^\s*using\b/.test(lineText) || index.usingRanges.length > 1) {
-      const organized = organizeUsings(model.getValue());
-      if (organized !== model.getValue()) {
+      const snapshot = this.getModelTextSnapshot(model);
+      const organized = organizeUsings(snapshot.code);
+      if (organized !== snapshot.code) {
         actions.push({
           title: 'Organize C# usings',
           kind: 'source',
@@ -2794,7 +3034,8 @@ class CSharpLanguageService {
   private async provideFoldingRanges(model: monaco.editor.ITextModel): Promise<monaco.languages.FoldingRange[]> {
     if (this.omnisharp) {
       try {
-        const response = await this.omnisharp('GetFoldingRangesAsync', model.getValue());
+        const snapshot = this.getModelTextSnapshot(model);
+        const response = await this.cachedOmniSharpModelCall('GetFoldingRangesAsync', model, snapshot, []);
         const ranges = this.convertFoldingRanges(response);
         if (ranges.length) return ranges;
       } catch {
@@ -2809,10 +3050,11 @@ class CSharpLanguageService {
     model: monaco.editor.ITextModel,
     options: monaco.languages.FormattingOptions
   ): Promise<monaco.languages.TextEdit[]> {
+    const snapshot = this.getModelTextSnapshot(model);
     if (this.omnisharp) {
       try {
-        const formatted = await this.omnisharp('GetFormattingAsync', model.getValue());
-        if (typeof formatted === 'string' && formatted !== model.getValue()) {
+        const formatted = await this.cachedOmniSharpModelCall('GetFormattingAsync', model, snapshot, []);
+        if (typeof formatted === 'string' && formatted !== snapshot.code) {
           return [{ range: model.getFullModelRange(), text: formatted }];
         }
         if (typeof formatted === 'string') return [];
@@ -2821,8 +3063,8 @@ class CSharpLanguageService {
       }
     }
 
-    const formatted = formatCSharp(model.getValue(), options);
-    return formatted === model.getValue()
+    const formatted = formatCSharp(snapshot.code, options);
+    return formatted === snapshot.code
       ? []
       : [{ range: model.getFullModelRange(), text: formatted }];
   }
@@ -2832,10 +3074,18 @@ class CSharpLanguageService {
     range: monaco.Range,
     options: monaco.languages.FormattingOptions
   ): Promise<monaco.languages.TextEdit[]> {
+    const snapshot = this.getModelTextSnapshot(model);
     if (this.omnisharp) {
       try {
-        const formatted = await this.omnisharp('GetRangeFormattingAsync', model.getValue(), this.rangeRequest(range));
-        if (typeof formatted === 'string' && formatted !== model.getValue()) {
+        const rangeRequest = this.rangeRequest(range);
+        const formatted = await this.cachedOmniSharpModelCall(
+          'GetRangeFormattingAsync',
+          model,
+          snapshot,
+          [rangeRequest],
+          rangeRequest
+        );
+        if (typeof formatted === 'string' && formatted !== snapshot.code) {
           return [{ range: model.getFullModelRange(), text: formatted }];
         }
         if (typeof formatted === 'string') return [];
@@ -2871,7 +3121,15 @@ class CSharpLanguageService {
   ): Promise<monaco.languages.InlayHintList> {
     if (this.omnisharp) {
       try {
-        const response = await this.omnisharp('GetInlayHintsAsync', model.getValue(), this.rangeRequest(range));
+        const snapshot = this.getModelTextSnapshot(model);
+        const rangeRequest = this.rangeRequest(range);
+        const response = await this.cachedOmniSharpModelCall(
+          'GetInlayHintsAsync',
+          model,
+          snapshot,
+          [rangeRequest],
+          rangeRequest
+        );
         const hints = this.convertInlayHints(response);
         if (hints.length) return { hints, dispose() {} };
       } catch {
@@ -3306,35 +3564,58 @@ class CSharpLanguageService {
   }
 
   private createDiagnosticProjectRequest(model: monaco.editor.ITextModel): CSharpDiagnosticProjectRequest {
+    return this.createSerializedDiagnosticProjectRequest(model).request;
+  }
+
+  private createSerializedDiagnosticProjectRequest(model: monaco.editor.ITextModel): CSharpSerializedProjectRequest {
     const currentPath = currentModelPath(model);
     const seen = new Set<string>([currentPath]);
     const files: CSharpDiagnosticProjectRequest['Files'] = [];
+    const fileKeyParts: string[] = [];
 
     for (const file of this.projectFilesProvider()) {
       if (file.language !== 'csharp') continue;
       const path = normalizeProjectPath(file.path);
       if (!path || seen.has(path)) continue;
       seen.add(path);
-      files.push({ Path: path, Content: file.content ?? '' });
+      const content = file.content ?? '';
+      const cachedHash = this.projectFileHashCache.get(path);
+      const hash = cachedHash && cachedHash.content === content
+        ? cachedHash.hash
+        : hashString(content);
+      this.projectFileHashCache.set(path, { content, hash, length: content.length });
+      fileKeyParts.push(`${path}:${content.length}:${hash}`);
+      files.push({ Path: path, Content: content });
     }
 
-    return { CurrentPath: currentPath, Files: files };
+    for (const path of this.projectFileHashCache.keys()) {
+      if (!seen.has(path)) this.projectFileHashCache.delete(path);
+    }
+
+    const fileKey = fileKeyParts.join('|');
+    const cached = this.projectRequestCache;
+    if (cached && cached.currentPath === currentPath && cached.fileKey === fileKey) {
+      return cached;
+    }
+
+    const request = { CurrentPath: currentPath, Files: files };
+    const serialized = JSON.stringify(request);
+    const snapshot = { request, serialized, fileKey, currentPath };
+    this.projectRequestCache = snapshot;
+    return snapshot;
   }
 
   private createDiagnosticCacheKey(
-    model: monaco.editor.ITextModel,
-    code: string,
-    request: CSharpDiagnosticProjectRequest
+    snapshot: CSharpModelTextSnapshot,
+    projectRequest: CSharpSerializedProjectRequest
   ) {
-    const fileKey = request.Files
-      .map(file => `${file.Path}:${file.Content.length}:${hashString(file.Content)}`)
-      .join('|');
     return [
-      model.uri.toString(),
-      model.getVersionId(),
-      code.length,
-      request.CurrentPath,
-      fileKey,
+      snapshot.uri,
+      snapshot.modelVersionId,
+      snapshot.length,
+      snapshot.hash,
+      projectRequest.currentPath,
+      projectRequest.fileKey,
       this.completionEnvironmentVersion,
     ].join(':');
   }
