@@ -1,7 +1,7 @@
 {
   "mainAssemblyName": "OmniSharpWasm",
   "resources": {
-    "hash": "sha256-xO2JLP5gixD5j+2OS9spDS7tuJetKu5qrweuOAd/A4o=",
+    "hash": "sha256-lveSB4fITL2r+lHpmV6IcRTf33zBulm6x2jL+KyS+UU=",
     "jsModuleNative": {
       "dotnet.native.8.0.24.utvdj08j35.js": "sha256-4g0GzvOXSwZvTLca4PrWJkoeltz+V9IF/hEFDcnVros="
     },
@@ -62,7 +62,7 @@
       "OmniSharp.Roslyn.CSharp.dll": "sha256-T1CsWZ98Id5aRCiuga0lxjdsO+QRp347/rhBNhg3teU=",
       "OmniSharp.Roslyn.dll": "sha256-6pFVMqi++4rnewM8LlhpPng0UnOnKn31v3bJP6wSv7Q=",
       "OmniSharp.Shared.dll": "sha256-ZhvudqE9rTl7TfXYeFCkvxmpYsegPn2SlMpfAIA68fc=",
-      "OmniSharpWasm.dll": "sha256-Smf2vkNjtcaPgLwMlUxLK6tXchY3QVFttYW6KYmYijg=",
+      "OmniSharpWasm.dll": "sha256-+JXSydyL2RhSDadzIPZLvQdsoUhuIjDcBAn/BRbZRAs=",
       "Serialize.Linq.dll": "sha256-+AZxaCS9+h8qGP5HE6g/GSOp0lRHdd8w2jXDjBNw6rM=",
       "System.Collections.Concurrent.dll": "sha256-AjVLgmkk/YLCdpu3UkEldU0Mq3aQ6HaxhCzP/HcenPc=",
       "System.Collections.dll": "sha256-+3HyuCOQBpDK6bNTkyxr+3NAaR1xItwpGwQqMyB1BzA=",

@@ -125,7 +125,7 @@ public class OmniSharpCompletionService
         }
 
 
-        if (document is null || (request.TriggerCharacter?.ToString() ?? string.Empty) == "")
+        if (document is null)
         {
             _logger.LogInformation("Could not find document for file {0}", request.FileName);
             return new CompletionResponse { Items = ImmutableArray<CompletionItem>.Empty };
@@ -135,6 +135,11 @@ public class OmniSharpCompletionService
         var position = sourceText.GetTextPosition(request);
 
         var completionService = CSharpCompletionService.GetService(document);
+        if (request.CompletionTrigger == CompletionTriggerKind.TriggerCharacter && request.TriggerCharacter is null)
+        {
+            _logger.LogTrace("Trigger-character completion requested without a trigger character.");
+            return new CompletionResponse { Items = ImmutableArray<CompletionItem>.Empty };
+        }
         Debug.Assert(request.TriggerCharacter != null || request.CompletionTrigger != CompletionTriggerKind.TriggerCharacter);
 
         if (request.CompletionTrigger == CompletionTriggerKind.TriggerCharacter &&
