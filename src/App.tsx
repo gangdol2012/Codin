@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, createContext, useContext, useCallback } from 'react';
+import React, { useState, useEffect, useRef, createContext, useContext, useCallback, useMemo } from 'react';
 import {
   FileCode,
   Play,
@@ -12,6 +12,7 @@ import {
   Code2,
   Cpu,
   Sparkles,
+  Search,
   X,
   Check,
   Settings,
@@ -6073,6 +6074,31 @@ interface FileTreeContextMenuState {
   y: number;
 }
 
+interface WorkspaceSearchResult {
+  id: string;
+  itemId: string;
+  path: string;
+  lineNumber: number;
+  column: number;
+  preview: string;
+  previewMatchStart: number;
+  matchLength: number;
+  kind: 'name' | 'content';
+}
+
+function createWorkspaceSearchPreview(source: string, matchStart: number, matchLength: number) {
+  const contextLength = 48;
+  const rawStart = Math.max(0, matchStart - contextLength);
+  const rawEnd = Math.min(source.length, matchStart + matchLength + contextLength);
+  const prefix = rawStart > 0 ? '...' : '';
+  const suffix = rawEnd < source.length ? '...' : '';
+  const preview = `${prefix}${source.slice(rawStart, rawEnd)}${suffix}` || source;
+  return {
+    preview,
+    previewMatchStart: prefix.length + matchStart - rawStart,
+  };
+}
+
 interface FileTreeContextValue {
   files: FSItem[];
   activeFileId: string;
@@ -6280,6 +6306,8 @@ export default function App() {
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renamingName, setRenamingName] = useState('');
   const [pendingNewItem, setPendingNewItem] = useState<FSItem | null>(null);
+  const [isSearchOpen, setIsSearchOpen] = useState(false);
+  const [searchQuery, setSearchQuery] = useState('');
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [settings, setSettings] = useState<AppSettings>(() => {
     const saved = localStorage.getItem(getProjectStorageKey(STORAGE_KEYS.settings));
@@ -6400,6 +6428,9 @@ export default function App() {
   const javaRuntimeIdleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [activeEditorTabId, setActiveEditorTabId] = useState<string | null>(null);
   const [mountedSharedEditorTarget, setMountedSharedEditorTarget] = useState<SharedEditorTarget | null>(null);
+  const searchPanelRef = useRef<HTMLDivElement>(null);
+  const searchButtonRef = useRef<HTMLButtonElement>(null);
+  const searchInputRef = useRef<HTMLInputElement>(null);
   const outputContainerRef = useRef<HTMLDivElement>(null);
   const outputInteractionInputRef = useRef<HTMLInputElement>(null);
   const terminalContainerRef = useRef<HTMLDivElement>(null);
@@ -6480,6 +6511,53 @@ export default function App() {
       window.removeEventListener('keydown', handleKeyDown);
     };
   }, [fileTreeContextMenu]);
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      const hasCommandModifier = event.metaKey || event.ctrlKey;
+      const key = event.key.toLowerCase();
+      const isSearchShortcut = hasCommandModifier && (
+        (event.shiftKey && key === 'f')
+        || (!event.shiftKey && key === 'p')
+      );
+      if (!isSearchShortcut) return;
+
+      event.preventDefault();
+      setIsSearchOpen(true);
+      window.setTimeout(() => searchInputRef.current?.select(), 0);
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, []);
+
+  useEffect(() => {
+    if (!isSearchOpen) return;
+
+    const focusTimer = window.setTimeout(() => searchInputRef.current?.focus(), 0);
+    const closeSearch = () => setIsSearchOpen(false);
+    const handlePointerDown = (event: PointerEvent) => {
+      const target = event.target as Node | null;
+      if (target && searchPanelRef.current?.contains(target)) return;
+      if (target && searchButtonRef.current?.contains(target)) return;
+      closeSearch();
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') closeSearch();
+    };
+
+    window.addEventListener('pointerdown', handlePointerDown);
+    window.addEventListener('resize', closeSearch);
+    window.addEventListener('scroll', closeSearch, true);
+    window.addEventListener('keydown', handleKeyDown);
+    return () => {
+      window.clearTimeout(focusTimer);
+      window.removeEventListener('pointerdown', handlePointerDown);
+      window.removeEventListener('resize', closeSearch);
+      window.removeEventListener('scroll', closeSearch, true);
+      window.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [isSearchOpen]);
 
   const createSharedEditorTarget = useCallback((tabId: string, itemId: string): SharedEditorTarget => {
     sharedEditorVersionRef.current += 1;
@@ -7029,6 +7107,77 @@ export default function App() {
     return getFsItemPath(files, id);
   };
 
+  const searchResults = useMemo<WorkspaceSearchResult[]>(() => {
+    const rawQuery = searchQuery.trim();
+    const searchMode: WorkspaceSearchResult['kind'] = rawQuery.startsWith('#') ? 'content' : 'name';
+    const query = searchMode === 'content' ? rawQuery.slice(1).trim() : rawQuery;
+    if (!query) return [];
+
+    const needle = query.toLocaleLowerCase();
+    const matchLength = query.length;
+    const maxResults = 300;
+    const results: WorkspaceSearchResult[] = [];
+    const searchableFiles = files
+      .filter((item): item is FSItem & { type: 'file' } => item.type === 'file')
+      .sort((left, right) => getFsItemPath(files, left.id).localeCompare(getFsItemPath(files, right.id)));
+
+    for (const file of searchableFiles) {
+      const path = getFsItemPath(files, file.id);
+      if (searchMode === 'name') {
+        const nameMatchStart = file.name.toLocaleLowerCase().indexOf(needle);
+        if (nameMatchStart < 0) continue;
+
+        const { preview, previewMatchStart } = createWorkspaceSearchPreview(file.name, nameMatchStart, matchLength);
+        results.push({
+          id: `${file.id}:name`,
+          itemId: file.id,
+          path,
+          lineNumber: 1,
+          column: 1,
+          preview,
+          previewMatchStart,
+          matchLength,
+          kind: 'name',
+        });
+        if (results.length >= maxResults) return results;
+        continue;
+      }
+
+      const content = file.content || '';
+      const lines = content.split(/\r\n|\r|\n/);
+      for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
+        const line = lines[lineIndex];
+        const lowerLine = line.toLocaleLowerCase();
+        let fromIndex = 0;
+
+        while (fromIndex <= lowerLine.length) {
+          const matchStart = lowerLine.indexOf(needle, fromIndex);
+          if (matchStart < 0) break;
+
+          const { preview, previewMatchStart } = createWorkspaceSearchPreview(line, matchStart, matchLength);
+          results.push({
+            id: `${file.id}:${lineIndex + 1}:${matchStart + 1}:${results.length}`,
+            itemId: file.id,
+            path,
+            lineNumber: lineIndex + 1,
+            column: matchStart + 1,
+            preview,
+            previewMatchStart,
+            matchLength,
+            kind: 'content',
+          });
+
+          if (results.length >= maxResults) return results;
+          fromIndex = matchStart + Math.max(1, needle.length);
+        }
+      }
+
+      if (results.length >= maxResults) return results;
+    }
+
+    return results;
+  }, [files, searchQuery]);
+
   useEffect(() => {
     configureCodeCraftTypeScriptDefaults();
 
@@ -7382,6 +7531,34 @@ export default function App() {
     const item = files.find(f => f.id === itemId);
     if (!item) return;
     openEditorTabWithItem(item);
+  };
+
+  const openSearchResult = (result: WorkspaceSearchResult) => {
+    const item = files.find(candidate => candidate.id === result.itemId);
+    if (!item || item.type !== 'file') return;
+
+    const path = getPath(item.id);
+    const uri = getMonacoProjectModelUri(path);
+    const contentQuery = searchQuery.trim().startsWith('#') ? searchQuery.trim().slice(1).trim() : searchQuery.trim();
+    pendingEditorNavigationRef.current = {
+      uri: uri.toString(),
+      itemId: item.id,
+      selectionOrPosition: {
+        startLineNumber: result.lineNumber,
+        startColumn: result.column,
+        endLineNumber: result.lineNumber,
+        endColumn: result.kind === 'content'
+          ? result.column + Math.max(1, contentQuery.length)
+          : result.column,
+      },
+    };
+
+    openEditorTabWithItem(item);
+    setIsSearchOpen(false);
+    queueMicrotask(() => {
+      const editor = editorRef.current;
+      if (editor) applyPendingEditorNavigation(editor);
+    });
   };
 
   useEffect(() => {
@@ -17103,6 +17280,30 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
               className="hidden"
               onChange={handleImportProjectDataFile}
             />
+            <Tooltip.Root>
+              <Tooltip.Trigger asChild>
+                <button
+                  ref={searchButtonRef}
+                  type="button"
+                  onClick={() => setIsSearchOpen(open => !open)}
+                  className={cn(
+                    "inline-flex items-center justify-center h-8 w-8 rounded-md transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-zinc-600",
+                    isSearchOpen
+                      ? "bg-zinc-800 text-zinc-100"
+                      : "text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800"
+                  )}
+                  aria-label="Search"
+                >
+                  <Search size={16} />
+                </button>
+              </Tooltip.Trigger>
+              <Tooltip.Portal>
+                <Tooltip.Content sideOffset={6} className="z-50 overflow-hidden rounded-md bg-zinc-900 border border-zinc-700 px-3 py-1.5 text-xs text-zinc-200 shadow-md animate-in fade-in-0 zoom-in-95 data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=closed]:zoom-out-95">
+                  Search
+                  <Tooltip.Arrow className="fill-zinc-700" />
+                </Tooltip.Content>
+              </Tooltip.Portal>
+            </Tooltip.Root>
             <div className="relative">
               <Tooltip.Root>
                 <Tooltip.Trigger asChild>
@@ -17322,6 +17523,97 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
           </div>
         </header>
       </Tooltip.Provider>
+
+      <AnimatePresence>
+        {isSearchOpen && (
+          <motion.div
+            ref={searchPanelRef}
+            initial={{ opacity: 0, y: -8, scale: 0.98 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: -8, scale: 0.98 }}
+            transition={{ duration: 0.12 }}
+            className="fixed right-3 top-14 z-50 w-[min(42rem,calc(100vw-1.5rem))] overflow-hidden rounded-xl border border-white/10 bg-zinc-950 shadow-2xl"
+          >
+            <div className="flex h-12 items-center gap-3 border-b border-white/10 px-3">
+              <Search size={16} className="shrink-0 text-zinc-500" />
+              <input
+                ref={searchInputRef}
+                type="text"
+                value={searchQuery}
+                onChange={(event) => setSearchQuery(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter' && searchResults[0]) {
+                    event.preventDefault();
+                    openSearchResult(searchResults[0]);
+                  }
+                  if (event.key === 'Escape') {
+                    event.preventDefault();
+                    setIsSearchOpen(false);
+                  }
+                }}
+                placeholder="Search"
+                className="min-w-0 flex-1 bg-transparent text-sm text-white outline-none placeholder:text-zinc-600"
+              />
+              {searchQuery ? (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setSearchQuery('');
+                    searchInputRef.current?.focus();
+                  }}
+                  className="rounded-md p-1 text-zinc-500 transition-colors hover:bg-white/10 hover:text-zinc-200"
+                  aria-label="Clear search"
+                >
+                  <X size={14} />
+                </button>
+              ) : null}
+            </div>
+
+            <div className="max-h-[min(30rem,calc(100vh-8rem))] overflow-y-auto p-1 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+              {!searchQuery.trim() ? (
+                <div className="px-3 py-8 text-center text-sm text-zinc-500">No query</div>
+              ) : searchResults.length === 0 ? (
+                <div className="px-3 py-8 text-center text-sm text-zinc-500">No matches</div>
+              ) : (
+                <>
+                  {searchResults.map(result => {
+                    const matchStart = Math.max(0, Math.min(result.previewMatchStart, result.preview.length));
+                    const matchEnd = Math.max(matchStart, Math.min(matchStart + result.matchLength, result.preview.length));
+                    const beforeMatch = result.preview.slice(0, matchStart);
+                    const matchedText = result.preview.slice(matchStart, matchEnd);
+                    const afterMatch = result.preview.slice(matchEnd);
+
+                    return (
+                      <button
+                        key={result.id}
+                        type="button"
+                        onClick={() => openSearchResult(result)}
+                        className="group mb-1 w-full rounded-lg px-3 py-2 text-left transition-colors last:mb-0 hover:bg-white/5 focus-visible:bg-white/5 focus-visible:outline-none"
+                      >
+                        <div className="flex items-center gap-2 text-xs">
+                          <FileCode size={13} className="shrink-0 text-zinc-500 group-hover:text-indigo-300" />
+                          <span className="min-w-0 flex-1 truncate text-zinc-300 group-hover:text-white">{result.path}</span>
+                          <span className="shrink-0 font-mono text-[10px] text-zinc-600">
+                            {result.kind === 'content' ? `${result.lineNumber}:${result.column}` : 'file'}
+                          </span>
+                        </div>
+                        <div className="mt-1 truncate pl-5 font-mono text-[11px] leading-5 text-zinc-500">
+                          {beforeMatch}
+                          <span className="rounded bg-indigo-500/20 px-0.5 text-indigo-200">{matchedText}</span>
+                          {afterMatch}
+                        </div>
+                      </button>
+                    );
+                  })}
+                  {searchResults.length >= 300 ? (
+                    <div className="px-3 py-2 text-center text-[11px] text-zinc-600">Showing first 300 matches</div>
+                  ) : null}
+                </>
+              )}
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       <main className="flex-1 flex flex-col relative min-w-0 bg-[rgb(28,28,28)]">
         <div className="flex-1 flex flex-col min-h-0 relative bg-[rgb(28,28,28)]">
