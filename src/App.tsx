@@ -6855,13 +6855,16 @@ export default function App() {
     if (editorRef.current !== editor) return;
     if (editor.getModel?.()?.getLanguageId?.() !== 'csharp') return;
 
-    const csharpAuthoring = await ensureCSharpAuthoringReady();
+    const csharpAuthoring = await getCSharpAuthoringModule();
     if (csharpDiagnosticsEditorRef.current !== editor) return;
     if (editorRef.current !== editor) return;
     if (editor.getModel?.()?.getLanguageId?.() !== 'csharp') return;
 
     csharpAuthoring.csharpService.setupEditor(editor, getCSharpProjectFileSnapshots);
-  }, [ensureCSharpAuthoringReady, getCSharpProjectFileSnapshots]);
+    void ensureCSharpAuthoringReady().catch(error => {
+      console.warn('Failed to prepare C# language support:', error);
+    });
+  }, [ensureCSharpAuthoringReady, getCSharpAuthoringModule, getCSharpProjectFileSnapshots]);
 
   useEffect(() => {
     void refreshCSharpDiagnostics();
@@ -6920,6 +6923,17 @@ export default function App() {
     }
 
     if (languageId === 'csharp') {
+      editor.updateOptions({
+        quickSuggestions: {
+          other: false,
+          comments: false,
+          strings: false,
+        },
+        wordBasedSuggestions: 'off',
+        suggest: {
+          showWords: false,
+        },
+      });
       csharpDiagnosticsEditorRef.current = editor;
       void refreshCSharpDiagnostics();
     } else if (csharpDiagnosticsEditorRef.current === editor) {

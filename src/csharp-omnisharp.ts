@@ -6,7 +6,7 @@ type OmniSharpCall = (method: string, ...args: unknown[]) => Promise<any>;
 export type CSharpOmniSharpSource = 'local';
 
 const CSHARP_OMNISHARP_URLS: Record<CSharpOmniSharpSource, string> = {
-  local: '/omnisharp/',
+  local: '/omnisharp/index.html',
 };
 
 function normalizeCSharpOmniSharpSource(source: unknown): CSharpOmniSharpSource {
@@ -595,7 +595,7 @@ function currentModelPath(model: monaco.editor.ITextModel) {
 // CodeCraft C# OmniSharp-only completion start
 const CSHARP_CONTEXTUAL_COMPLETION_FIX_VERSION = '2026-05-25-omnisharp-only-v4';
 
-const CSHARP_CONTEXTUAL_COMPLETION_TRIGGER_CHARACTERS = ['.', '(', ',', '<', '[', ' ', '#', ':', '=', '{', '}', '?', '@'];
+const CSHARP_CONTEXTUAL_COMPLETION_TRIGGER_CHARACTERS = ['(', ',', '<', '[', ' ', '#', ':', '=', '{', '}', '?', '@'];
 
 const CSHARP_LSP_COMPLETION_KIND_TO_MONACO = new Map<number, monaco.languages.CompletionItemKind>([
   [1, monaco.languages.CompletionItemKind.Text],
@@ -852,6 +852,7 @@ function csharpCompletionCharacterBefore(model: monaco.editor.ITextModel, positi
 }
 
 function csharpOmniSharpCompletionTriggerKind(context: monaco.languages.CompletionContext): 1 | 2 | 3 {
+  if (context.triggerCharacter === '.') return 1;
   return context.triggerKind === monaco.languages.CompletionTriggerKind.TriggerCharacter
     ? 2
     : context.triggerKind === monaco.languages.CompletionTriggerKind.TriggerForIncompleteCompletions
@@ -898,8 +899,7 @@ function csharpContextualCompletionCacheKey(
   position: monaco.Position,
   context: monaco.languages.CompletionContext,
   request: any,
-  completionEnvironmentVersion: number,
-  completionWorkerStateKey: string | null
+  completionEnvironmentVersion: number
 ): string {
   const triggerCharacter = typeof context.triggerCharacter === 'string' ? context.triggerCharacter : '';
   const previousCharacter = csharpCompletionCharacterBefore(model, position) ?? '';
@@ -915,7 +915,6 @@ function csharpContextualCompletionCacheKey(
     triggerCharacter,
     previousCharacter,
     completionEnvironmentVersion,
-    completionWorkerStateKey ?? '',
   ].join('|');
 }
 
@@ -1519,6 +1518,7 @@ class CSharpLanguageService {
   }
 
   async initialize(iframeUrl = CSHARP_OMNISHARP_URLS.local) {
+    this.ensureProvidersRegistered();
     const nextIframeUrl = iframeUrl.trim() || CSHARP_OMNISHARP_URLS.local;
     if (this.initialized && this.iframeUrl === nextIframeUrl && this.omnisharp) return;
     if (this.initializationPromise && this.iframeUrl === nextIframeUrl) {
@@ -1643,14 +1643,17 @@ class CSharpLanguageService {
         });
       };
 
-      if (!this.providersRegistered) {
-        this.registerProviders();
-        this.providersRegistered = true;
-      }
+      this.ensureProvidersRegistered();
     } catch (error) {
       this.disposeOmniSharpRuntime();
       throw error;
     }
+  }
+
+  ensureProvidersRegistered() {
+    if (this.providersRegistered) return;
+    this.registerProviders();
+    this.providersRegistered = true;
   }
 
   private disposeOmniSharpRuntime() {
@@ -1952,6 +1955,18 @@ class CSharpLanguageService {
   private modelChangeListener: monaco.IDisposable | null = null;
 
   setupEditor(editor: monaco.editor.IStandaloneCodeEditor, projectFilesProvider?: CSharpProjectFilesProvider) {
+    this.ensureProvidersRegistered();
+    editor.updateOptions({
+      quickSuggestions: {
+        other: false,
+        comments: false,
+        strings: false,
+      },
+      wordBasedSuggestions: 'off',
+      suggest: {
+        showWords: false,
+      },
+    });
     if (projectFilesProvider) {
       this.projectFilesProvider = projectFilesProvider;
     }
@@ -2005,8 +2020,9 @@ class CSharpLanguageService {
           model: this.summarizeModel(model),
         });
         this.requestDiagnostics(model);
-        this.modelChangeListener = model.onDidChangeContent(() => {
+        this.modelChangeListener = model.onDidChangeContent(event => {
           if (!model.isDisposed() && model.getLanguageId() === 'csharp') {
+            const shouldTriggerMemberCompletion = this.shouldTriggerMemberCompletionAfterChange(model, event);
             this.semanticCache.delete(model);
             this.clearCompletionState({ structural: false });
             this.recordDebugEvent({
@@ -2017,6 +2033,9 @@ class CSharpLanguageService {
               model: this.summarizeModel(model),
             });
             this.requestDiagnostics(model);
+            if (shouldTriggerMemberCompletion) {
+              window.setTimeout(() => this.triggerMemberCompletion(model), 25);
+            }
           }
         });
       } else {
@@ -2222,6 +2241,39 @@ class CSharpLanguageService {
     }
   }
 
+  private shouldTriggerMemberCompletionAfterChange(
+    model: monaco.editor.ITextModel,
+    event: monaco.editor.IModelContentChangedEvent
+  ) {
+    if (!this.editor || this.editor.getModel() !== model) return false;
+    if (event.changes.length !== 1) return false;
+
+    const change = event.changes[0];
+    if (change.rangeLength !== 0) return false;
+
+    const position = new monaco.Position(change.range.startLineNumber, change.range.startColumn + 1);
+    if (change.text === '.') {
+      return csharpCompletionCharacterBefore(model, position) === '.';
+    }
+
+    if (change.text.length !== 1 || !isIdentifierPart(change.text, 0)) return false;
+    const filterRange = this.getCompletionFilterRangeAtPosition(model, position);
+    return filterRange.startColumn > 1
+      && model.getLineContent(position.lineNumber).charAt(filterRange.startColumn - 2) === '.';
+  }
+
+  private triggerMemberCompletion(model: monaco.editor.ITextModel) {
+    if (!this.editor || this.editor.getModel() !== model || model.isDisposed() || model.getLanguageId() !== 'csharp') return;
+    const position = this.editor.getPosition();
+    if (!position) return;
+    const filterRange = this.getCompletionFilterRangeAtPosition(model, position);
+    const hasMemberAccessPrefix = filterRange.startColumn > 1
+      && model.getLineContent(position.lineNumber).charAt(filterRange.startColumn - 2) === '.';
+    if (csharpCompletionCharacterBefore(model, position) !== '.' && !hasMemberAccessPrefix) return;
+    if (!this.isEditorAtPosition(model, position)) return;
+    this.editor.trigger('csharp-omnisharp', 'editor.action.triggerSuggest', {});
+  }
+
   private toMarkerSeverity(severity: unknown): monaco.MarkerSeverity {
     if (typeof severity === 'number') {
       if (severity === monaco.MarkerSeverity.Error || severity >= 8) return monaco.MarkerSeverity.Error;
@@ -2251,11 +2303,10 @@ class CSharpLanguageService {
       context,
       request,
       this.completionEnvironmentVersion,
-      this.completionWorkerStateKey
     );
 
     const cached = this.completionCache.get(cacheKey);
-    if (cached && this.completionWorkerStateKey === cacheKey) return this.toCompletionList(cached);
+    if (cached) return this.toCompletionList(cached);
 
     const runtimeReady = await this.ensureLocalOmniSharpRuntime();
     if (!runtimeReady || !this.omnisharp || model.isDisposed()) {

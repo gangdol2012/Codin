@@ -10,6 +10,7 @@ function registerService(monacoService) {
   }
 
   const methods = {};
+  const methodQueues = {};
 
   // Override the invokeMethod prototype
   // Biggest bottleneck here is marshalling JS to WASM for strings
@@ -18,10 +19,13 @@ function registerService(monacoService) {
   monacoService.__proto__.invokeMethod = function (...args) {
     try {
       const parsed = JSON.parse(args[args.length - 1]);
+      if (typeof parsed?.ResultPayload !== "string") {
+        return orig.call(this, ...args);
+      }
       const parsedResult = JSON.parse(
         atob(parsed.ResultPayload.slice(1, parsed.ResultPayload.length - 1))
       );
-      methods[parsedResult.type](parsedResult.payload);
+      methods[parsedResult.type]?.(parsedResult.payload);
       parsed.ResultPayload = JSON.stringify(JSON.stringify("{}"));
       return orig.call(this, args[0], null);
     } catch (e) {
@@ -35,8 +39,9 @@ function registerService(monacoService) {
   window.addEventListener("message", (e) => {
     if (e.data?.omnisharp) {
       const { method, args, id } = e.data.omnisharp;
-      methods[method] = (payload) => {
-        e.source.postMessage(
+      const source = e.source;
+      const respond = (payload) => {
+        source.postMessage(
           {
             omnisharp: {
               method,
@@ -47,12 +52,29 @@ function registerService(monacoService) {
           "*"
         );
       };
+      const invoke = () => new Promise((resolve) => {
+        methods[method] = (payload) => {
+          try {
+            respond(payload);
+          } finally {
+            delete methods[method];
+            resolve();
+          }
+        };
 
-      monacoService.invokeMethodAsync(
-        "RunAsync",
-        method,
-        args.map((a) => (typeof a === "object" ? JSON.stringify(a) : a))
-      );
+        monacoService.invokeMethodAsync(
+          "RunAsync",
+          method,
+          args.map((a) => (typeof a === "object" ? JSON.stringify(a) : a))
+        ).catch((error) => {
+          console.warn(error);
+          delete methods[method];
+          respond(false);
+          resolve();
+        });
+      });
+
+      methodQueues[method] = (methodQueues[method] || Promise.resolve()).then(invoke, invoke);
     }
   });
 }
