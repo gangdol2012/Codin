@@ -133,6 +133,7 @@ const NPM_INSTALL_PROGRESS_DETAIL_LIMIT = 120;
 const MAX_NPM_PACKAGE_TEXT_FILE_BYTES = 5 * 1024 * 1024;
 const MAX_NPM_PACKAGE_TOTAL_TEXT_BYTES = 40 * 1024 * 1024;
 const NPM_INCLUDE_FETCH_TIMEOUT_MS = 12000;
+const CODECRAFT_EDITOR_INDENT_SIZE = 4;
 
 interface CodeCraftProjectMeta {
   id: string;
@@ -1092,8 +1093,10 @@ const buildSharedEditorOptions = (fontSize: number) => ({
   tabFocusMode: false,
   useTabStops: true,
   stickyTabStops: false,
+  tabSize: CODECRAFT_EDITOR_INDENT_SIZE,
+  indentSize: CODECRAFT_EDITOR_INDENT_SIZE,
   insertSpaces: true,
-  detectIndentation: true,
+  detectIndentation: false,
   minimap: { enabled: true },
   scrollBeyondLastLine: false,
   scrollBeyondLastColumn: 5,
@@ -1224,6 +1227,19 @@ const buildSharedEditorOptions = (fontSize: number) => ({
     horizontalScrollbarSize: 10
   }
 });
+
+const updateCodeCraftModelOptions = (model: monaco.editor.ITextModel | null | undefined) => {
+  model?.updateOptions?.({
+    tabSize: CODECRAFT_EDITOR_INDENT_SIZE,
+    indentSize: CODECRAFT_EDITOR_INDENT_SIZE,
+    insertSpaces: true,
+    trimAutoWhitespace: true,
+    bracketColorizationOptions: {
+      enabled: false,
+      independentColorPoolPerBracketType: false,
+    },
+  });
+};
 
 // Define AI tools
 function isAssistantProvider(value: unknown): value is AssistantProvider {
@@ -6685,16 +6701,7 @@ export default function App() {
 
   const resetSharedEditorOptions = useCallback((editor: any) => {
     editor.updateOptions(buildSharedEditorOptions(settings.fontSize));
-    editor.getModel?.()?.updateOptions?.({
-      tabSize: 2,
-      indentSize: 2,
-      insertSpaces: true,
-      trimAutoWhitespace: true,
-      bracketColorizationOptions: {
-        enabled: false,
-        independentColorPoolPerBracketType: false,
-      },
-    });
+    updateCodeCraftModelOptions(editor.getModel?.());
   }, [settings.fontSize]);
 
   const buildMergedCachedPythonPackageStubs = useCallback(() => {
@@ -7196,13 +7203,14 @@ export default function App() {
 
       nextModelUris.add(uriKey);
       if (!existingModel) {
-        monaco.editor.createModel(content, language, uri);
+        updateCodeCraftModelOptions(monaco.editor.createModel(content, language, uri));
         continue;
       }
 
       if (existingModel.getLanguageId() !== language) {
         monaco.editor.setModelLanguage(existingModel, language);
       }
+      updateCodeCraftModelOptions(existingModel);
       if (existingModel.getValue() !== content) {
         existingModel.setValue(content);
       }
@@ -12165,9 +12173,7 @@ finally:
       await runPackageJsonDependencySync();
 
       const runtimeLanguage = getProjectRuntimeLanguageForFile(currentFile);
-      const runnableFiles = getProjectRunnableFiles();
-      const compatibleFiles = getProjectRunFilesForEntry(currentFile, runnableFiles);
-      const projectFiles = toProjectSourceFiles(compatibleFiles.length > 0 ? compatibleFiles : [currentFile]);
+      const projectFiles = toProjectSourceFiles([currentFile]);
       const entryFile = projectFiles.find(file => file.id === currentFile.id) ?? projectFiles[0] ?? null;
 
       if (!runtimeLanguage || !entryFile) {
