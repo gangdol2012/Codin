@@ -1,6 +1,16 @@
 import React, { useState, useEffect, useRef, createContext, useContext, useCallback, useMemo } from 'react';
 import {
+  Binary,
+  Boxes,
+  Braces,
+  Coffee,
   FileCode,
+  FileArchive,
+  FileCog,
+  FileImage,
+  FileJson,
+  FileText,
+  FileType,
   Play,
   Plus,
   Trash2,
@@ -32,6 +42,7 @@ import {
   Database,
   GitBranch,
   GitCommitHorizontal,
+  Hash,
   RefreshCw,
   CloudUpload,
   KeyRound
@@ -132,6 +143,8 @@ const PYTHON_CACHE_PACKAGE_META_KEY = 'packages';
 const PYTHON_CACHE_PACKAGE_SNAPSHOT_KEY = 'snapshot';
 const NPM_PACKAGE_DB_NAME = 'codecraft-npm-packages';
 const NPM_PACKAGE_STORE_NAME = 'packages';
+const GIT_STATE_DB_NAME = 'codecraft-git-state';
+const GIT_STATE_STORE_NAME = 'state';
 const MAX_NPM_INSTALL_PACKAGE_COUNT = 4096;
 const NPM_INSTALL_BROWSER_YIELD_EVERY = 8;
 const NPM_INSTALL_PROGRESS_DETAIL_LIMIT = 120;
@@ -345,6 +358,19 @@ function openNpmPackageDB(): Promise<IDBDatabase> {
     req.onupgradeneeded = () => {
       if (!req.result.objectStoreNames.contains(NPM_PACKAGE_STORE_NAME)) {
         req.result.createObjectStore(NPM_PACKAGE_STORE_NAME);
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+function openGitStateDB(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(GIT_STATE_DB_NAME, 1);
+    req.onupgradeneeded = () => {
+      if (!req.result.objectStoreNames.contains(GIT_STATE_STORE_NAME)) {
+        req.result.createObjectStore(GIT_STATE_STORE_NAME);
       }
     };
     req.onsuccess = () => resolve(req.result);
@@ -924,7 +950,9 @@ const STORAGE_KEYS = {
 };
 
 const PROJECT_LOCAL_STORAGE_KEYS = [
-  ...Object.values(STORAGE_KEYS),
+  ...Object.entries(STORAGE_KEYS)
+    .filter(([key]) => key !== 'gitState')
+    .map(([, value]) => value),
   SYNC_META_KEY,
 ];
 
@@ -987,6 +1015,71 @@ const EXT_TO_LANGUAGE: Record<string, string> = {
 function langFromFilename(name: string): string {
   const ext = name.split('.').pop()?.toLowerCase() || '';
   return EXT_TO_LANGUAGE[ext] || 'plaintext';
+}
+
+function getFilenameExtension(name: string) {
+  const filename = name.split('/').pop()?.toLowerCase() || '';
+  const parts = filename.split('.');
+  return parts.length > 1 ? parts.pop() || '' : '';
+}
+
+function getFileIconMeta(path: string, language?: string) {
+  const filename = path.split('/').pop()?.toLowerCase() || path.toLowerCase();
+  const extension = getFilenameExtension(path);
+  const resolvedLanguage = (language || langFromFilename(filename)).toLowerCase();
+
+  if (filename === 'package.json' || filename === 'package-lock.json') return { Icon: Boxes, className: 'text-emerald-400' };
+  if (/^(?:vite|wrangler|tailwind|postcss|eslint|prettier|tsconfig|jsconfig|babel|rollup|webpack|vercel)\b/.test(filename)) return { Icon: FileCog, className: 'text-zinc-400' };
+  if (/^(?:dockerfile|containerfile)$/.test(filename)) return { Icon: Boxes, className: 'text-cyan-400' };
+
+  if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'avif', 'ico', 'bmp'].includes(extension)) return { Icon: FileImage, className: 'text-fuchsia-400' };
+  if (['zip', 'tar', 'gz', 'tgz', 'br', 'rar', '7z'].includes(extension)) return { Icon: FileArchive, className: 'text-stone-400' };
+  if (['wasm', 'dll', 'pdb', 'bin', 'dat'].includes(extension)) return { Icon: Binary, className: 'text-zinc-500' };
+
+  switch (resolvedLanguage) {
+    case 'javascript':
+      return { Icon: Braces, className: 'text-yellow-300' };
+    case 'typescript':
+      return { Icon: Braces, className: 'text-sky-400' };
+    case 'python':
+      return { Icon: FileCode, className: 'text-emerald-400' };
+    case 'csharp':
+      return { Icon: Hash, className: 'text-violet-400' };
+    case 'java':
+      return { Icon: Coffee, className: 'text-orange-400' };
+    case 'c':
+    case 'cpp':
+      return { Icon: Binary, className: 'text-blue-400' };
+    case 'html':
+      return { Icon: FileCode, className: 'text-orange-300' };
+    case 'css':
+    case 'scss':
+    case 'less':
+      return { Icon: Hash, className: 'text-cyan-400' };
+    case 'json':
+      return { Icon: FileJson, className: 'text-amber-300' };
+    case 'markdown':
+    case 'plaintext':
+      return { Icon: FileText, className: 'text-zinc-400' };
+    case 'xml':
+      return extension === 'svg'
+        ? { Icon: FileImage, className: 'text-pink-400' }
+        : { Icon: FileCode, className: 'text-orange-300' };
+    case 'yaml':
+    case 'ini':
+      return { Icon: FileCog, className: 'text-zinc-400' };
+    case 'shell':
+      return { Icon: TerminalIcon, className: 'text-lime-400' };
+    case 'sql':
+      return { Icon: Database, className: 'text-cyan-300' };
+    default:
+      return { Icon: FileType, className: 'text-zinc-500' };
+  }
+}
+
+function FileTypeIcon({ path, language, size = 16, className }: { path: string; language?: string; size?: number; className?: string }) {
+  const { Icon, className: iconClassName } = getFileIconMeta(path, language);
+  return <Icon size={size} className={cn("shrink-0", iconClassName, className)} />;
 }
 
 const INITIAL_LAYOUT: IJsonModel = {
@@ -2411,6 +2504,7 @@ interface CodeCraftUserDataExport {
     npmPackages: StoredNpmPackage[];
     pyodidePackageMeta: Record<string, SerializedCachedPyodidePackageMeta>;
     pyodidePackageSnapshot: SerializedCachedPyodideEnvironmentSnapshot | null;
+    gitState: GitRepositoryState;
   };
   browserBoundData: {
     fileSystemSyncHandlesExported: false;
@@ -3595,21 +3689,25 @@ async function deleteCodeCraftProjectData(projectId: string) {
     savePersistedPyodidePackageMetaCache({}, projectId),
     savePersistedPyodidePackageSnapshot(null, projectId),
     clearStoredSyncHandles(projectId),
+    deleteStoredGitState(projectId),
   ]);
 }
 
 async function createCodeCraftUserDataExport(
   localStorageOverrides: Record<string, string> = {},
-  projectId = getActiveProjectId()
+  projectId = getActiveProjectId(),
+  gitStateOverride?: GitRepositoryState
 ): Promise<CodeCraftUserDataExport> {
   const [
     npmPackages,
     pyodidePackageMeta,
     pyodidePackageSnapshot,
+    storedGitState,
   ] = await Promise.all([
     loadAllStoredNpmPackages(projectId).catch(() => []),
     loadPersistedPyodidePackageMetaCache(projectId).catch(() => ({})),
     loadPersistedPyodidePackageSnapshot(projectId).catch(() => null),
+    loadStoredGitState(projectId).catch(() => null),
   ]);
 
   return {
@@ -3624,6 +3722,7 @@ async function createCodeCraftUserDataExport(
       npmPackages,
       pyodidePackageMeta: serializeCachedPyodidePackageMetaRecord(pyodidePackageMeta),
       pyodidePackageSnapshot: serializeCachedPyodideEnvironmentSnapshot(pyodidePackageSnapshot),
+      gitState: normalizeGitState(gitStateOverride || storedGitState),
     },
     browserBoundData: {
       fileSystemSyncHandlesExported: false,
@@ -3653,9 +3752,18 @@ async function restoreCodeCraftUserDataExport(raw: unknown, projectId = getActiv
   const indexedDBSnapshot = backup.indexedDB && typeof backup.indexedDB === 'object'
     ? backup.indexedDB
     : null;
+  let gitStateSnapshot: unknown = indexedDBSnapshot?.gitState;
+  if (!gitStateSnapshot && localStorageSnapshot[STORAGE_KEYS.gitState]) {
+    try {
+      gitStateSnapshot = JSON.parse(localStorageSnapshot[STORAGE_KEYS.gitState]);
+    } catch {
+      gitStateSnapshot = null;
+    }
+  }
   await replaceAllStoredNpmPackages(Array.isArray(indexedDBSnapshot?.npmPackages) ? indexedDBSnapshot.npmPackages : [], projectId);
   await savePersistedPyodidePackageMetaCache(deserializeCachedPyodidePackageMetaRecord(indexedDBSnapshot?.pyodidePackageMeta), projectId);
   await savePersistedPyodidePackageSnapshot(deserializeCachedPyodideEnvironmentSnapshot(indexedDBSnapshot?.pyodidePackageSnapshot), projectId);
+  await saveStoredGitState(normalizeGitState(gitStateSnapshot), projectId);
   await clearStoredSyncHandles(projectId);
 }
 
@@ -4554,6 +4662,13 @@ interface GitBranchRecord {
   upstream?: string;
 }
 
+interface GitTagRecord {
+  name: string;
+  target: string;
+  message?: string;
+  timestamp: number;
+}
+
 interface GitRemoteRecord {
   name: string;
   url: string;
@@ -4578,11 +4693,22 @@ interface GitRepositoryState {
   currentBranch: string;
   branches: Record<string, GitBranchRecord>;
   commits: Record<string, GitCommitRecord>;
+  tags: Record<string, GitTagRecord>;
+  stashes: GitStashRecord[];
   remotes: Record<string, GitRemoteRecord>;
   config: Record<string, string>;
   ghAuth: GitHubAuthRecord | null;
   lastFetchedAt: number | null;
   stagedPaths: string[];
+}
+
+interface GitStashRecord {
+  id: string;
+  message: string;
+  branch: string;
+  baseHead: string | null;
+  timestamp: number;
+  files: Record<string, string>;
 }
 
 interface GitFileChange {
@@ -4607,6 +4733,7 @@ interface GitBranchSyncStatus {
 const DEFAULT_GIT_BRANCH = 'main';
 const DEFAULT_GIT_REMOTE_URL = 'codecraft://remote/default';
 const GIT_REMOTE_STORAGE_PREFIX = 'codecraft-git-remote:';
+const GIT_STATE_STORAGE_PREFIX = 'codecraft-git-state:';
 
 function createDefaultGitState(): GitRepositoryState {
   return {
@@ -4620,6 +4747,8 @@ function createDefaultGitState(): GitRepositoryState {
       },
     },
     commits: {},
+    tags: {},
+    stashes: [],
     remotes: {
       origin: {
         name: 'origin',
@@ -4656,6 +4785,8 @@ function normalizeGitState(raw: unknown): GitRepositoryState {
     currentBranch,
     branches: normalizedBranches,
     commits: source.commits && typeof source.commits === 'object' ? source.commits : {},
+    tags: source.tags && typeof source.tags === 'object' ? source.tags : {},
+    stashes: Array.isArray(source.stashes) ? source.stashes.filter(stash => stash && typeof stash === 'object') as GitStashRecord[] : [],
     remotes: source.remotes && typeof source.remotes === 'object' ? source.remotes : fallback.remotes,
     config: source.config && typeof source.config === 'object' ? source.config : fallback.config,
     ghAuth: source.ghAuth && typeof source.ghAuth === 'object' ? source.ghAuth : null,
@@ -4664,12 +4795,84 @@ function normalizeGitState(raw: unknown): GitRepositoryState {
   };
 }
 
-function loadSavedGitState() {
-  try {
-    return normalizeGitState(JSON.parse(localStorage.getItem(getProjectStorageKey(STORAGE_KEYS.gitState)) || 'null'));
-  } catch {
-    return createDefaultGitState();
+function getGitStateStorageKey(projectId = getActiveProjectId()) {
+  return `${GIT_STATE_STORAGE_PREFIX}${projectId}`;
+}
+
+function getLegacyGitStateLocalStorageKeys(projectId = getActiveProjectId()) {
+  const keys = [getProjectStorageKey(STORAGE_KEYS.gitState, projectId)];
+  if (projectId === DEFAULT_PROJECT_ID) keys.push(STORAGE_KEYS.gitState);
+  return keys;
+}
+
+function loadLegacySavedGitState(projectId = getActiveProjectId()) {
+  for (const key of getLegacyGitStateLocalStorageKeys(projectId)) {
+    try {
+      const value = localStorage.getItem(key);
+      if (value != null) return normalizeGitState(JSON.parse(value));
+    } catch {
+      return createDefaultGitState();
+    }
   }
+  return null;
+}
+
+function removeLegacySavedGitState(projectId = getActiveProjectId()) {
+  for (const key of getLegacyGitStateLocalStorageKeys(projectId)) {
+    localStorage.removeItem(key);
+  }
+}
+
+async function loadStoredGitState(projectId = getActiveProjectId()): Promise<GitRepositoryState | null> {
+  try {
+    const db = await openGitStateDB();
+    const stored = await new Promise<unknown>((resolve, reject) => {
+      const tx = db.transaction(GIT_STATE_STORE_NAME, 'readonly');
+      const req = tx.objectStore(GIT_STATE_STORE_NAME).get(getGitStateStorageKey(projectId));
+      tx.oncomplete = () => resolve(req.result);
+      tx.onerror = () => reject(tx.error);
+      req.onerror = () => reject(req.error);
+    });
+    if (stored) {
+      removeLegacySavedGitState(projectId);
+      return normalizeGitState(stored);
+    }
+  } catch {
+    const legacy = loadLegacySavedGitState(projectId);
+    return legacy || null;
+  }
+
+  const legacy = loadLegacySavedGitState(projectId);
+  if (legacy) {
+    await saveStoredGitState(legacy, projectId);
+    removeLegacySavedGitState(projectId);
+    return legacy;
+  }
+
+  return null;
+}
+
+async function saveStoredGitState(state: GitRepositoryState, projectId = getActiveProjectId()) {
+  const db = await openGitStateDB();
+  const snapshot = normalizeGitState(state);
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction(GIT_STATE_STORE_NAME, 'readwrite');
+    tx.objectStore(GIT_STATE_STORE_NAME).put(snapshot, getGitStateStorageKey(projectId));
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+  removeLegacySavedGitState(projectId);
+}
+
+async function deleteStoredGitState(projectId = getActiveProjectId()) {
+  const db = await openGitStateDB();
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction(GIT_STATE_STORE_NAME, 'readwrite');
+    tx.objectStore(GIT_STATE_STORE_NAME).delete(getGitStateStorageKey(projectId));
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+  removeLegacySavedGitState(projectId);
 }
 
 function serializeWorkspaceSnapshot(items: FSItem[]) {
@@ -4731,6 +4934,42 @@ function getGitWorkspaceChanges(state: GitRepositoryState, items: FSItem[]) {
   return diffGitSnapshots(head?.files || {}, serializeWorkspaceSnapshot(items));
 }
 
+function matchesGitPathspec(path: string, pathspecs: string[]) {
+  if (pathspecs.length === 0 || pathspecs.includes('.')) return true;
+  return pathspecs.some(spec => {
+    const normalized = normalizeProjectPath(spec);
+    return path === normalized || path.startsWith(`${normalized}/`);
+  });
+}
+
+function resolveGitRevision(state: GitRepositoryState, revision = 'HEAD') {
+  const target = revision.trim() || 'HEAD';
+  if (target === 'HEAD') return state.branches[state.currentBranch]?.head || null;
+  if (state.branches[target]?.head) return state.branches[target].head;
+  if (state.tags[target]?.target) return state.tags[target].target;
+  const remoteRef = getGitRemoteBranchRefs(state).find(ref => ref.label === target || `remotes/${ref.label}` === target);
+  if (remoteRef?.head) return remoteRef.head;
+  const exactCommit = state.commits[target];
+  if (exactCommit) return exactCommit.id;
+  const matches = Object.keys(state.commits).filter(id => id.startsWith(target));
+  return matches.length === 1 ? matches[0] : null;
+}
+
+function getGitRevisionCommit(state: GitRepositoryState, revision = 'HEAD') {
+  const id = resolveGitRevision(state, revision);
+  return id ? state.commits[id] || null : null;
+}
+
+function formatGitCommitDetails(commit: GitCommitRecord) {
+  return [
+    `commit ${commit.id}`,
+    `Author: ${commit.author}`,
+    `Date:   ${formatGitTimestamp(commit.timestamp)}`,
+    '',
+    `    ${commit.message}`,
+  ];
+}
+
 function isGitAncestor(state: GitRepositoryState, ancestorId: string | null, descendantId: string | null) {
   if (!ancestorId) return true;
   if (!descendantId) return false;
@@ -4745,6 +4984,30 @@ function isGitAncestor(state: GitRepositoryState, ancestorId: string | null, des
     if (commit) stack.push(...commit.parentIds);
   }
   return false;
+}
+
+function getGitMergeBase(state: GitRepositoryState, leftId: string | null, rightId: string | null) {
+  if (!leftId || !rightId) return null;
+  const ancestors = new Set<string>();
+  const collect = [leftId];
+  while (collect.length > 0) {
+    const id = collect.pop();
+    if (!id || ancestors.has(id)) continue;
+    ancestors.add(id);
+    const commit = state.commits[id];
+    if (commit) collect.push(...commit.parentIds);
+  }
+  const scan = [rightId];
+  const seen = new Set<string>();
+  while (scan.length > 0) {
+    const id = scan.pop();
+    if (!id || seen.has(id)) continue;
+    if (ancestors.has(id)) return id;
+    seen.add(id);
+    const commit = state.commits[id];
+    if (commit) scan.push(...commit.parentIds);
+  }
+  return null;
 }
 
 function getGitBranchSyncStatus(state: GitRepositoryState): GitBranchSyncStatus {
@@ -4872,27 +5135,59 @@ function decodeGitHubBase64Content(content: string) {
   return new TextDecoder().decode(bytes);
 }
 
-function loadStoredGitRemote(remote: GitRemoteRecord): GitRemoteRecord {
+async function loadStoredGitRemote(remote: GitRemoteRecord): Promise<GitRemoteRecord> {
+  try {
+    const db = await openGitStateDB();
+    const parsed = await new Promise<unknown>((resolve, reject) => {
+      const tx = db.transaction(GIT_STATE_STORE_NAME, 'readonly');
+      const req = tx.objectStore(GIT_STATE_STORE_NAME).get(getGitRemoteStorageKey(remote.url));
+      tx.oncomplete = () => resolve(req.result);
+      tx.onerror = () => reject(tx.error);
+      req.onerror = () => reject(req.error);
+    });
+    if (parsed && typeof parsed === 'object') {
+      localStorage.removeItem(getGitRemoteStorageKey(remote.url));
+      const stored = parsed as Partial<GitRemoteRecord>;
+      return {
+        ...remote,
+        branchHeads: stored.branchHeads && typeof stored.branchHeads === 'object' ? stored.branchHeads : remote.branchHeads,
+        branchFiles: stored.branchFiles && typeof stored.branchFiles === 'object' ? stored.branchFiles : remote.branchFiles,
+      };
+    }
+  } catch {
+    // Ignore corrupt IndexedDB remote storage and try the legacy localStorage value.
+  }
+
   try {
     const parsed = JSON.parse(localStorage.getItem(getGitRemoteStorageKey(remote.url)) || 'null');
     if (parsed && typeof parsed === 'object') {
-      return {
+      const migratedRemote = {
         ...remote,
         branchHeads: parsed.branchHeads && typeof parsed.branchHeads === 'object' ? parsed.branchHeads : remote.branchHeads,
         branchFiles: parsed.branchFiles && typeof parsed.branchFiles === 'object' ? parsed.branchFiles : remote.branchFiles,
       };
+      await saveStoredGitRemote(migratedRemote);
+      localStorage.removeItem(getGitRemoteStorageKey(remote.url));
+      return migratedRemote;
     }
   } catch {
-    // Ignore corrupt remote storage and keep the local remote metadata.
+    // Ignore corrupt legacy remote storage and keep the local remote metadata.
   }
   return remote;
 }
 
-function saveStoredGitRemote(remote: GitRemoteRecord) {
-  localStorage.setItem(getGitRemoteStorageKey(remote.url), JSON.stringify({
-    branchHeads: remote.branchHeads,
-    branchFiles: remote.branchFiles,
-  }));
+async function saveStoredGitRemote(remote: GitRemoteRecord) {
+  const db = await openGitStateDB();
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction(GIT_STATE_STORE_NAME, 'readwrite');
+    tx.objectStore(GIT_STATE_STORE_NAME).put({
+      branchHeads: remote.branchHeads,
+      branchFiles: remote.branchFiles,
+    }, getGitRemoteStorageKey(remote.url));
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+  localStorage.removeItem(getGitRemoteStorageKey(remote.url));
 }
 
 function createFsItemsFromSnapshot(snapshot: Record<string, string>, previousItems: FSItem[]) {
@@ -6760,7 +7055,7 @@ const FileTreeItem = React.memo(({ item, depth = 0 }: { item: FSItem; depth?: nu
           ) : (
             <>
               <div className="w-3.5 shrink-0 pointer-events-none" />
-              <FileCode size={16} className={cn("shrink-0 pointer-events-none", isActive ? "text-indigo-400" : "text-zinc-500")} />
+              <FileTypeIcon path={item.name} language={item.language} size={16} className="pointer-events-none" />
             </>
           )}
           {isRenaming ? (
@@ -6851,7 +7146,7 @@ export default function App() {
   ]);
   const [terminalInput, setTerminalInput] = useState('');
   const [terminalCwd, setTerminalCwd] = useState<string | null>(null); // null is root
-  const [gitState, setGitState] = useState<GitRepositoryState>(() => loadSavedGitState());
+  const [gitState, setGitState] = useState<GitRepositoryState>(() => loadLegacySavedGitState() || createDefaultGitState());
   const [sourceControlCommitMessage, setSourceControlCommitMessage] = useState('');
   const [sourceControlNewBranchName, setSourceControlNewBranchName] = useState('');
   const [sourceControlStatus, setSourceControlStatus] = useState('');
@@ -7015,6 +7310,8 @@ export default function App() {
   terminalCwdRef.current = terminalCwd;
   const gitStateRef = useRef(gitState);
   gitStateRef.current = gitState;
+  const gitStatePersistenceReadyRef = useRef(false);
+  const gitStateMutationVersionRef = useRef(0);
   const lastSourceControlFetchFocusRef = useRef(0);
   const csharpRuntimeReadyRef = useRef<Promise<void> | null>(null);
   const csharpInteractiveWorkerRef = useRef<Worker | null>(null);
@@ -8416,8 +8713,36 @@ export default function App() {
   }, [settings]);
 
   useEffect(() => {
-    localStorage.setItem(getProjectStorageKey(STORAGE_KEYS.gitState), JSON.stringify(gitState));
-  }, [gitState]);
+    let cancelled = false;
+    const projectId = activeProjectId;
+    const startedMutationVersion = gitStateMutationVersionRef.current;
+    gitStatePersistenceReadyRef.current = false;
+
+    loadStoredGitState(projectId)
+      .then(stored => {
+        if (cancelled) return;
+        const mutatedDuringHydration = gitStateMutationVersionRef.current !== startedMutationVersion;
+        if (stored && !mutatedDuringHydration) {
+          gitStateRef.current = stored;
+          setGitState(stored);
+        }
+        gitStatePersistenceReadyRef.current = true;
+        void saveStoredGitState(gitStateRef.current, projectId);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        gitStatePersistenceReadyRef.current = true;
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [activeProjectId]);
+
+  useEffect(() => {
+    if (!gitStatePersistenceReadyRef.current) return;
+    void saveStoredGitState(gitState, activeProjectId);
+  }, [activeProjectId, gitState]);
 
   useEffect(() => {
     const nextRunnableFiles = getProjectRunnableFiles();
@@ -15020,6 +15345,7 @@ finally:
 
   const updateGitState = (updater: (current: GitRepositoryState) => GitRepositoryState) => {
     const next = updater(gitStateRef.current);
+    gitStateMutationVersionRef.current += 1;
     gitStateRef.current = next;
     setGitState(next);
     return next;
@@ -15071,7 +15397,16 @@ finally:
     const repoRef = parseGitHubRemoteUrl(remote.url);
     if (!repoRef) return remote;
     getGitHubAuth();
-    const refs = await githubApiRequest(`/repos/${encodeURIComponent(repoRef.owner)}/${encodeURIComponent(repoRef.repo)}/git/matching-refs/heads`);
+    let refs: any;
+    try {
+      refs = await githubApiRequest(`/repos/${encodeURIComponent(repoRef.owner)}/${encodeURIComponent(repoRef.repo)}/git/matching-refs/heads`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (/git repository is empty/i.test(message)) {
+        return { ...remote, branchHeads: {}, branchFiles: {} };
+      }
+      throw error;
+    }
     const branchHeads: Record<string, string | null> = {};
     const branchFiles: Record<string, Record<string, string>> = {};
 
@@ -15091,7 +15426,7 @@ finally:
       throw new Error(`fatal: '${remote.url}' is not a supported Git remote URL. ${getSupportedGitRemoteUrlHelp()}`);
     }
     if (isGitHubRemote(remote)) return fetchGitHubRemote(remote);
-    return loadStoredGitRemote(remote);
+    return await loadStoredGitRemote(remote);
   };
 
   const refreshGitRemotes = async (state = gitStateRef.current, remoteName?: string) => {
@@ -15273,6 +15608,190 @@ finally:
     };
   };
 
+  const stageGitPaths = (pathspecs: string[] = []) => {
+    const state = gitStateRef.current;
+    const changes = getGitWorkspaceChanges(state, filesRef.current);
+    if (changes.length === 0) return { ok: true, lines: ['nothing to add'] };
+    const matchedPaths = changes
+      .filter(change => matchesGitPathspec(change.path, pathspecs))
+      .map(change => change.path);
+    if (matchedPaths.length === 0) return { ok: false, lines: [`fatal: pathspec '${pathspecs.join(' ')}' did not match any files`] };
+    updateGitState(current => ({
+      ...current,
+      stagedPaths: [...new Set([...(current.stagedPaths || []), ...matchedPaths])],
+    }));
+    return { ok: true, lines: [`Staged ${matchedPaths.length} change${matchedPaths.length === 1 ? '' : 's'}.`] };
+  };
+
+  const unstageGitPaths = (pathspecs: string[] = []) => {
+    const state = gitStateRef.current;
+    const staged = state.stagedPaths || [];
+    const nextStaged = pathspecs.length === 0 || pathspecs.includes('.')
+      ? []
+      : staged.filter(path => !matchesGitPathspec(path, pathspecs));
+    updateGitState(current => ({ ...current, stagedPaths: nextStaged }));
+    return { ok: true, lines: [`Unstaged ${staged.length - nextStaged.length} path${staged.length - nextStaged.length === 1 ? '' : 's'}.`] };
+  };
+
+  const restoreGitPaths = (pathspecs: string[] = [], stagedOnly = false) => {
+    if (stagedOnly) return unstageGitPaths(pathspecs);
+    const state = gitStateRef.current;
+    const headFiles = getGitHeadCommit(state)?.files || {};
+    const currentSnapshot = serializeWorkspaceSnapshot(filesRef.current);
+    const nextSnapshot = { ...currentSnapshot };
+    const paths = new Set([...Object.keys(currentSnapshot), ...Object.keys(headFiles)]);
+    let restoredCount = 0;
+    for (const path of paths) {
+      if (!matchesGitPathspec(path, pathspecs)) continue;
+      restoredCount += 1;
+      if (Object.prototype.hasOwnProperty.call(headFiles, path)) nextSnapshot[path] = headFiles[path];
+      else delete nextSnapshot[path];
+    }
+    if (restoredCount === 0) return { ok: false, lines: [`error: pathspec '${pathspecs.join(' ')}' did not match any files`] };
+    setFiles(current => createFsItemsFromSnapshot(nextSnapshot, current));
+    updateGitState(current => ({
+      ...current,
+      stagedPaths: (current.stagedPaths || []).filter(path => !matchesGitPathspec(path, pathspecs)),
+    }));
+    return { ok: true, lines: [`Restored ${restoredCount} path${restoredCount === 1 ? '' : 's'}.`] };
+  };
+
+  const resetGitToRevision = (revision = 'HEAD', mode: 'soft' | 'mixed' | 'hard' = 'mixed') => {
+    const state = gitStateRef.current;
+    const targetCommit = getGitRevisionCommit(state, revision);
+    if (!targetCommit) return { ok: false, lines: [`fatal: ambiguous argument '${revision}': unknown revision or path not in the working tree`] };
+    if (mode === 'hard') setFiles(current => createFsItemsFromSnapshot(targetCommit.files, current));
+    updateGitState(current => ({
+      ...current,
+      branches: {
+        ...current.branches,
+        [current.currentBranch]: {
+          ...current.branches[current.currentBranch],
+          head: targetCommit.id,
+        },
+      },
+      stagedPaths: mode === 'soft' ? current.stagedPaths || [] : [],
+    }));
+    return { ok: true, lines: [`HEAD is now at ${targetCommit.id.slice(0, 7)} ${targetCommit.message}`] };
+  };
+
+  const cleanGitWorkspace = () => {
+    const state = gitStateRef.current;
+    const headFiles = getGitHeadCommit(state)?.files || {};
+    const currentSnapshot = serializeWorkspaceSnapshot(filesRef.current);
+    const addedPaths = Object.keys(currentSnapshot).filter(path => !Object.prototype.hasOwnProperty.call(headFiles, path));
+    if (addedPaths.length === 0) return { ok: true, lines: ['Nothing to clean.'] };
+    const nextSnapshot = { ...currentSnapshot };
+    for (const path of addedPaths) delete nextSnapshot[path];
+    setFiles(current => createFsItemsFromSnapshot(nextSnapshot, current));
+    updateGitState(current => ({ ...current, stagedPaths: (current.stagedPaths || []).filter(path => !addedPaths.includes(path)) }));
+    return { ok: true, lines: addedPaths.map(path => `Removing ${path}`) };
+  };
+
+  const createGitStash = (message?: string) => {
+    const state = gitStateRef.current;
+    const changes = getGitWorkspaceChanges(state, filesRef.current);
+    if (changes.length === 0) return { ok: true, lines: ['No local changes to save'] };
+    const branch = state.branches[state.currentBranch];
+    const stash: GitStashRecord = {
+      id: `stash-${Date.now().toString(36)}`,
+      message: message?.trim() || `WIP on ${state.currentBranch}`,
+      branch: state.currentBranch,
+      baseHead: branch?.head || null,
+      timestamp: Date.now(),
+      files: serializeWorkspaceSnapshot(filesRef.current),
+    };
+    const headFiles = getGitHeadCommit(state)?.files || {};
+    setFiles(current => createFsItemsFromSnapshot(headFiles, current));
+    updateGitState(current => ({ ...current, stashes: [stash, ...(current.stashes || [])], stagedPaths: [] }));
+    return { ok: true, lines: [`Saved working directory and index state ${stash.id}: ${stash.message}`] };
+  };
+
+  const applyGitStash = (index = 0, drop = false) => {
+    const state = gitStateRef.current;
+    const stash = state.stashes[index];
+    if (!stash) return { ok: false, lines: [`fatal: log for stash is empty`] };
+    if (getGitWorkspaceChanges(state, filesRef.current).length > 0) {
+      return { ok: false, lines: ['error: Your local changes would be overwritten by stash apply. Commit, reset, or stash them first.'] };
+    }
+    setFiles(current => createFsItemsFromSnapshot(stash.files, current));
+    updateGitState(current => ({
+      ...current,
+      stashes: drop ? current.stashes.filter((_, stashIndex) => stashIndex !== index) : current.stashes,
+      stagedPaths: [],
+    }));
+    return { ok: true, lines: [drop ? `Dropped and applied stash@{${index}}.` : `Applied stash@{${index}}.`] };
+  };
+
+  const mergeGitRevision = (revision: string) => {
+    const state = gitStateRef.current;
+    const targetCommit = getGitRevisionCommit(state, revision);
+    const currentBranch = state.branches[state.currentBranch];
+    const currentHead = currentBranch?.head || null;
+    if (!targetCommit) return { ok: false, lines: [`merge: ${revision} - not something we can merge`] };
+    if (getGitWorkspaceChanges(state, filesRef.current).length > 0) return { ok: false, lines: ['error: Your local changes would be overwritten by merge. Commit or stash them first.'] };
+    if (!currentHead || isGitAncestor(state, currentHead, targetCommit.id)) {
+      setFiles(current => createFsItemsFromSnapshot(targetCommit.files, current));
+      updateGitState(current => ({
+        ...current,
+        branches: {
+          ...current.branches,
+          [current.currentBranch]: { ...current.branches[current.currentBranch], head: targetCommit.id },
+        },
+        stagedPaths: [],
+      }));
+      return { ok: true, lines: [`Fast-forward to ${targetCommit.id.slice(0, 7)}`] };
+    }
+    if (isGitAncestor(state, targetCommit.id, currentHead)) return { ok: true, lines: ['Already up to date.'] };
+
+    const currentCommit = state.commits[currentHead];
+    const baseId = getGitMergeBase(state, currentHead, targetCommit.id);
+    const baseFiles = baseId ? state.commits[baseId]?.files || {} : {};
+    const currentFiles = currentCommit?.files || {};
+    const targetFiles = targetCommit.files;
+    const paths = new Set([...Object.keys(baseFiles), ...Object.keys(currentFiles), ...Object.keys(targetFiles)]);
+    const conflicts: string[] = [];
+    const merged = { ...currentFiles };
+    for (const path of paths) {
+      const base = baseFiles[path];
+      const currentValue = currentFiles[path];
+      const targetValue = targetFiles[path];
+      const currentChanged = currentValue !== base;
+      const targetChanged = targetValue !== base;
+      if (currentChanged && targetChanged && currentValue !== targetValue) conflicts.push(path);
+      else if (targetChanged) {
+        if (targetValue === undefined) delete merged[path];
+        else merged[path] = targetValue;
+      }
+    }
+    if (conflicts.length > 0) return { ok: false, lines: ['Automatic merge failed; fix conflicts and then commit the result.', ...conflicts.map(path => `CONFLICT ${path}`)] };
+
+    const timestamp = Date.now();
+    const message = `Merge ${revision} into ${state.currentBranch}`;
+    const id = createGitCommitId(merged, message, timestamp);
+    const authorName = state.config['user.name'] || state.ghAuth?.user || 'CodeCraft User';
+    const authorEmail = state.config['user.email'] || 'codecraft@example.local';
+    const commit: GitCommitRecord = {
+      id,
+      message,
+      author: `${authorName} <${authorEmail}>`,
+      timestamp,
+      parentIds: [currentHead, targetCommit.id],
+      files: merged,
+    };
+    setFiles(current => createFsItemsFromSnapshot(merged, current));
+    updateGitState(current => ({
+      ...current,
+      branches: {
+        ...current.branches,
+        [current.currentBranch]: { ...current.branches[current.currentBranch], head: id },
+      },
+      commits: { ...current.commits, [id]: commit },
+      stagedPaths: [],
+    }));
+    return { ok: true, lines: [`Merge made by the CodeCraft strategy.`, formatGitCommitLine(commit)] };
+  };
+
   const getGitSyncStatusForOperation = (remoteName?: string, remoteBranch?: string) => {
     const currentState = gitStateRef.current;
     const branch = currentState.branches[currentState.currentBranch];
@@ -15318,7 +15837,7 @@ finally:
         branchHeads: { ...remote.branchHeads, [status.remoteBranch]: branch.head },
         branchFiles: { ...remote.branchFiles, [status.remoteBranch]: headCommit.files },
       };
-      saveStoredGitRemote(nextRemote);
+      await saveStoredGitRemote(nextRemote);
     }
     const pushedCommit: GitCommitRecord = nextHead === branch.head ? headCommit : {
       ...headCommit,
@@ -15369,7 +15888,7 @@ finally:
         if (!/name already exists|already exists/i.test(message)) throw error;
       }
     }
-    const origin = loadStoredGitRemote({
+    const origin = await loadStoredGitRemote({
       name: 'origin',
       url,
       branchHeads: {},
@@ -15441,7 +15960,7 @@ finally:
         branchHeads: { ...remote.branchHeads, [status.remoteBranch]: branch.head },
         branchFiles: { ...remote.branchFiles, [status.remoteBranch]: headCommit.files },
       };
-      saveStoredGitRemote(nextRemote);
+      await saveStoredGitRemote(nextRemote);
     }
     const pushedCommit: GitCommitRecord = nextHead === branch.head ? headCommit : {
       ...headCommit,
@@ -15586,6 +16105,7 @@ finally:
 
   const resetGitRepository = () => {
     const next = createDefaultGitState();
+    gitStateMutationVersionRef.current += 1;
     gitStateRef.current = next;
     setGitState(next);
     setSourceControlCommitMessage('');
@@ -15622,6 +16142,19 @@ finally:
     setSourceControlStatus(result.lines.join('\n'));
   };
 
+  const runSourceControlGitCommand = async (args: string[]) => {
+    try {
+      setSourceControlStatus((await executeGitCli(args)).join('\n'));
+    } catch (error) {
+      setSourceControlStatus(`Git failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
+
+  const promptSourceControlValue = (label: string, fallback = '') => {
+    const value = window.prompt(label, fallback);
+    return value === null ? null : value.trim();
+  };
+
   const executeGitCli = async (args: string[]) => {
     const subCmd = (args[1] || '').toLowerCase();
     const state = gitStateRef.current;
@@ -15634,7 +16167,7 @@ finally:
     if (!subCmd || subCmd === '--help' || subCmd === 'help') {
       return [
         'usage: git <command> [<args>]',
-        'Commands: init, status, add, commit, log, branch, checkout, switch, remote, fetch, pull, push, diff, config, rev-parse, clone',
+        'Commands: init, status, add, restore, reset, commit, log, show, branch, checkout, switch, merge, tag, stash, remote, fetch, pull, push, ls-remote, clean, diff, config, rev-parse, clone',
       ];
     }
     if (subCmd === '--version' || subCmd === 'version') return ['git version 2.45.0-codecraft'];
@@ -15665,24 +16198,24 @@ finally:
       return lines;
     }
     if (subCmd === 'add') {
-      if (changes.length === 0) return ['nothing to add'];
       const pathspecs = args.slice(2).filter(arg => arg && !arg.startsWith('-'));
       const stageAll = args.includes('-A') || args.includes('--all') || pathspecs.includes('.');
       if (!stageAll && pathspecs.length === 0) return ['Nothing specified, nothing added.'];
-      const matchedPaths = stageAll
-        ? changes.map(change => change.path)
-        : changes
-            .filter(change => pathspecs.some(spec => {
-              const normalized = normalizeProjectPath(spec);
-              return change.path === normalized || change.path.startsWith(`${normalized}/`);
-            }))
-            .map(change => change.path);
-      if (matchedPaths.length === 0) return [`fatal: pathspec '${pathspecs.join(' ')}' did not match any files`];
-      updateGitState(current => ({
-        ...current,
-        stagedPaths: [...new Set([...(current.stagedPaths || []), ...matchedPaths])],
-      }));
-      return [`Staged ${matchedPaths.length} change${matchedPaths.length === 1 ? '' : 's'}.`];
+      return stageGitPaths(stageAll ? [] : pathspecs).lines;
+    }
+    if (subCmd === 'restore') {
+      const stagedOnly = args.includes('--staged');
+      const pathspecs = args.slice(2).filter(arg => arg && !arg.startsWith('-'));
+      return restoreGitPaths(pathspecs, stagedOnly).lines;
+    }
+    if (subCmd === 'reset') {
+      const revision = args.slice(2).find(arg => arg && !arg.startsWith('-')) || 'HEAD';
+      if (args.includes('--hard')) return resetGitToRevision(revision, 'hard').lines;
+      if (args.includes('--soft')) return resetGitToRevision(revision, 'soft').lines;
+      if (args.includes('--mixed')) return resetGitToRevision(revision, 'mixed').lines;
+      const pathspecs = args.slice(2).filter(arg => arg && !arg.startsWith('-'));
+      if (pathspecs.length > 0) return unstageGitPaths(pathspecs).lines;
+      return resetGitToRevision('HEAD', 'mixed').lines;
     }
     if (subCmd === 'commit') {
       const messageIndex = args.findIndex(arg => arg === '-m' || arg === '--message');
@@ -15709,7 +16242,53 @@ finally:
       }
       return lines.length ? lines : ['fatal: your current branch does not have any commits yet'];
     }
+    if (subCmd === 'show') {
+      const revision = args[2] || 'HEAD';
+      const commit = getGitRevisionCommit(state, revision);
+      if (!commit) return [`fatal: bad revision '${revision}'`];
+      return [
+        ...formatGitCommitDetails(commit),
+        '',
+        ...diffGitSnapshots(commit.parentIds[0] ? state.commits[commit.parentIds[0]]?.files || {} : {}, commit.files)
+          .flatMap(change => [`${formatGitChangeKind(change.kind)}\t${change.path}`]),
+      ];
+    }
     if (subCmd === 'branch') {
+      const upstreamIndex = args.findIndex(arg => arg === '--set-upstream-to' || arg.startsWith('--set-upstream-to='));
+      if (upstreamIndex >= 0) {
+        const upstream = args[upstreamIndex].includes('=') ? args[upstreamIndex].slice(args[upstreamIndex].indexOf('=') + 1) : args[upstreamIndex + 1] || '';
+        const branchName = args.find((arg, index) => index > upstreamIndex + (args[upstreamIndex].includes('=') ? 0 : 1) && !arg.startsWith('-')) || state.currentBranch;
+        const slashIndex = upstream.indexOf('/');
+        const remoteName = slashIndex >= 0 ? upstream.slice(0, slashIndex) : '';
+        const remoteBranch = slashIndex >= 0 ? upstream.slice(slashIndex + 1) : '';
+        if (!state.branches[branchName]) return [`fatal: branch '${branchName}' does not exist`];
+        if (!remoteName || !state.remotes[remoteName] || !Object.prototype.hasOwnProperty.call(state.remotes[remoteName].branchHeads, remoteBranch)) {
+          return [`fatal: the requested upstream branch '${upstream}' does not exist`];
+        }
+        updateGitState(current => ({
+          ...current,
+          branches: {
+            ...current.branches,
+            [branchName]: { ...current.branches[branchName], upstream },
+          },
+        }));
+        return [`branch '${branchName}' set up to track '${upstream}'.`];
+      }
+      const renameIndex = args.findIndex(arg => arg === '-m' || arg === '-M');
+      if (renameIndex >= 0) {
+        const oldName = args[renameIndex + 2] ? args[renameIndex + 1] : state.currentBranch;
+        const newName = args[renameIndex + 2] || args[renameIndex + 1];
+        if (!newName || !isValidGitBranchName(newName)) return [getInvalidGitBranchMessage(newName || '')];
+        if (!state.branches[oldName]) return [`fatal: branch '${oldName}' does not exist`];
+        if (state.branches[newName] && args[renameIndex] !== '-M') return [`fatal: a branch named '${newName}' already exists`];
+        updateGitState(current => {
+          const branches = { ...current.branches };
+          branches[newName] = { ...branches[oldName], name: newName };
+          delete branches[oldName];
+          return { ...current, currentBranch: current.currentBranch === oldName ? newName : current.currentBranch, branches };
+        });
+        return [`Renamed branch ${oldName} to ${newName}.`];
+      }
       const deleteIndex = args.findIndex(arg => arg === '-d' || arg === '-D');
       if (deleteIndex >= 0) {
         const name = args[deleteIndex + 1];
@@ -15749,6 +16328,7 @@ finally:
       return Object.keys(state.branches).sort().map(name => `${name === state.currentBranch ? '*' : ' '} ${name}`);
     }
     if (subCmd === 'checkout') {
+      if (args[2] === '--') return restoreGitPaths(args.slice(3)).lines;
       if (args[2] === '-b') return checkoutGitBranch(args[3] || '', true).lines;
       return checkoutGitBranch(args[2] || '', false).lines;
     }
@@ -15770,11 +16350,12 @@ finally:
         if (!isValidGitRemoteName(name)) return [`fatal: '${name}' is not a valid remote name`];
         if (state.remotes[name]) return [`error: remote ${name} already exists.`];
         if (!isSupportedGitRemoteUrl(url)) return [`fatal: '${url}' is not a supported Git remote URL. ${getSupportedGitRemoteUrlHelp()}`];
+        const storedRemote = await loadStoredGitRemote({ name, url, branchHeads: {}, branchFiles: {} });
         updateGitState(current => ({
           ...current,
           remotes: {
             ...current.remotes,
-            [name]: loadStoredGitRemote({ name, url, branchHeads: {}, branchFiles: {} }),
+            [name]: storedRemote,
           },
         }));
         return [`Added remote ${name} -> ${url}`];
@@ -15789,21 +16370,41 @@ finally:
         });
         return [`Removed remote ${name}.`];
       }
+      if (remoteSub === 'rename') {
+        const oldName = args[3];
+        const newName = args[4];
+        if (!oldName || !newName) return ['usage: git remote rename <old> <new>'];
+        if (!state.remotes[oldName]) return [`error: No such remote: '${oldName}'`];
+        if (!isValidGitRemoteName(newName)) return [`fatal: '${newName}' is not a valid remote name`];
+        if (state.remotes[newName]) return [`error: remote ${newName} already exists.`];
+        updateGitState(current => {
+          const remotes = { ...current.remotes };
+          remotes[newName] = { ...remotes[oldName], name: newName };
+          delete remotes[oldName];
+          const branches = Object.fromEntries(Object.entries(current.branches).map(([name, branch]) => [
+            name,
+            branch.upstream?.startsWith(`${oldName}/`) ? { ...branch, upstream: `${newName}/${branch.upstream.slice(oldName.length + 1)}` } : branch,
+          ]));
+          return { ...current, remotes, branches };
+        });
+        return [`Renamed remote ${oldName} to ${newName}.`];
+      }
       if (remoteSub === 'set-url') {
         const name = args[3];
         const url = args[4];
         if (!name || !url || !state.remotes[name]) return ['usage: git remote set-url <name> <url>'];
         if (!isSupportedGitRemoteUrl(url)) return [`fatal: '${url}' is not a supported Git remote URL. ${getSupportedGitRemoteUrlHelp()}`];
+        const storedRemote = await loadStoredGitRemote({ ...state.remotes[name], url });
         updateGitState(current => ({
           ...current,
           remotes: {
             ...current.remotes,
-            [name]: loadStoredGitRemote({ ...current.remotes[name], url }),
+            [name]: storedRemote,
           },
         }));
         return [`Updated remote ${name} -> ${url}`];
       }
-      return ['usage: git remote [-v] | git remote add <name> <url> | git remote remove <name> | git remote set-url <name> <url>'];
+      return ['usage: git remote [-v] | git remote add <name> <url> | git remote remove <name> | git remote rename <old> <new> | git remote set-url <name> <url>'];
     }
     if (subCmd === 'fetch') {
       const remoteName = args[2];
@@ -15813,6 +16414,79 @@ finally:
     }
     if (subCmd === 'pull') return (await pullGitBranch(args[2], args[3])).lines;
     if (subCmd === 'push') return (await pushGitBranch(args[2], args[3])).lines;
+    if (subCmd === 'ls-remote') {
+      const remoteName = args[2] || 'origin';
+      if (!state.remotes[remoteName]) return [`fatal: '${remoteName}' does not appear to be a git remote`];
+      const fetchedState = await refreshGitRemotes(state, remoteName);
+      const remote = fetchedState.remotes[remoteName];
+      return Object.entries(remote.branchHeads).flatMap(([name, sha]) => sha ? [`${sha}\trefs/heads/${name}`] : []);
+    }
+    if (subCmd === 'clean') {
+      if (!args.includes('-f') && !args.includes('--force')) return ['fatal: clean.requireForce defaults to true and neither -f nor -i given'];
+      return cleanGitWorkspace().lines;
+    }
+    if (subCmd === 'stash') {
+      const stashSub = (args[2] || 'push').toLowerCase();
+      if (stashSub === 'push' || stashSub === 'save') return createGitStash(getCliOptionValue(args, ['-m', '--message']) || args.slice(3).filter(arg => !arg.startsWith('-')).join(' ')).lines;
+      if (stashSub === 'list') return state.stashes.length ? state.stashes.map((stash, index) => `stash@{${index}}: ${stash.message}`) : [];
+      if (stashSub === 'apply') return applyGitStash(Number((args[3] || 'stash@{0}').match(/\d+/)?.[0] || 0), false).lines;
+      if (stashSub === 'pop') return applyGitStash(Number((args[3] || 'stash@{0}').match(/\d+/)?.[0] || 0), true).lines;
+      if (stashSub === 'drop') {
+        const index = Number((args[3] || 'stash@{0}').match(/\d+/)?.[0] || 0);
+        if (!state.stashes[index]) return [`fatal: stash@{${index}} does not exist`];
+        updateGitState(current => ({ ...current, stashes: current.stashes.filter((_, stashIndex) => stashIndex !== index) }));
+        return [`Dropped stash@{${index}}.`];
+      }
+      return ['usage: git stash push|list|apply|pop|drop'];
+    }
+    if (subCmd === 'tag') {
+      const deleteIndex = args.findIndex(arg => arg === '-d' || arg === '--delete');
+      if (deleteIndex >= 0) {
+        const name = args[deleteIndex + 1];
+        if (!name || !state.tags[name]) return [`error: tag '${name || ''}' not found.`];
+        updateGitState(current => {
+          const tags = { ...current.tags };
+          delete tags[name];
+          return { ...current, tags };
+        });
+        return [`Deleted tag '${name}'.`];
+      }
+      const tagArgs: string[] = [];
+      for (let index = 2; index < args.length; index += 1) {
+        const arg = args[index];
+        if (arg === '-m' || arg === '--message') {
+          index += 1;
+          continue;
+        }
+        if (arg.startsWith('-')) continue;
+        tagArgs.push(arg);
+      }
+      const tagName = tagArgs[0];
+      if (!tagName) return Object.keys(state.tags).sort();
+      if (!isValidGitBranchName(tagName)) return [`fatal: '${tagName}' is not a valid tag name`];
+      if (state.tags[tagName]) return [`fatal: tag '${tagName}' already exists`];
+      const targetRevision = tagArgs[1] || 'HEAD';
+      const target = resolveGitRevision(state, targetRevision);
+      if (!target) return [`fatal: Failed to resolve '${targetRevision}' as a valid ref.`];
+      updateGitState(current => ({
+        ...current,
+        tags: {
+          ...current.tags,
+          [tagName]: {
+            name: tagName,
+            target,
+            message: getCliOptionValue(args, ['-m', '--message']) || undefined,
+            timestamp: Date.now(),
+          },
+        },
+      }));
+      return [`Created tag ${tagName} at ${target.slice(0, 7)}.`];
+    }
+    if (subCmd === 'merge') {
+      const revision = args.slice(2).find(arg => !arg.startsWith('-'));
+      if (!revision) return ['usage: git merge <branch|commit|tag>'];
+      return mergeGitRevision(revision).lines;
+    }
     if (subCmd === 'diff') {
       if (changes.length === 0) return [];
       return changes.flatMap(change => {
@@ -15952,11 +16626,12 @@ finally:
           const message = error instanceof Error ? error.message : String(error);
           if (!/name already exists|already exists/i.test(message)) throw error;
         }
+        const originRemote = await loadStoredGitRemote({ name: 'origin', url, branchHeads: {}, branchFiles: {} });
         updateGitState(current => ({
           ...current,
           remotes: {
             ...current.remotes,
-            origin: loadStoredGitRemote({ name: 'origin', url, branchHeads: {}, branchFiles: {} }),
+            origin: originRemote,
           },
           branches: {
             ...current.branches,
@@ -17070,7 +17745,7 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
         setTerminalOutput([...newOutput, 'Usage: nuget include <namespace> | nuget list']);
       }
     } else if (cmd === 'help') {
-      setTerminalOutput([...newOutput, 'Standard commands: ls, pwd, cd, mkdir, touch, open, cat, rm, clear, help, date, echo', 'Source control: git status|add|commit|log|branch|checkout|switch|remote|fetch|pull|push|diff|config|clone, gh auth|repo|pr|issue', 'Python: pip install <package> [-force] | pip upgrade <package> [-version <ver>] | pip uninstall <package> | pip include <module> | pip list', 'JavaScript/TypeScript: npm install <package...> | npm uninstall <package...> | npm include <module> [url] | npm remove <module> | npm list', 'C#: nuget include <namespace> | nuget list', 'JavaScript/TypeScript: use Run or Project Run on .js, .jsx, .ts, and .tsx files', 'C/C++: use Run or Project Run on .c, .cpp, .cc, .cxx, and matching header files', 'Java: use Run or Project Run on .java files']);
+      setTerminalOutput([...newOutput, 'Standard commands: ls, pwd, cd, mkdir, touch, open, cat, rm, clear, help, date, echo', 'Source control: git status|add|restore|reset|commit|log|show|branch|checkout|switch|merge|tag|stash|remote|fetch|pull|push|ls-remote|clean|diff|config|rev-parse|clone, gh auth|repo|pr|issue', 'Python: pip install <package> [-force] | pip upgrade <package> [-version <ver>] | pip uninstall <package> | pip include <module> | pip list', 'JavaScript/TypeScript: npm install <package...> | npm uninstall <package...> | npm include <module> [url] | npm remove <module> | npm list', 'C#: nuget include <namespace> | nuget list', 'JavaScript/TypeScript: use Run or Project Run on .js, .jsx, .ts, and .tsx files', 'C/C++: use Run or Project Run on .c, .cpp, .cc, .cxx, and matching header files', 'Java: use Run or Project Run on .java files']);
     } else if (cmd === 'date') {
       setTerminalOutput([...newOutput, new Date().toLocaleString()]);
     } else if (cmd === 'echo') {
@@ -17493,25 +18168,25 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
     [STORAGE_KEYS.files]: JSON.stringify(filesRef.current),
     [STORAGE_KEYS.settings]: JSON.stringify(settings),
     [STORAGE_KEYS.assistantChats]: JSON.stringify(assistantChats),
-    [STORAGE_KEYS.gitState]: JSON.stringify(gitStateRef.current),
     [STORAGE_KEYS.layout]: JSON.stringify(layoutModel.toJson()),
     [SYNC_META_KEY]: JSON.stringify(syncMeta),
   });
 
-  const persistCurrentProjectSnapshot = (projectId = activeProjectId) => {
+  const persistCurrentProjectSnapshot = async (projectId = activeProjectId) => {
     const overrides = getLiveUserDataLocalStorageOverrides();
     for (const [key, value] of Object.entries(overrides)) {
       localStorage.setItem(getProjectStorageKey(key, projectId), value);
     }
+    await saveStoredGitState(gitStateRef.current, projectId);
     setProjects(touchProjectUpdatedAt(projectId));
   };
 
-  const switchProject = (projectId: string) => {
+  const switchProject = async (projectId: string) => {
     if (projectId === activeProjectId) {
       setIsProjectMenuOpen(false);
       return;
     }
-    persistCurrentProjectSnapshot(activeProjectId);
+    await persistCurrentProjectSnapshot(activeProjectId);
     if (!setActiveProjectId(projectId)) {
       setProjectMenuStatus('Project no longer exists.');
       setProjects(loadProjectRegistry());
@@ -17582,7 +18257,7 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
     if (!window.confirm(`Delete project "${project.name}" and its stored data?`)) return;
 
     if (projectId !== activeProjectId) {
-      persistCurrentProjectSnapshot(activeProjectId);
+      await persistCurrentProjectSnapshot(activeProjectId);
     }
 
     const remainingProjects = currentProjects.filter(candidate => candidate.id !== projectId);
@@ -17610,8 +18285,8 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
     setProjectMenuStatus(cleanupStatus || `Deleted ${project.name}.`);
   };
 
-  const handleCreateProject = () => {
-    persistCurrentProjectSnapshot(activeProjectId);
+  const handleCreateProject = async () => {
+    await persistCurrentProjectSnapshot(activeProjectId);
     const existingProjects = loadProjectRegistry();
     const now = Date.now();
     const project: CodeCraftProjectMeta = {
@@ -17633,7 +18308,7 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
     event.currentTarget.value = '';
     if (!file) return;
 
-    persistCurrentProjectSnapshot(activeProjectId);
+    await persistCurrentProjectSnapshot(activeProjectId);
     const existingProjects = loadProjectRegistry();
     const now = Date.now();
     const project: CodeCraftProjectMeta = {
@@ -17670,7 +18345,7 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
       } else {
         await persistPyodidePackageMetaCache();
       }
-      const backup = await createCodeCraftUserDataExport(getLiveUserDataLocalStorageOverrides());
+      const backup = await createCodeCraftUserDataExport(getLiveUserDataLocalStorageOverrides(), activeProjectId, gitStateRef.current);
       const blob = new Blob([JSON.stringify(backup, null, 2)], { type: 'application/json' });
       const url = URL.createObjectURL(blob);
       const link = document.createElement('a');
@@ -18274,7 +18949,7 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
                   {files.filter(f => f.parentId === tabItem.id).map(child => (
                     <div key={child.id} onClick={() => { openEditorTab(child.id); if (child.type === 'folder') toggleFolder(child.id); }} className="p-4 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10 hover:border-indigo-500/30 transition-all cursor-pointer group">
                       <div className="flex items-center gap-3">
-                        {child.type === 'folder' ? <Folder size={20} className="text-amber-400" /> : <FileCode size={20} className="text-indigo-400" />}
+                        {child.type === 'folder' ? <Folder size={20} className="text-amber-400" /> : <FileTypeIcon path={child.name} language={child.language} size={20} />}
                         <span className="text-sm font-medium text-zinc-300 group-hover:text-white transition-colors">{child.name}</span>
                       </div>
                     </div>
@@ -18517,6 +19192,208 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
         gitRepositoryPublished && gitSyncStatus.needsPublish ? 'Branch unpublished' : '',
         gitSyncStatus.diverged ? 'Diverged' : '',
       ].filter(Boolean);
+      const sourceControlGitActionGroups: { title: string; actions: { label: string; run: () => void | Promise<void>; disabled?: boolean }[] }[] = [
+        {
+          title: 'Workspace',
+          actions: [
+            { label: 'Status', run: () => runSourceControlGitCommand(['git', 'status']) },
+            { label: 'Diff', run: () => runSourceControlGitCommand(['git', 'diff']) },
+            { label: 'Stage All', run: () => runSourceControlGitCommand(['git', 'add', '-A']), disabled: gitChanges.length === 0 },
+            { label: 'Unstage', run: () => runSourceControlGitCommand(['git', 'reset']) },
+            {
+              label: 'Commit',
+              run: () => {
+                const message = sourceControlCommitMessage.trim() || promptSourceControlValue('Commit message') || '';
+                if (!message) return setSourceControlStatus('Commit cancelled: message is required.');
+                const staged = stageGitPaths();
+                if (!staged.ok) return setSourceControlStatus(staged.lines.join('\n'));
+                setSourceControlStatus(createGitCommit(message, gitStateRef.current.stagedPaths || []).lines.join('\n'));
+              },
+              disabled: gitChanges.length === 0,
+            },
+            {
+              label: 'Restore',
+              run: () => {
+                const pathspec = promptSourceControlValue('Pathspec to restore', '.');
+                if (pathspec !== null) void runSourceControlGitCommand(['git', 'restore', pathspec || '.']);
+              },
+              disabled: gitChanges.length === 0,
+            },
+            { label: 'Clean', run: () => runSourceControlGitCommand(['git', 'clean', '-f']), disabled: gitChanges.every(change => change.kind !== 'added') },
+            {
+              label: 'Reset Mixed',
+              run: () => {
+                const revision = promptSourceControlValue('Revision', 'HEAD');
+                if (revision !== null) void runSourceControlGitCommand(['git', 'reset', '--mixed', revision || 'HEAD']);
+              },
+            },
+            {
+              label: 'Reset Hard',
+              run: () => {
+                const revision = promptSourceControlValue('Revision', 'HEAD');
+                if (revision !== null) void runSourceControlGitCommand(['git', 'reset', '--hard', revision || 'HEAD']);
+              },
+            },
+          ],
+        },
+        {
+          title: 'History',
+          actions: [
+            { label: 'Log', run: () => runSourceControlGitCommand(['git', 'log']) },
+            { label: 'Show HEAD', run: () => runSourceControlGitCommand(['git', 'show', 'HEAD']) },
+            { label: 'Tags', run: () => runSourceControlGitCommand(['git', 'tag']) },
+            {
+              label: 'Create Tag',
+              run: () => {
+                const tag = promptSourceControlValue('Tag name');
+                if (tag) void runSourceControlGitCommand(['git', 'tag', tag]);
+              },
+              disabled: !currentBranch?.head,
+            },
+            {
+              label: 'Delete Tag',
+              run: () => {
+                const tag = promptSourceControlValue('Tag to delete');
+                if (tag) void runSourceControlGitCommand(['git', 'tag', '-d', tag]);
+              },
+              disabled: Object.keys(gitState.tags).length === 0,
+            },
+            {
+              label: 'Stash',
+              run: () => {
+                const message = promptSourceControlValue('Stash message', `WIP on ${gitState.currentBranch}`);
+                if (message !== null) void runSourceControlGitCommand(['git', 'stash', 'push', '-m', message]);
+              },
+              disabled: gitChanges.length === 0,
+            },
+            { label: 'Stashes', run: () => runSourceControlGitCommand(['git', 'stash', 'list']) },
+            { label: 'Pop Stash', run: () => runSourceControlGitCommand(['git', 'stash', 'pop']), disabled: gitState.stashes.length === 0 },
+          ],
+        },
+        {
+          title: 'Branches',
+          actions: [
+            { label: 'Branches', run: () => runSourceControlGitCommand(['git', 'branch', '-a']) },
+            {
+              label: 'Checkout',
+              run: () => {
+                const branch = promptSourceControlValue('Branch to checkout', gitState.currentBranch);
+                if (branch) void runSourceControlGitCommand(['git', 'checkout', branch]);
+              },
+            },
+            {
+              label: 'Create Branch',
+              run: () => {
+                const branch = promptSourceControlValue('New branch');
+                if (branch) setSourceControlStatus(checkoutGitBranch(branch, true).lines.join('\n'));
+              },
+            },
+            {
+              label: 'Rename Branch',
+              run: () => {
+                const branch = promptSourceControlValue('New branch name', gitState.currentBranch);
+                if (branch) void runSourceControlGitCommand(['git', 'branch', '-m', gitState.currentBranch, branch]);
+              },
+            },
+            {
+              label: 'Delete Branch',
+              run: () => {
+                const branch = promptSourceControlValue('Branch to delete');
+                if (branch) void runSourceControlGitCommand(['git', 'branch', '-d', branch]);
+              },
+            },
+            {
+              label: 'Set Upstream',
+              run: () => {
+                const upstream = promptSourceControlValue('Upstream', currentBranch?.upstream || `origin/${gitState.currentBranch}`);
+                if (upstream) void runSourceControlGitCommand(['git', 'branch', '--set-upstream-to', upstream]);
+              },
+            },
+            {
+              label: 'Merge',
+              run: () => {
+                const revision = promptSourceControlValue('Branch, tag, or commit to merge');
+                if (revision) void runSourceControlGitCommand(['git', 'merge', revision]);
+              },
+            },
+          ],
+        },
+        {
+          title: 'Remote',
+          actions: [
+            { label: 'Fetch', run: () => runSourceControlGitCommand(['git', 'fetch']) },
+            { label: 'Pull', run: () => runSourceControlGitCommand(['git', 'pull']) },
+            { label: 'Push', run: () => runSourceControlGitCommand(['git', 'push']) },
+            { label: 'Sync', run: async () => setSourceControlStatus((await syncGitBranch()).lines.join('\n')) },
+            { label: 'Publish Repo', run: async () => setSourceControlStatus((await publishGitRepository()).lines.join('\n')), disabled: gitRepositoryPublished },
+            { label: 'Publish Branch', run: async () => setSourceControlStatus((await publishGitBranch()).lines.join('\n')), disabled: !gitSyncStatus.needsPublish },
+            { label: 'Remotes', run: () => runSourceControlGitCommand(['git', 'remote', '-v']) },
+            {
+              label: 'LS Remote',
+              run: () => {
+                const remote = promptSourceControlValue('Remote', 'origin');
+                if (remote !== null) void runSourceControlGitCommand(['git', 'ls-remote', remote || 'origin']);
+              },
+            },
+            {
+              label: 'Add Remote',
+              run: () => {
+                const name = promptSourceControlValue('Remote name', 'origin');
+                const url = promptSourceControlValue('Remote URL');
+                if (name && url) void runSourceControlGitCommand(['git', 'remote', 'add', name, url]);
+              },
+            },
+            {
+              label: 'Set URL',
+              run: () => {
+                const name = promptSourceControlValue('Remote name', 'origin');
+                if (name === null) return;
+                const url = promptSourceControlValue('Remote URL', gitState.remotes[name]?.url || '');
+                if (name && url) void runSourceControlGitCommand(['git', 'remote', 'set-url', name, url]);
+              },
+            },
+            {
+              label: 'Rename Remote',
+              run: () => {
+                const oldName = promptSourceControlValue('Old remote name', 'origin');
+                const newName = promptSourceControlValue('New remote name');
+                if (oldName && newName) void runSourceControlGitCommand(['git', 'remote', 'rename', oldName, newName]);
+              },
+            },
+            {
+              label: 'Remove Remote',
+              run: () => {
+                const name = promptSourceControlValue('Remote to remove');
+                if (name) void runSourceControlGitCommand(['git', 'remote', 'remove', name]);
+              },
+            },
+            {
+              label: 'Clone',
+              run: () => {
+                const url = promptSourceControlValue('Clone URL');
+                if (!url) return;
+                const force = window.confirm('Clone replaces the current CodeCraft workspace. Continue?');
+                if (force) void runSourceControlGitCommand(['git', 'clone', url, '--force']);
+              },
+            },
+          ],
+        },
+        {
+          title: 'Repository',
+          actions: [
+            {
+              label: 'Init',
+              run: () => {
+                if (window.confirm('Reinitialize the virtual Git repository for this workspace?')) void runSourceControlGitCommand(['git', 'init']);
+              },
+            },
+            { label: 'Config', run: () => runSourceControlGitCommand(['git', 'config', '--list']) },
+            { label: 'HEAD', run: () => runSourceControlGitCommand(['git', 'rev-parse', 'HEAD']) },
+            { label: 'Branch Name', run: () => runSourceControlGitCommand(['git', 'rev-parse', '--abbrev-ref', 'HEAD']) },
+            { label: 'Terminal', run: () => selectDockPanel('terminal') },
+          ],
+        },
+      ];
 
       return (
         <div className="h-full w-full flex flex-col bg-[rgb(28,28,28)] text-zinc-300 border-white/10">
@@ -18611,24 +19488,25 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
 
             <div className="space-y-2 border-t border-white/10 pt-3">
               <div className="text-[10px] font-medium uppercase tracking-wide text-zinc-500">Actions</div>
-              <div className="grid grid-cols-2 gap-2">
-                <button type="button" onClick={() => void handleSourceControlFetch()} className="rounded-md bg-white/5 px-2 py-2 text-xs text-zinc-300 transition-colors hover:bg-white/10">Fetch</button>
-                <button type="button" onClick={async () => {
-                  try { setSourceControlStatus((await pullGitBranch()).lines.join('\n')); }
-                  catch (error) { setSourceControlStatus(`Pull failed: ${error instanceof Error ? error.message : String(error)}`); }
-                }} className="rounded-md bg-white/5 px-2 py-2 text-xs text-zinc-300 transition-colors hover:bg-white/10">Pull</button>
-                <button type="button" onClick={async () => {
-                  try { setSourceControlStatus((await pushGitBranch()).lines.join('\n')); }
-                  catch (error) { setSourceControlStatus(`Push failed: ${error instanceof Error ? error.message : String(error)}`); }
-                }} className="rounded-md bg-white/5 px-2 py-2 text-xs text-zinc-300 transition-colors hover:bg-white/10">Push</button>
-                <button type="button" onClick={async () => {
-                  try { setSourceControlStatus((await syncGitBranch()).lines.join('\n')); }
-                  catch (error) { setSourceControlStatus(`Sync failed: ${error instanceof Error ? error.message : String(error)}`); }
-                }} className="rounded-md bg-white/5 px-2 py-2 text-xs text-zinc-300 transition-colors hover:bg-white/10">Sync</button>
-              </div>
-              <div className="grid grid-cols-2 gap-2">
-                <button type="button" onClick={async () => setSourceControlStatus((await executeGitCli(['git', 'status'])).join('\n'))} className="rounded-md bg-white/5 px-2 py-2 text-xs text-zinc-300 transition-colors hover:bg-white/10">Status</button>
-                <button type="button" onClick={() => selectDockPanel('terminal')} className="rounded-md bg-white/5 px-2 py-2 text-xs text-zinc-300 transition-colors hover:bg-white/10">Terminal</button>
+              <div className="space-y-3">
+                {sourceControlGitActionGroups.map(group => (
+                  <div key={group.title} className="space-y-1.5">
+                    <div className="text-[10px] text-zinc-600">{group.title}</div>
+                    <div className="grid grid-cols-3 gap-1.5">
+                      {group.actions.map(action => (
+                        <button
+                          key={action.label}
+                          type="button"
+                          onClick={() => void action.run()}
+                          disabled={action.disabled}
+                          className="min-h-8 rounded-md bg-white/5 px-2 py-1.5 text-[11px] leading-tight text-zinc-300 transition-colors hover:bg-white/10 disabled:cursor-not-allowed disabled:text-zinc-600"
+                        >
+                          {action.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                ))}
               </div>
             </div>
 
@@ -19062,7 +19940,7 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
                   <div className="mt-2 max-h-24 space-y-1 overflow-y-auto custom-scrollbar pr-1">
                     {chatAttachments.map(file => (
                       <div key={file.id} className="flex items-center gap-2 rounded-lg bg-black/20 px-2 py-1.5">
-                        <FileCode size={13} className={cn("shrink-0", file.source === 'workspace' ? "text-indigo-300" : "text-emerald-300")} />
+                        <FileTypeIcon path={file.path} size={13} className={file.source === 'upload' ? "opacity-90" : undefined} />
                         <span className="min-w-0 flex-1 truncate text-[11px] text-zinc-300">{file.path}</span>
                         <button
                           type="button"
@@ -19192,7 +20070,13 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
   factoryRef.current = factoryImpl;
   const factory = useCallback((node: TabNode) => factoryRef.current(node), []);
 
-  const getDockTabIcon = (component?: string) => {
+  const getDockTabIcon = (node: any, component?: string) => {
+    if (component === 'editor') {
+      const itemId = typeof node.getConfig === 'function' ? node.getConfig()?.itemId : undefined;
+      const item = typeof itemId === 'string' ? files.find(candidate => candidate.id === itemId) : null;
+      if (item?.type === 'file') return <FileTypeIcon path={item.name} language={item.language} size={14} />;
+      if (item?.type === 'folder') return <Folder size={14} className="text-amber-400" />;
+    }
     if (component === 'explorer') return <Folder size={14} />;
     if (component === 'sourceControl') return <GitBranch size={14} />;
     if (component === 'terminal') return <TerminalIcon size={14} />;
@@ -19206,7 +20090,7 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
     const label = typeof node.getName === 'function' ? node.getName() : '';
     renderValues.content = (
       <span className="inline-flex items-center gap-2 text-sm font-normal">
-        {getDockTabIcon(component)}
+        {getDockTabIcon(node, component)}
         <span>{label}</span>
       </span>
     );
@@ -19603,7 +20487,7 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
                         className="group mb-1 w-full rounded-lg px-3 py-2 text-left transition-colors last:mb-0 hover:bg-white/5 focus-visible:bg-white/5 focus-visible:outline-none"
                       >
                         <div className="flex items-center gap-2 text-xs">
-                          <FileCode size={13} className="shrink-0 text-zinc-500 group-hover:text-indigo-300" />
+                          <FileTypeIcon path={result.path} size={13} />
                           <span className="min-w-0 flex-1 truncate text-zinc-300 group-hover:text-white">{result.path}</span>
                           <span className="shrink-0 font-mono text-[10px] text-zinc-600">
                             {result.kind === 'content' ? `${result.lineNumber}:${result.column}` : 'file'}

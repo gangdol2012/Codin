@@ -1,11 +1,18 @@
+using System.Collections.Immutable;
+using System.Reflection;
+using System.Composition.Hosting;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.CodeActions;
+using Microsoft.CodeAnalysis.CodeFixes;
+using Microsoft.CodeAnalysis.CodeRefactorings;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Microsoft.CodeAnalysis.FindSymbols;
 using Microsoft.CodeAnalysis.Formatting;
+using Microsoft.CodeAnalysis.Host.Mef;
 using Microsoft.CodeAnalysis.Text;
 using OmniSharp.Models;
 using OmniSharp.Models.SignatureHelp;
@@ -21,6 +28,7 @@ public class MonacoService
     OmniSharpCompletionService _completionService = null!;
     OmniSharpSignatureHelpService _signatureService = null!;
     OmniSharpQuickInfoProvider _quickInfoProvider = null!;
+    CodeActionProviderSet? _codeActionProviderSet;
     readonly SemaphoreSlim _completionGate = new(1, 1);
     readonly SemaphoreSlim _diagnosticGate = new(1, 1);
 
@@ -77,7 +85,7 @@ public class MonacoService
     public record DiagnosticProjectFileDto(string Path, string Content);
     public record DiagnosticProjectRequest(string? CurrentPath, DiagnosticProjectFileDto[]? Files);
     public record MonacoLocation(TextRange Range, string? Path = null, string? Name = null, string? Kind = null, string? Detail = null);
-    public record MonacoTextEdit(TextRange Range, string Text);
+    public record MonacoTextEdit(TextRange Range, string Text, string? Path = null);
     public record RenameInfo(bool CanRename, TextRange? Range, string? Text, string? RejectReason);
     public record CodeActionDto(string Title, string Kind, MonacoTextEdit[] Edits, bool IsPreferred);
     public record DocumentSymbolDto(string Name, string Detail, string Kind, TextRange Range, TextRange SelectionRange, DocumentSymbolDto[] Children);
@@ -85,6 +93,7 @@ public class MonacoService
     public record InlayHintDto(string Kind, string Label, PositionDto Position, bool PaddingLeft, bool PaddingRight);
     public record FoldingRangeDto(int Start, int End, string? Kind);
     internal record ResponsePayload(object? Payload, string? Type);
+    record CodeActionProviderSet(CodeFixProvider[] CodeFixProviders, CodeRefactoringProvider[] RefactoringProviders, IDisposable? Container);
 
     #endregion
 
@@ -424,9 +433,14 @@ $@"using System;
 
     public async Task<byte[]> GetCodeActionsAsync(string code, string rangeRequestString)
     {
+        return await GetCodeActionsAsync(code, rangeRequestString, string.Empty);
+    }
+
+    public async Task<byte[]> GetCodeActionsAsync(string code, string rangeRequestString, string diagnosticRequestString)
+    {
         return await RunDiagnosticAsync(async () =>
         {
-            var document = await UpdateDocumentAsync(_diagnosticProject, code);
+            var document = await UpdateDiagnosticDocumentAsync(code, diagnosticRequestString);
             var text = await document.GetTextAsync();
             var source = text.ToString();
             var actions = new List<CodeActionDto>();
@@ -464,6 +478,8 @@ $@"using System;
                     new[] { new MonacoTextEdit(ToRange(text, TextSpan.FromBounds(0, text.Length)), organized) },
                     false));
             }
+
+            await AddRoslynCodeActionsAsync(document, requestSpan, diagnostics, actions);
 
             return Payload(actions
                 .GroupBy(action => action.Title)
@@ -663,6 +679,211 @@ $@"using System;
         }
 
         return semanticModel.GetDiagnostics().ToList();
+    }
+
+    async Task AddRoslynCodeActionsAsync(
+        Document document,
+        TextSpan requestSpan,
+        List<Microsoft.CodeAnalysis.Diagnostic> diagnostics,
+        List<CodeActionDto> actions)
+    {
+        var providers = GetCodeActionProviderSet();
+        var matchingDiagnostics = diagnostics
+            .Where(diagnostic => DiagnosticAppliesToSpan(diagnostic, requestSpan))
+            .ToArray();
+
+        foreach (var provider in providers.CodeFixProviders)
+        {
+            var providerDiagnostics = matchingDiagnostics
+                .Where(diagnostic => provider.FixableDiagnosticIds.Contains(diagnostic.Id))
+                .ToImmutableArray();
+
+            if (providerDiagnostics.IsDefaultOrEmpty)
+            {
+                continue;
+            }
+
+            var registered = new List<CodeAction>();
+            var context = new CodeFixContext(
+                document,
+                requestSpan,
+                providerDiagnostics,
+                (action, _) => registered.Add(action),
+                CancellationToken.None);
+
+            try
+            {
+                await provider.RegisterCodeFixesAsync(context);
+                await AddConcreteCodeActionsAsync(document, registered, "quickfix", actions);
+            }
+            catch (Exception e)
+            {
+                Console.WriteLine($"Code fix provider {provider.GetType().Name} failed: {e.Message}");
+            }
+        }
+
+        foreach (var provider in providers.RefactoringProviders)
+        {
+            var registered = new List<CodeAction>();
+            var context = new CodeRefactoringContext(
+                document,
+                requestSpan,
+                action => registered.Add(action),
+                CancellationToken.None);
+
+            try
+            {
+                await provider.ComputeRefactoringsAsync(context);
+                await AddConcreteCodeActionsAsync(document, registered, "refactor", actions);
+            }
+            catch (Exception e)
+            {
+                Console.WriteLine($"Refactoring provider {provider.GetType().Name} failed: {e.Message}");
+            }
+        }
+    }
+
+    async Task AddConcreteCodeActionsAsync(
+        Document document,
+        IEnumerable<CodeAction> sourceActions,
+        string kind,
+        List<CodeActionDto> actions)
+    {
+        foreach (var action in sourceActions.SelectMany(FlattenCodeAction))
+        {
+            try
+            {
+                var edits = await GetCodeActionEditsAsync(document, action);
+                if (edits.Length == 0)
+                {
+                    continue;
+                }
+
+                actions.Add(new CodeActionDto(action.Title, kind, edits, false));
+            }
+            catch (Exception e)
+            {
+                Console.WriteLine($"Code action {action.Title} failed: {e.Message}");
+            }
+        }
+    }
+
+    async Task<MonacoTextEdit[]> GetCodeActionEditsAsync(Document document, CodeAction action)
+    {
+        var operations = await action.GetOperationsAsync(CancellationToken.None);
+        var applyChanges = operations.OfType<ApplyChangesOperation>().FirstOrDefault();
+        if (applyChanges == null)
+        {
+            return Array.Empty<MonacoTextEdit>();
+        }
+
+        return await ToMonacoTextEditsAsync(document, applyChanges.ChangedSolution);
+    }
+
+    async Task<MonacoTextEdit[]> ToMonacoTextEditsAsync(Document currentDocument, Solution changedSolution)
+    {
+        var edits = new List<MonacoTextEdit>();
+        var solutionChanges = changedSolution.GetChanges(currentDocument.Project.Solution);
+
+        foreach (var projectChanges in solutionChanges.GetProjectChanges())
+        {
+            foreach (var documentId in projectChanges.GetChangedDocuments())
+            {
+                var oldDocument = projectChanges.OldProject.GetDocument(documentId);
+                var newDocument = projectChanges.NewProject.GetDocument(documentId);
+                if (oldDocument == null || newDocument == null)
+                {
+                    continue;
+                }
+
+                var oldText = await oldDocument.GetTextAsync();
+                var changes = await newDocument.GetTextChangesAsync(oldDocument, CancellationToken.None);
+                var path = oldDocument.Id == currentDocument.Id ? null : NormalizeLocationPath(oldDocument.FilePath);
+                edits.AddRange(changes.Select(change => new MonacoTextEdit(ToRange(oldText, change.Span), change.NewText ?? string.Empty, path)));
+            }
+
+            foreach (var documentId in projectChanges.GetAddedDocuments())
+            {
+                var newDocument = projectChanges.NewProject.GetDocument(documentId);
+                if (newDocument == null)
+                {
+                    continue;
+                }
+
+                var newText = await newDocument.GetTextAsync();
+                var path = NormalizeLocationPath(newDocument.FilePath);
+                if (!string.IsNullOrWhiteSpace(path))
+                {
+                    edits.Add(new MonacoTextEdit(
+                        new TextRange(new PositionDto(0, 0), new PositionDto(0, 0)),
+                        newText.ToString(),
+                        path));
+                }
+            }
+        }
+
+        return edits
+            .GroupBy(edit => $"{edit.Path}:{edit.Range.Start.Line}:{edit.Range.Start.Character}:{edit.Range.End.Line}:{edit.Range.End.Character}:{edit.Text}")
+            .Select(group => group.First())
+            .ToArray();
+    }
+
+    IEnumerable<CodeAction> FlattenCodeAction(CodeAction action)
+    {
+        if (!action.NestedActions.IsDefaultOrEmpty)
+        {
+            foreach (var nested in action.NestedActions.SelectMany(FlattenCodeAction))
+            {
+                yield return nested;
+            }
+            yield break;
+        }
+
+        yield return action;
+    }
+
+    static bool DiagnosticAppliesToSpan(Microsoft.CodeAnalysis.Diagnostic diagnostic, TextSpan span)
+    {
+        return span.Length == 0
+            || diagnostic.Location == Location.None
+            || diagnostic.Location.SourceTree == null
+            || diagnostic.Location.SourceSpan.IntersectsWith(span);
+    }
+
+    CodeActionProviderSet GetCodeActionProviderSet()
+    {
+        if (_codeActionProviderSet != null)
+        {
+            return _codeActionProviderSet;
+        }
+
+        try
+        {
+            var assemblies = MefHostServices.DefaultAssemblies
+                .Concat(new[]
+                {
+                    typeof(CodeAction).Assembly,
+                    typeof(CodeFixProvider).Assembly,
+                    Assembly.Load("Microsoft.CodeAnalysis.Features"),
+                    Assembly.Load("Microsoft.CodeAnalysis.CSharp.Features")
+                })
+                .Distinct()
+                .ToArray();
+            var container = new ContainerConfiguration()
+                .WithAssemblies(assemblies)
+                .CreateContainer();
+            _codeActionProviderSet = new CodeActionProviderSet(
+                container.GetExports<CodeFixProvider>().ToArray(),
+                container.GetExports<CodeRefactoringProvider>().ToArray(),
+                container);
+        }
+        catch (Exception e)
+        {
+            Console.WriteLine($"Could not initialize Roslyn code action providers: {e.Message}");
+            _codeActionProviderSet = new CodeActionProviderSet(Array.Empty<CodeFixProvider>(), Array.Empty<CodeRefactoringProvider>(), null);
+        }
+
+        return _codeActionProviderSet;
     }
 
     async Task<SemanticTokenDto[]> BuildSemanticTokensAsync(Document document)

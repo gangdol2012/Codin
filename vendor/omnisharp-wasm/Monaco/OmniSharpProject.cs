@@ -70,6 +70,99 @@ public class OmniSharpProject
         "System.Threading.Tasks"
     };
 
+    private static readonly string[] DotNet8ReferenceAssemblyNames =
+    {
+        "Microsoft.CSharp",
+        "Microsoft.Win32.Primitives",
+        "netstandard",
+        "System",
+        "System.Collections",
+        "System.Collections.Concurrent",
+        "System.Collections.Immutable",
+        "System.Collections.NonGeneric",
+        "System.Collections.Specialized",
+        "System.ComponentModel",
+        "System.ComponentModel.Composition",
+        "System.ComponentModel.Primitives",
+        "System.ComponentModel.TypeConverter",
+        "System.Configuration.ConfigurationManager",
+        "System.Console",
+        "System.Data.Common",
+        "System.Data.DataSetExtensions",
+        "System.Diagnostics.Contracts",
+        "System.Diagnostics.Debug",
+        "System.Diagnostics.DiagnosticSource",
+        "System.Diagnostics.FileVersionInfo",
+        "System.Diagnostics.Process",
+        "System.Diagnostics.StackTrace",
+        "System.Diagnostics.Tools",
+        "System.Diagnostics.TraceSource",
+        "System.Diagnostics.Tracing",
+        "System.Drawing",
+        "System.Drawing.Primitives",
+        "System.Globalization",
+        "System.IO.Compression",
+        "System.IO.FileSystem",
+        "System.IO.MemoryMappedFiles",
+        "System.Linq",
+        "System.Linq.Expressions",
+        "System.Linq.Queryable",
+        "System.Memory",
+        "System.Net.Http",
+        "System.Net.Primitives",
+        "System.Net.Requests",
+        "System.Net.WebClient",
+        "System.ObjectModel",
+        "System.Private.CoreLib",
+        "System.Private.DataContractSerialization",
+        "System.Private.Uri",
+        "System.Private.Xml",
+        "System.Private.Xml.Linq",
+        "System.Reactive",
+        "System.Reflection.DispatchProxy",
+        "System.Reflection.Emit",
+        "System.Reflection.Emit.ILGeneration",
+        "System.Reflection.Emit.Lightweight",
+        "System.Reflection.Metadata",
+        "System.Reflection.Primitives",
+        "System.Resources.ResourceManager",
+        "System.Runtime",
+        "System.Runtime.Extensions",
+        "System.Runtime.InteropServices",
+        "System.Runtime.InteropServices.JavaScript",
+        "System.Runtime.InteropServices.RuntimeInformation",
+        "System.Runtime.Intrinsics",
+        "System.Runtime.Loader",
+        "System.Runtime.Numerics",
+        "System.Runtime.Serialization.Formatters",
+        "System.Runtime.Serialization.Json",
+        "System.Runtime.Serialization.Primitives",
+        "System.Runtime.Serialization.Xml",
+        "System.Security.AccessControl",
+        "System.Security.Claims",
+        "System.Security.Cryptography",
+        "System.Security.Cryptography.ProtectedData",
+        "System.Security.Permissions",
+        "System.Security.Principal.Windows",
+        "System.Text.Encoding.CodePages",
+        "System.Text.Encoding.Extensions",
+        "System.Text.Encodings.Web",
+        "System.Text.Json",
+        "System.Text.RegularExpressions",
+        "System.Threading",
+        "System.Threading.Channels",
+        "System.Threading.Tasks",
+        "System.Threading.Tasks.Extensions",
+        "System.Threading.Tasks.Parallel",
+        "System.Threading.Thread",
+        "System.Threading.ThreadPool",
+        "System.Xml.Linq",
+        "System.Xml.ReaderWriter",
+        "System.Xml.XDocument",
+        "System.Xml.XPath",
+        "System.Xml.XPath.XDocument"
+    };
+
     private static readonly CSharpParseOptions ParseOptions = CSharpParseOptions.Default
         .WithKind(SourceCodeKind.Regular)
         .WithLanguageVersion(LanguageVersion.Preview);
@@ -84,6 +177,7 @@ public class OmniSharpProject
     private readonly Dictionary<string, DocumentId> _additionalDocumentIds = new(StringComparer.Ordinal);
     private readonly Dictionary<string, string> _additionalDocumentContents = new(StringComparer.Ordinal);
     private string _primaryDocumentText = string.Empty;
+    private string _primaryDocumentPath = string.Empty;
     private string Uri {get; init;}
     public OmniSharpProject(string uri)
     {
@@ -124,7 +218,7 @@ public class OmniSharpProject
             }
         }
 
-        // Keep authoring support close to the same "core library" profile used by the BrowserCSharp runtime.
+        // Start with the core library profile, then let `nuget include` lazily pull the wider .NET 8 set.
         TryAddNamedAssembly("System.Runtime");
         TryAddNamedAssembly("System.Collections");
         TryAddNamedAssembly("netstandard");
@@ -207,7 +301,9 @@ public class OmniSharpProject
             nextDocuments[path] = file.Content ?? string.Empty;
         }
 
-        if (safeCode == _primaryDocumentText && DictionariesEqual(_additionalDocumentContents, nextDocuments))
+        if (safeCode == _primaryDocumentText &&
+            normalizedActivePath == _primaryDocumentPath &&
+            DictionariesEqual(_additionalDocumentContents, nextDocuments))
         {
             return Task.FromResult(Workspace.CurrentSolution.GetDocument(DocumentId)!);
         }
@@ -219,6 +315,13 @@ public class OmniSharpProject
         if (safeCode != _primaryDocumentText)
         {
             solution = solution.WithDocumentText(DocumentId, SourceText.From(safeCode));
+        }
+
+        if (!string.IsNullOrWhiteSpace(normalizedActivePath) && normalizedActivePath != _primaryDocumentPath)
+        {
+            solution = solution
+                .WithDocumentName(DocumentId, SourceNameForPath(normalizedActivePath))
+                .WithDocumentFilePath(DocumentId, normalizedActivePath);
         }
 
         foreach (var stalePath in _additionalDocumentIds.Keys.Where(path => !nextDocuments.ContainsKey(path)).ToArray())
@@ -251,6 +354,7 @@ public class OmniSharpProject
         if (Workspace.TryApplyChanges(solution))
         {
             _primaryDocumentText = safeCode;
+            _primaryDocumentPath = normalizedActivePath;
             _additionalDocumentIds.Clear();
             foreach (var (path, documentId) in nextDocumentIds)
             {
@@ -279,8 +383,7 @@ public class OmniSharpProject
             return new NamespaceIncludeResult(namespaceName, Array.Empty<string>(), Array.Empty<string>(), false, "Namespace is required.");
         }
 
-        var matchingAssemblies = AppDomain.CurrentDomain
-            .GetAssemblies()
+        var matchingAssemblies = GetAssembliesForNamespaceMatching()
             .Where(a => !a.IsDynamic)
             .Where(a => AssemblyMatchesNamespace(a, namespaceName))
             .OrderBy(a => a.GetName().Name, StringComparer.Ordinal)
@@ -293,7 +396,7 @@ public class OmniSharpProject
                 Array.Empty<string>(),
                 Array.Empty<string>(),
                 false,
-                $"No loaded assemblies matched namespace '{namespaceName}'."
+                $"No .NET 8 assemblies matched namespace '{namespaceName}'."
             );
         }
 
@@ -346,6 +449,44 @@ public class OmniSharpProject
             success,
             message
         );
+    }
+
+    private static IReadOnlyCollection<Assembly> GetAssembliesForNamespaceMatching()
+    {
+        var assembliesByName = new Dictionary<string, Assembly>(StringComparer.Ordinal);
+
+        void TrackAssembly(Assembly assembly)
+        {
+            var assemblyName = assembly.GetName().Name;
+            if (!string.IsNullOrWhiteSpace(assemblyName))
+            {
+                assembliesByName[assemblyName] = assembly;
+            }
+        }
+
+        foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies())
+        {
+            TrackAssembly(assembly);
+        }
+
+        foreach (var assemblyName in DotNet8ReferenceAssemblyNames)
+        {
+            if (assembliesByName.ContainsKey(assemblyName))
+            {
+                continue;
+            }
+
+            try
+            {
+                TrackAssembly(Assembly.Load(assemblyName));
+            }
+            catch (Exception e)
+            {
+                Console.WriteLine($"Failed to load .NET 8 reference assembly {assemblyName}: {e.Message}");
+            }
+        }
+
+        return assembliesByName.Values;
     }
 
     private void ApplyMetadataReferencesToWorkspace()

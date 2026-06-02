@@ -386,6 +386,7 @@ interface OmniSharpLocationDto {
 interface OmniSharpTextEditDto {
   range: OmniSharpRangeDto;
   text: string;
+  path?: string;
 }
 
 interface OmniSharpRenameInfoDto {
@@ -2968,12 +2969,14 @@ class CSharpLanguageService {
       try {
         const snapshot = this.getModelTextSnapshot(model);
         const rangeRequest = this.rangeRequest(range);
+        const projectRequest = this.createSerializedDiagnosticProjectRequest(model);
         const response = await this.cachedOmniSharpModelCall(
           'GetCodeActionsAsync',
           model,
           snapshot,
-          [rangeRequest],
-          rangeRequest
+          [rangeRequest, projectRequest.serialized],
+          rangeRequest,
+          projectRequest.serialized
         );
         actions.push(...this.convertCodeActions(model, response, context.markers));
       } catch {
@@ -3428,7 +3431,11 @@ class CSharpLanguageService {
   }
 
   private uriForLocation(model: monaco.editor.ITextModel, location: OmniSharpLocationDto): monaco.Uri {
-    const path = normalizeProjectPath(location.path ?? '');
+    return this.uriForProjectPath(model, location.path);
+  }
+
+  private uriForProjectPath(model: monaco.editor.ITextModel, rawPath?: string): monaco.Uri {
+    const path = normalizeProjectPath(rawPath ?? '');
     if (!path || path === currentModelPath(model)) return model.uri;
 
     const existing = monaco.editor.getModels()
@@ -3454,9 +3461,14 @@ class CSharpLanguageService {
 
   private convertWorkspaceEdit(model: monaco.editor.ITextModel, edit: OmniSharpTextEditDto): monaco.languages.IWorkspaceTextEdit[] {
     const range = this.toEditorRange(edit.range);
-    return range
-      ? [{ resource: model.uri, textEdit: { range, text: edit.text }, versionId: model.getVersionId() }]
-      : [];
+    if (!range) return [];
+
+    const resource = this.uriForProjectPath(model, edit.path);
+    return [{
+      resource,
+      textEdit: { range, text: edit.text },
+      versionId: monaco.editor.getModel(resource)?.getVersionId() ?? model.getVersionId(),
+    }];
   }
 
   private convertCodeActions(

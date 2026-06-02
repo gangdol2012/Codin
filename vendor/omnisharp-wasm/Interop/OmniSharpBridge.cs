@@ -52,7 +52,9 @@ public class MonacoServiceWrapper {
             case "GetRangeFormattingAsync":
                 return await worker.RunAsync(a => a.GetRangeFormattingAsync(args[0], args[1]));
             case "GetCodeActionsAsync":
-                return await worker.RunAsync(a => a.GetCodeActionsAsync(args[0], args[1]));
+                return args.Length > 2
+                    ? await worker.RunAsync(a => a.GetCodeActionsAsync(args[0], args[1], args[2]))
+                    : await worker.RunAsync(a => a.GetCodeActionsAsync(args[0], args[1]));
             case "GetInlayHintsAsync":
                 return await worker.RunAsync(a => a.GetInlayHintsAsync(args[0], args[1]));
             case "GetFoldingRangesAsync":
