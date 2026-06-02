@@ -68,6 +68,45 @@ export const BrowserCSharp = {
   executeRegularProjectInteractive(paths: string[], contents: string[], entryPath: string): Promise<ScriptResult> {
     return invoke<ScriptResult>('ExecuteRegularProjectInteractive', paths, contents, entryPath);
   },
+
+  executeRegularProjectWithFiles(
+    paths: string[],
+    contents: string[],
+    entryPath: string,
+    runtimePaths: string[],
+    runtimeContents: string[]
+  ): Promise<ScriptResult & { files?: RuntimeFileSnapshot[] }> {
+    return invoke<ScriptResult & { files?: RuntimeFileSnapshot[] }>(
+      'ExecuteRegularProjectWithFiles',
+      paths,
+      contents,
+      entryPath,
+      runtimePaths,
+      runtimeContents
+    );
+  },
+
+  executeRegularProjectWithFilesInteractive(
+    paths: string[],
+    contents: string[],
+    entryPath: string,
+    runtimePaths: string[],
+    runtimeContents: string[]
+  ): Promise<ScriptResult & { files?: RuntimeFileSnapshot[] }> {
+    return invoke<ScriptResult & { files?: RuntimeFileSnapshot[] }>(
+      'ExecuteRegularProjectWithFilesInteractive',
+      paths,
+      contents,
+      entryPath,
+      runtimePaths,
+      runtimeContents
+    );
+  },
 };
+
+export interface RuntimeFileSnapshot {
+  path: string;
+  content: string;
+}
 
 export type { ScriptResult } from 'browser-csharp';

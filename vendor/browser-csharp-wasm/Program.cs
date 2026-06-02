@@ -20,6 +20,7 @@ namespace BrowserCSharp
 	public static class Program
 	{
 		private const string frameworkBinUri = "_framework/_bin";
+		private const string codecraftWorkspaceRoot = "/workspace";
 		private static readonly IImmutableSet<string> references = ImmutableHashSet.Create(
 			"mscorlib",
 			"netstandard",
@@ -318,6 +319,177 @@ namespace BrowserCSharp
 			return Task.Run(execute);
 		}
 
+		[JSInvokable]
+		public static Task<ProjectExecutionResult> ExecuteRegularProjectWithFiles(
+			string[] paths,
+			string[] contents,
+			string entryPath,
+			string[] runtimePaths,
+			string[] runtimeContents
+		)
+		{
+			async Task<ProjectExecutionResult> execute()
+			{
+				return await ExecuteRegularProjectWithFilesCore(paths, contents, entryPath, runtimePaths, runtimeContents, false).ConfigureAwait(false);
+			}
+
+			return Task.Run(execute);
+		}
+
+		[JSInvokable]
+		public static Task<ProjectExecutionResult> ExecuteRegularProjectWithFilesInteractive(
+			string[] paths,
+			string[] contents,
+			string entryPath,
+			string[] runtimePaths,
+			string[] runtimeContents
+		)
+		{
+			async Task<ProjectExecutionResult> execute()
+			{
+				return await ExecuteRegularProjectWithFilesCore(paths, contents, entryPath, runtimePaths, runtimeContents, true).ConfigureAwait(false);
+			}
+
+			return Task.Run(execute);
+		}
+
+		private static async Task<ProjectExecutionResult> ExecuteRegularProjectWithFilesCore(
+			string[] paths,
+			string[] contents,
+			string entryPath,
+			string[] runtimePaths,
+			string[] runtimeContents,
+			bool interactive
+		)
+		{
+			if (paths == null || contents == null || paths.Length == 0 || paths.Length != contents.Length)
+			{
+				return new ProjectExecutionResult(null, null, "Invalid C# project payload.", Array.Empty<FileSnapshot>());
+			}
+
+			KeyValuePair<string, string>[] sourceFiles = paths
+				.Select((path, index) => new KeyValuePair<string, string>(
+					NormalizeWorkspaceRelativePath(String.IsNullOrWhiteSpace(path) ? $"File{index + 1}.cs" : path),
+					contents[index] ?? String.Empty
+				))
+				.ToArray();
+			KeyValuePair<string, string>[] runtimeFiles = BuildRuntimeFiles(
+				runtimePaths,
+				runtimeContents,
+				sourceFiles
+			);
+			string normalizedEntryPath = NormalizeWorkspaceRelativePath(entryPath);
+			WriteProjectFilesToWorkspace(runtimeFiles);
+
+			CompilationResult compilationResult = await CompileRegularProgram(sourceFiles, normalizedEntryPath).ConfigureAwait(false);
+
+			if (!compilationResult.Success)
+			{
+				return new ProjectExecutionResult(
+					null,
+					null,
+					String.Join('\n', compilationResult.Errors.Select(x => x.GetMessage())),
+					CollectWorkspaceFiles()
+				);
+			}
+
+			ExecutionResult result = await RunRegularProgram(
+				compilationResult.Assembly,
+				compilationResult.Compilation,
+				interactive,
+				codecraftWorkspaceRoot
+			).ConfigureAwait(false);
+			return new ProjectExecutionResult(result.Result, result.StdOut, result.StdErr, CollectWorkspaceFiles());
+		}
+
+		private static KeyValuePair<string, string>[] BuildRuntimeFiles(
+			string[] runtimePaths,
+			string[] runtimeContents,
+			KeyValuePair<string, string>[] sourceFiles
+		)
+		{
+			if (runtimePaths == null || runtimeContents == null || runtimePaths.Length == 0 || runtimePaths.Length != runtimeContents.Length)
+			{
+				return sourceFiles;
+			}
+
+			Dictionary<string, string> files = new Dictionary<string, string>(StringComparer.Ordinal);
+			for (int index = 0; index < runtimePaths.Length; index++)
+			{
+				string path = NormalizeWorkspaceRelativePath(runtimePaths[index]);
+				files[path] = runtimeContents[index] ?? String.Empty;
+			}
+			foreach (KeyValuePair<string, string> sourceFile in sourceFiles)
+			{
+				files[sourceFile.Key] = sourceFile.Value ?? String.Empty;
+			}
+			return files
+				.OrderBy(file => file.Key, StringComparer.Ordinal)
+				.Select(file => new KeyValuePair<string, string>(file.Key, file.Value))
+				.ToArray();
+		}
+
+		private static string NormalizeWorkspaceRelativePath(string path)
+		{
+			string[] parts = (path ?? String.Empty)
+				.Replace('\\', '/')
+				.Split('/')
+				.Select(part => part.Trim())
+				.Where(part => part.Length > 0 && part != "." && part != "..")
+				.ToArray();
+			return parts.Length > 0 ? String.Join("/", parts) : "Program.cs";
+		}
+
+		private static void RecreateWorkspaceRoot()
+		{
+			try
+			{
+				if (Directory.Exists(codecraftWorkspaceRoot))
+				{
+					Directory.Delete(codecraftWorkspaceRoot, true);
+				}
+			}
+			catch
+			{
+				// Runtime scratch files are reset best-effort before each project run.
+			}
+			Directory.CreateDirectory(codecraftWorkspaceRoot);
+		}
+
+		private static void WriteProjectFilesToWorkspace(IEnumerable<KeyValuePair<string, string>> sourceFiles)
+		{
+			RecreateWorkspaceRoot();
+			foreach (KeyValuePair<string, string> sourceFile in sourceFiles)
+			{
+				string relativePath = NormalizeWorkspaceRelativePath(sourceFile.Key);
+				string fullPath = Path.Combine(codecraftWorkspaceRoot, relativePath.Replace('/', Path.DirectorySeparatorChar));
+				string directory = Path.GetDirectoryName(fullPath);
+				if (!String.IsNullOrWhiteSpace(directory))
+				{
+					Directory.CreateDirectory(directory);
+				}
+				File.WriteAllText(fullPath, sourceFile.Value ?? String.Empty, Encoding.UTF8);
+			}
+		}
+
+		private static FileSnapshot[] CollectWorkspaceFiles()
+		{
+			if (!Directory.Exists(codecraftWorkspaceRoot))
+			{
+				return Array.Empty<FileSnapshot>();
+			}
+
+			return Directory
+				.GetFiles(codecraftWorkspaceRoot, "*", SearchOption.AllDirectories)
+				.Select(path =>
+				{
+					string relativePath = path.Substring(codecraftWorkspaceRoot.Length).TrimStart(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+					return new FileSnapshot(relativePath.Replace(Path.DirectorySeparatorChar, '/'), File.ReadAllText(path, Encoding.UTF8));
+				})
+				.OrderBy(file => file.Path, StringComparer.Ordinal)
+				.ToArray();
+		}
+
 		private static async Task<CompilationResult> CompileRegularProgram(IReadOnlyList<KeyValuePair<string, string>> sourceFiles, string entryPath)
 		{
 			PortableExecutableReference[] refs = await loadedReferences.ConfigureAwait(false);
@@ -444,7 +616,12 @@ internal static class __CodeCraftEntry
 			return String.IsNullOrWhiteSpace(namespaceName) ? typeName : $"{namespaceName}.{typeName}";
 		}
 
-		private static async Task<ExecutionResult> RunRegularProgram(Assembly assembly, Compilation compilation, bool interactive = false)
+		private static async Task<ExecutionResult> RunRegularProgram(
+			Assembly assembly,
+			Compilation compilation,
+			bool interactive = false,
+			string workingDirectory = null
+		)
 		{
 			IMethodSymbol entrySymbol = compilation.GetEntryPoint(CancellationToken.None);
 			if (entrySymbol == null)
@@ -461,8 +638,15 @@ internal static class __CodeCraftEntry
 			TextWriter ogOut = Console.Out;
 			TextWriter ogError = Console.Error;
 			TextReader ogIn = Console.In;
+			string ogCurrentDirectory = null;
 			try
 			{
+				if (!String.IsNullOrWhiteSpace(workingDirectory))
+				{
+					Directory.CreateDirectory(workingDirectory);
+					ogCurrentDirectory = Directory.GetCurrentDirectory();
+					Directory.SetCurrentDirectory(workingDirectory);
+				}
 				StringWriter sw = interactive ? null : new StringWriter();
 				StringWriter ew = interactive ? null : new StringWriter();
 				if (interactive)
@@ -518,6 +702,14 @@ internal static class __CodeCraftEntry
 				Console.SetOut(ogOut);
 				Console.SetError(ogError);
 				Console.SetIn(ogIn);
+				if (!String.IsNullOrWhiteSpace(ogCurrentDirectory))
+				{
+					try
+					{
+						Directory.SetCurrentDirectory(ogCurrentDirectory);
+					}
+					catch { }
+				}
 			}
 		}
 

@@ -4436,6 +4436,108 @@ function getFsItemPath(items: FSItem[], id: string | undefined): string {
   return parentPath ? `${parentPath}/${item.name}` : item.name;
 }
 
+function normalizeRuntimeWorkspacePath(path: string, fallback = 'main.txt') {
+  return normalizeProjectPath(path || fallback) || fallback;
+}
+
+function buildRuntimeWorkspaceInitialFileMap(files: Array<RuntimeFileSnapshot & { name?: string }>) {
+  const initialFiles = new Map<string, string>();
+  for (const file of files) {
+    initialFiles.set(normalizeRuntimeWorkspacePath(file.path, file.name || 'main.txt'), file.content || '');
+  }
+  return initialFiles;
+}
+
+function getRuntimeWorkspaceChangedFiles(initialFiles: Map<string, string>, finalFiles: RuntimeFileSnapshot[]) {
+  const changed = new Map<string, RuntimeFileSnapshot>();
+  for (const file of finalFiles) {
+    const path = normalizeRuntimeWorkspacePath(file.path, 'output.txt');
+    const content = String(file.content ?? '');
+    if (initialFiles.get(path) === content) continue;
+    changed.set(path, { path, content });
+  }
+  return [...changed.values()].sort((left, right) => left.path.localeCompare(right.path));
+}
+
+function upsertRuntimeWorkspaceFilesIntoExplorer(items: FSItem[], files: RuntimeFileSnapshot[]) {
+  if (files.length === 0) return items;
+
+  const next = items.map(item => ({ ...item }));
+  const findChild = (parentId: string | null, name: string, type?: FSItem['type']) => (
+    next.find(item => item.parentId === parentId && item.name === name && (!type || item.type === type))
+  );
+  const ensureFolder = (parentId: string | null, name: string) => {
+    const existing = findChild(parentId, name, 'folder');
+    if (existing) {
+      existing.isOpen = true;
+      return existing.id;
+    }
+
+    const folder: FSItem = {
+      id: createFsItemId(),
+      name,
+      type: 'folder',
+      parentId,
+      isOpen: true,
+    };
+    next.push(folder);
+    return folder.id;
+  };
+
+  for (const file of files) {
+    const segments = normalizeRuntimeWorkspacePath(file.path, 'output.txt').split('/').filter(Boolean);
+    if (segments.length === 0) continue;
+
+    let parentId: string | null = null;
+    for (const segment of segments.slice(0, -1)) {
+      parentId = ensureFolder(parentId, segment);
+    }
+
+    const fileName = segments[segments.length - 1];
+    const existingFile = findChild(parentId, fileName, 'file');
+    if (existingFile) {
+      existingFile.content = file.content;
+      existingFile.language = langFromFilename(fileName);
+      continue;
+    }
+
+    next.push({
+      id: createFsItemId(),
+      name: fileName,
+      type: 'file',
+      parentId,
+      content: file.content,
+      language: langFromFilename(fileName),
+    });
+  }
+
+  return next;
+}
+
+function getRuntimeWorkspaceFilesFromExplorer(items: FSItem[]) {
+  const byPath = new Map<string, RuntimeFileSnapshot>();
+  for (const item of items) {
+    if (item.type !== 'file') continue;
+    const path = normalizeRuntimeWorkspacePath(getFsItemPath(items, item.id), item.name || 'file.txt');
+    byPath.set(path, { path, content: item.content || '' });
+  }
+  return [...byPath.values()].sort((left, right) => left.path.localeCompare(right.path));
+}
+
+function formatRuntimeReturnValue(value: unknown) {
+  if (value === undefined || value === null) return '';
+  if (typeof value === 'object') {
+    if (Array.isArray(value)) return value.length === 0 ? '' : JSON.stringify(value);
+    if (Object.keys(value as Record<string, unknown>).length === 0) return '';
+    try {
+      return JSON.stringify(value);
+    } catch {
+      return String(value).trim();
+    }
+  }
+  return String(value).trim();
+}
+
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value);
 }
@@ -4750,6 +4852,11 @@ interface ProjectSourceFile {
   path: string;
   content: string;
   language: ProjectFileLanguage;
+}
+
+interface RuntimeFileSnapshot {
+  path: string;
+  content: string;
 }
 
 type JavaScriptExecutionMode = 'classic-function' | 'async-function';
@@ -8225,6 +8332,16 @@ export default function App() {
     setExecutionStartupStatus(prev => prev ? `${prev}\n${message}` : message);
   };
 
+  const syncRuntimeWorkspaceFilesToExplorer = (initialFiles: Map<string, string>, finalFiles: RuntimeFileSnapshot[]) => {
+    const changedFiles = getRuntimeWorkspaceChangedFiles(initialFiles, finalFiles);
+    if (changedFiles.length === 0) return;
+
+    setFiles(prev => upsertRuntimeWorkspaceFilesIntoExplorer(prev, changedFiles));
+    appendExecutionStartupStatus(
+      `Synced ${changedFiles.length} runtime file${changedFiles.length === 1 ? '' : 's'} into the Explorer workspace.`
+    );
+  };
+
   function getCurrentAssistantSelectionContext() {
     if (!editorRef.current || !activeItem) {
       return "";
@@ -11132,6 +11249,8 @@ json.dumps(sorted(_imports))
     paths?: string[];
     contents?: string[];
     entryPath?: string;
+    runtimePaths?: string[];
+    runtimeContents?: string[];
   }): Promise<any> => new Promise((resolve, reject) => {
     if (csharpInteractiveWorkerRunRejectRef.current) {
       reject(new Error('C# interactive runner is already active.'));
@@ -11433,17 +11552,54 @@ for _name in (
     }
   };
 
-  const writePythonProjectFiles = (pyodide: any, rootPath: string, projectFiles: ProjectSourceFile[]) => {
+  const writePythonRuntimeFiles = (pyodide: any, rootPath: string, runtimeFiles: RuntimeFileSnapshot[]) => {
     removePyodideFsPath(pyodide, rootPath);
     ensurePyodideDirectory(pyodide, rootPath);
 
-    for (const file of projectFiles) {
-      const fullPath = `${rootPath}/${file.path}`;
+    for (const file of runtimeFiles) {
+      const fullPath = `${rootPath}/${normalizeRuntimeWorkspacePath(file.path, 'file.txt')}`;
       const parentPath = dirnameProjectPath(fullPath);
       if (parentPath) {
         ensurePyodideDirectory(pyodide, parentPath);
       }
       pyodide.FS.writeFile(fullPath, file.content, { encoding: 'utf8' });
+    }
+  };
+
+  const collectPyodideRuntimeWorkspaceFiles = async (pyodide: any, rootPath: string): Promise<RuntimeFileSnapshot[]> => {
+    const json = await pyodide.runPythonAsync(`
+import json
+import os
+
+_codecraft_root = ${JSON.stringify(rootPath)}
+_codecraft_files = []
+if os.path.isdir(_codecraft_root):
+    for _dirpath, _dirnames, _filenames in os.walk(_codecraft_root):
+        _dirnames[:] = sorted(_dirnames)
+        for _filename in sorted(_filenames):
+            _path = os.path.join(_dirpath, _filename)
+            _rel = os.path.relpath(_path, _codecraft_root).replace(os.sep, "/")
+            try:
+                with open(_path, "r", encoding="utf-8", errors="replace") as _file:
+                    _content = _file.read()
+            except Exception:
+                continue
+            _codecraft_files.append({"path": _rel, "content": _content})
+json.dumps(_codecraft_files)
+`);
+    try {
+      const parsed = JSON.parse(String(json || '[]'));
+      return Array.isArray(parsed)
+        ? parsed
+          .filter((file): file is RuntimeFileSnapshot => (
+            file
+            && typeof file.path === 'string'
+            && typeof file.content === 'string'
+          ))
+          .map(file => ({ path: normalizeRuntimeWorkspacePath(file.path, 'output.txt'), content: file.content }))
+        : [];
+    } catch {
+      return [];
     }
   };
 
@@ -11505,11 +11661,13 @@ for _name in (
         });
       }
 
-      const projectRoot = '/codecraft_project';
-      writePythonProjectFiles(pyodide, projectRoot, projectFiles);
+      const projectRoot = '/workspace';
+      const runtimeFiles = getRuntimeWorkspaceFilesFromExplorer(filesRef.current);
+      const initialRuntimeFiles = buildRuntimeWorkspaceInitialFileMap(runtimeFiles);
+      writePythonRuntimeFiles(pyodide, projectRoot, runtimeFiles);
       appendExecutionStartupStatus(`Loaded ${projectFiles.length} Python project file(s).`);
 
-      const entryPath = `${projectRoot}/${entryFile.path}`;
+      const entryPath = `${projectRoot}/${normalizeRuntimeWorkspacePath(entryFile.path, entryFile.name || 'main.py')}`;
       const entryDir = entryPath.includes('/') ? entryPath.slice(0, entryPath.lastIndexOf('/')) || projectRoot : projectRoot;
       const runner = `
 import os
@@ -11526,7 +11684,7 @@ for candidate in (entry_dir, project_root):
         sys.path.insert(0, candidate)
 
 try:
-    os.chdir(entry_dir or project_root)
+    os.chdir(project_root)
     runpy.run_path(entry_path, run_name="__main__")
 finally:
     os.chdir(previous_cwd)
@@ -11543,6 +11701,7 @@ finally:
       );
 
       flushPythonStdout();
+      syncRuntimeWorkspaceFilesToExplorer(initialRuntimeFiles, await collectPyodideRuntimeWorkspaceFiles(pyodide, projectRoot));
     } catch (err) {
       setExecutionStartupStatus('');
       flushPythonStdout();
@@ -11562,7 +11721,7 @@ finally:
     }
   };
 
-  const runPython = async (code: string) => {
+  const runPython = async (entryFile: ProjectSourceFile) => {
     const timeoutMs = normalizeExecutionTimeoutMs(settings.pythonExecutionTimeoutMs);
     const pythonStdoutDecoder = new TextDecoder();
     const flushPythonStdout = () => {
@@ -11580,7 +11739,7 @@ finally:
       await ensurePyodideWithPackages(appendExecutionStartupStatus);
       setExecutionStartupStatus('');
       clearPyodideIdleTimer();
-      await ensurePyodideUsesTypeshedSurface(code);
+      await ensurePyodideUsesTypeshedSurface(entryFile.content);
       const pyodide = (window as any).pyodide;
 
       pyodide.setStdout({
@@ -11615,20 +11774,45 @@ finally:
         });
       }
 
+      const projectRoot = '/workspace';
+      const runtimeFiles = getRuntimeWorkspaceFilesFromExplorer(filesRef.current);
+      const initialRuntimeFiles = buildRuntimeWorkspaceInitialFileMap(runtimeFiles);
+      writePythonRuntimeFiles(pyodide, projectRoot, runtimeFiles);
+      const entryPath = `${projectRoot}/${normalizeRuntimeWorkspacePath(entryFile.path, entryFile.name || 'main.py')}`;
+      const entryDir = entryPath.includes('/') ? entryPath.slice(0, entryPath.lastIndexOf('/')) || projectRoot : projectRoot;
+      const runner = `
+import os
+import runpy
+import sys
+
+project_root = ${JSON.stringify(projectRoot)}
+entry_path = ${JSON.stringify(entryPath)}
+entry_dir = ${JSON.stringify(entryDir)}
+previous_cwd = os.getcwd()
+
+for candidate in (entry_dir, project_root):
+    if candidate and candidate not in sys.path:
+        sys.path.insert(0, candidate)
+
+try:
+    os.chdir(project_root)
+    runpy.run_path(entry_path, run_name="__main__")
+finally:
+    os.chdir(previous_cwd)
+`;
+
       installPyodideExecutionTimeoutGuard(pyodide, timeoutMs);
-      const result = await withExecutionTimeout(
+      await withExecutionTimeout(
         'Python execution',
         timeoutMs,
-        () => pyodide.runPythonAsync(code),
+        () => pyodide.runPythonAsync(runner),
         async () => {
           unloadPyodide();
         }
       );
 
       flushPythonStdout();
-      if (result !== undefined) {
-        setOutput(prev => prev + (prev ? '\n' : '') + `Return value: ${String(result)}`);
-      }
+      syncRuntimeWorkspaceFilesToExplorer(initialRuntimeFiles, await collectPyodideRuntimeWorkspaceFiles(pyodide, projectRoot));
     } catch (err) {
       setExecutionStartupStatus('');
       flushPythonStdout();
@@ -11712,9 +11896,36 @@ finally:
       }
       const BrowserCSharp = csharpModule?.BrowserCSharp;
       const contextId = getCSharpScriptContextId(fileId);
+      const sourceItem = filesRef.current.find(item => item.id === fileId && item.type === 'file');
+      const sourcePath = sourceItem ? getFsItemPath(filesRef.current, sourceItem.id) : 'Program.cs';
+      const runtimeProjectFiles: ProjectSourceFile[] = [{
+        id: fileId,
+        name: sourceItem?.name || sourcePath.split('/').pop() || 'Program.cs',
+        path: normalizeRuntimeWorkspacePath(sourcePath, 'Program.cs'),
+        content: code,
+        language: 'csharp',
+      }];
+      const runtimeFiles = getRuntimeWorkspaceFilesFromExplorer(filesRef.current);
+      const runtimeFilesWithCurrentSource = runtimeFiles.map(file => (
+        file.path === runtimeProjectFiles[0].path ? { ...file, content: code } : file
+      ));
+      if (!runtimeFilesWithCurrentSource.some(file => file.path === runtimeProjectFiles[0].path)) {
+        runtimeFilesWithCurrentSource.push({ path: runtimeProjectFiles[0].path, content: code });
+      }
+      const initialRuntimeFiles = buildRuntimeWorkspaceInitialFileMap(runtimeFilesWithCurrentSource);
 
       const executeCSharp = async () => {
         if (useInteractiveWorker) {
+          if (settings.csharpExecutionMode === 'regular') {
+            return runCSharpInInteractiveWorker({
+              mode: 'project',
+              paths: runtimeProjectFiles.map(file => file.path),
+              contents: runtimeProjectFiles.map(file => file.content),
+              entryPath: runtimeProjectFiles[0].path,
+              runtimePaths: runtimeFilesWithCurrentSource.map(file => file.path),
+              runtimeContents: runtimeFilesWithCurrentSource.map(file => file.content),
+            });
+          }
           if (settings.csharpExecutionMode === 'script-context') {
             return runCSharpInInteractiveWorker({
               mode: 'script-context',
@@ -11743,7 +11954,13 @@ finally:
         if (settings.csharpExecutionMode === 'script') {
           return BrowserCSharp.ExecuteScript(code);
         }
-        return BrowserCSharp.executeRegular(code);
+        return BrowserCSharp.executeRegularProjectWithFiles(
+          runtimeProjectFiles.map(file => file.path),
+          runtimeProjectFiles.map(file => file.content),
+          runtimeProjectFiles[0].path,
+          runtimeFilesWithCurrentSource.map(file => file.path),
+          runtimeFilesWithCurrentSource.map(file => file.content)
+        );
       };
 
       setExecutionStartupStatus('');
@@ -11769,13 +11986,13 @@ finally:
 
       const stdOut = (result.stdOut || '').trim();
       const stdErr = (result.stdErr || '').trim();
-      const returnValue = result.result;
+      const returnValue = formatRuntimeReturnValue(result.result);
 
       const chunks: string[] = [];
       if (stdErr) chunks.push(stdErr);
       if (stdOut) chunks.push(stdOut);
-      if (returnValue !== undefined && returnValue !== null && String(returnValue).trim()) {
-        chunks.push(`Return value: ${String(returnValue)}`);
+      if (returnValue) {
+        chunks.push(`Return value: ${returnValue}`);
       }
 
       const finalOutput = chunks.join('\n');
@@ -11786,6 +12003,9 @@ finally:
         });
       } else {
         setOutput(finalOutput || 'C# executed successfully with no output.');
+      }
+      if (settings.csharpExecutionMode === 'regular') {
+        syncRuntimeWorkspaceFilesToExplorer(initialRuntimeFiles, Array.isArray((result as any).files) ? (result as any).files : []);
       }
     } catch (err) {
       setExecutionStartupStatus('');
@@ -11815,6 +12035,21 @@ finally:
         ? ''
         : ' Project run uses regular C# compilation.';
       setExecutionStartupStatus(`Compiling and executing C# project from ${entryFile.path}.${note}`);
+      const runtimeProjectFiles = projectFiles.map(file => ({
+        ...file,
+        path: normalizeRuntimeWorkspacePath(file.path, file.name || 'Program.cs'),
+      }));
+      const runtimeFiles = getRuntimeWorkspaceFilesFromExplorer(filesRef.current);
+      const runtimeSourceByPath = new Map(runtimeProjectFiles.map(file => [file.path, file.content]));
+      const runtimeFilesWithCurrentSources = runtimeFiles.map(file => (
+        runtimeSourceByPath.has(file.path) ? { ...file, content: runtimeSourceByPath.get(file.path) || '' } : file
+      ));
+      for (const file of runtimeProjectFiles) {
+        if (!runtimeFilesWithCurrentSources.some(runtimeFile => runtimeFile.path === file.path)) {
+          runtimeFilesWithCurrentSources.push({ path: file.path, content: file.content });
+        }
+      }
+      const initialRuntimeFiles = buildRuntimeWorkspaceInitialFileMap(runtimeFilesWithCurrentSources);
 
       const result = await withExecutionTimeout(
         'C# execution',
@@ -11822,14 +12057,18 @@ finally:
         () => useInteractiveWorker
           ? runCSharpInInteractiveWorker({
             mode: 'project',
-            paths: projectFiles.map(file => file.path),
-            contents: projectFiles.map(file => file.content),
-            entryPath: entryFile.path,
+            paths: runtimeProjectFiles.map(file => file.path),
+            contents: runtimeProjectFiles.map(file => file.content),
+            entryPath: normalizeRuntimeWorkspacePath(entryFile.path, entryFile.name || 'Program.cs'),
+            runtimePaths: runtimeFilesWithCurrentSources.map(file => file.path),
+            runtimeContents: runtimeFilesWithCurrentSources.map(file => file.content),
           })
-          : BrowserCSharp!.executeRegularProject(
-            projectFiles.map(file => file.path),
-            projectFiles.map(file => file.content),
-            entryFile.path
+          : BrowserCSharp!.executeRegularProjectWithFiles(
+            runtimeProjectFiles.map(file => file.path),
+            runtimeProjectFiles.map(file => file.content),
+            normalizeRuntimeWorkspacePath(entryFile.path, entryFile.name || 'Program.cs'),
+            runtimeFilesWithCurrentSources.map(file => file.path),
+            runtimeFilesWithCurrentSources.map(file => file.content)
           ),
         async () => {
           if (useInteractiveWorker) {
@@ -11843,13 +12082,13 @@ finally:
 
       const stdOut = (result.stdOut || '').trim();
       const stdErr = (result.stdErr || '').trim();
-      const returnValue = result.result;
+      const returnValue = formatRuntimeReturnValue(result.result);
 
       const chunks: string[] = [];
       if (stdErr) chunks.push(stdErr);
       if (stdOut) chunks.push(stdOut);
-      if (returnValue !== undefined && returnValue !== null && String(returnValue).trim()) {
-        chunks.push(`Return value: ${String(returnValue)}`);
+      if (returnValue) {
+        chunks.push(`Return value: ${returnValue}`);
       }
 
       setExecutionStartupStatus('');
@@ -11862,6 +12101,7 @@ finally:
       } else {
         setOutput(finalOutput || 'C# project executed successfully with no output.');
       }
+      syncRuntimeWorkspaceFilesToExplorer(initialRuntimeFiles, Array.isArray((result as any).files) ? (result as any).files : []);
     } catch (err) {
       setExecutionStartupStatus('');
       setOutput(`C# Error: ${err instanceof Error ? err.message : String(err)}`);
@@ -12206,7 +12446,7 @@ finally:
         if (projectFiles.length > 1) {
           await runPythonProject(projectFiles, entryFile);
         } else {
-          await runPython(entryFile.content);
+          await runPython(entryFile);
         }
         return;
       }

@@ -30,6 +30,8 @@ const requiredBrowserCSharpMethods = [
   'ExecuteRegularInteractive',
   'ExecuteRegularProject',
   'ExecuteRegularProjectInteractive',
+  'ExecuteRegularProjectWithFiles',
+  'ExecuteRegularProjectWithFilesInteractive',
 ];
 
 function getSourceFiles(dir) {

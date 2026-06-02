@@ -18,6 +18,8 @@ type RuntimeMessage = {
   paths?: string[];
   contents?: string[];
   entryPath?: string;
+  runtimePaths?: string[];
+  runtimeContents?: string[];
 };
 
 function toRootedFrameworkUrl(value: string) {
@@ -273,10 +275,12 @@ async function invokeBrowserCSharp(message: RuntimeMessage) {
     case 'project':
       return DotNet.invokeMethodAsync(
         'BrowserCSharp',
-        'ExecuteRegularProjectInteractive',
+        'ExecuteRegularProjectWithFilesInteractive',
         message.paths || [],
         message.contents || [],
         message.entryPath || '',
+        message.runtimePaths || [],
+        message.runtimeContents || [],
       );
     case 'regular':
     default:
