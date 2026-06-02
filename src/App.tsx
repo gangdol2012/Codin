@@ -29,7 +29,12 @@ import {
   Pencil,
   Bug,
   Activity,
-  Database
+  Database,
+  GitBranch,
+  GitCommitHorizontal,
+  RefreshCw,
+  CloudUpload,
+  KeyRound
 } from 'lucide-react';
 import Editor, { DiffEditor } from '@monaco-editor/react';
 import { configureMonacoSuggestionAcceptance } from './monaco-suggest';
@@ -914,7 +919,8 @@ const STORAGE_KEYS = {
   npmPackages: 'codecraft-npm-packages',
   javascriptIncludedModules: 'codecraft-javascript-included-modules',
   csharpNamespaces: 'codecraft-csharp-namespaces',
-  pyiImportSizeLimits: 'codecraft-pyi-import-size-limits'
+  pyiImportSizeLimits: 'codecraft-pyi-import-size-limits',
+  gitState: 'codecraft-git-state'
 };
 
 const PROJECT_LOCAL_STORAGE_KEYS = [
@@ -1002,6 +1008,13 @@ const INITIAL_LAYOUT: IJsonModel = {
             id: "explorer-panel-tab",
             name: "Explorer",
             component: "explorer",
+            enableClose: false
+          },
+          {
+            type: "tab",
+            id: "source-control-panel-tab",
+            name: "Source Control",
+            component: "sourceControl",
             enableClose: false
           }
         ]
@@ -4524,6 +4537,410 @@ function getRuntimeWorkspaceFilesFromExplorer(items: FSItem[]) {
   return [...byPath.values()].sort((left, right) => left.path.localeCompare(right.path));
 }
 
+type GitChangeKind = 'added' | 'modified' | 'deleted';
+
+interface GitCommitRecord {
+  id: string;
+  message: string;
+  author: string;
+  timestamp: number;
+  parentIds: string[];
+  files: Record<string, string>;
+}
+
+interface GitBranchRecord {
+  name: string;
+  head: string | null;
+  upstream?: string;
+}
+
+interface GitRemoteRecord {
+  name: string;
+  url: string;
+  branchHeads: Record<string, string | null>;
+  branchFiles: Record<string, Record<string, string>>;
+}
+
+interface GitHubAuthRecord {
+  token: string;
+  user: string;
+  scopes: string[];
+  loggedInAt: number;
+}
+
+interface GitHubRepositoryRef {
+  owner: string;
+  repo: string;
+}
+
+interface GitRepositoryState {
+  initialized: boolean;
+  currentBranch: string;
+  branches: Record<string, GitBranchRecord>;
+  commits: Record<string, GitCommitRecord>;
+  remotes: Record<string, GitRemoteRecord>;
+  config: Record<string, string>;
+  ghAuth: GitHubAuthRecord | null;
+  lastFetchedAt: number | null;
+  stagedPaths: string[];
+}
+
+interface GitFileChange {
+  path: string;
+  kind: GitChangeKind;
+  before?: string;
+  after?: string;
+}
+
+interface GitBranchSyncStatus {
+  upstream: string;
+  remoteName: string;
+  remoteBranch: string;
+  remoteHead: string | null;
+  localHead: string | null;
+  needsPublish: boolean;
+  needsPush: boolean;
+  needsPull: boolean;
+  diverged: boolean;
+}
+
+const DEFAULT_GIT_BRANCH = 'main';
+const DEFAULT_GIT_REMOTE_URL = 'codecraft://remote/default';
+const GIT_REMOTE_STORAGE_PREFIX = 'codecraft-git-remote:';
+
+function createDefaultGitState(): GitRepositoryState {
+  return {
+    initialized: true,
+    currentBranch: DEFAULT_GIT_BRANCH,
+    branches: {
+      [DEFAULT_GIT_BRANCH]: {
+        name: DEFAULT_GIT_BRANCH,
+        head: null,
+        upstream: `origin/${DEFAULT_GIT_BRANCH}`,
+      },
+    },
+    commits: {},
+    remotes: {
+      origin: {
+        name: 'origin',
+        url: DEFAULT_GIT_REMOTE_URL,
+        branchHeads: {},
+        branchFiles: {},
+      },
+    },
+    config: {
+      'user.name': 'CodeCraft User',
+      'user.email': 'codecraft@example.local',
+    },
+    ghAuth: null,
+    lastFetchedAt: null,
+    stagedPaths: [],
+  };
+}
+
+function normalizeGitState(raw: unknown): GitRepositoryState {
+  const fallback = createDefaultGitState();
+  if (!raw || typeof raw !== 'object') return fallback;
+  const source = raw as Partial<GitRepositoryState>;
+  const branches = source.branches && typeof source.branches === 'object' ? source.branches : fallback.branches;
+  const currentBranch = typeof source.currentBranch === 'string' && branches[source.currentBranch]
+    ? source.currentBranch
+    : Object.keys(branches)[0] || DEFAULT_GIT_BRANCH;
+  const normalizedBranches = { ...branches };
+  if (!normalizedBranches[currentBranch]) {
+    normalizedBranches[currentBranch] = { name: currentBranch, head: null, upstream: `origin/${currentBranch}` };
+  }
+
+  return {
+    initialized: source.initialized !== false,
+    currentBranch,
+    branches: normalizedBranches,
+    commits: source.commits && typeof source.commits === 'object' ? source.commits : {},
+    remotes: source.remotes && typeof source.remotes === 'object' ? source.remotes : fallback.remotes,
+    config: source.config && typeof source.config === 'object' ? source.config : fallback.config,
+    ghAuth: source.ghAuth && typeof source.ghAuth === 'object' ? source.ghAuth : null,
+    lastFetchedAt: typeof source.lastFetchedAt === 'number' ? source.lastFetchedAt : null,
+    stagedPaths: Array.isArray(source.stagedPaths) ? source.stagedPaths.filter(path => typeof path === 'string') : [],
+  };
+}
+
+function loadSavedGitState() {
+  try {
+    return normalizeGitState(JSON.parse(localStorage.getItem(getProjectStorageKey(STORAGE_KEYS.gitState)) || 'null'));
+  } catch {
+    return createDefaultGitState();
+  }
+}
+
+function serializeWorkspaceSnapshot(items: FSItem[]) {
+  const snapshot: Record<string, string> = {};
+  for (const item of items) {
+    if (item.type !== 'file') continue;
+    const path = normalizeProjectPath(getFsItemPath(items, item.id));
+    if (!path) continue;
+    snapshot[path] = item.content || '';
+  }
+  return snapshot;
+}
+
+function snapshotFingerprint(files: Record<string, string>) {
+  const text = Object.keys(files)
+    .sort()
+    .map(path => `${path}\0${files[path]}`)
+    .join('\0');
+  let hash = 2166136261;
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(16).padStart(8, '0');
+}
+
+function createGitCommitId(files: Record<string, string>, message: string, timestamp: number) {
+  return `${snapshotFingerprint(files)}${Math.abs(hashString(`${message}:${timestamp}`)).toString(16).slice(0, 4)}`;
+}
+
+function hashString(value: string) {
+  let hash = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    hash = Math.imul(31, hash) + value.charCodeAt(index) | 0;
+  }
+  return hash;
+}
+
+function getGitHeadCommit(state: GitRepositoryState) {
+  const branch = state.branches[state.currentBranch];
+  return branch?.head ? state.commits[branch.head] || null : null;
+}
+
+function diffGitSnapshots(base: Record<string, string>, current: Record<string, string>): GitFileChange[] {
+  const paths = new Set([...Object.keys(base), ...Object.keys(current)]);
+  const changes: GitFileChange[] = [];
+  for (const path of [...paths].sort()) {
+    const hadBase = Object.prototype.hasOwnProperty.call(base, path);
+    const hasCurrent = Object.prototype.hasOwnProperty.call(current, path);
+    if (!hadBase && hasCurrent) changes.push({ path, kind: 'added', after: current[path] });
+    else if (hadBase && !hasCurrent) changes.push({ path, kind: 'deleted', before: base[path] });
+    else if (base[path] !== current[path]) changes.push({ path, kind: 'modified', before: base[path], after: current[path] });
+  }
+  return changes;
+}
+
+function getGitWorkspaceChanges(state: GitRepositoryState, items: FSItem[]) {
+  const head = getGitHeadCommit(state);
+  return diffGitSnapshots(head?.files || {}, serializeWorkspaceSnapshot(items));
+}
+
+function isGitAncestor(state: GitRepositoryState, ancestorId: string | null, descendantId: string | null) {
+  if (!ancestorId) return true;
+  if (!descendantId) return false;
+  const stack = [descendantId];
+  const seen = new Set<string>();
+  while (stack.length > 0) {
+    const id = stack.pop();
+    if (!id || seen.has(id)) continue;
+    if (id === ancestorId) return true;
+    seen.add(id);
+    const commit = state.commits[id];
+    if (commit) stack.push(...commit.parentIds);
+  }
+  return false;
+}
+
+function getGitBranchSyncStatus(state: GitRepositoryState): GitBranchSyncStatus {
+  const branch = state.branches[state.currentBranch] || { name: state.currentBranch, head: null };
+  const upstream = branch.upstream || `origin/${branch.name}`;
+  const slashIndex = upstream.indexOf('/');
+  const remoteName = slashIndex >= 0 ? upstream.slice(0, slashIndex) : 'origin';
+  const remoteBranch = slashIndex >= 0 ? upstream.slice(slashIndex + 1) : branch.name;
+  const remote = state.remotes[remoteName];
+  const remoteHasBranch = !!remote && Object.prototype.hasOwnProperty.call(remote.branchHeads, remoteBranch);
+  const remoteHead = remoteHasBranch ? remote.branchHeads[remoteBranch] || null : null;
+  const localHead = branch.head || null;
+  const needsPublish = !!remote && !remoteHasBranch && !!localHead;
+  const needsPush = !!remote && remoteHasBranch && localHead !== remoteHead && isGitAncestor(state, remoteHead, localHead);
+  const needsPull = !!remote && remoteHasBranch && localHead !== remoteHead && isGitAncestor(state, localHead, remoteHead);
+  const diverged = !!remote && remoteHasBranch && localHead !== remoteHead && !needsPush && !needsPull;
+  return { upstream, remoteName, remoteBranch, remoteHead, localHead, needsPublish, needsPush, needsPull, diverged };
+}
+
+function formatGitChangeKind(kind: GitChangeKind) {
+  if (kind === 'added') return 'A';
+  if (kind === 'deleted') return 'D';
+  return 'M';
+}
+
+function formatGitCommitLine(commit: GitCommitRecord) {
+  return `${commit.id.slice(0, 7)} ${commit.message}`;
+}
+
+function formatGitTimestamp(timestamp: number) {
+  return new Date(timestamp).toLocaleString();
+}
+
+function getGitRemoteStorageKey(url: string) {
+  return `${GIT_REMOTE_STORAGE_PREFIX}${url || DEFAULT_GIT_REMOTE_URL}`;
+}
+
+function isGitRepositoryPublished(state: GitRepositoryState) {
+  const origin = state.remotes.origin;
+  return !!origin && origin.url !== DEFAULT_GIT_REMOTE_URL;
+}
+
+function parseGitHubRemoteUrl(url: string): GitHubRepositoryRef | null {
+  const trimmed = url.trim().replace(/\.git$/i, '');
+  const shorthand = trimmed.match(/^github:([^/\s]+)\/([^/\s]+)$/i);
+  if (shorthand && isValidGitHubRepositoryPart(shorthand[1]) && isValidGitHubRepositoryPart(shorthand[2])) {
+    return { owner: shorthand[1], repo: shorthand[2] };
+  }
+  const https = trimmed.match(/^https:\/\/github\.com\/([^/\s]+)\/([^/\s]+)$/i);
+  if (https && isValidGitHubRepositoryPart(https[1]) && isValidGitHubRepositoryPart(https[2])) {
+    return { owner: https[1], repo: https[2] };
+  }
+  const ssh = trimmed.match(/^git@github\.com:([^/\s]+)\/([^/\s]+)$/i);
+  if (ssh && isValidGitHubRepositoryPart(ssh[1]) && isValidGitHubRepositoryPart(ssh[2])) {
+    return { owner: ssh[1], repo: ssh[2] };
+  }
+  return null;
+}
+
+function isGitHubRemote(remote: GitRemoteRecord) {
+  return !!parseGitHubRemoteUrl(remote.url);
+}
+
+function isValidGitHubRepositoryPart(value: string) {
+  return /^[A-Za-z0-9_.-]+$/.test(value) && !value.startsWith('.') && !value.endsWith('.');
+}
+
+function parseGitHubRepositoryArg(value: string): GitHubRepositoryRef | null {
+  const trimmed = value.trim().replace(/\.git$/i, '');
+  const match = trimmed.match(/^([^/\s]+)\/([^/\s]+)$/);
+  if (!match) return null;
+  if (!isValidGitHubRepositoryPart(match[1]) || !isValidGitHubRepositoryPart(match[2])) return null;
+  return { owner: match[1], repo: match[2] };
+}
+
+function isValidCodeCraftRemoteUrl(url: string) {
+  return /^codecraft:\/\/remote\/[A-Za-z0-9._~:/-]+$/.test(url.trim());
+}
+
+function isSupportedGitRemoteUrl(url: string) {
+  return !!parseGitHubRemoteUrl(url) || isValidCodeCraftRemoteUrl(url);
+}
+
+function getSupportedGitRemoteUrlHelp() {
+  return 'Use github:owner/repo, https://github.com/owner/repo, git@github.com:owner/repo.git, or codecraft://remote/name.';
+}
+
+function isValidGitRemoteName(name: string) {
+  return /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name);
+}
+
+function isValidGitBranchName(name: string) {
+  if (!name || name !== name.trim()) return false;
+  if (/[\s\x00-\x1F\x7F~^:?*[\\]/.test(name)) return false;
+  if (name.startsWith('-') || name.startsWith('/') || name.endsWith('/')) return false;
+  if (name === '@' || name.includes('@{') || name.includes('..') || name.includes('//')) return false;
+  if (name.endsWith('.') || name.endsWith('.lock')) return false;
+  return name.split('/').every(part => !!part && part !== '.' && part !== '..' && !part.endsWith('.lock') && !part.endsWith('.'));
+}
+
+function getInvalidGitBranchMessage(name: string) {
+  return `fatal: '${name || ''}' is not a valid branch name`;
+}
+
+function getGitRemoteBranchRefs(state: GitRepositoryState) {
+  return Object.values(state.remotes).flatMap(remote => (
+    Object.keys(remote.branchHeads)
+      .sort()
+      .map(branchName => ({
+        remoteName: remote.name,
+        branchName,
+        label: `${remote.name}/${branchName}`,
+        head: remote.branchHeads[branchName] || null,
+        files: remote.branchFiles[branchName] || {},
+      }))
+  ));
+}
+
+function decodeGitHubBase64Content(content: string) {
+  const binary = atob(content.replace(/\s/g, ''));
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return new TextDecoder().decode(bytes);
+}
+
+function loadStoredGitRemote(remote: GitRemoteRecord): GitRemoteRecord {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(getGitRemoteStorageKey(remote.url)) || 'null');
+    if (parsed && typeof parsed === 'object') {
+      return {
+        ...remote,
+        branchHeads: parsed.branchHeads && typeof parsed.branchHeads === 'object' ? parsed.branchHeads : remote.branchHeads,
+        branchFiles: parsed.branchFiles && typeof parsed.branchFiles === 'object' ? parsed.branchFiles : remote.branchFiles,
+      };
+    }
+  } catch {
+    // Ignore corrupt remote storage and keep the local remote metadata.
+  }
+  return remote;
+}
+
+function saveStoredGitRemote(remote: GitRemoteRecord) {
+  localStorage.setItem(getGitRemoteStorageKey(remote.url), JSON.stringify({
+    branchHeads: remote.branchHeads,
+    branchFiles: remote.branchFiles,
+  }));
+}
+
+function createFsItemsFromSnapshot(snapshot: Record<string, string>, previousItems: FSItem[]) {
+  const previousByPath = new Map(previousItems.map(item => [normalizeProjectPath(getFsItemPath(previousItems, item.id)), item]));
+  const next: FSItem[] = [];
+  const folderIds = new Map<string, string>();
+  const ensureFolder = (path: string, name: string, parentId: string | null) => {
+    const normalized = normalizeProjectPath(path);
+    const existing = previousByPath.get(normalized);
+    const id = existing?.type === 'folder' ? existing.id : createFsItemId();
+    if (!folderIds.has(normalized)) {
+      folderIds.set(normalized, id);
+      next.push({
+        id,
+        name,
+        type: 'folder',
+        parentId,
+        isOpen: existing?.isOpen ?? true,
+      });
+    }
+    return folderIds.get(normalized) || id;
+  };
+
+  for (const path of Object.keys(snapshot).sort()) {
+    const segments = normalizeProjectPath(path).split('/').filter(Boolean);
+    if (segments.length === 0) continue;
+    let parentId: string | null = null;
+    let currentPath = '';
+    for (const segment of segments.slice(0, -1)) {
+      currentPath = currentPath ? `${currentPath}/${segment}` : segment;
+      parentId = ensureFolder(currentPath, segment, parentId);
+    }
+    const fileName = segments[segments.length - 1];
+    const normalizedFilePath = normalizeProjectPath(path);
+    const existing = previousByPath.get(normalizedFilePath);
+    next.push({
+      id: existing?.type === 'file' ? existing.id : createFsItemId(),
+      name: fileName,
+      type: 'file',
+      parentId,
+      content: snapshot[path] || '',
+      language: langFromFilename(fileName),
+    });
+  }
+
+  return next;
+}
+
 function formatRuntimeReturnValue(value: unknown) {
   if (value === undefined || value === null) return '';
   if (typeof value === 'object') {
@@ -4961,12 +5378,39 @@ const loadSavedLayout = (): IJsonModel => {
   if (!saved) return INITIAL_LAYOUT;
   try {
     const parsed = JSON.parse(saved);
-    if (parsed && parsed.layout) return parsed as IJsonModel;
+    if (parsed && parsed.layout) return ensureSourceControlLayoutTab(parsed as IJsonModel);
     return INITIAL_LAYOUT;
   } catch {
     return INITIAL_LAYOUT;
   }
 };
+
+function ensureSourceControlLayoutTab(model: IJsonModel): IJsonModel {
+  let hasSourceControl = false;
+  let explorerTabset: any = null;
+  const visit = (node: any) => {
+    if (node?.type === 'tab' && node.component === 'sourceControl') hasSourceControl = true;
+    if (
+      node?.type === 'tabset'
+      && Array.isArray(node.children)
+      && node.children.some((child: any) => child?.type === 'tab' && child.component === 'explorer')
+    ) {
+      explorerTabset = node;
+    }
+    for (const child of node?.children || []) visit(child);
+  };
+  visit((model as any).layout);
+  if (hasSourceControl || !explorerTabset) return model;
+  const explorerIndex = explorerTabset.children.findIndex((child: any) => child?.type === 'tab' && child.component === 'explorer');
+  explorerTabset.children.splice(Math.max(0, explorerIndex + 1), 0, {
+    type: "tab",
+    id: "source-control-panel-tab",
+    name: "Source Control",
+    component: "sourceControl",
+    enableClose: false,
+  });
+  return model;
+}
 
 const DEFAULT_SETTINGS: AppSettings = {
   clearOutputOnRun: true,
@@ -6407,6 +6851,10 @@ export default function App() {
   ]);
   const [terminalInput, setTerminalInput] = useState('');
   const [terminalCwd, setTerminalCwd] = useState<string | null>(null); // null is root
+  const [gitState, setGitState] = useState<GitRepositoryState>(() => loadSavedGitState());
+  const [sourceControlCommitMessage, setSourceControlCommitMessage] = useState('');
+  const [sourceControlNewBranchName, setSourceControlNewBranchName] = useState('');
+  const [sourceControlStatus, setSourceControlStatus] = useState('');
   const [isRunning, setIsRunning] = useState(false);
   const [assistantChats, setAssistantChats] = useState<AssistantChat[]>(() => loadSavedAssistantChats());
   const [assistantInputs, setAssistantInputs] = useState<Record<string, string>>({
@@ -6565,6 +7013,9 @@ export default function App() {
   terminalOutputRef.current = terminalOutput;
   const terminalCwdRef = useRef<string | null>(terminalCwd);
   terminalCwdRef.current = terminalCwd;
+  const gitStateRef = useRef(gitState);
+  gitStateRef.current = gitState;
+  const lastSourceControlFetchFocusRef = useRef(0);
   const csharpRuntimeReadyRef = useRef<Promise<void> | null>(null);
   const csharpInteractiveWorkerRef = useRef<Worker | null>(null);
   const csharpInteractiveWorkerRunRejectRef = useRef<((error: Error) => void) | null>(null);
@@ -6614,6 +7065,24 @@ export default function App() {
       ? activeEditorTabNode.getConfig().itemId
       : null;
   const activeEditorTabItem = activeEditorTabItemId ? files.find(f => f.id === activeEditorTabItemId) : null;
+  const gitChanges = useMemo(() => getGitWorkspaceChanges(gitState, files), [files, gitState]);
+  const gitSyncStatus = useMemo(() => getGitBranchSyncStatus(gitState), [gitState]);
+  const gitRepositoryPublished = useMemo(() => isGitRepositoryPublished(gitState), [gitState]);
+  const sourceControlActionLabel = gitChanges.length > 0
+    ? 'Commit'
+    : !gitRepositoryPublished
+      ? 'Publish Repository'
+      : gitSyncStatus.needsPublish
+      ? 'Publish Branch'
+      : gitSyncStatus.needsPull || gitSyncStatus.needsPush || gitSyncStatus.diverged
+        ? 'Sync Changes'
+        : 'Commit';
+  const sourceControlActionDisabled = gitChanges.length === 0
+    && gitRepositoryPublished
+    && !gitSyncStatus.needsPublish
+    && !gitSyncStatus.needsPull
+    && !gitSyncStatus.needsPush
+    && !gitSyncStatus.diverged;
 
   useEffect(() => {
     if (!fileTreeContextMenu) return;
@@ -7939,12 +8408,16 @@ export default function App() {
       setProjects(touchProjectUpdatedAt(activeProjectId));
     }, 500);
     return () => window.clearTimeout(timeoutId);
-  }, [activeProjectId, assistantChats, files, settings, syncMeta]);
+  }, [activeProjectId, assistantChats, files, settings, syncMeta, gitState]);
 
   // Save settings to localStorage
   useEffect(() => {
     localStorage.setItem(getProjectStorageKey(STORAGE_KEYS.settings), JSON.stringify(settings));
   }, [settings]);
+
+  useEffect(() => {
+    localStorage.setItem(getProjectStorageKey(STORAGE_KEYS.gitState), JSON.stringify(gitState));
+  }, [gitState]);
 
   useEffect(() => {
     const nextRunnableFiles = getProjectRunnableFiles();
@@ -12784,6 +13257,7 @@ finally:
     let selectedEditorItemId: string | null = null;
     let selectedEditorTabId: string | null = null;
     let hasSelectedEditorTab = false;
+    let hasSelectedSourceControlTab = false;
 
     const collectLayoutState = (node: any) => {
       if (node.type === 'tab' && node.component === 'assistant' && typeof node.config?.chatId === 'string') {
@@ -12796,6 +13270,9 @@ finally:
           hasSelectedEditorTab = true;
           selectedEditorTabId = typeof selectedTab.id === 'string' ? selectedTab.id : null;
           selectedEditorItemId = typeof selectedTab.config?.itemId === 'string' ? selectedTab.config.itemId : null;
+        }
+        if (selectedTab?.component === 'sourceControl') {
+          hasSelectedSourceControlTab = true;
         }
       }
       for (const child of node.children || []) {
@@ -12822,6 +13299,13 @@ finally:
       });
     }
     if (skipEditorSyncRef.current) return;
+    if (hasSelectedSourceControlTab) {
+      const now = Date.now();
+      if (now - lastSourceControlFetchFocusRef.current > 1000) {
+        lastSourceControlFetchFocusRef.current = now;
+        void refreshGitRemotes().catch(() => undefined);
+      }
+    }
     setActiveEditorTabId(selectedEditorTabId);
     setActiveFileId(hasSelectedEditorTab ? (selectedEditorItemId || '') : '');
   };
@@ -14534,6 +15018,1014 @@ finally:
     return packageArgs;
   };
 
+  const updateGitState = (updater: (current: GitRepositoryState) => GitRepositoryState) => {
+    const next = updater(gitStateRef.current);
+    gitStateRef.current = next;
+    setGitState(next);
+    return next;
+  };
+
+  const getGitHubAuth = () => {
+    const auth = gitStateRef.current.ghAuth;
+    if (!auth?.token) throw new Error('GitHub authentication required. Run gh auth login first.');
+    return auth;
+  };
+
+  const githubApiRequest = async (path: string, init: RequestInit = {}, token = getGitHubAuth().token) => {
+    const response = await fetch(`https://api.github.com${path}`, {
+      ...init,
+      headers: {
+        'Accept': 'application/vnd.github+json',
+        'Authorization': `Bearer ${token}`,
+        'X-GitHub-Api-Version': '2022-11-28',
+        ...(init.body ? { 'Content-Type': 'application/json' } : {}),
+        ...(init.headers || {}),
+      },
+    });
+    const text = await response.text();
+    const json = text ? safeJsonParse(text) : null;
+    if (!response.ok) {
+      const message = typeof json?.message === 'string' ? json.message : text || `GitHub request failed (${response.status})`;
+      throw new Error(message);
+    }
+    return json;
+  };
+
+  const getGitHubRemoteFiles = async (repoRef: GitHubRepositoryRef, commitSha: string) => {
+    const commit = await githubApiRequest(`/repos/${encodeURIComponent(repoRef.owner)}/${encodeURIComponent(repoRef.repo)}/git/commits/${encodeURIComponent(commitSha)}`);
+    const treeSha = commit?.tree?.sha;
+    if (!treeSha) return {};
+    const tree = await githubApiRequest(`/repos/${encodeURIComponent(repoRef.owner)}/${encodeURIComponent(repoRef.repo)}/git/trees/${encodeURIComponent(treeSha)}?recursive=1`);
+    const files: Record<string, string> = {};
+    const blobs = (Array.isArray(tree?.tree) ? tree.tree : [])
+      .filter((entry: any) => entry?.type === 'blob' && typeof entry.path === 'string' && typeof entry.sha === 'string');
+
+    await Promise.all(blobs.map(async (entry: any) => {
+      const blob = await githubApiRequest(`/repos/${encodeURIComponent(repoRef.owner)}/${encodeURIComponent(repoRef.repo)}/git/blobs/${encodeURIComponent(entry.sha)}`);
+      if (typeof blob?.content === 'string') files[normalizeProjectPath(entry.path)] = decodeGitHubBase64Content(blob.content);
+    }));
+    return files;
+  };
+
+  const fetchGitHubRemote = async (remote: GitRemoteRecord) => {
+    const repoRef = parseGitHubRemoteUrl(remote.url);
+    if (!repoRef) return remote;
+    getGitHubAuth();
+    const refs = await githubApiRequest(`/repos/${encodeURIComponent(repoRef.owner)}/${encodeURIComponent(repoRef.repo)}/git/matching-refs/heads`);
+    const branchHeads: Record<string, string | null> = {};
+    const branchFiles: Record<string, Record<string, string>> = {};
+
+    for (const ref of Array.isArray(refs) ? refs : []) {
+      const refName = typeof ref?.ref === 'string' ? ref.ref.replace(/^refs\/heads\//, '') : '';
+      const sha = typeof ref?.object?.sha === 'string' ? ref.object.sha : '';
+      if (!refName || !sha) continue;
+      branchHeads[refName] = sha;
+      branchFiles[refName] = await getGitHubRemoteFiles(repoRef, sha);
+    }
+
+    return { ...remote, branchHeads, branchFiles };
+  };
+
+  const loadRemoteForGit = async (remote: GitRemoteRecord) => {
+    if (!isSupportedGitRemoteUrl(remote.url)) {
+      throw new Error(`fatal: '${remote.url}' is not a supported Git remote URL. ${getSupportedGitRemoteUrlHelp()}`);
+    }
+    if (isGitHubRemote(remote)) return fetchGitHubRemote(remote);
+    return loadStoredGitRemote(remote);
+  };
+
+  const refreshGitRemotes = async (state = gitStateRef.current, remoteName?: string) => {
+    if (remoteName && !state.remotes[remoteName]) {
+      throw new Error(`fatal: '${remoteName}' does not appear to be a git remote`);
+    }
+    const remotes: Record<string, GitRemoteRecord> = remoteName ? { ...state.remotes } : {};
+    const entries = remoteName ? [[remoteName, state.remotes[remoteName]] as const] : Object.entries(state.remotes);
+    for (const [name, remote] of entries) {
+      remotes[name] = await loadRemoteForGit(remote);
+    }
+    return updateGitState(current => {
+      const commits = { ...current.commits };
+      const fetchedAt = Date.now();
+      for (const remote of Object.values(remotes)) {
+        for (const [branchName, sha] of Object.entries(remote.branchHeads)) {
+          if (!sha || commits[sha]) continue;
+          commits[sha] = {
+            id: sha,
+            message: `Remote ${remote.name}/${branchName}`,
+            author: 'GitHub <noreply@github.com>',
+            timestamp: fetchedAt,
+            parentIds: [],
+            files: remote.branchFiles[branchName] || {},
+          };
+        }
+      }
+      return { ...current, remotes, commits, lastFetchedAt: fetchedAt };
+    });
+  };
+
+  const getCurrentGitHubRepositoryRef = () => {
+    const origin = gitStateRef.current.remotes.origin;
+    const repoRef = origin ? parseGitHubRemoteUrl(origin.url) : null;
+    if (!repoRef) throw new Error('gh: current repository does not have a GitHub origin remote.');
+    return repoRef;
+  };
+
+  const getCliOptionValue = (args: string[], names: string[]) => {
+    for (const name of names) {
+      const index = args.findIndex(arg => arg === name || arg.startsWith(`${name}=`));
+      if (index < 0) continue;
+      const arg = args[index];
+      if (arg.includes('=')) return arg.slice(arg.indexOf('=') + 1);
+      return args[index + 1] || '';
+    }
+    return '';
+  };
+
+  const createGitHubCommit = async (
+    remote: GitRemoteRecord,
+    branchName: string,
+    files: Record<string, string>,
+    message: string,
+    parentSha: string | null,
+  ) => {
+    const repoRef = parseGitHubRemoteUrl(remote.url);
+    if (!repoRef) throw new Error('Remote is not a GitHub repository.');
+    getGitHubAuth();
+    const tree = await githubApiRequest(
+      `/repos/${encodeURIComponent(repoRef.owner)}/${encodeURIComponent(repoRef.repo)}/git/trees`,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          tree: Object.entries(files).map(([path, content]) => ({
+            path,
+            mode: '100644',
+            type: 'blob',
+            content,
+          })),
+        }),
+      },
+    );
+    if (!tree?.sha) throw new Error('GitHub did not return a tree SHA.');
+    const commitPayload: any = {
+      message,
+      tree: tree.sha,
+      parents: parentSha ? [parentSha] : [],
+    };
+    const commit = await githubApiRequest(
+      `/repos/${encodeURIComponent(repoRef.owner)}/${encodeURIComponent(repoRef.repo)}/git/commits`,
+      {
+        method: 'POST',
+        body: JSON.stringify(commitPayload),
+      },
+    );
+    if (!commit?.sha) throw new Error('GitHub did not return a commit SHA.');
+
+    const branchExists = Object.prototype.hasOwnProperty.call(remote.branchHeads, branchName);
+    if (branchExists) {
+      await githubApiRequest(
+        `/repos/${encodeURIComponent(repoRef.owner)}/${encodeURIComponent(repoRef.repo)}/git/refs/heads/${encodeURIComponent(branchName)}`,
+        {
+          method: 'PATCH',
+          body: JSON.stringify({ sha: commit.sha, force: false }),
+        },
+      );
+    } else {
+      await githubApiRequest(
+        `/repos/${encodeURIComponent(repoRef.owner)}/${encodeURIComponent(repoRef.repo)}/git/refs`,
+        {
+          method: 'POST',
+          body: JSON.stringify({ ref: `refs/heads/${branchName}`, sha: commit.sha }),
+        },
+      );
+    }
+
+    return commit.sha as string;
+  };
+
+  const createGitCommit = (message: string, stagedPaths?: string[]) => {
+    const commitMessage = message.trim();
+    if (!commitMessage) return { ok: false, lines: ['git commit: commit message is required.'] };
+
+    const currentState = gitStateRef.current;
+    const currentFiles = filesRef.current;
+    const allChanges = getGitWorkspaceChanges(currentState, currentFiles);
+    const normalizedStagedPaths = stagedPaths?.map(normalizeProjectPath).filter(Boolean) || null;
+    const stagedPathSet = normalizedStagedPaths ? new Set(normalizedStagedPaths) : null;
+    const changes = stagedPathSet
+      ? allChanges.filter(change => stagedPathSet.has(change.path))
+      : allChanges;
+    if (changes.length === 0) return { ok: false, lines: ['nothing to commit, working tree clean'] };
+
+    const headSnapshot = getGitHeadCommit(currentState)?.files || {};
+    const currentSnapshot = serializeWorkspaceSnapshot(currentFiles);
+    const snapshot = stagedPathSet
+      ? { ...headSnapshot }
+      : currentSnapshot;
+    if (stagedPathSet) {
+      for (const change of changes) {
+        if (change.kind === 'deleted') delete snapshot[change.path];
+        else snapshot[change.path] = currentSnapshot[change.path] || '';
+      }
+    }
+    const timestamp = Date.now();
+    const branch = currentState.branches[currentState.currentBranch] || {
+      name: currentState.currentBranch,
+      head: null,
+      upstream: `origin/${currentState.currentBranch}`,
+    };
+    const parentIds = branch.head ? [branch.head] : [];
+    const id = createGitCommitId(snapshot, commitMessage, timestamp);
+    const authorName = currentState.config['user.name'] || currentState.ghAuth?.user || 'CodeCraft User';
+    const authorEmail = currentState.config['user.email'] || 'codecraft@example.local';
+    const commit: GitCommitRecord = {
+      id,
+      message: commitMessage,
+      author: `${authorName} <${authorEmail}>`,
+      timestamp,
+      parentIds,
+      files: snapshot,
+    };
+
+    updateGitState(state => ({
+      ...state,
+      currentBranch: branch.name,
+      branches: {
+        ...state.branches,
+        [branch.name]: {
+          ...branch,
+          head: id,
+        },
+      },
+      commits: {
+        ...state.commits,
+        [id]: commit,
+      },
+      stagedPaths: [],
+    }));
+
+    setSourceControlCommitMessage('');
+    return {
+      ok: true,
+      lines: [
+        `[${branch.name} ${id.slice(0, 7)}] ${commitMessage}`,
+        `${changes.length} file${changes.length === 1 ? '' : 's'} changed`,
+      ],
+    };
+  };
+
+  const getGitSyncStatusForOperation = (remoteName?: string, remoteBranch?: string) => {
+    const currentState = gitStateRef.current;
+    const branch = currentState.branches[currentState.currentBranch];
+    if (!branch) throw new Error(`fatal: current branch '${currentState.currentBranch}' is missing`);
+    if (!remoteName && !remoteBranch) return getGitBranchSyncStatus(currentState);
+    const resolvedRemote = remoteName || (branch.upstream?.split('/')[0] || 'origin');
+    const resolvedBranch = remoteBranch || currentState.currentBranch;
+    if (!isValidGitRemoteName(resolvedRemote) || !currentState.remotes[resolvedRemote]) {
+      throw new Error(`fatal: '${resolvedRemote}' does not appear to be a git remote`);
+    }
+    if (!isValidGitBranchName(resolvedBranch)) throw new Error(getInvalidGitBranchMessage(resolvedBranch));
+    return getGitBranchSyncStatus({
+      ...currentState,
+      branches: {
+        ...currentState.branches,
+        [currentState.currentBranch]: {
+          ...branch,
+          upstream: `${resolvedRemote}/${resolvedBranch}`,
+        },
+      },
+    });
+  };
+
+  const publishGitBranch = async () => {
+    const currentState = gitStateRef.current;
+    const status = getGitBranchSyncStatus(currentState);
+    const remote = currentState.remotes[status.remoteName];
+    const branch = currentState.branches[currentState.currentBranch];
+    if (!remote) return { ok: false, lines: [`fatal: '${status.remoteName}' does not appear to be a git remote`] };
+    if (!branch?.head) return { ok: false, lines: ['No commits to publish.'] };
+    const headCommit = currentState.commits[branch.head];
+    if (!headCommit) return { ok: false, lines: ['Current branch head is missing.'] };
+
+    let nextRemote: GitRemoteRecord;
+    let nextHead = branch.head;
+    if (isGitHubRemote(remote)) {
+      const githubCommitSha = await createGitHubCommit(remote, status.remoteBranch, headCommit.files, headCommit.message, status.remoteHead);
+      nextHead = githubCommitSha;
+      nextRemote = await fetchGitHubRemote({ ...remote, branchHeads: { ...remote.branchHeads, [status.remoteBranch]: githubCommitSha } });
+    } else {
+      nextRemote = {
+        ...remote,
+        branchHeads: { ...remote.branchHeads, [status.remoteBranch]: branch.head },
+        branchFiles: { ...remote.branchFiles, [status.remoteBranch]: headCommit.files },
+      };
+      saveStoredGitRemote(nextRemote);
+    }
+    const pushedCommit: GitCommitRecord = nextHead === branch.head ? headCommit : {
+      ...headCommit,
+      id: nextHead,
+      parentIds: status.remoteHead ? [status.remoteHead] : [],
+    };
+    updateGitState(state => ({
+      ...state,
+      branches: {
+        ...state.branches,
+        [branch.name]: { ...branch, head: nextHead, upstream: `${status.remoteName}/${status.remoteBranch}` },
+      },
+      commits: { ...state.commits, [nextHead]: pushedCommit },
+      remotes: {
+        ...state.remotes,
+        [status.remoteName]: nextRemote,
+      },
+      lastFetchedAt: Date.now(),
+    }));
+    return { ok: true, lines: [`Published branch ${branch.name} to ${status.remoteName}/${status.remoteBranch}.`] };
+  };
+
+  const publishGitRepository = async () => {
+    const currentState = gitStateRef.current;
+    if (isGitRepositoryPublished(currentState)) return publishGitBranch();
+
+    const repoSlug = activeProject.name
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '') || activeProject.id || 'codecraft-project';
+    const owner = currentState.ghAuth?.user || 'codecraft';
+    const url = currentState.ghAuth
+      ? `github:${owner}/${repoSlug}`
+      : `codecraft://remote/${activeProject.id || repoSlug}`;
+    if (currentState.ghAuth) {
+      try {
+        await githubApiRequest('/user/repos', {
+          method: 'POST',
+          body: JSON.stringify({
+            name: repoSlug,
+            private: true,
+            auto_init: false,
+          }),
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (!/name already exists|already exists/i.test(message)) throw error;
+      }
+    }
+    const origin = loadStoredGitRemote({
+      name: 'origin',
+      url,
+      branchHeads: {},
+      branchFiles: {},
+    });
+
+    updateGitState(state => ({
+      ...state,
+      remotes: {
+        ...state.remotes,
+        origin,
+      },
+      branches: {
+        ...state.branches,
+        [state.currentBranch]: {
+          ...state.branches[state.currentBranch],
+          upstream: `origin/${state.currentBranch}`,
+        },
+      },
+    }));
+
+    const publishedBranch = await publishGitBranch();
+    return {
+      ok: publishedBranch.ok,
+      lines: [
+        currentState.ghAuth
+          ? `Published repository ${owner}/${repoSlug}.`
+          : `Published repository to ${url}.`,
+        ...publishedBranch.lines,
+      ],
+    };
+  };
+
+  const pushGitBranch = async (remoteName?: string, remoteBranch?: string) => {
+    const currentState = gitStateRef.current;
+    const status = getGitSyncStatusForOperation(remoteName, remoteBranch);
+    if (status.needsPublish) {
+      if (remoteName || remoteBranch) {
+        updateGitState(state => ({
+          ...state,
+          branches: {
+            ...state.branches,
+            [state.currentBranch]: {
+              ...state.branches[state.currentBranch],
+              upstream: `${status.remoteName}/${status.remoteBranch}`,
+            },
+          },
+        }));
+      }
+      return publishGitBranch();
+    }
+    const remote = currentState.remotes[status.remoteName];
+    const branch = currentState.branches[currentState.currentBranch];
+    if (!remote) return { ok: false, lines: [`fatal: '${status.remoteName}' does not appear to be a git remote`] };
+    if (!branch?.head) return { ok: false, lines: ['Everything up-to-date'] };
+    if (status.needsPull && !status.needsPush) return { ok: false, lines: ['Updates were rejected because the remote contains work that you do not have locally. Run git pull first.'] };
+    const headCommit = currentState.commits[branch.head];
+    if (!headCommit) return { ok: false, lines: ['Current branch head is missing.'] };
+
+    let nextRemote: GitRemoteRecord;
+    let nextHead = branch.head;
+    if (isGitHubRemote(remote)) {
+      const githubCommitSha = await createGitHubCommit(remote, status.remoteBranch, headCommit.files, headCommit.message, status.remoteHead);
+      nextHead = githubCommitSha;
+      nextRemote = await fetchGitHubRemote({ ...remote, branchHeads: { ...remote.branchHeads, [status.remoteBranch]: githubCommitSha } });
+    } else {
+      nextRemote = {
+        ...remote,
+        branchHeads: { ...remote.branchHeads, [status.remoteBranch]: branch.head },
+        branchFiles: { ...remote.branchFiles, [status.remoteBranch]: headCommit.files },
+      };
+      saveStoredGitRemote(nextRemote);
+    }
+    const pushedCommit: GitCommitRecord = nextHead === branch.head ? headCommit : {
+      ...headCommit,
+      id: nextHead,
+      parentIds: status.remoteHead ? [status.remoteHead] : [],
+    };
+    updateGitState(state => ({
+      ...state,
+      branches: {
+        ...state.branches,
+        [branch.name]: { ...branch, head: nextHead, upstream: `${status.remoteName}/${status.remoteBranch}` },
+      },
+      commits: { ...state.commits, [nextHead]: pushedCommit },
+      remotes: {
+        ...state.remotes,
+        [status.remoteName]: nextRemote,
+      },
+      lastFetchedAt: Date.now(),
+    }));
+    return { ok: true, lines: [`Pushed ${branch.name} to ${status.remoteName}/${status.remoteBranch}.`] };
+  };
+
+  const pullGitBranch = async (remoteName?: string, remoteBranch?: string) => {
+    const fetchedState = await refreshGitRemotes(gitStateRef.current, remoteName);
+    const branch = fetchedState.branches[fetchedState.currentBranch] || {
+      name: fetchedState.currentBranch,
+      head: null,
+      upstream: `origin/${fetchedState.currentBranch}`,
+    };
+    const resolvedRemoteName = remoteName || (branch?.upstream?.split('/')[0] || 'origin');
+    const resolvedRemoteBranch = remoteBranch || fetchedState.currentBranch;
+    if ((remoteName || remoteBranch) && (!isValidGitRemoteName(resolvedRemoteName) || !fetchedState.remotes[resolvedRemoteName])) {
+      return { ok: false, lines: [`fatal: '${resolvedRemoteName}' does not appear to be a git remote`] };
+    }
+    if ((remoteName || remoteBranch) && !isValidGitBranchName(resolvedRemoteBranch)) {
+      return { ok: false, lines: [getInvalidGitBranchMessage(resolvedRemoteBranch)] };
+    }
+    const status = remoteName || remoteBranch
+      ? getGitBranchSyncStatus({
+          ...fetchedState,
+          branches: {
+            ...fetchedState.branches,
+            [fetchedState.currentBranch]: {
+              ...branch,
+              upstream: `${resolvedRemoteName}/${resolvedRemoteBranch}`,
+            },
+          },
+        })
+      : getGitBranchSyncStatus(fetchedState);
+    const remote = fetchedState.remotes[status.remoteName];
+    if (!remote || !Object.prototype.hasOwnProperty.call(remote.branchHeads, status.remoteBranch)) {
+      return { ok: false, lines: [`There is no tracking branch for ${fetchedState.currentBranch}.`] };
+    }
+    if (gitChanges.length > 0) return { ok: false, lines: ['error: Your local changes would be overwritten by pull. Commit them first.'] };
+    const remoteHead = remote.branchHeads[status.remoteBranch] || null;
+    const remoteFiles = remote.branchFiles[status.remoteBranch] || {};
+    if (!remoteHead || status.localHead === remoteHead) return { ok: true, lines: ['Already up to date.'] };
+    if (status.needsPush && !status.needsPull || status.diverged) {
+      return { ok: false, lines: ['fatal: Not possible to fast-forward. Commit or push local work first.'] };
+    }
+
+    setFiles(current => createFsItemsFromSnapshot(remoteFiles, current));
+    updateGitState(state => ({
+      ...state,
+      branches: {
+        ...state.branches,
+        [state.currentBranch]: {
+          ...state.branches[state.currentBranch],
+          head: remoteHead,
+          upstream: `${status.remoteName}/${status.remoteBranch}`,
+        },
+      },
+      stagedPaths: [],
+    }));
+    return { ok: true, lines: [`Fast-forwarded ${fetchedState.currentBranch} to ${remoteHead.slice(0, 7)}.`] };
+  };
+
+  const syncGitBranch = async () => {
+    const status = getGitBranchSyncStatus(gitStateRef.current);
+    if (status.needsPull || status.diverged) {
+      const pulled = await pullGitBranch();
+      if (!pulled.ok) return pulled;
+    }
+    return pushGitBranch();
+  };
+
+  const checkoutGitBranch = (branchName: string, create = false) => {
+    const name = branchName.trim();
+    if (!name) return { ok: false, lines: ['git checkout: branch name is required.'] };
+    if (!isValidGitBranchName(name)) return { ok: false, lines: [getInvalidGitBranchMessage(name)] };
+    if (gitChanges.length > 0) return { ok: false, lines: ['error: Your local changes would be overwritten by checkout. Commit them first.'] };
+
+    const currentState = gitStateRef.current;
+    const existing = currentState.branches[name];
+    if (create && existing) return { ok: false, lines: [`fatal: a branch named '${name}' already exists`] };
+    const currentBranch = currentState.branches[currentState.currentBranch];
+    const remoteBranch = !existing && !create
+      ? getGitRemoteBranchRefs(currentState)
+          .filter(ref => ref.label === name || ref.branchName === name)
+          .sort((left, right) => (left.remoteName === 'origin' ? -1 : 0) - (right.remoteName === 'origin' ? -1 : 0))[0] || null
+      : null;
+    if (!existing && !create && !remoteBranch) return { ok: false, lines: [`error: pathspec '${name}' did not match any branch`] };
+    const nextName = remoteBranch ? remoteBranch.branchName : name;
+    const nextBranch = existing || (remoteBranch ? {
+      name: remoteBranch.branchName,
+      head: remoteBranch.head,
+      upstream: remoteBranch.label,
+    } : {
+      name,
+      head: currentBranch?.head || null,
+      upstream: `origin/${name}`,
+    });
+    const headFiles = nextBranch.head ? currentState.commits[nextBranch.head]?.files || {} : {};
+    const remoteFiles = remoteBranch ? remoteBranch.files : headFiles;
+    setFiles(current => createFsItemsFromSnapshot(remoteFiles, current));
+    updateGitState(state => ({
+      ...state,
+      currentBranch: nextName,
+      branches: {
+        ...state.branches,
+        [nextName]: nextBranch,
+      },
+      stagedPaths: [],
+      commits: remoteBranch?.head && !state.commits[remoteBranch.head]
+        ? {
+            ...state.commits,
+            [remoteBranch.head]: {
+              id: remoteBranch.head,
+              message: `Remote ${remoteBranch.label}`,
+              author: 'GitHub <noreply@github.com>',
+              timestamp: Date.now(),
+              parentIds: [],
+              files: remoteFiles,
+            },
+          }
+        : state.commits,
+    }));
+    setSourceControlNewBranchName('');
+    if (remoteBranch) return { ok: true, lines: [`Switched to a new branch '${nextName}' tracking '${remoteBranch.label}'.`] };
+    return { ok: true, lines: [create && !existing ? `Switched to a new branch '${name}'` : `Switched to branch '${name}'`] };
+  };
+
+  const resetGitRepository = () => {
+    const next = createDefaultGitState();
+    gitStateRef.current = next;
+    setGitState(next);
+    setSourceControlCommitMessage('');
+    setSourceControlStatus('');
+    return next;
+  };
+
+  const handleSourceControlAction = async () => {
+    try {
+      const result = gitChanges.length > 0
+        ? createGitCommit(sourceControlCommitMessage || 'Update workspace')
+        : !gitRepositoryPublished
+          ? await publishGitRepository()
+          : gitSyncStatus.needsPublish
+          ? await publishGitBranch()
+          : await syncGitBranch();
+      setSourceControlStatus(result.lines.join('\n'));
+    } catch (error) {
+      setSourceControlStatus(`GitHub error: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
+
+  const handleSourceControlFetch = async () => {
+    try {
+      await refreshGitRemotes();
+      setSourceControlStatus(`Fetched remotes at ${new Date().toLocaleTimeString()}.`);
+    } catch (error) {
+      setSourceControlStatus(`Fetch failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
+
+  const handleSourceControlCreateBranch = () => {
+    const result = checkoutGitBranch(sourceControlNewBranchName, true);
+    setSourceControlStatus(result.lines.join('\n'));
+  };
+
+  const executeGitCli = async (args: string[]) => {
+    const subCmd = (args[1] || '').toLowerCase();
+    const state = gitStateRef.current;
+    const branch = state.branches[state.currentBranch];
+    const changes = getGitWorkspaceChanges(state, filesRef.current);
+    const stagedPathSet = new Set(state.stagedPaths || []);
+    const stagedChanges = changes.filter(change => stagedPathSet.has(change.path));
+    const unstagedChanges = changes.filter(change => !stagedPathSet.has(change.path));
+
+    if (!subCmd || subCmd === '--help' || subCmd === 'help') {
+      return [
+        'usage: git <command> [<args>]',
+        'Commands: init, status, add, commit, log, branch, checkout, switch, remote, fetch, pull, push, diff, config, rev-parse, clone',
+      ];
+    }
+    if (subCmd === '--version' || subCmd === 'version') return ['git version 2.45.0-codecraft'];
+    if (subCmd === 'init') {
+      resetGitRepository();
+      return ['Initialized empty CodeCraft Git repository.'];
+    }
+    if (subCmd === 'status') {
+      const syncStatus = getGitBranchSyncStatus(state);
+      const lines = [`On branch ${state.currentBranch}`];
+      if (!isGitRepositoryPublished(state)) lines.push('Your repository is not published.');
+      else if (syncStatus.needsPublish) lines.push(`Your branch is not published to ${syncStatus.upstream}.`);
+      if (syncStatus.needsPull) lines.push(`Your branch is behind '${syncStatus.upstream}'.`);
+      if (syncStatus.needsPush) lines.push(`Your branch is ahead of '${syncStatus.upstream}'.`);
+      if (syncStatus.diverged) lines.push(`Your branch and '${syncStatus.upstream}' have diverged.`);
+      if (changes.length === 0) {
+        lines.push('nothing to commit, working tree clean');
+      } else {
+        if (stagedChanges.length > 0) {
+          lines.push('Changes to be committed:');
+          lines.push(...stagedChanges.map(change => `  ${formatGitChangeKind(change.kind)} ${change.path}`));
+        }
+        if (unstagedChanges.length > 0) {
+          lines.push('Changes not staged for commit:');
+          lines.push(...unstagedChanges.map(change => `  ${formatGitChangeKind(change.kind)} ${change.path}`));
+        }
+      }
+      return lines;
+    }
+    if (subCmd === 'add') {
+      if (changes.length === 0) return ['nothing to add'];
+      const pathspecs = args.slice(2).filter(arg => arg && !arg.startsWith('-'));
+      const stageAll = args.includes('-A') || args.includes('--all') || pathspecs.includes('.');
+      if (!stageAll && pathspecs.length === 0) return ['Nothing specified, nothing added.'];
+      const matchedPaths = stageAll
+        ? changes.map(change => change.path)
+        : changes
+            .filter(change => pathspecs.some(spec => {
+              const normalized = normalizeProjectPath(spec);
+              return change.path === normalized || change.path.startsWith(`${normalized}/`);
+            }))
+            .map(change => change.path);
+      if (matchedPaths.length === 0) return [`fatal: pathspec '${pathspecs.join(' ')}' did not match any files`];
+      updateGitState(current => ({
+        ...current,
+        stagedPaths: [...new Set([...(current.stagedPaths || []), ...matchedPaths])],
+      }));
+      return [`Staged ${matchedPaths.length} change${matchedPaths.length === 1 ? '' : 's'}.`];
+    }
+    if (subCmd === 'commit') {
+      const messageIndex = args.findIndex(arg => arg === '-m' || arg === '--message');
+      if (messageIndex < 0) return ['usage: git commit -m <message>'];
+      const message = args[messageIndex + 1] || '';
+      if (stagedChanges.length === 0) return ['no changes added to commit'];
+      return createGitCommit(message, state.stagedPaths || []).lines;
+    }
+    if (subCmd === 'log') {
+      const lines: string[] = [];
+      let head = branch?.head || null;
+      const seen = new Set<string>();
+      while (head && !seen.has(head)) {
+        const commit = state.commits[head];
+        if (!commit) break;
+        seen.add(head);
+        lines.push(`commit ${commit.id}`);
+        lines.push(`Author: ${commit.author}`);
+        lines.push(`Date:   ${formatGitTimestamp(commit.timestamp)}`);
+        lines.push('');
+        lines.push(`    ${commit.message}`);
+        lines.push('');
+        head = commit.parentIds[0] || null;
+      }
+      return lines.length ? lines : ['fatal: your current branch does not have any commits yet'];
+    }
+    if (subCmd === 'branch') {
+      const deleteIndex = args.findIndex(arg => arg === '-d' || arg === '-D');
+      if (deleteIndex >= 0) {
+        const name = args[deleteIndex + 1];
+        if (!name || !state.branches[name]) return [`error: branch '${name || ''}' not found`];
+        if (name === state.currentBranch) return [`error: Cannot delete branch '${name}' checked out at CodeCraft workspace`];
+        updateGitState(current => {
+          const nextBranches = { ...current.branches };
+          delete nextBranches[name];
+          return { ...current, branches: nextBranches };
+        });
+        return [`Deleted branch ${name}.`];
+      }
+      const listRemote = args.includes('-r') || args.includes('--remotes');
+      const listAll = args.includes('-a') || args.includes('--all');
+      if (listRemote || listAll) {
+        const localLines = listAll ? Object.keys(state.branches).sort().map(name => `${name === state.currentBranch ? '*' : ' '} ${name}`) : [];
+        const remoteLines = getGitRemoteBranchRefs(state).map(ref => `  remotes/${ref.label}`);
+        return [...localLines, ...remoteLines].length ? [...localLines, ...remoteLines] : [];
+      }
+      const createName = args[2];
+      if (createName) {
+        if (!isValidGitBranchName(createName)) return [getInvalidGitBranchMessage(createName)];
+        if (state.branches[createName]) return [`fatal: a branch named '${createName}' already exists`];
+        updateGitState(current => ({
+          ...current,
+          branches: {
+            ...current.branches,
+            [createName]: {
+              name: createName,
+              head: current.branches[current.currentBranch]?.head || null,
+              upstream: `origin/${createName}`,
+            },
+          },
+        }));
+        return [`Created branch ${createName}.`];
+      }
+      return Object.keys(state.branches).sort().map(name => `${name === state.currentBranch ? '*' : ' '} ${name}`);
+    }
+    if (subCmd === 'checkout') {
+      if (args[2] === '-b') return checkoutGitBranch(args[3] || '', true).lines;
+      return checkoutGitBranch(args[2] || '', false).lines;
+    }
+    if (subCmd === 'switch') {
+      const create = args.includes('-c') || args.includes('--create');
+      const name = create ? args[args.findIndex(arg => arg === '-c' || arg === '--create') + 1] : args[2];
+      return checkoutGitBranch(name || '', create).lines;
+    }
+    if (subCmd === 'remote') {
+      const remoteSub = (args[2] || '').toLowerCase();
+      if (!remoteSub || remoteSub === '-v') {
+        const remotes = Object.values(state.remotes);
+        return remotes.length ? remotes.flatMap(remote => [`${remote.name}\t${remote.url} (fetch)`, `${remote.name}\t${remote.url} (push)`]) : [];
+      }
+      if (remoteSub === 'add') {
+        const name = args[3];
+        const url = args[4];
+        if (!name || !url) return ['usage: git remote add <name> <url>'];
+        if (!isValidGitRemoteName(name)) return [`fatal: '${name}' is not a valid remote name`];
+        if (state.remotes[name]) return [`error: remote ${name} already exists.`];
+        if (!isSupportedGitRemoteUrl(url)) return [`fatal: '${url}' is not a supported Git remote URL. ${getSupportedGitRemoteUrlHelp()}`];
+        updateGitState(current => ({
+          ...current,
+          remotes: {
+            ...current.remotes,
+            [name]: loadStoredGitRemote({ name, url, branchHeads: {}, branchFiles: {} }),
+          },
+        }));
+        return [`Added remote ${name} -> ${url}`];
+      }
+      if (remoteSub === 'remove' || remoteSub === 'rm') {
+        const name = args[3];
+        if (!name || !state.remotes[name]) return [`error: No such remote: '${name || ''}'`];
+        updateGitState(current => {
+          const remotes = { ...current.remotes };
+          delete remotes[name];
+          return { ...current, remotes };
+        });
+        return [`Removed remote ${name}.`];
+      }
+      if (remoteSub === 'set-url') {
+        const name = args[3];
+        const url = args[4];
+        if (!name || !url || !state.remotes[name]) return ['usage: git remote set-url <name> <url>'];
+        if (!isSupportedGitRemoteUrl(url)) return [`fatal: '${url}' is not a supported Git remote URL. ${getSupportedGitRemoteUrlHelp()}`];
+        updateGitState(current => ({
+          ...current,
+          remotes: {
+            ...current.remotes,
+            [name]: loadStoredGitRemote({ ...current.remotes[name], url }),
+          },
+        }));
+        return [`Updated remote ${name} -> ${url}`];
+      }
+      return ['usage: git remote [-v] | git remote add <name> <url> | git remote remove <name> | git remote set-url <name> <url>'];
+    }
+    if (subCmd === 'fetch') {
+      const remoteName = args[2];
+      if (remoteName && !isValidGitRemoteName(remoteName)) return [`fatal: '${remoteName}' does not appear to be a git remote`];
+      await refreshGitRemotes(state, remoteName);
+      return [remoteName ? `Fetched ${remoteName}.` : 'Fetch complete.'];
+    }
+    if (subCmd === 'pull') return (await pullGitBranch(args[2], args[3])).lines;
+    if (subCmd === 'push') return (await pushGitBranch(args[2], args[3])).lines;
+    if (subCmd === 'diff') {
+      if (changes.length === 0) return [];
+      return changes.flatMap(change => {
+        const lines = [`diff --git a/${change.path} b/${change.path}`, `${formatGitChangeKind(change.kind)} ${change.path}`];
+        if (change.kind !== 'added') lines.push(`--- a/${change.path}`);
+        if (change.kind !== 'deleted') lines.push(`+++ b/${change.path}`);
+        if (change.before !== undefined) lines.push(...change.before.split('\n').slice(0, 40).map(line => `-${line}`));
+        if (change.after !== undefined) lines.push(...change.after.split('\n').slice(0, 40).map(line => `+${line}`));
+        return lines;
+      });
+    }
+    if (subCmd === 'config') {
+      if (args[2] === '--list') return Object.entries(state.config).map(([key, value]) => `${key}=${value}`);
+      const key = args[2];
+      const value = args[3];
+      if (!key) return ['usage: git config [--list] <key> [value]'];
+      if (value === undefined) return [state.config[key] || ''];
+      updateGitState(current => ({ ...current, config: { ...current.config, [key]: value } }));
+      return [];
+    }
+    if (subCmd === 'rev-parse') {
+      if (args[2] === '--abbrev-ref' && args[3] === 'HEAD') return [state.currentBranch];
+      if (args[2] === 'HEAD') return [branch?.head || ''];
+      return ['.'];
+    }
+    if (subCmd === 'clone') {
+      const url = args.slice(2).find(arg => !arg.startsWith('-'));
+      if (!url) return ['usage: git clone <url>'];
+      if (!isSupportedGitRemoteUrl(url)) return [`fatal: repository '${url}' is not a supported Git remote URL. ${getSupportedGitRemoteUrlHelp()}`];
+      if (!args.includes('--force') && Object.keys(serializeWorkspaceSnapshot(filesRef.current)).length > 0) {
+        return ['fatal: destination path current CodeCraft workspace already exists and is not an empty directory. Use git clone <url> --force to replace it.'];
+      }
+      const remote = await loadRemoteForGit({ name: 'origin', url, branchHeads: {}, branchFiles: {} });
+      const branchNames = Object.keys(remote.branchHeads);
+      const cloneBranchName = branchNames.includes(DEFAULT_GIT_BRANCH) ? DEFAULT_GIT_BRANCH : branchNames[0] || DEFAULT_GIT_BRANCH;
+      const head = remote.branchHeads[cloneBranchName] || null;
+      const commits = head ? {
+        [head]: {
+          id: head,
+          message: `Remote origin/${cloneBranchName}`,
+          author: 'GitHub <noreply@github.com>',
+          timestamp: Date.now(),
+          parentIds: [],
+          files: remote.branchFiles[cloneBranchName] || {},
+        },
+      } : {};
+      setFiles(current => createFsItemsFromSnapshot(remote.branchFiles[cloneBranchName] || {}, current));
+      updateGitState(current => ({
+        ...current,
+        currentBranch: cloneBranchName,
+        branches: {
+          [cloneBranchName]: { name: cloneBranchName, head, upstream: `origin/${cloneBranchName}` },
+        },
+        commits,
+        remotes: { origin: remote },
+        lastFetchedAt: Date.now(),
+        stagedPaths: [],
+      }));
+      return [`Cloned ${url} into current CodeCraft workspace.`];
+    }
+    return [`git: '${subCmd}' is not implemented in CodeCraft Git yet.`];
+  };
+
+  const executeGhCli = async (args: string[]) => {
+    const area = (args[1] || '').toLowerCase();
+    const subCmd = (args[2] || '').toLowerCase();
+    const state = gitStateRef.current;
+
+    if (!area || area === '--help' || area === 'help') {
+      return [
+        'GitHub CLI for CodeCraft',
+        'Commands: gh auth login|status|logout, gh repo view|create|clone, gh pr list|create, gh issue list|create',
+      ];
+    }
+    if (area === '--version' || area === 'version') return ['gh version 2.63.0-codecraft'];
+    if (area === 'auth') {
+      if (subCmd === 'login') {
+        const tokenIndex = args.findIndex(arg => arg === '--with-token' || arg === '--token');
+        const token = tokenIndex >= 0 ? args[tokenIndex + 1] || '' : window.prompt('GitHub token for CodeCraft gh auth') || '';
+        if (!token.trim()) return ['gh auth login: token is required.'];
+        const userIndex = args.findIndex(arg => arg === '--user');
+        const viewer = await githubApiRequest('/user', {}, token.trim());
+        const user = userIndex >= 0 ? args[userIndex + 1] || viewer?.login || 'github-user' : viewer?.login || 'github-user';
+        updateGitState(current => ({
+          ...current,
+          ghAuth: {
+            token: token.trim(),
+            user,
+            scopes: ['repo', 'workflow', 'read:org'],
+            loggedInAt: Date.now(),
+          },
+        }));
+        return [`Logged in to github.com as ${user}.`];
+      }
+      if (subCmd === 'status') {
+        return state.ghAuth
+          ? [`github.com`, `  Logged in to github.com account ${state.ghAuth.user}`, `  Token scopes: ${state.ghAuth.scopes.join(', ')}`]
+          : ['You are not logged into any GitHub hosts. Run gh auth login.'];
+      }
+      if (subCmd === 'logout') {
+        updateGitState(current => ({ ...current, ghAuth: null }));
+        return ['Logged out of github.com.'];
+      }
+      return ['usage: gh auth login|status|logout'];
+    }
+    if (!state.ghAuth) return ['gh: authentication required. Run gh auth login first.'];
+    if (area === 'repo') {
+      if (subCmd === 'view') {
+        const repoRef = args[3] ? parseGitHubRepositoryArg(args[3]) : getCurrentGitHubRepositoryRef();
+        if (!repoRef) return ['usage: gh repo view [owner/repo]'];
+        const repo = await githubApiRequest(`/repos/${encodeURIComponent(repoRef.owner)}/${encodeURIComponent(repoRef.repo)}`);
+        return [
+          `name:\t${repo?.full_name || `${repoRef.owner}/${repoRef.repo}`}`,
+          `owner:\t${repo?.owner?.login || repoRef.owner}`,
+          `visibility:\t${repo?.private ? 'private' : 'public'}`,
+          `default branch:\t${repo?.default_branch || DEFAULT_GIT_BRANCH}`,
+          `url:\t${repo?.html_url || `https://github.com/${repoRef.owner}/${repoRef.repo}`}`,
+        ];
+      }
+      if (subCmd === 'create') {
+        const rawName = args[3] || `${activeProject.name.replace(/\s+/g, '-').toLowerCase()}-repo`;
+        const parsed = rawName.includes('/') ? parseGitHubRepositoryArg(rawName) : null;
+        const owner = parsed?.owner || state.ghAuth.user;
+        const name = parsed?.repo || rawName;
+        if (!isValidGitHubRepositoryPart(owner) || !isValidGitHubRepositoryPart(name)) return ['usage: gh repo create [owner/]name'];
+        const url = `github:${owner}/${name}`;
+        try {
+          await githubApiRequest(owner === state.ghAuth.user ? '/user/repos' : `/orgs/${encodeURIComponent(owner)}/repos`, {
+            method: 'POST',
+            body: JSON.stringify({
+              name,
+              private: true,
+              auto_init: false,
+            }),
+          });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          if (!/name already exists|already exists/i.test(message)) throw error;
+        }
+        updateGitState(current => ({
+          ...current,
+          remotes: {
+            ...current.remotes,
+            origin: loadStoredGitRemote({ name: 'origin', url, branchHeads: {}, branchFiles: {} }),
+          },
+          branches: {
+            ...current.branches,
+            [current.currentBranch]: {
+              ...current.branches[current.currentBranch],
+              upstream: `origin/${current.currentBranch}`,
+            },
+          },
+        }));
+        return [`Created repository ${owner}/${name}`, `Added remote origin -> ${url}`];
+      }
+      if (subCmd === 'clone') {
+        const repo = args[3];
+        if (!repo) return ['usage: gh repo clone <owner/name>'];
+        const repoRef = parseGitHubRepositoryArg(repo);
+        if (!repoRef) return ['usage: gh repo clone <owner/name>'];
+        return executeGitCli(['git', 'clone', `github:${repoRef.owner}/${repoRef.repo}`, ...args.slice(4)]);
+      }
+      return ['usage: gh repo view|create|clone'];
+    }
+    if (area === 'pr') {
+      if (subCmd === 'list') {
+        const repoRef = getCurrentGitHubRepositoryRef();
+        const stateValue = getCliOptionValue(args, ['--state']) || 'open';
+        const pulls = await githubApiRequest(`/repos/${encodeURIComponent(repoRef.owner)}/${encodeURIComponent(repoRef.repo)}/pulls?state=${encodeURIComponent(stateValue)}`);
+        if (!Array.isArray(pulls) || pulls.length === 0) return ['No pull requests found.'];
+        return pulls.map((pull: any) => `#${pull.number}\t${pull.title}\t${pull.head?.ref || ''} -> ${pull.base?.ref || ''}\t${pull.html_url || ''}`);
+      }
+      if (subCmd === 'create') {
+        const repoRef = getCurrentGitHubRepositoryRef();
+        const title = getCliOptionValue(args, ['--title', '-t']);
+        const body = getCliOptionValue(args, ['--body', '-b']);
+        const base = getCliOptionValue(args, ['--base', '-B']) || DEFAULT_GIT_BRANCH;
+        const head = getCliOptionValue(args, ['--head', '-H']) || state.currentBranch;
+        if (!title.trim()) return ['usage: gh pr create --title <title> [--body <body>] [--base <branch>] [--head <branch>]'];
+        if (!isValidGitBranchName(base) || !isValidGitBranchName(head)) return ['gh pr create: invalid base or head branch name'];
+        const pull = await githubApiRequest(`/repos/${encodeURIComponent(repoRef.owner)}/${encodeURIComponent(repoRef.repo)}/pulls`, {
+          method: 'POST',
+          body: JSON.stringify({ title, body, base, head }),
+        });
+        return [`Created pull request #${pull?.number || ''}: ${pull?.title || title}`, `URL: ${pull?.html_url || ''}`];
+      }
+      return ['usage: gh pr list|create'];
+    }
+    if (area === 'issue') {
+      if (subCmd === 'list') {
+        const repoRef = getCurrentGitHubRepositoryRef();
+        const stateValue = getCliOptionValue(args, ['--state']) || 'open';
+        const issues = await githubApiRequest(`/repos/${encodeURIComponent(repoRef.owner)}/${encodeURIComponent(repoRef.repo)}/issues?state=${encodeURIComponent(stateValue)}`);
+        const plainIssues = Array.isArray(issues) ? issues.filter((issue: any) => !issue.pull_request) : [];
+        if (plainIssues.length === 0) return ['No issues found.'];
+        return plainIssues.map((issue: any) => `#${issue.number}\t${issue.title}\t${issue.html_url || ''}`);
+      }
+      if (subCmd === 'create') {
+        const repoRef = getCurrentGitHubRepositoryRef();
+        const title = getCliOptionValue(args, ['--title', '-t']);
+        const body = getCliOptionValue(args, ['--body', '-b']);
+        if (!title.trim()) return ['usage: gh issue create --title <title> [--body <body>]'];
+        const issue = await githubApiRequest(`/repos/${encodeURIComponent(repoRef.owner)}/${encodeURIComponent(repoRef.repo)}/issues`, {
+          method: 'POST',
+          body: JSON.stringify({ title, body }),
+        });
+        return [`Created issue #${issue?.number || ''}: ${issue?.title || title}`, `URL: ${issue?.html_url || ''}`];
+      }
+      return ['usage: gh issue list|create'];
+    }
+    return [`gh: '${area}' is not implemented in CodeCraft gh yet.`];
+  };
+
   const confirmNewItem = () => {
     if (!namingState || !namingName.trim()) {
       setNamingState(null);
@@ -14741,6 +16233,18 @@ finally:
         setTerminalOutput(newOutput);
       } else {
         setTerminalOutput([...newOutput, `rm: cannot remove '${name}': No such file or directory`]);
+      }
+    } else if (cmd === 'git') {
+      try {
+        setTerminalOutput([...newOutput, ...await executeGitCli(args)]);
+      } catch (error) {
+        setTerminalOutput([...newOutput, `git: ${error instanceof Error ? error.message : String(error)}`]);
+      }
+    } else if (cmd === 'gh') {
+      try {
+        setTerminalOutput([...newOutput, ...await executeGhCli(args)]);
+      } catch (error) {
+        setTerminalOutput([...newOutput, `gh: ${error instanceof Error ? error.message : String(error)}`]);
       }
     } else if (cmd === 'pip') {
       const subCmd = args[1];
@@ -15566,7 +17070,7 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
         setTerminalOutput([...newOutput, 'Usage: nuget include <namespace> | nuget list']);
       }
     } else if (cmd === 'help') {
-      setTerminalOutput([...newOutput, 'Standard commands: ls, pwd, cd, mkdir, touch, open, cat, rm, clear, help, date, echo', 'Python: pip install <package> [-force] | pip upgrade <package> [-version <ver>] | pip uninstall <package> | pip include <module> | pip list', 'JavaScript/TypeScript: npm install <package...> | npm uninstall <package...> | npm include <module> [url] | npm remove <module> | npm list', 'C#: nuget include <namespace> | nuget list', 'JavaScript/TypeScript: use Run or Project Run on .js, .jsx, .ts, and .tsx files', 'C/C++: use Run or Project Run on .c, .cpp, .cc, .cxx, and matching header files', 'Java: use Run or Project Run on .java files']);
+      setTerminalOutput([...newOutput, 'Standard commands: ls, pwd, cd, mkdir, touch, open, cat, rm, clear, help, date, echo', 'Source control: git status|add|commit|log|branch|checkout|switch|remote|fetch|pull|push|diff|config|clone, gh auth|repo|pr|issue', 'Python: pip install <package> [-force] | pip upgrade <package> [-version <ver>] | pip uninstall <package> | pip include <module> | pip list', 'JavaScript/TypeScript: npm install <package...> | npm uninstall <package...> | npm include <module> [url] | npm remove <module> | npm list', 'C#: nuget include <namespace> | nuget list', 'JavaScript/TypeScript: use Run or Project Run on .js, .jsx, .ts, and .tsx files', 'C/C++: use Run or Project Run on .c, .cpp, .cc, .cxx, and matching header files', 'Java: use Run or Project Run on .java files']);
     } else if (cmd === 'date') {
       setTerminalOutput([...newOutput, new Date().toLocaleString()]);
     } else if (cmd === 'echo') {
@@ -15989,6 +17493,7 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
     [STORAGE_KEYS.files]: JSON.stringify(filesRef.current),
     [STORAGE_KEYS.settings]: JSON.stringify(settings),
     [STORAGE_KEYS.assistantChats]: JSON.stringify(assistantChats),
+    [STORAGE_KEYS.gitState]: JSON.stringify(gitStateRef.current),
     [STORAGE_KEYS.layout]: JSON.stringify(layoutModel.toJson()),
     [SYNC_META_KEY]: JSON.stringify(syncMeta),
   });
@@ -16997,6 +18502,224 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
       );
     }
 
+    if (component === "sourceControl") {
+      const commits = Object.values(gitState.commits)
+        .sort((left, right) => right.timestamp - left.timestamp);
+      const branchNames = Object.keys(gitState.branches).sort();
+      const remoteBranchRefs = getGitRemoteBranchRefs(gitState)
+        .filter(ref => !gitState.branches[ref.branchName])
+        .sort((left, right) => left.label.localeCompare(right.label));
+      const currentBranch = gitState.branches[gitState.currentBranch];
+      const statusPills = [
+        !gitRepositoryPublished ? 'Repository unpublished' : '',
+        gitSyncStatus.needsPull ? 'Pull' : '',
+        gitSyncStatus.needsPush ? 'Push' : '',
+        gitRepositoryPublished && gitSyncStatus.needsPublish ? 'Branch unpublished' : '',
+        gitSyncStatus.diverged ? 'Diverged' : '',
+      ].filter(Boolean);
+
+      return (
+        <div className="h-full w-full flex flex-col bg-[rgb(28,28,28)] text-zinc-300 border-white/10">
+          <div className="flex items-center justify-between gap-2 border-b border-white/10 px-3 py-2">
+            <div className="flex min-w-0 items-center gap-2">
+              <GitBranch size={15} className="shrink-0 text-emerald-300" />
+              <div className="min-w-0">
+                <div className="truncate text-xs font-medium text-zinc-200">{gitState.currentBranch}</div>
+                <div className="truncate text-[10px] text-zinc-500">
+                  {currentBranch?.upstream || `origin/${gitState.currentBranch}`}
+                </div>
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => void handleSourceControlFetch()}
+              className="rounded-md p-1.5 text-zinc-500 transition-colors hover:bg-white/10 hover:text-white"
+              title="Fetch"
+            >
+              <RefreshCw size={14} />
+            </button>
+          </div>
+
+          <div className="flex-1 overflow-y-auto custom-scrollbar p-3 space-y-3">
+            <div className="space-y-2">
+              <input
+                type="text"
+                value={sourceControlCommitMessage}
+                onChange={(event) => setSourceControlCommitMessage(event.target.value)}
+                placeholder="Commit message"
+                className="w-full rounded-md border border-white/10 bg-black/20 px-3 py-2 text-xs text-zinc-100 outline-none transition-colors placeholder:text-zinc-600 focus:border-emerald-500/50"
+              />
+              <button
+                type="button"
+                disabled={sourceControlActionDisabled}
+                onClick={() => void handleSourceControlAction()}
+                className={cn(
+                  "flex w-full items-center justify-center gap-2 rounded-md px-3 py-2 text-xs font-semibold transition-colors",
+                  sourceControlActionDisabled
+                    ? "cursor-not-allowed bg-white/5 text-zinc-600"
+                    : "bg-emerald-600 text-white hover:bg-emerald-500"
+                )}
+              >
+                {sourceControlActionLabel === 'Publish Branch' || sourceControlActionLabel === 'Publish Repository' ? <CloudUpload size={14} /> : sourceControlActionLabel === 'Sync Changes' ? <RefreshCw size={14} /> : <GitCommitHorizontal size={14} />}
+                {sourceControlActionLabel}
+              </button>
+              {statusPills.length > 0 && (
+                <div className="flex flex-wrap gap-1">
+                  {statusPills.map(label => (
+                    <span key={label} className="rounded bg-emerald-500/10 px-2 py-0.5 text-[10px] text-emerald-300">{label}</span>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            <div className="space-y-2 border-t border-white/10 pt-3">
+              <div className="flex items-center gap-2">
+                <select
+                  value={gitState.currentBranch}
+                  onChange={(event) => {
+                    const result = checkoutGitBranch(event.target.value);
+                    setSourceControlStatus(result.lines.join('\n'));
+                  }}
+                  className="min-w-0 flex-1 rounded-md border border-white/10 bg-black/20 px-2 py-2 text-xs text-zinc-200 outline-none"
+                >
+                  {branchNames.map(name => <option key={name} value={name}>{name}</option>)}
+                  {remoteBranchRefs.length > 0 ? (
+                    <optgroup label="Remote branches">
+                      {remoteBranchRefs.map(ref => <option key={ref.label} value={ref.label}>{ref.label}</option>)}
+                    </optgroup>
+                  ) : null}
+                </select>
+              </div>
+              <div className="flex items-center gap-2">
+                <input
+                  type="text"
+                  value={sourceControlNewBranchName}
+                  onChange={(event) => setSourceControlNewBranchName(event.target.value)}
+                  placeholder="New branch"
+                  className="min-w-0 flex-1 rounded-md border border-white/10 bg-black/20 px-2 py-2 text-xs text-zinc-100 outline-none placeholder:text-zinc-600"
+                />
+                <button
+                  type="button"
+                  onClick={handleSourceControlCreateBranch}
+                  disabled={!sourceControlNewBranchName.trim() || !isValidGitBranchName(sourceControlNewBranchName.trim())}
+                  className="rounded-md bg-white/10 px-2 py-2 text-xs text-zinc-200 transition-colors hover:bg-white/15 disabled:cursor-not-allowed disabled:text-zinc-600"
+                >
+                  Create
+                </button>
+              </div>
+            </div>
+
+            <div className="space-y-2 border-t border-white/10 pt-3">
+              <div className="text-[10px] font-medium uppercase tracking-wide text-zinc-500">Actions</div>
+              <div className="grid grid-cols-2 gap-2">
+                <button type="button" onClick={() => void handleSourceControlFetch()} className="rounded-md bg-white/5 px-2 py-2 text-xs text-zinc-300 transition-colors hover:bg-white/10">Fetch</button>
+                <button type="button" onClick={async () => {
+                  try { setSourceControlStatus((await pullGitBranch()).lines.join('\n')); }
+                  catch (error) { setSourceControlStatus(`Pull failed: ${error instanceof Error ? error.message : String(error)}`); }
+                }} className="rounded-md bg-white/5 px-2 py-2 text-xs text-zinc-300 transition-colors hover:bg-white/10">Pull</button>
+                <button type="button" onClick={async () => {
+                  try { setSourceControlStatus((await pushGitBranch()).lines.join('\n')); }
+                  catch (error) { setSourceControlStatus(`Push failed: ${error instanceof Error ? error.message : String(error)}`); }
+                }} className="rounded-md bg-white/5 px-2 py-2 text-xs text-zinc-300 transition-colors hover:bg-white/10">Push</button>
+                <button type="button" onClick={async () => {
+                  try { setSourceControlStatus((await syncGitBranch()).lines.join('\n')); }
+                  catch (error) { setSourceControlStatus(`Sync failed: ${error instanceof Error ? error.message : String(error)}`); }
+                }} className="rounded-md bg-white/5 px-2 py-2 text-xs text-zinc-300 transition-colors hover:bg-white/10">Sync</button>
+              </div>
+              <div className="grid grid-cols-2 gap-2">
+                <button type="button" onClick={async () => setSourceControlStatus((await executeGitCli(['git', 'status'])).join('\n'))} className="rounded-md bg-white/5 px-2 py-2 text-xs text-zinc-300 transition-colors hover:bg-white/10">Status</button>
+                <button type="button" onClick={() => selectDockPanel('terminal')} className="rounded-md bg-white/5 px-2 py-2 text-xs text-zinc-300 transition-colors hover:bg-white/10">Terminal</button>
+              </div>
+            </div>
+
+            <div className="space-y-2 border-t border-white/10 pt-3">
+              <div className="flex items-center justify-between gap-2">
+                <div className="text-[10px] font-medium uppercase tracking-wide text-zinc-500">Changes</div>
+                <div className="text-[10px] text-zinc-600">{gitChanges.length}</div>
+              </div>
+              {gitChanges.length === 0 ? (
+                <div className="rounded-md border border-white/10 bg-white/5 px-3 py-2 text-xs text-zinc-500">Working tree clean.</div>
+              ) : (
+                <div className="space-y-1">
+                  {gitChanges.map(change => (
+                    <button
+                      type="button"
+                      key={`${change.kind}:${change.path}`}
+                      onClick={() => {
+                        const item = files.find(file => file.type === 'file' && normalizeProjectPath(getFsItemPath(files, file.id)) === change.path);
+                        if (item) openEditorTab(item.id);
+                      }}
+                      className="flex w-full items-center gap-2 rounded-md bg-white/5 px-2 py-1.5 text-left text-xs text-zinc-300 transition-colors hover:bg-white/10"
+                    >
+                      <span className={cn(
+                        "w-4 shrink-0 font-mono text-[10px]",
+                        change.kind === 'added' ? "text-emerald-300" : change.kind === 'deleted' ? "text-red-300" : "text-amber-300"
+                      )}>
+                        {formatGitChangeKind(change.kind)}
+                      </span>
+                      <span className="min-w-0 flex-1 truncate">{change.path}</span>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            <div className="space-y-2 border-t border-white/10 pt-3">
+              <div className="text-[10px] font-medium uppercase tracking-wide text-zinc-500">Repository Graph</div>
+              {commits.length === 0 ? (
+                <div className="rounded-md border border-white/10 bg-white/5 px-3 py-2 text-xs text-zinc-500">No commits yet.</div>
+              ) : (
+                <div className="space-y-2">
+                  {commits.slice(0, 24).map(commit => {
+                    const branchLabels = branchNames.filter(name => gitState.branches[name]?.head === commit.id);
+                    const remoteLabels = Object.values(gitState.remotes).flatMap(remote => (
+                      Object.entries(remote.branchHeads)
+                        .filter(([, head]) => head === commit.id)
+                        .map(([name]) => `${remote.name}/${name}`)
+                    ));
+                    return (
+                      <div key={commit.id} className="relative rounded-md border border-white/10 bg-black/20 px-3 py-2">
+                        <div className="flex items-start gap-2">
+                          <GitCommitHorizontal size={14} className="mt-0.5 shrink-0 text-emerald-300" />
+                          <div className="min-w-0 flex-1">
+                            <div className="truncate text-xs text-zinc-200">{formatGitCommitLine(commit)}</div>
+                            <div className="mt-1 text-[10px] text-zinc-500">{formatGitTimestamp(commit.timestamp)}</div>
+                            {(branchLabels.length > 0 || remoteLabels.length > 0) && (
+                              <div className="mt-2 flex flex-wrap gap-1">
+                                {[...branchLabels, ...remoteLabels].map(label => (
+                                  <span key={label} className="rounded bg-white/10 px-1.5 py-0.5 text-[10px] text-zinc-300">{label}</span>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+
+            {sourceControlStatus && (
+              <pre className="whitespace-pre-wrap rounded-md border border-white/10 bg-black/30 px-3 py-2 font-mono text-[11px] text-zinc-400">
+                {sourceControlStatus}
+              </pre>
+            )}
+
+            <div className="space-y-2 border-t border-white/10 pt-3">
+              <div className="text-[10px] font-medium uppercase tracking-wide text-zinc-500">GitHub</div>
+              <div className="flex items-center gap-2 rounded-md border border-white/10 bg-white/5 px-3 py-2 text-xs">
+                <KeyRound size={13} className={gitState.ghAuth ? "text-emerald-300" : "text-zinc-600"} />
+                <span className="min-w-0 flex-1 truncate">
+                  {gitState.ghAuth ? `Logged in as ${gitState.ghAuth.user}` : 'Run gh auth login in Terminal'}
+                </span>
+              </div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
     if (component === "explorer") {
       const contextMenuItem = fileTreeContextMenu?.itemId
         ? files.find(item => item.id === fileTreeContextMenu.itemId) || null
@@ -17471,6 +19194,7 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
 
   const getDockTabIcon = (component?: string) => {
     if (component === 'explorer') return <Folder size={14} />;
+    if (component === 'sourceControl') return <GitBranch size={14} />;
     if (component === 'terminal') return <TerminalIcon size={14} />;
     if (component === 'output') return <Play size={14} />;
     if (component === 'assistant') return <Sparkles size={14} />;
