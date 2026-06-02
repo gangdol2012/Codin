@@ -1,5 +1,5 @@
 using System.Net.Http;
-using System.Reflection;
+using System.Text.Json;
 
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
@@ -16,10 +16,10 @@ public class AssemblyMetadataHelper
     {
         _httpClient.BaseAddress = new Uri(uri);
     }
-    public async Task<MetadataReference?> GetAssemblyMetadataReference(Assembly assembly)
+
+    public async Task<MetadataReference?> GetAssemblyMetadataReference(string assemblyName)
     {
         MetadataReference? ret = null;
-        var assemblyName = assembly.GetName().Name ?? "";
         var assemblyUrl = $"./_framework/{assemblyName}.dll";
         try
         {
@@ -48,7 +48,46 @@ public class AssemblyMetadataHelper
         }
         return ret;
     }
+
+    public async Task<IReadOnlyDictionary<string, IReadOnlyList<string>>> GetNamespaceIndex()
+    {
+        const string namespaceIndexUrl = "./_framework/codecraft-namespace-index.json";
+
+        try
+        {
+            var response = await _httpClient.GetAsync(namespaceIndexUrl);
+            if (!response.IsSuccessStatusCode)
+            {
+                Console.WriteLine($"Namespace index not found at {namespaceIndexUrl}: {response.StatusCode}");
+                return new Dictionary<string, IReadOnlyList<string>>(StringComparer.Ordinal);
+            }
+
+            await using var stream = await response.Content.ReadAsStreamAsync();
+            var index = await JsonSerializer.DeserializeAsync<NamespaceIndexDocument>(
+                stream,
+                new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+
+            return index?.Namespaces?
+                .Where(entry => !string.IsNullOrWhiteSpace(entry.Key))
+                .ToDictionary(
+                    entry => entry.Key,
+                    entry => (IReadOnlyList<string>)entry.Value
+                        .Where(assemblyName => !string.IsNullOrWhiteSpace(assemblyName))
+                        .Distinct(StringComparer.Ordinal)
+                        .OrderBy(assemblyName => assemblyName, StringComparer.Ordinal)
+                        .ToArray(),
+                    StringComparer.Ordinal)
+                ?? new Dictionary<string, IReadOnlyList<string>>(StringComparer.Ordinal);
+        }
+        catch (Exception e)
+        {
+            Console.WriteLine($"Error fetching namespace index: {e.Message}");
+            return new Dictionary<string, IReadOnlyList<string>>(StringComparer.Ordinal);
+        }
+    }
 }
+
+public sealed record NamespaceIndexDocument(Dictionary<string, string[]> Namespaces);
 
 
 public class OmniSharpProject
@@ -56,7 +95,6 @@ public class OmniSharpProject
     public record NamespaceIncludeResult(string NamespaceName, IReadOnlyList<string> AddedAssemblies, IReadOnlyList<string> MatchedAssemblies, bool Success, string Message);
     public record SourceFileSnapshot(string Path, string Content);
 
-    private List<Assembly> Assemblies = new List<Assembly>();
     public static List<MetadataReference> MetadataReferences = new List<MetadataReference>();
     private static HashSet<string> ReferencedAssemblyNames = new HashSet<string>(StringComparer.Ordinal);
     private static readonly string[] DefaultUsings =
@@ -70,97 +108,17 @@ public class OmniSharpProject
         "System.Threading.Tasks"
     };
 
-    private static readonly string[] DotNet8ReferenceAssemblyNames =
+    private static readonly string[] DefaultReferenceAssemblyNames =
     {
-        "Microsoft.CSharp",
-        "Microsoft.Win32.Primitives",
-        "netstandard",
+        "System.Console",
+        "System.Linq",
+        "System.Net.Http",
+        "System.Private.CoreLib",
+        "System.Runtime",
+        "System.Threading.Tasks",
         "System",
         "System.Collections",
-        "System.Collections.Concurrent",
-        "System.Collections.Immutable",
-        "System.Collections.NonGeneric",
-        "System.Collections.Specialized",
-        "System.ComponentModel",
-        "System.ComponentModel.Composition",
-        "System.ComponentModel.Primitives",
-        "System.ComponentModel.TypeConverter",
-        "System.Configuration.ConfigurationManager",
-        "System.Console",
-        "System.Data.Common",
-        "System.Data.DataSetExtensions",
-        "System.Diagnostics.Contracts",
-        "System.Diagnostics.Debug",
-        "System.Diagnostics.DiagnosticSource",
-        "System.Diagnostics.FileVersionInfo",
-        "System.Diagnostics.Process",
-        "System.Diagnostics.StackTrace",
-        "System.Diagnostics.Tools",
-        "System.Diagnostics.TraceSource",
-        "System.Diagnostics.Tracing",
-        "System.Drawing",
-        "System.Drawing.Primitives",
-        "System.Globalization",
-        "System.IO.Compression",
-        "System.IO.FileSystem",
-        "System.IO.MemoryMappedFiles",
-        "System.Linq",
-        "System.Linq.Expressions",
-        "System.Linq.Queryable",
-        "System.Memory",
-        "System.Net.Http",
-        "System.Net.Primitives",
-        "System.Net.Requests",
-        "System.Net.WebClient",
-        "System.ObjectModel",
-        "System.Private.CoreLib",
-        "System.Private.DataContractSerialization",
-        "System.Private.Uri",
-        "System.Private.Xml",
-        "System.Private.Xml.Linq",
-        "System.Reactive",
-        "System.Reflection.DispatchProxy",
-        "System.Reflection.Emit",
-        "System.Reflection.Emit.ILGeneration",
-        "System.Reflection.Emit.Lightweight",
-        "System.Reflection.Metadata",
-        "System.Reflection.Primitives",
-        "System.Resources.ResourceManager",
-        "System.Runtime",
-        "System.Runtime.Extensions",
-        "System.Runtime.InteropServices",
-        "System.Runtime.InteropServices.JavaScript",
-        "System.Runtime.InteropServices.RuntimeInformation",
-        "System.Runtime.Intrinsics",
-        "System.Runtime.Loader",
-        "System.Runtime.Numerics",
-        "System.Runtime.Serialization.Formatters",
-        "System.Runtime.Serialization.Json",
-        "System.Runtime.Serialization.Primitives",
-        "System.Runtime.Serialization.Xml",
-        "System.Security.AccessControl",
-        "System.Security.Claims",
-        "System.Security.Cryptography",
-        "System.Security.Cryptography.ProtectedData",
-        "System.Security.Permissions",
-        "System.Security.Principal.Windows",
-        "System.Text.Encoding.CodePages",
-        "System.Text.Encoding.Extensions",
-        "System.Text.Encodings.Web",
-        "System.Text.Json",
-        "System.Text.RegularExpressions",
-        "System.Threading",
-        "System.Threading.Channels",
-        "System.Threading.Tasks",
-        "System.Threading.Tasks.Extensions",
-        "System.Threading.Tasks.Parallel",
-        "System.Threading.Thread",
-        "System.Threading.ThreadPool",
-        "System.Xml.Linq",
-        "System.Xml.ReaderWriter",
-        "System.Xml.XDocument",
-        "System.Xml.XPath",
-        "System.Xml.XPath.XDocument"
+        "netstandard"
     };
 
     private static readonly CSharpParseOptions ParseOptions = CSharpParseOptions.Default
@@ -178,89 +136,44 @@ public class OmniSharpProject
     private readonly Dictionary<string, string> _additionalDocumentContents = new(StringComparer.Ordinal);
     private string _primaryDocumentText = string.Empty;
     private string _primaryDocumentPath = string.Empty;
+    private IReadOnlyDictionary<string, IReadOnlyList<string>> _namespaceIndex = new Dictionary<string, IReadOnlyList<string>>(StringComparer.Ordinal);
     private string Uri {get; init;}
     public OmniSharpProject(string uri)
     {
         Uri = uri;
-
-        var assemblyNames = new HashSet<string>(StringComparer.Ordinal);
-
-        void AddAssembly(Assembly assembly)
-        {
-            var name = assembly.GetName().Name;
-            if (!string.IsNullOrWhiteSpace(name) && assemblyNames.Add(name))
-            {
-                Assemblies.Add(assembly);
-            }
-        }
-
-        void TryAddNamedAssembly(string assemblyName)
-        {
-            try
-            {
-                AddAssembly(Assembly.Load(assemblyName));
-            }
-            catch (Exception e)
-            {
-                Console.WriteLine($"Failed to load reference assembly {assemblyName}: {e.Message}");
-            }
-        }
-
-        void TryAddTypeAssembly(Type type)
-        {
-            try
-            {
-                AddAssembly(type.Assembly);
-            }
-            catch (Exception e)
-            {
-                Console.WriteLine($"Failed to load reference assembly for {type.FullName}: {e.Message}");
-            }
-        }
-
-        // Start with the core library profile, then let `nuget include` lazily pull the wider .NET 8 set.
-        TryAddNamedAssembly("System.Runtime");
-        TryAddNamedAssembly("System.Collections");
-        TryAddNamedAssembly("netstandard");
-        TryAddNamedAssembly("System");
-        TryAddTypeAssembly(typeof(object));
-        TryAddTypeAssembly(typeof(Console));
-        TryAddTypeAssembly(typeof(List<>));
-        TryAddTypeAssembly(typeof(Task));
-        TryAddTypeAssembly(typeof(Enumerable));
-        TryAddTypeAssembly(typeof(HttpClient));
     }
 
     public async Task Init()
     {
         var host = MefHostServices.Create(MefHostServices.DefaultAssemblies);
         Workspace = new AdhocWorkspace(host);
+        var mh = new AssemblyMetadataHelper(Uri);
+        _namespaceIndex = await mh.GetNamespaceIndex();
 
         if (MetadataReferences.Count == 0)
         {
-            var mh = new AssemblyMetadataHelper(Uri);
-
-            
-            foreach (var a in Assemblies)
+            foreach (var assemblyName in DefaultReferenceAssemblyNames)
             {
                 try
                 {
-                    var metadataReference = await mh.GetAssemblyMetadataReference(a);
-                    if (metadataReference == null)
+                    if (ReferencedAssemblyNames.Contains(assemblyName))
                     {
-                        Console.WriteLine($"Did not get metadata ref {a.FullName}");
                         continue;
                     }
-                    MetadataReferences.Add(metadataReference);
-                    var assemblyName = a.GetName().Name;
-                    if (!string.IsNullOrWhiteSpace(assemblyName))
+
+                    var metadataReference = await mh.GetAssemblyMetadataReference(assemblyName);
+                    if (metadataReference == null)
                     {
-                        ReferencedAssemblyNames.Add(assemblyName);
+                        Console.WriteLine($"Did not get metadata ref {assemblyName}");
+                        continue;
                     }
+
+                    MetadataReferences.Add(metadataReference);
+                    ReferencedAssemblyNames.Add(assemblyName);
                 }
                 catch (Exception e)
                 {
-                    Console.WriteLine($"Could not add rdrf {e.Message}");
+                    Console.WriteLine($"Could not add metadata reference for {assemblyName}: {e.Message}");
                 }
             }
         }
@@ -383,13 +296,10 @@ public class OmniSharpProject
             return new NamespaceIncludeResult(namespaceName, Array.Empty<string>(), Array.Empty<string>(), false, "Namespace is required.");
         }
 
-        var matchingAssemblies = GetAssembliesForNamespaceMatching()
-            .Where(a => !a.IsDynamic)
-            .Where(a => AssemblyMatchesNamespace(a, namespaceName))
-            .OrderBy(a => a.GetName().Name, StringComparer.Ordinal)
+        var matchingAssemblyNames = GetAssemblyNamesForNamespace(namespaceName)
             .ToList();
 
-        if (matchingAssemblies.Count == 0)
+        if (matchingAssemblyNames.Count == 0)
         {
             return new NamespaceIncludeResult(
                 namespaceName,
@@ -403,9 +313,8 @@ public class OmniSharpProject
         var helper = new AssemblyMetadataHelper(Uri);
         var addedAssemblyNames = new List<string>();
 
-        foreach (var assembly in matchingAssemblies)
+        foreach (var assemblyName in matchingAssemblyNames)
         {
-            var assemblyName = assembly.GetName().Name;
             if (string.IsNullOrWhiteSpace(assemblyName) || ReferencedAssemblyNames.Contains(assemblyName))
             {
                 continue;
@@ -413,7 +322,7 @@ public class OmniSharpProject
 
             try
             {
-                var metadataReference = await helper.GetAssemblyMetadataReference(assembly);
+                var metadataReference = await helper.GetAssemblyMetadataReference(assemblyName);
                 if (metadataReference == null)
                 {
                     continue;
@@ -431,13 +340,7 @@ public class OmniSharpProject
 
         ApplyMetadataReferencesToWorkspace();
 
-        var matchedAssemblyNames = matchingAssemblies
-            .Select(a => a.GetName().Name)
-            .Where(name => !string.IsNullOrWhiteSpace(name))
-            .Cast<string>()
-            .ToList();
-
-        var success = matchedAssemblyNames.Count > 0;
+        var success = matchingAssemblyNames.Count > 0;
         var message = addedAssemblyNames.Count > 0
             ? $"Included {addedAssemblyNames.Count} assembly reference(s) for '{namespaceName}'."
             : $"Namespace '{namespaceName}' was already available or did not add new metadata references.";
@@ -445,48 +348,62 @@ public class OmniSharpProject
         return new NamespaceIncludeResult(
             namespaceName,
             addedAssemblyNames,
-            matchedAssemblyNames,
+            matchingAssemblyNames,
             success,
             message
         );
     }
 
-    private static IReadOnlyCollection<Assembly> GetAssembliesForNamespaceMatching()
+    private IReadOnlyCollection<string> GetAssemblyNamesForNamespace(string namespaceName)
     {
-        var assembliesByName = new Dictionary<string, Assembly>(StringComparer.Ordinal);
+        var assemblyNames = new SortedSet<string>(StringComparer.Ordinal);
 
-        void TrackAssembly(Assembly assembly)
+        foreach (var (indexedNamespace, indexedAssemblyNames) in _namespaceIndex)
         {
-            var assemblyName = assembly.GetName().Name;
-            if (!string.IsNullOrWhiteSpace(assemblyName))
-            {
-                assembliesByName[assemblyName] = assembly;
-            }
-        }
-
-        foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies())
-        {
-            TrackAssembly(assembly);
-        }
-
-        foreach (var assemblyName in DotNet8ReferenceAssemblyNames)
-        {
-            if (assembliesByName.ContainsKey(assemblyName))
+            if (!NamespaceMatches(indexedNamespace, namespaceName))
             {
                 continue;
             }
 
-            try
+            foreach (var assemblyName in indexedAssemblyNames)
             {
-                TrackAssembly(Assembly.Load(assemblyName));
-            }
-            catch (Exception e)
-            {
-                Console.WriteLine($"Failed to load .NET 8 reference assembly {assemblyName}: {e.Message}");
+                assemblyNames.Add(assemblyName);
             }
         }
 
-        return assembliesByName.Values;
+        foreach (var assemblyName in GetIndexedAssemblyNames())
+        {
+            if (NamespaceMatches(assemblyName, namespaceName))
+            {
+                assemblyNames.Add(assemblyName);
+            }
+        }
+
+        return assemblyNames.ToArray();
+    }
+
+    private IReadOnlyCollection<string> GetIndexedAssemblyNames()
+    {
+        var assemblyNames = new SortedSet<string>(StringComparer.Ordinal);
+        foreach (var indexedAssemblyNames in _namespaceIndex.Values)
+        {
+            foreach (var assemblyName in indexedAssemblyNames)
+            {
+                assemblyNames.Add(assemblyName);
+            }
+        }
+
+        return assemblyNames.ToArray();
+    }
+
+    private static bool NamespaceMatches(string candidate, string namespaceName)
+    {
+        if (candidate.Equals(namespaceName, StringComparison.Ordinal))
+        {
+            return true;
+        }
+
+        return candidate.StartsWith(namespaceName + ".", StringComparison.Ordinal);
     }
 
     private void ApplyMetadataReferencesToWorkspace()
@@ -499,60 +416,6 @@ public class OmniSharpProject
         var projectId = DocumentId.ProjectId;
         var updatedSolution = Workspace.CurrentSolution.WithProjectMetadataReferences(projectId, MetadataReferences);
         Workspace.TryApplyChanges(updatedSolution);
-    }
-
-    private static bool AssemblyMatchesNamespace(Assembly assembly, string namespaceName)
-    {
-        var assemblyName = assembly.GetName().Name;
-        if (!string.IsNullOrWhiteSpace(assemblyName))
-        {
-            if (assemblyName.Equals(namespaceName, StringComparison.Ordinal))
-            {
-                return true;
-            }
-
-            if (assemblyName.StartsWith(namespaceName + ".", StringComparison.Ordinal))
-            {
-                return true;
-            }
-        }
-
-        try
-        {
-            return AssemblyDefinesNamespace(assembly.ExportedTypes, namespaceName);
-        }
-        catch (ReflectionTypeLoadException e)
-        {
-            return AssemblyDefinesNamespace(e.Types.Where(t => t != null)!.Cast<Type>(), namespaceName);
-        }
-        catch
-        {
-            return false;
-        }
-    }
-
-    private static bool AssemblyDefinesNamespace(IEnumerable<Type> types, string namespaceName)
-    {
-        foreach (var type in types)
-        {
-            var typeNamespace = type.Namespace;
-            if (string.IsNullOrWhiteSpace(typeNamespace))
-            {
-                continue;
-            }
-
-            if (typeNamespace.Equals(namespaceName, StringComparison.Ordinal))
-            {
-                return true;
-            }
-
-            if (typeNamespace.StartsWith(namespaceName + ".", StringComparison.Ordinal))
-            {
-                return true;
-            }
-        }
-
-        return false;
     }
 
     private static bool DictionariesEqual(IReadOnlyDictionary<string, string> left, IReadOnlyDictionary<string, string> right)

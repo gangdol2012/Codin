@@ -1,0 +1,3462 @@
+{
+  "generatedAtUtc": "2026-06-02T10:11:32.072794+00:00",
+  "assemblies": [
+    "BlazorWorker.BackgroundServiceFactory",
+    "BlazorWorker.Core",
+    "BlazorWorker.Extensions.JSRuntime",
+    "BlazorWorker.WorkerBackgroundService",
+    "BlazorWorker.WorkerCore",
+    "Humanizer",
+    "ICSharpCode.Decompiler",
+    "Microsoft.AspNetCore.Components",
+    "Microsoft.AspNetCore.Components.Web",
+    "Microsoft.AspNetCore.Components.WebAssembly",
+    "Microsoft.CSharp",
+    "Microsoft.CodeAnalysis",
+    "Microsoft.CodeAnalysis.AnalyzerUtilities",
+    "Microsoft.CodeAnalysis.CSharp",
+    "Microsoft.CodeAnalysis.CSharp.Features",
+    "Microsoft.CodeAnalysis.CSharp.Workspaces",
+    "Microsoft.CodeAnalysis.Elfie",
+    "Microsoft.CodeAnalysis.Features",
+    "Microsoft.CodeAnalysis.Scripting",
+    "Microsoft.CodeAnalysis.Workspaces",
+    "Microsoft.DiaSymReader",
+    "Microsoft.Extensions.Caching.Abstractions",
+    "Microsoft.Extensions.Caching.Memory",
+    "Microsoft.Extensions.Configuration",
+    "Microsoft.Extensions.Configuration.Abstractions",
+    "Microsoft.Extensions.Configuration.Json",
+    "Microsoft.Extensions.DependencyInjection",
+    "Microsoft.Extensions.DependencyInjection.Abstractions",
+    "Microsoft.Extensions.FileProviders.Abstractions",
+    "Microsoft.Extensions.FileProviders.Physical",
+    "Microsoft.Extensions.FileSystemGlobbing",
+    "Microsoft.Extensions.Logging",
+    "Microsoft.Extensions.Logging.Abstractions",
+    "Microsoft.Extensions.Options",
+    "Microsoft.Extensions.Primitives",
+    "Microsoft.JSInterop",
+    "Microsoft.JSInterop.WebAssembly",
+    "Microsoft.Win32.Primitives",
+    "Newtonsoft.Json",
+    "NuGet.Versioning",
+    "OmniSharp.Abstractions",
+    "OmniSharp.Roslyn",
+    "OmniSharp.Roslyn.CSharp",
+    "OmniSharp.Shared",
+    "OmniSharpWasm",
+    "Serialize.Linq",
+    "System",
+    "System.Collections",
+    "System.Collections.Concurrent",
+    "System.Collections.Immutable",
+    "System.Collections.NonGeneric",
+    "System.Collections.Specialized",
+    "System.ComponentModel",
+    "System.ComponentModel.Composition",
+    "System.ComponentModel.Primitives",
+    "System.ComponentModel.TypeConverter",
+    "System.Composition.AttributedModel",
+    "System.Composition.Convention",
+    "System.Composition.Hosting",
+    "System.Composition.Runtime",
+    "System.Composition.TypedParts",
+    "System.Configuration.ConfigurationManager",
+    "System.Console",
+    "System.Data.Common",
+    "System.Data.DataSetExtensions",
+    "System.Diagnostics.Contracts",
+    "System.Diagnostics.Debug",
+    "System.Diagnostics.DiagnosticSource",
+    "System.Diagnostics.FileVersionInfo",
+    "System.Diagnostics.Process",
+    "System.Diagnostics.StackTrace",
+    "System.Diagnostics.Tools",
+    "System.Diagnostics.TraceSource",
+    "System.Diagnostics.Tracing",
+    "System.Drawing",
+    "System.Drawing.Primitives",
+    "System.Globalization",
+    "System.IO.Compression",
+    "System.IO.FileSystem",
+    "System.IO.MemoryMappedFiles",
+    "System.Linq",
+    "System.Linq.Expressions",
+    "System.Linq.Queryable",
+    "System.Memory",
+    "System.Net.Http",
+    "System.Net.Primitives",
+    "System.Net.Requests",
+    "System.Net.WebClient",
+    "System.ObjectModel",
+    "System.Private.CoreLib",
+    "System.Private.DataContractSerialization",
+    "System.Private.Uri",
+    "System.Private.Xml",
+    "System.Private.Xml.Linq",
+    "System.Reactive",
+    "System.Reflection.DispatchProxy",
+    "System.Reflection.Emit",
+    "System.Reflection.Emit.ILGeneration",
+    "System.Reflection.Emit.Lightweight",
+    "System.Reflection.Metadata",
+    "System.Reflection.Primitives",
+    "System.Resources.ResourceManager",
+    "System.Runtime",
+    "System.Runtime.Extensions",
+    "System.Runtime.InteropServices",
+    "System.Runtime.InteropServices.JavaScript",
+    "System.Runtime.InteropServices.RuntimeInformation",
+    "System.Runtime.Intrinsics",
+    "System.Runtime.Loader",
+    "System.Runtime.Numerics",
+    "System.Runtime.Serialization.Formatters",
+    "System.Runtime.Serialization.Json",
+    "System.Runtime.Serialization.Primitives",
+    "System.Runtime.Serialization.Xml",
+    "System.Security.AccessControl",
+    "System.Security.Claims",
+    "System.Security.Cryptography",
+    "System.Security.Cryptography.ProtectedData",
+    "System.Security.Permissions",
+    "System.Security.Principal.Windows",
+    "System.Text.Encoding.CodePages",
+    "System.Text.Encoding.Extensions",
+    "System.Text.Encodings.Web",
+    "System.Text.Json",
+    "System.Text.RegularExpressions",
+    "System.Threading",
+    "System.Threading.Channels",
+    "System.Threading.Tasks",
+    "System.Threading.Tasks.Extensions",
+    "System.Threading.Tasks.Parallel",
+    "System.Threading.Thread",
+    "System.Threading.ThreadPool",
+    "System.Xml.Linq",
+    "System.Xml.ReaderWriter",
+    "System.Xml.XDocument",
+    "System.Xml.XPath",
+    "System.Xml.XPath.XDocument",
+    "netstandard"
+  ],
+  "namespaces": {
+    "Analyzer.Utilities": [
+      "Microsoft.CodeAnalysis.AnalyzerUtilities"
+    ],
+    "Analyzer.Utilities.Extensions": [
+      "Microsoft.CodeAnalysis.AnalyzerUtilities"
+    ],
+    "Analyzer.Utilities.Lightup": [
+      "Microsoft.CodeAnalysis.AnalyzerUtilities"
+    ],
+    "Analyzer.Utilities.Options": [
+      "Microsoft.CodeAnalysis.AnalyzerUtilities"
+    ],
+    "Analyzer.Utilities.PooledObjects": [
+      "Microsoft.CodeAnalysis.AnalyzerUtilities"
+    ],
+    "Analyzer.Utilities.PooledObjects.Extensions": [
+      "Microsoft.CodeAnalysis.AnalyzerUtilities"
+    ],
+    "BlazorWorker.BackgroundServiceFactory": [
+      "BlazorWorker.BackgroundServiceFactory"
+    ],
+    "BlazorWorker.Core": [
+      "BlazorWorker.Core",
+      "BlazorWorker.WorkerCore"
+    ],
+    "BlazorWorker.Core.CoreInstanceService": [
+      "BlazorWorker.Core"
+    ],
+    "BlazorWorker.Core.SimpleInstanceService": [
+      "BlazorWorker.Core"
+    ],
+    "BlazorWorker.Extensions.JSRuntime": [
+      "BlazorWorker.Extensions.JSRuntime"
+    ],
+    "BlazorWorker.WorkerBackgroundService": [
+      "BlazorWorker.WorkerBackgroundService"
+    ],
+    "BlazorWorker.WorkerCore": [
+      "BlazorWorker.WorkerCore"
+    ],
+    "BlazorWorker.WorkerCore.SimpleInstanceService": [
+      "BlazorWorker.WorkerCore"
+    ],
+    "BlazorWorker.WorkerCore.WebAssemblyBindingsProxy": [
+      "BlazorWorker.WorkerCore"
+    ],
+    "CodeCraft.OmniSharpWasm": [
+      "OmniSharpWasm"
+    ],
+    "Elfie.Serialization": [
+      "Microsoft.CodeAnalysis.Elfie"
+    ],
+    "FxResources.System.ComponentModel.Composition": [
+      "System.ComponentModel.Composition"
+    ],
+    "FxResources.System.Composition.Convention": [
+      "System.Composition.Convention"
+    ],
+    "FxResources.System.Composition.Hosting": [
+      "System.Composition.Hosting"
+    ],
+    "FxResources.System.Composition.TypedParts": [
+      "System.Composition.TypedParts"
+    ],
+    "FxResources.System.Configuration.ConfigurationManager": [
+      "System.Configuration.ConfigurationManager"
+    ],
+    "FxResources.System.Private.DataContractSerialization": [
+      "System.Private.DataContractSerialization"
+    ],
+    "FxResources.System.Security.Cryptography.ProtectedData": [
+      "System.Security.Cryptography.ProtectedData"
+    ],
+    "FxResources.System.Security.Permissions": [
+      "System.Security.Permissions"
+    ],
+    "Humanizer": [
+      "Humanizer"
+    ],
+    "Humanizer.Bytes": [
+      "Humanizer"
+    ],
+    "Humanizer.Configuration": [
+      "Humanizer"
+    ],
+    "Humanizer.DateTimeHumanizeStrategy": [
+      "Humanizer"
+    ],
+    "Humanizer.Inflections": [
+      "Humanizer"
+    ],
+    "Humanizer.Localisation": [
+      "Humanizer"
+    ],
+    "Humanizer.Localisation.CollectionFormatters": [
+      "Humanizer"
+    ],
+    "Humanizer.Localisation.DateToOrdinalWords": [
+      "Humanizer"
+    ],
+    "Humanizer.Localisation.Formatters": [
+      "Humanizer"
+    ],
+    "Humanizer.Localisation.GrammaticalNumber": [
+      "Humanizer"
+    ],
+    "Humanizer.Localisation.NumberToWords": [
+      "Humanizer"
+    ],
+    "Humanizer.Localisation.NumberToWords.Italian": [
+      "Humanizer"
+    ],
+    "Humanizer.Localisation.NumberToWords.Romanian": [
+      "Humanizer"
+    ],
+    "Humanizer.Localisation.Ordinalizers": [
+      "Humanizer"
+    ],
+    "Humanizer.Localisation.TimeToClockNotation": [
+      "Humanizer"
+    ],
+    "ICSharpCode.Decompiler": [
+      "ICSharpCode.Decompiler"
+    ],
+    "ICSharpCode.Decompiler.CSharp": [
+      "ICSharpCode.Decompiler"
+    ],
+    "ICSharpCode.Decompiler.CSharp.OutputVisitor": [
+      "ICSharpCode.Decompiler"
+    ],
+    "ICSharpCode.Decompiler.CSharp.ProjectDecompiler": [
+      "ICSharpCode.Decompiler"
+    ],
+    "ICSharpCode.Decompiler.CSharp.Resolver": [
+      "ICSharpCode.Decompiler"
+    ],
+    "ICSharpCode.Decompiler.CSharp.Syntax": [
+      "ICSharpCode.Decompiler"
+    ],
+    "ICSharpCode.Decompiler.CSharp.Syntax.PatternMatching": [
+      "ICSharpCode.Decompiler"
+    ],
+    "ICSharpCode.Decompiler.CSharp.Transforms": [
+      "ICSharpCode.Decompiler"
+    ],
+    "ICSharpCode.Decompiler.CSharp.TypeSystem": [
+      "ICSharpCode.Decompiler"
+    ],
+    "ICSharpCode.Decompiler.DebugInfo": [
+      "ICSharpCode.Decompiler"
+    ],
+    "ICSharpCode.Decompiler.Disassembler": [
+      "ICSharpCode.Decompiler"
+    ],
+    "ICSharpCode.Decompiler.Documentation": [
+      "ICSharpCode.Decompiler"
+    ],
+    "ICSharpCode.Decompiler.FlowAnalysis": [
+      "ICSharpCode.Decompiler"
+    ],
+    "ICSharpCode.Decompiler.IL": [
+      "ICSharpCode.Decompiler"
+    ],
+    "ICSharpCode.Decompiler.IL.ControlFlow": [
+      "ICSharpCode.Decompiler"
+    ],
+    "ICSharpCode.Decompiler.IL.Patterns": [
+      "ICSharpCode.Decompiler"
+    ],
+    "ICSharpCode.Decompiler.IL.Transforms": [
+      "ICSharpCode.Decompiler"
+    ],
+    "ICSharpCode.Decompiler.Metadata": [
+      "ICSharpCode.Decompiler"
+    ],
+    "ICSharpCode.Decompiler.Output": [
+      "ICSharpCode.Decompiler"
+    ],
+    "ICSharpCode.Decompiler.Semantics": [
+      "ICSharpCode.Decompiler"
+    ],
+    "ICSharpCode.Decompiler.Solution": [
+      "ICSharpCode.Decompiler"
+    ],
+    "ICSharpCode.Decompiler.TypeSystem": [
+      "ICSharpCode.Decompiler"
+    ],
+    "ICSharpCode.Decompiler.TypeSystem.Implementation": [
+      "ICSharpCode.Decompiler"
+    ],
+    "ICSharpCode.Decompiler.Util": [
+      "ICSharpCode.Decompiler"
+    ],
+    "Internal": [
+      "System.Private.CoreLib"
+    ],
+    "Internal.Runtime.InteropServices": [
+      "System.Private.CoreLib"
+    ],
+    "LightJson": [
+      "ICSharpCode.Decompiler"
+    ],
+    "LightJson.Serialization": [
+      "ICSharpCode.Decompiler"
+    ],
+    "MS.Internal.Xml.Linq.ComponentModel": [
+      "System.ComponentModel.TypeConverter"
+    ],
+    "MS.Internal.Xml.XPath": [
+      "System.Private.Xml"
+    ],
+    "Microsoft.AspNetCore.Components": [
+      "Microsoft.AspNetCore.Components",
+      "Microsoft.AspNetCore.Components.Web",
+      "Microsoft.AspNetCore.Components.WebAssembly"
+    ],
+    "Microsoft.AspNetCore.Components.Forms": [
+      "Microsoft.AspNetCore.Components.Web",
+      "Microsoft.AspNetCore.Components.WebAssembly"
+    ],
+    "Microsoft.AspNetCore.Components.HotReload": [
+      "Microsoft.AspNetCore.Components"
+    ],
+    "Microsoft.AspNetCore.Components.Infrastructure": [
+      "Microsoft.AspNetCore.Components"
+    ],
+    "Microsoft.AspNetCore.Components.Reflection": [
+      "Microsoft.AspNetCore.Components"
+    ],
+    "Microsoft.AspNetCore.Components.RenderTree": [
+      "Microsoft.AspNetCore.Components",
+      "Microsoft.AspNetCore.Components.Web"
+    ],
+    "Microsoft.AspNetCore.Components.Rendering": [
+      "Microsoft.AspNetCore.Components"
+    ],
+    "Microsoft.AspNetCore.Components.Routing": [
+      "Microsoft.AspNetCore.Components"
+    ],
+    "Microsoft.AspNetCore.Components.Sections": [
+      "Microsoft.AspNetCore.Components"
+    ],
+    "Microsoft.AspNetCore.Components.Web": [
+      "Microsoft.AspNetCore.Components.Web"
+    ],
+    "Microsoft.AspNetCore.Components.Web.Infrastructure": [
+      "Microsoft.AspNetCore.Components.Web"
+    ],
+    "Microsoft.AspNetCore.Components.WebAssembly.Hosting": [
+      "Microsoft.AspNetCore.Components.WebAssembly"
+    ],
+    "Microsoft.AspNetCore.Components.WebAssembly.Infrastructure": [
+      "Microsoft.AspNetCore.Components.WebAssembly"
+    ],
+    "Microsoft.AspNetCore.Components.WebAssembly.Rendering": [
+      "Microsoft.AspNetCore.Components.WebAssembly"
+    ],
+    "Microsoft.AspNetCore.Components.WebAssembly.Services": [
+      "Microsoft.AspNetCore.Components.WebAssembly"
+    ],
+    "Microsoft.AspNetCore.Internal": [
+      "Microsoft.AspNetCore.Components"
+    ],
+    "Microsoft.CSharp.RuntimeBinder": [
+      "Microsoft.CSharp"
+    ],
+    "Microsoft.CSharp.RuntimeBinder.Errors": [
+      "Microsoft.CSharp"
+    ],
+    "Microsoft.CSharp.RuntimeBinder.Semantics": [
+      "Microsoft.CSharp"
+    ],
+    "Microsoft.CSharp.RuntimeBinder.Syntax": [
+      "Microsoft.CSharp"
+    ],
+    "Microsoft.Cci": [
+      "Microsoft.CodeAnalysis",
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis": [
+      "Humanizer",
+      "ICSharpCode.Decompiler",
+      "Microsoft.CodeAnalysis",
+      "Microsoft.CodeAnalysis.AnalyzerUtilities",
+      "Microsoft.CodeAnalysis.CSharp",
+      "Microsoft.CodeAnalysis.CSharp.Features",
+      "Microsoft.CodeAnalysis.CSharp.Workspaces",
+      "Microsoft.CodeAnalysis.Features",
+      "Microsoft.CodeAnalysis.Scripting",
+      "Microsoft.CodeAnalysis.Workspaces",
+      "Microsoft.DiaSymReader",
+      "Newtonsoft.Json",
+      "OmniSharp.Abstractions",
+      "OmniSharp.Roslyn",
+      "OmniSharp.Roslyn.CSharp",
+      "Serialize.Linq",
+      "System.Reactive"
+    ],
+    "Microsoft.CodeAnalysis.AddAccessibilityModifiers": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.AddAnonymousTypeMemberName": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.AddConstructorParametersFromMembers": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.AddDebuggerDisplay": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.AddFileBanner": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.AddImport": [
+      "Microsoft.CodeAnalysis.Features",
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.AddMissingImports": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.AddMissingReference": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.AddObsoleteAttribute": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.AddPackage": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.AddParameter": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.AddRequiredParentheses": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.AliasAmbiguousType": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.Analyzers.MatchFolderAndNamespace": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.Analyzers.UseCoalesceExpression": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.BraceCompletion": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.BraceMatching": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.BracePairs": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp": [
+      "Microsoft.CodeAnalysis.CSharp",
+      "Microsoft.CodeAnalysis.CSharp.Features",
+      "Microsoft.CodeAnalysis.CSharp.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.AddAccessibilityModifiers": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.AddAnonymousTypeMemberName": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.AddDebuggerDisplay": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.AddFileBanner": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.AddImport": [
+      "Microsoft.CodeAnalysis.CSharp.Features",
+      "Microsoft.CodeAnalysis.CSharp.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.AddMissingImports": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.AddMissingReference": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.AddObsoleteAttribute": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.AddPackage": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.AddParameter": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.AddRequiredParentheses": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.AliasAmbiguousType": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.Analyzers.ConvertProgram": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.Analyzers.ForEachCast": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.Analyzers.MakeFieldReadonly": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.Analyzers.MatchFolderAndNamespace": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.Analyzers.RemoveUnnecessaryNullableDirective": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.Analyzers.SimplifyInterpolation": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.Analyzers.UseCoalesceExpression": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.AssignOutParameters": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.BraceCompletion": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.BraceMatching": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.BracePairs": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.CaseCorrection": [
+      "Microsoft.CodeAnalysis.CSharp.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.ChangeNamespace": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.ChangeSignature": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.Classification": [
+      "Microsoft.CodeAnalysis.CSharp.Features",
+      "Microsoft.CodeAnalysis.CSharp.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.Classification.Classifiers": [
+      "Microsoft.CodeAnalysis.CSharp.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.CodeCleanup": [
+      "Microsoft.CodeAnalysis.CSharp.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.CodeFixes.AddExplicitCast": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.CodeFixes.AddInheritdoc": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.CodeFixes.ConvertToAsync": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.CodeFixes.DeclareAsNullable": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.CodeFixes.FixIncorrectConstraint": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.CodeFixes.FixReturnType": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.CodeFixes.ForEachCast": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.CodeFixes.FullyQualify": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.CodeFixes.GenerateDeconstructMethod": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.CodeFixes.GenerateEnumMember": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.CodeFixes.GenerateMethod": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.CodeFixes.GenerateType": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.CodeFixes.HideBase": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.CodeFixes.Iterator": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.CodeFixes.MakeMemberRequired": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.CodeFixes.MakeStatementAsynchronous": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.CodeFixes.MatchFolderAndNamespace": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.CodeFixes.RemoveNewModifier": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.CodeFixes.RemoveUnnecessaryNullableDirective": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.CodeFixes.Suppression": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.CodeFixes.TransposeRecordKeyword": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.CodeFixes.UseExpressionBodyForLambda": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.CodeFixes.UseNameofInAttribute": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.CodeFixesAndRefactorings": [
+      "Microsoft.CodeAnalysis.CSharp.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.CodeGen": [
+      "Microsoft.CodeAnalysis.CSharp"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.CodeGeneration": [
+      "Microsoft.CodeAnalysis.CSharp.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.CodeLens": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.CodeRefactorings": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.CodeRefactorings.AddAwait": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.CodeRefactorings.AddMissingImports": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.CodeRefactorings.ConvertLocalFunctionToMethod": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.CodeRefactorings.EnableNullable": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.CodeRefactorings.ExtractClass": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.CodeRefactorings.InlineMethod": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.CodeRefactorings.InlineTemporary": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.CodeRefactorings.MoveStaticMembers": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.CodeRefactorings.MoveType": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.CodeRefactorings.PullMemberUp": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.CodeRefactorings.ReplaceMethodWithProperty": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.CodeRefactorings.SyncNamespace": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.CodeRefactorings.UseExplicitType": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.CodeRefactorings.UseImplicitType": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.CodeRefactorings.UseRecursivePatterns": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.CodeRefactorings.UseType": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.CodeStyle": [
+      "Microsoft.CodeAnalysis.CSharp.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.CodeStyle.TypeStyle": [
+      "Microsoft.CodeAnalysis.CSharp.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.Completion": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.Completion.CompletionProviders.Snippets": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.Completion.KeywordRecommenders": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.Completion.Providers": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.Completion.Providers.DeclarationName": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.ConditionalExpressionInStringInterpolation": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.ConflictMarkerResolution": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.ConvertAnonymousType": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.ConvertAutoPropertyToFullProperty": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.ConvertBetweenRegularAndVerbatimString": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.ConvertCast": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.ConvertForEachToFor": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.ConvertForToForEach": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.ConvertIfToSwitch": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.ConvertLinq": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.ConvertLinq.ConvertForEachToLinqQuery": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.ConvertNamespace": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.ConvertNumericLiteral": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.ConvertPrimaryToRegularConstructor": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.ConvertProgram": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.ConvertSwitchStatementToExpression": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.ConvertToInterpolatedString": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.ConvertToRawString": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.ConvertToRecord": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.ConvertTupleToStruct": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.ConvertTypeOfToNameOf": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.Debugging": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.DecompiledSource": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.Diagnostics": [
+      "Microsoft.CodeAnalysis.CSharp.Features",
+      "Microsoft.CodeAnalysis.CSharp.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.Diagnostics.AddBraces": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.Diagnostics.Analyzers": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.Diagnostics.NamingStyles": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.Diagnostics.SimplifyTypeNames": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.Diagnostics.TypeStyle": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.DisambiguateSameVariable": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.DocumentHighlighting": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.DocumentationComments": [
+      "Microsoft.CodeAnalysis.CSharp",
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.EditAndContinue": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.Editing": [
+      "Microsoft.CodeAnalysis.CSharp.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.EmbeddedLanguages": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.EmbeddedLanguages.LanguageServices": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.EmbeddedLanguages.VirtualChars": [
+      "Microsoft.CodeAnalysis.CSharp.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.Emit": [
+      "Microsoft.CodeAnalysis.CSharp"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.Emit.NoPia": [
+      "Microsoft.CodeAnalysis.CSharp"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.EncapsulateField": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.Extensions": [
+      "Microsoft.CodeAnalysis.CSharp.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.Extensions.ContextQuery": [
+      "Microsoft.CodeAnalysis.CSharp.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.ExternalAccess.Pythia": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.ExternalAccess.Pythia.Api": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.ExtractInterface": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.ExtractMethod": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.Features.EmbeddedLanguages": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.FileHeaders": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.FindSymbols": [
+      "Microsoft.CodeAnalysis.CSharp.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.FindUsages": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.Formatting": [
+      "Microsoft.CodeAnalysis.CSharp.Features",
+      "Microsoft.CodeAnalysis.CSharp.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.GenerateConstructor": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.GenerateConstructorFromMembers": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.GenerateDefaultConstructors": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.GenerateEqualsAndGetHashCodeFromMembers": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.GenerateMember.GenerateEnumMember": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.GenerateMember.GenerateMethod": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.GenerateMember.GenerateParameterizedMember": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.GenerateMember.GenerateVariable": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.GenerateType": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.GenerateVariable": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.GeneratedCodeRecognition": [
+      "Microsoft.CodeAnalysis.CSharp.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.GoToDefinition": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.ImplementAbstractClass": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.ImplementInterface": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.Indentation": [
+      "Microsoft.CodeAnalysis.CSharp.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.InheritanceMargin": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.InitializeParameter": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.InlineDeclaration": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.InlineHints": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.IntroduceParameter": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.IntroduceUsingStatement": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.IntroduceVariable": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.InvertConditional": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.InvertIf": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.InvertLogical": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.InvokeDelegateWithConditionalAccess": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.KeywordHighlighting": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.KeywordHighlighting.KeywordHighlighters": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.LanguageServer": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.LanguageService": [
+      "Microsoft.CodeAnalysis.CSharp.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.LineSeparators": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.MakeFieldReadonly": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.MakeLocalFunctionStatic": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.MakeMemberStatic": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.MakeMethodAsynchronous": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.MakeMethodSynchronous": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.MakeRefStruct": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.MakeStructFieldsWritable": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.MakeStructMemberReadOnly": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.MakeStructReadOnly": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.MakeTypeAbstract": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.MakeTypePartial": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.MetadataAsSource": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.MisplacedUsingDirectives": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.MoveDeclarationNearReference": [
+      "Microsoft.CodeAnalysis.CSharp.Features",
+      "Microsoft.CodeAnalysis.CSharp.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.MoveToNamespace": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.NameTupleElement": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.NavigateTo": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.Navigation": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.NavigationBar": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.NewLines.ArrowExpressionClausePlacement": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.NewLines.ConditionalExpressionPlacement": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.NewLines.ConsecutiveBracePlacement": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.NewLines.ConsecutiveStatementPlacement": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.NewLines.ConstructorInitializerPlacement": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.NewLines.EmbeddedStatementPlacement": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.NewLines.MultipleBlankLines": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.OrderModifiers": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.OrganizeImports": [
+      "Microsoft.CodeAnalysis.CSharp.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.Organizing": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.Organizing.Organizers": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.PopulateSwitch": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.Precedence": [
+      "Microsoft.CodeAnalysis.CSharp.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.QualifyMemberAccess": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.QuickInfo": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.ReassignedVariable": [
+      "Microsoft.CodeAnalysis.CSharp.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.Recommendations": [
+      "Microsoft.CodeAnalysis.CSharp.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.RemoveAsyncModifier": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.RemoveConfusingSuppression": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.RemoveInKeyword": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.RemoveRedundantEquality": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.RemoveUnnecessaryCast": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.RemoveUnnecessaryDiscardDesignation": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.RemoveUnnecessaryImports": [
+      "Microsoft.CodeAnalysis.CSharp.Features",
+      "Microsoft.CodeAnalysis.CSharp.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.RemoveUnnecessaryLambdaExpression": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.RemoveUnnecessaryParentheses": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.RemoveUnnecessarySuppressions": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.RemoveUnreachableCode": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.RemoveUnusedLocalFunction": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.RemoveUnusedMembers": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.RemoveUnusedParametersAndValues": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.RemoveUnusedVariable": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.Rename": [
+      "Microsoft.CodeAnalysis.CSharp.Features",
+      "Microsoft.CodeAnalysis.CSharp.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.ReplaceConditionalWithStatements": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.ReplaceDefaultLiteral": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.ReplaceDiscardDeclarationsWithAssignments": [
+      "Microsoft.CodeAnalysis.CSharp.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.ReplaceDocCommentTextWithTag": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.ReplacePropertyWithMethods": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.ReverseForStatement": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.SemanticModelReuse": [
+      "Microsoft.CodeAnalysis.CSharp.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.Serialization": [
+      "Microsoft.CodeAnalysis.CSharp.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.Shared.Extensions": [
+      "Microsoft.CodeAnalysis.CSharp.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.Shared.Lightup": [
+      "Microsoft.CodeAnalysis.CSharp.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.SignatureHelp": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.Simplification": [
+      "Microsoft.CodeAnalysis.CSharp.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.Simplification.Simplifiers": [
+      "Microsoft.CodeAnalysis.CSharp.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.SimplifyBooleanExpression": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.SimplifyInterpolation": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.SimplifyLinqExpression": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.SimplifyPropertyPattern": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.SimplifyThisOrMe": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.SimplifyTypeNames": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.Snippets": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.SolutionCrawler": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.SpellCheck": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.SplitOrMergeIfStatements": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.SplitStringLiteral": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.StringIndentation": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.Structure": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.Symbols": [
+      "Microsoft.CodeAnalysis.CSharp"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.Symbols.Metadata.PE": [
+      "Microsoft.CodeAnalysis.CSharp"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.Symbols.PublicModel": [
+      "Microsoft.CodeAnalysis.CSharp"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.Symbols.Retargeting": [
+      "Microsoft.CodeAnalysis.CSharp"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.SyncNamespaces": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.Syntax": [
+      "Microsoft.CodeAnalysis.CSharp",
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.Syntax.InternalSyntax": [
+      "Microsoft.CodeAnalysis.CSharp"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.TaskList": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.Testing": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.TopLevelStatements": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.TypeStyle": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.UnsealClass": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.UpdateProjectToAllowUnsafe": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.UpgradeProject": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.UseAutoProperty": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.UseCoalesceExpression": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.UseCollectionExpression": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.UseCollectionInitializer": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.UseCompoundAssignment": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.UseConditionalExpression": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.UseDeconstruction": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.UseDefaultLiteral": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.UseExplicitTypeForConst": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.UseExpressionBody": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.UseExpressionBodyForLambda": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.UseImplicitObjectCreation": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.UseIndexOrRangeOperator": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.UseInferredMemberName": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.UseInterpolatedVerbatimString": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.UseIsNullCheck": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.UseLocalFunction": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.UseNamedArguments": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.UseNameofInAttribute": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.UseNullPropagation": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.UseObjectInitializer": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.UsePatternCombinators": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.UsePatternMatching": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.UsePrimaryConstructor": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.UseSimpleUsingStatement": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.UseThrowExpression": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.UseTupleSwap": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.UseUtf8StringLiteral": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.Utilities": [
+      "Microsoft.CodeAnalysis.CSharp.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.ValidateFormatString": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.Wrapping": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.Wrapping.BinaryExpression": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.Wrapping.ChainedExpression": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CSharp.Wrapping.SeparatedSyntaxList": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.CaseCorrection": [
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.ChangeNamespace": [
+      "Microsoft.CodeAnalysis.Features",
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.ChangeSignature": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.Classification": [
+      "Microsoft.CodeAnalysis.Features",
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.Classification.Classifiers": [
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.CodeActions": [
+      "Microsoft.CodeAnalysis.CSharp.Workspaces",
+      "Microsoft.CodeAnalysis.Features",
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.CodeActions.WorkspaceServices": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.CodeCleanup": [
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.CodeCleanup.Providers": [
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.CodeFixes": [
+      "Microsoft.CodeAnalysis.Features",
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.CodeFixes.AddExplicitCast": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.CodeFixes.Configuration": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.CodeFixes.Configuration.ConfigureCodeStyle": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.CodeFixes.Configuration.ConfigureSeverity": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.CodeFixes.FullyQualify": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.CodeFixes.GenerateMember": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.CodeFixes.Iterator": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.CodeFixes.MatchFolderAndNamespace": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.CodeFixes.NamingStyles": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.CodeFixes.Suppression": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.CodeFixesAndRefactorings": [
+      "Microsoft.CodeAnalysis.Features",
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.CodeGen": [
+      "Microsoft.CodeAnalysis"
+    ],
+    "Microsoft.CodeAnalysis.CodeGeneration": [
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.CodeLens": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.CodeMetrics": [
+      "Microsoft.CodeAnalysis.AnalyzerUtilities"
+    ],
+    "Microsoft.CodeAnalysis.CodeQuality": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.CodeRefactorings": [
+      "Microsoft.CodeAnalysis.Features",
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.CodeRefactorings.AddAwait": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.CodeRefactorings.ExtractMethod": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.CodeRefactorings.MoveType": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.CodeRefactorings.PullMemberUp": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.CodeRefactorings.PullMemberUp.Dialog": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.CodeRefactorings.SyncNamespace": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.CodeStyle": [
+      "Microsoft.CodeAnalysis.CSharp.Features",
+      "Microsoft.CodeAnalysis.CSharp.Workspaces",
+      "Microsoft.CodeAnalysis.Features",
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.Collections": [
+      "Microsoft.CodeAnalysis",
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.Collections.Internal": [
+      "Microsoft.CodeAnalysis",
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.CommentSelection": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.Common": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.Completion": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.Completion.Log": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.Completion.Providers": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.Completion.Providers.Snippets": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.ConflictMarkerResolution": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.Contracts.Client": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.Contracts.EditAndContinue": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.ConvertAnonymousType": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.ConvertAutoPropertyToFullProperty": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.ConvertCast": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.ConvertForEachToFor": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.ConvertForToForEach": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.ConvertIfToSwitch": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.ConvertLinq": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.ConvertLinq.ConvertForEachToLinqQuery": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.ConvertNumericLiteral": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.ConvertToAsync": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.ConvertToInterpolatedString": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.ConvertTupleToStruct": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.ConvertTypeOfToNameOf": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.Debugging": [
+      "Microsoft.CodeAnalysis",
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.DecompiledSource": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.DesignerAttribute": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.Diagnostics": [
+      "Microsoft.CodeAnalysis",
+      "Microsoft.CodeAnalysis.CSharp.Features",
+      "Microsoft.CodeAnalysis.Features",
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.Diagnostics.AddImport": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.Diagnostics.Analyzers.NamingStyles": [
+      "Microsoft.CodeAnalysis.Features",
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.Diagnostics.CSharp": [
+      "Microsoft.CodeAnalysis.CSharp"
+    ],
+    "Microsoft.CodeAnalysis.Diagnostics.Log": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.Diagnostics.Telemetry": [
+      "Microsoft.CodeAnalysis"
+    ],
+    "Microsoft.CodeAnalysis.Differencing": [
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.DocumentHighlighting": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.DocumentationComments": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.EditAndContinue": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.Editing": [
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.Editor.CSharp.CommentSelection": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.Editor.CSharp.LanguageServices": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.Editor.Implementation.Suggestions": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.EditorConfig": [
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.EditorConfig.Parsing": [
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.EditorConfig.Parsing.NamingStyles": [
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.Elfie": [
+      "Microsoft.CodeAnalysis.Elfie"
+    ],
+    "Microsoft.CodeAnalysis.Elfie.Diagnostics": [
+      "Microsoft.CodeAnalysis.Elfie"
+    ],
+    "Microsoft.CodeAnalysis.Elfie.Extensions": [
+      "Microsoft.CodeAnalysis.Elfie"
+    ],
+    "Microsoft.CodeAnalysis.Elfie.Model": [
+      "Microsoft.CodeAnalysis.Elfie"
+    ],
+    "Microsoft.CodeAnalysis.Elfie.Model.Index": [
+      "Microsoft.CodeAnalysis.Elfie"
+    ],
+    "Microsoft.CodeAnalysis.Elfie.Model.Map": [
+      "Microsoft.CodeAnalysis.Elfie"
+    ],
+    "Microsoft.CodeAnalysis.Elfie.Model.Strings": [
+      "Microsoft.CodeAnalysis.Elfie"
+    ],
+    "Microsoft.CodeAnalysis.Elfie.Model.Structures": [
+      "Microsoft.CodeAnalysis.Elfie"
+    ],
+    "Microsoft.CodeAnalysis.Elfie.Model.Tree": [
+      "Microsoft.CodeAnalysis.Elfie"
+    ],
+    "Microsoft.CodeAnalysis.Elfie.PDB": [
+      "Microsoft.CodeAnalysis.Elfie"
+    ],
+    "Microsoft.CodeAnalysis.Elfie.Serialization": [
+      "Microsoft.CodeAnalysis.Elfie"
+    ],
+    "Microsoft.CodeAnalysis.EmbeddedLanguages": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.EmbeddedLanguages.Common": [
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.EmbeddedLanguages.RegularExpressions": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.EmbeddedLanguages.StackFrame": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.EmbeddedLanguages.VirtualChars": [
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.Emit": [
+      "Microsoft.CodeAnalysis",
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.Emit.EditAndContinue": [
+      "Microsoft.CodeAnalysis"
+    ],
+    "Microsoft.CodeAnalysis.Emit.NoPia": [
+      "Microsoft.CodeAnalysis"
+    ],
+    "Microsoft.CodeAnalysis.EncapsulateField": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.ErrorLogger": [
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.ErrorReporting": [
+      "Microsoft.CodeAnalysis",
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.Extensions": [
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.ExternalAccess.Pythia": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.ExternalAccess.Pythia.Api": [
+      "Microsoft.CodeAnalysis.CSharp.Features",
+      "Microsoft.CodeAnalysis.CSharp.Workspaces",
+      "Microsoft.CodeAnalysis.Features",
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.ExternalAccess.Razor.Api": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.ExternalAccess.UnitTesting": [
+      "Microsoft.CodeAnalysis.Features",
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.ExternalAccess.UnitTesting.Api": [
+      "Microsoft.CodeAnalysis.Features",
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.ExternalAccess.UnitTesting.LegacySolutionEvents": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.ExternalAccess.UnitTesting.SolutionCrawler": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.ExternalAccess.VSTypeScript": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.ExternalAccess.VSTypeScript.Api": [
+      "Microsoft.CodeAnalysis.Features",
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.ExternalAccess.Watch.Api": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.ExtractClass": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.ExtractInterface": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.ExtractMethod": [
+      "Microsoft.CodeAnalysis.Features",
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.Features.EmbeddedLanguages": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.Features.EmbeddedLanguages.DateAndTime": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.Features.EmbeddedLanguages.DateAndTime.LanguageServices": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.Features.EmbeddedLanguages.Json": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.Features.EmbeddedLanguages.Json.LanguageServices": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.Features.EmbeddedLanguages.RegularExpressions.LanguageServices": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.Features.Intents": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.Features.RQName": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.Features.RQName.Nodes": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.Features.RQName.SimpleTree": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.Features.Testing": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.Features.Workspaces": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.FileHeaders": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.FindSymbols": [
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.FindSymbols.FindReferences": [
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.FindSymbols.Finders": [
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.FindSymbols.SymbolTree": [
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.FindUsages": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.FlowAnalysis": [
+      "Microsoft.CodeAnalysis",
+      "Microsoft.CodeAnalysis.AnalyzerUtilities",
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.FlowAnalysis.DataFlow": [
+      "Microsoft.CodeAnalysis.AnalyzerUtilities"
+    ],
+    "Microsoft.CodeAnalysis.FlowAnalysis.DataFlow.CopyAnalysis": [
+      "Microsoft.CodeAnalysis.AnalyzerUtilities"
+    ],
+    "Microsoft.CodeAnalysis.FlowAnalysis.DataFlow.DisposeAnalysis": [
+      "Microsoft.CodeAnalysis.AnalyzerUtilities"
+    ],
+    "Microsoft.CodeAnalysis.FlowAnalysis.DataFlow.PointsToAnalysis": [
+      "Microsoft.CodeAnalysis.AnalyzerUtilities"
+    ],
+    "Microsoft.CodeAnalysis.FlowAnalysis.DataFlow.ValueContentAnalysis": [
+      "Microsoft.CodeAnalysis.AnalyzerUtilities"
+    ],
+    "Microsoft.CodeAnalysis.FlowAnalysis.SymbolUsageAnalysis": [
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.ForEachCast": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.Formatting": [
+      "Microsoft.CodeAnalysis.CSharp.Features",
+      "Microsoft.CodeAnalysis.Features",
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.Formatting.Rules": [
+      "Microsoft.CodeAnalysis.Features",
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.GenerateComparisonOperators": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.GenerateConstructorFromMembers": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.GenerateDefaultConstructors": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.GenerateEqualsAndGetHashCodeFromMembers": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.GenerateFromMembers": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.GenerateMember": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.GenerateMember.GenerateConstructor": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.GenerateMember.GenerateEnumMember": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.GenerateMember.GenerateParameterizedMember": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.GenerateMember.GenerateVariable": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.GenerateOverrides": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.GenerateType": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.GeneratedCodeRecognition": [
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.GoToBase": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.GoToDefinition": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.Highlighting": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.Host": [
+      "Microsoft.CodeAnalysis.Features",
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.Host.Mef": [
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.ImplementAbstractClass": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.ImplementInterface": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.ImplementType": [
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.Indentation": [
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.InheritanceMargin": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.InitializeParameter": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.InlineHints": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.InlineMethod": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.InlineTemporary": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.Internal": [
+      "Microsoft.CodeAnalysis",
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.Internal.Log": [
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.InternalUtilities": [
+      "Microsoft.CodeAnalysis"
+    ],
+    "Microsoft.CodeAnalysis.Interop": [
+      "Microsoft.CodeAnalysis"
+    ],
+    "Microsoft.CodeAnalysis.IntroduceParameter": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.IntroduceUsingStatement": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.IntroduceVariable": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.InvertConditional": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.InvertIf": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.InvertLogical": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.LanguageServer": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.LanguageServerIndexFormat": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.LanguageService": [
+      "Microsoft.CodeAnalysis.Features",
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.LanguageService.TypeInferenceService": [
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.LegacySolutionEvents": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.LineSeparators": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.Logging": [
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.MakeFieldReadonly": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.MakeMemberStatic": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.MakeMethodAsynchronous": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.MakeMethodSynchronous": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.MakeTypeAbstract": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.MakeTypePartial": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.MapCode": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.MetadataAsSource": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.MoveDeclarationNearReference": [
+      "Microsoft.CodeAnalysis.Features",
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.MoveStaticMembers": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.MoveToNamespace": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.NameTupleElement": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.NamingStyles": [
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.NavigateTo": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.Navigation": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.NavigationBar": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.NewLines.ConsecutiveStatementPlacement": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.NewLines.MultipleBlankLines": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.Notification": [
+      "Microsoft.CodeAnalysis.Features",
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.Operations": [
+      "Microsoft.CodeAnalysis",
+      "Microsoft.CodeAnalysis.CSharp"
+    ],
+    "Microsoft.CodeAnalysis.Options": [
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.Options.EditorConfig": [
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.OrderModifiers": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.OrganizeImports": [
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.Organizing": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.Organizing.Organizers": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.Packaging": [
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.PasteTracking": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.PatternMatching": [
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.PdbSourceDocument": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.PickMembers": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.PooledObjects": [
+      "Microsoft.CodeAnalysis",
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.PopulateSwitch": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.Precedence": [
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.PreferFrameworkType": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.Progress": [
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.ProjectManagement": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.ProjectSystem": [
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.PullMemberUp": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.QualifyMemberAccess": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.QuickInfo": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.ReassignedVariable": [
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.Recommendations": [
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.Remote": [
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.RemoveAsyncModifier": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.RemoveRedundantEquality": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.RemoveUnnecessaryCast": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.RemoveUnnecessaryImports": [
+      "Microsoft.CodeAnalysis.CSharp.Workspaces",
+      "Microsoft.CodeAnalysis.Features",
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.RemoveUnnecessaryNullableDirective": [
+      "Microsoft.CodeAnalysis.CSharp.Features"
+    ],
+    "Microsoft.CodeAnalysis.RemoveUnnecessaryParentheses": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.RemoveUnnecessarySuppressions": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.RemoveUnusedMembers": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.RemoveUnusedParametersAndValues": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.RemoveUnusedVariable": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.Rename": [
+      "Microsoft.CodeAnalysis.Features",
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.Rename.ConflictEngine": [
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.ReplaceConditionalWithStatements": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.ReplaceDiscardDeclarationsWithAssignments": [
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.ReplaceDocCommentTextWithTag": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.ReplaceMethodWithProperty": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.ReplacePropertyWithMethods": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.RulesetToEditorconfig": [
+      "Microsoft.CodeAnalysis.AnalyzerUtilities"
+    ],
+    "Microsoft.CodeAnalysis.RuntimeMembers": [
+      "Microsoft.CodeAnalysis"
+    ],
+    "Microsoft.CodeAnalysis.SQLite.Interop": [
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.SQLite.v2": [
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.SQLite.v2.Interop": [
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.Scripting": [
+      "Microsoft.CodeAnalysis.Scripting"
+    ],
+    "Microsoft.CodeAnalysis.Scripting.Hosting": [
+      "Microsoft.CodeAnalysis.Scripting"
+    ],
+    "Microsoft.CodeAnalysis.SemanticModelReuse": [
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.Serialization": [
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.Shared": [
+      "Microsoft.CodeAnalysis.Features",
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.Shared.CodeStyle": [
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.Shared.Collections": [
+      "Microsoft.CodeAnalysis",
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.Shared.Extensions": [
+      "Microsoft.CodeAnalysis.Features",
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.Shared.Extensions.ContextQuery": [
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.Shared.Helpers.RemoveUnnecessaryImports": [
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.Shared.Naming": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.Shared.TestHooks": [
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.Shared.Utilities": [
+      "Microsoft.CodeAnalysis.Features",
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.SignatureHelp": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.Simplification": [
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.Simplification.Simplifiers": [
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.SimplifyBooleanExpression": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.SimplifyInterpolation": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.SimplifyLinqExpression": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.SimplifyThisOrMe": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.SimplifyTypeNames": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.Snippets": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.Snippets.SnippetProviders": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.SolutionCrawler": [
+      "Microsoft.CodeAnalysis.Features",
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.SourceGeneration": [
+      "Microsoft.CodeAnalysis",
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.SourceGeneratorTelemetry": [
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.SpellCheck": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.SplitOrMergeIfStatements": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.StackTraceExplorer": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.Storage": [
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.Storage.CloudCache": [
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.StringIndentation": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.Structure": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.SymbolDisplay": [
+      "Microsoft.CodeAnalysis"
+    ],
+    "Microsoft.CodeAnalysis.SymbolMapping": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.SymbolSearch": [
+      "Microsoft.CodeAnalysis.Features",
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.Symbols": [
+      "Microsoft.CodeAnalysis"
+    ],
+    "Microsoft.CodeAnalysis.SyncNamespaces": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.Syntax": [
+      "Microsoft.CodeAnalysis"
+    ],
+    "Microsoft.CodeAnalysis.Syntax.InternalSyntax": [
+      "Microsoft.CodeAnalysis"
+    ],
+    "Microsoft.CodeAnalysis.Tagging": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.Tags": [
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.TaskList": [
+      "Microsoft.CodeAnalysis.Features",
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.Telemetry": [
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.Text": [
+      "Microsoft.CodeAnalysis",
+      "Microsoft.CodeAnalysis.Features",
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.UnitTests": [
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.UnsealClass": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.UnusedReferences": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.UnusedReferences.ProjectAssets": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.UpdateLegacySuppressions": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.UpgradeProject": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.UseAutoProperty": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.UseCoalesceExpression": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.UseCollectionExpression": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.UseCollectionInitializer": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.UseCompoundAssignment": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.UseConditionalExpression": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.UseExplicitTupleName": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.UseInferredMemberName": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.UseIsNullCheck": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.UseNamedArguments": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.UseNullPropagation": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.UseObjectInitializer": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.UseSystemHashCode": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.UseThrowExpression": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.Utilities": [
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.ValidateFormatString": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.ValueTracking": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.VisualBasic.CodeGeneration": [
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.VisualBasic.CodeStyle": [
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.VisualBasic.Formatting": [
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.VisualBasic.Simplification": [
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.Workspaces.Diagnostics": [
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.Workspaces.ProjectSystem": [
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Microsoft.CodeAnalysis.Wrapping": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.Wrapping.BinaryExpression": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.Wrapping.ChainedExpression": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.CodeAnalysis.Wrapping.SeparatedSyntaxList": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.DiaSymReader": [
+      "Microsoft.CodeAnalysis",
+      "Microsoft.DiaSymReader"
+    ],
+    "Microsoft.Extensions.Caching.Distributed": [
+      "Microsoft.Extensions.Caching.Abstractions",
+      "Microsoft.Extensions.Caching.Memory"
+    ],
+    "Microsoft.Extensions.Caching.Memory": [
+      "Microsoft.Extensions.Caching.Abstractions",
+      "Microsoft.Extensions.Caching.Memory"
+    ],
+    "Microsoft.Extensions.Configuration": [
+      "Microsoft.Extensions.Configuration",
+      "Microsoft.Extensions.Configuration.Abstractions"
+    ],
+    "Microsoft.Extensions.Configuration.Json": [
+      "Microsoft.Extensions.Configuration.Json"
+    ],
+    "Microsoft.Extensions.DependencyInjection": [
+      "Microsoft.Extensions.Caching.Memory",
+      "Microsoft.Extensions.DependencyInjection",
+      "Microsoft.Extensions.DependencyInjection.Abstractions",
+      "Microsoft.Extensions.Logging",
+      "Microsoft.Extensions.Options"
+    ],
+    "Microsoft.Extensions.DependencyInjection.Extensions": [
+      "Microsoft.Extensions.DependencyInjection.Abstractions"
+    ],
+    "Microsoft.Extensions.DependencyInjection.ServiceLookup": [
+      "Microsoft.Extensions.DependencyInjection"
+    ],
+    "Microsoft.Extensions.FileProviders": [
+      "Microsoft.Extensions.Configuration",
+      "Microsoft.Extensions.FileProviders.Abstractions",
+      "Microsoft.Extensions.FileProviders.Physical"
+    ],
+    "Microsoft.Extensions.FileSystemGlobbing": [
+      "Microsoft.Extensions.FileSystemGlobbing"
+    ],
+    "Microsoft.Extensions.FileSystemGlobbing.Abstractions": [
+      "Microsoft.Extensions.FileSystemGlobbing"
+    ],
+    "Microsoft.Extensions.FileSystemGlobbing.Internal": [
+      "Microsoft.Extensions.FileSystemGlobbing"
+    ],
+    "Microsoft.Extensions.FileSystemGlobbing.Internal.PathSegments": [
+      "Microsoft.Extensions.FileSystemGlobbing"
+    ],
+    "Microsoft.Extensions.FileSystemGlobbing.Internal.PatternContexts": [
+      "Microsoft.Extensions.FileSystemGlobbing"
+    ],
+    "Microsoft.Extensions.FileSystemGlobbing.Internal.Patterns": [
+      "Microsoft.Extensions.FileSystemGlobbing"
+    ],
+    "Microsoft.Extensions.FileSystemGlobbing.Util": [
+      "Microsoft.Extensions.FileSystemGlobbing"
+    ],
+    "Microsoft.Extensions.Internal": [
+      "Microsoft.Extensions.Caching.Abstractions",
+      "Microsoft.Extensions.Configuration",
+      "Microsoft.Extensions.DependencyInjection",
+      "Microsoft.Extensions.Logging.Abstractions"
+    ],
+    "Microsoft.Extensions.Logging": [
+      "Microsoft.Extensions.Logging",
+      "Microsoft.Extensions.Logging.Abstractions"
+    ],
+    "Microsoft.Extensions.Options": [
+      "Microsoft.Extensions.Options"
+    ],
+    "Microsoft.Extensions.Primitives": [
+      "Microsoft.Extensions.Primitives"
+    ],
+    "Microsoft.Internal": [
+      "System.ComponentModel.Composition"
+    ],
+    "Microsoft.Internal.Collections": [
+      "System.ComponentModel.Composition"
+    ],
+    "Microsoft.JSInterop": [
+      "Microsoft.JSInterop"
+    ],
+    "Microsoft.JSInterop.Implementation": [
+      "Microsoft.JSInterop"
+    ],
+    "Microsoft.JSInterop.Infrastructure": [
+      "Microsoft.JSInterop"
+    ],
+    "Microsoft.JSInterop.WebAssembly": [
+      "Microsoft.JSInterop.WebAssembly"
+    ],
+    "Microsoft.SourceLink.Tools": [
+      "Microsoft.CodeAnalysis.Features"
+    ],
+    "Microsoft.Win32.SafeHandles": [
+      "System.IO.MemoryMappedFiles",
+      "System.Private.CoreLib",
+      "System.Text.Encoding.CodePages"
+    ],
+    "Mono": [
+      "System.Private.CoreLib"
+    ],
+    "Mono.HotReload": [
+      "System.Private.CoreLib"
+    ],
+    "Newtonsoft.Json": [
+      "Newtonsoft.Json"
+    ],
+    "Newtonsoft.Json.Bson": [
+      "Newtonsoft.Json"
+    ],
+    "Newtonsoft.Json.Converters": [
+      "Newtonsoft.Json"
+    ],
+    "Newtonsoft.Json.Linq": [
+      "Newtonsoft.Json"
+    ],
+    "Newtonsoft.Json.Linq.JsonPath": [
+      "Newtonsoft.Json"
+    ],
+    "Newtonsoft.Json.Schema": [
+      "Newtonsoft.Json"
+    ],
+    "Newtonsoft.Json.Serialization": [
+      "Newtonsoft.Json"
+    ],
+    "Newtonsoft.Json.Utilities": [
+      "Newtonsoft.Json"
+    ],
+    "NuGet.Shared": [
+      "NuGet.Versioning"
+    ],
+    "NuGet.Versioning": [
+      "NuGet.Versioning"
+    ],
+    "OmniSharp": [
+      "OmniSharp.Abstractions",
+      "OmniSharp.Roslyn",
+      "OmniSharp.Roslyn.CSharp",
+      "OmniSharp.Shared"
+    ],
+    "OmniSharp.Abstractions.Models.V1.FixAll": [
+      "OmniSharp.Abstractions"
+    ],
+    "OmniSharp.Abstractions.Models.V1.ReAnalyze": [
+      "OmniSharp.Abstractions"
+    ],
+    "OmniSharp.Abstractions.Services": [
+      "OmniSharp.Roslyn"
+    ],
+    "OmniSharp.Eventing": [
+      "OmniSharp.Abstractions"
+    ],
+    "OmniSharp.Extensions": [
+      "OmniSharp.Roslyn"
+    ],
+    "OmniSharp.FileSystem": [
+      "OmniSharp.Shared"
+    ],
+    "OmniSharp.FileWatching": [
+      "OmniSharp.Abstractions"
+    ],
+    "OmniSharp.Helpers": [
+      "OmniSharp.Roslyn",
+      "OmniSharp.Roslyn.CSharp"
+    ],
+    "OmniSharp.Logging": [
+      "OmniSharp.Shared"
+    ],
+    "OmniSharp.MSBuild.Discovery": [
+      "OmniSharp.Abstractions"
+    ],
+    "OmniSharp.Mef": [
+      "OmniSharp.Abstractions"
+    ],
+    "OmniSharp.Models": [
+      "OmniSharp.Abstractions"
+    ],
+    "OmniSharp.Models.AutoComplete": [
+      "OmniSharp.Abstractions"
+    ],
+    "OmniSharp.Models.ChangeBuffer": [
+      "OmniSharp.Abstractions"
+    ],
+    "OmniSharp.Models.CodeAction": [
+      "OmniSharp.Abstractions"
+    ],
+    "OmniSharp.Models.CodeCheck": [
+      "OmniSharp.Abstractions"
+    ],
+    "OmniSharp.Models.CodeFormat": [
+      "OmniSharp.Abstractions"
+    ],
+    "OmniSharp.Models.Diagnostics": [
+      "OmniSharp.Abstractions"
+    ],
+    "OmniSharp.Models.Events": [
+      "OmniSharp.Abstractions"
+    ],
+    "OmniSharp.Models.FileClose": [
+      "OmniSharp.Abstractions"
+    ],
+    "OmniSharp.Models.FileOpen": [
+      "OmniSharp.Abstractions"
+    ],
+    "OmniSharp.Models.FilesChanged": [
+      "OmniSharp.Abstractions"
+    ],
+    "OmniSharp.Models.FindImplementations": [
+      "OmniSharp.Abstractions"
+    ],
+    "OmniSharp.Models.FindSymbols": [
+      "OmniSharp.Abstractions"
+    ],
+    "OmniSharp.Models.FindUsages": [
+      "OmniSharp.Abstractions"
+    ],
+    "OmniSharp.Models.FixUsings": [
+      "OmniSharp.Abstractions"
+    ],
+    "OmniSharp.Models.Format": [
+      "OmniSharp.Abstractions"
+    ],
+    "OmniSharp.Models.GotoDefinition": [
+      "OmniSharp.Abstractions"
+    ],
+    "OmniSharp.Models.GotoFile": [
+      "OmniSharp.Abstractions"
+    ],
+    "OmniSharp.Models.GotoRegion": [
+      "OmniSharp.Abstractions"
+    ],
+    "OmniSharp.Models.Highlight": [
+      "OmniSharp.Abstractions"
+    ],
+    "OmniSharp.Models.MembersFlat": [
+      "OmniSharp.Abstractions"
+    ],
+    "OmniSharp.Models.MembersTree": [
+      "OmniSharp.Abstractions"
+    ],
+    "OmniSharp.Models.Metadata": [
+      "OmniSharp.Abstractions"
+    ],
+    "OmniSharp.Models.Navigate": [
+      "OmniSharp.Abstractions"
+    ],
+    "OmniSharp.Models.PackageSearch": [
+      "OmniSharp.Abstractions"
+    ],
+    "OmniSharp.Models.PackageSource": [
+      "OmniSharp.Abstractions"
+    ],
+    "OmniSharp.Models.PackageVersion": [
+      "OmniSharp.Abstractions"
+    ],
+    "OmniSharp.Models.ProjectInformation": [
+      "OmniSharp.Abstractions"
+    ],
+    "OmniSharp.Models.Rename": [
+      "OmniSharp.Abstractions"
+    ],
+    "OmniSharp.Models.SemanticHighlight": [
+      "OmniSharp.Abstractions"
+    ],
+    "OmniSharp.Models.SignatureHelp": [
+      "OmniSharp.Abstractions"
+    ],
+    "OmniSharp.Models.TestCommand": [
+      "OmniSharp.Abstractions"
+    ],
+    "OmniSharp.Models.TypeLookup": [
+      "OmniSharp.Abstractions"
+    ],
+    "OmniSharp.Models.UpdateBuffer": [
+      "OmniSharp.Abstractions"
+    ],
+    "OmniSharp.Models.V2": [
+      "OmniSharp.Abstractions"
+    ],
+    "OmniSharp.Models.V2.CodeActions": [
+      "OmniSharp.Abstractions"
+    ],
+    "OmniSharp.Models.V2.CodeStructure": [
+      "OmniSharp.Abstractions"
+    ],
+    "OmniSharp.Models.WorkspaceInformation": [
+      "OmniSharp.Abstractions"
+    ],
+    "OmniSharp.Models.v1.Completion": [
+      "OmniSharp.Abstractions"
+    ],
+    "OmniSharp.Options": [
+      "OmniSharp.Shared"
+    ],
+    "OmniSharp.Plugins": [
+      "OmniSharp.Abstractions"
+    ],
+    "OmniSharp.Roslyn": [
+      "OmniSharp.Roslyn"
+    ],
+    "OmniSharp.Roslyn.CSharp.Helpers": [
+      "OmniSharp.Roslyn.CSharp"
+    ],
+    "OmniSharp.Roslyn.CSharp.Services": [
+      "OmniSharp.Roslyn.CSharp"
+    ],
+    "OmniSharp.Roslyn.CSharp.Services.Buffer": [
+      "OmniSharp.Roslyn.CSharp"
+    ],
+    "OmniSharp.Roslyn.CSharp.Services.CodeActions": [
+      "OmniSharp.Roslyn.CSharp"
+    ],
+    "OmniSharp.Roslyn.CSharp.Services.Completion": [
+      "OmniSharp.Roslyn.CSharp"
+    ],
+    "OmniSharp.Roslyn.CSharp.Services.Decompilation": [
+      "OmniSharp.Roslyn.CSharp"
+    ],
+    "OmniSharp.Roslyn.CSharp.Services.Diagnostics": [
+      "OmniSharp.Roslyn.CSharp"
+    ],
+    "OmniSharp.Roslyn.CSharp.Services.Documentation": [
+      "OmniSharp.Roslyn.CSharp"
+    ],
+    "OmniSharp.Roslyn.CSharp.Services.Files": [
+      "OmniSharp.Roslyn.CSharp"
+    ],
+    "OmniSharp.Roslyn.CSharp.Services.Formatting": [
+      "OmniSharp.Roslyn.CSharp"
+    ],
+    "OmniSharp.Roslyn.CSharp.Services.Highlighting": [
+      "OmniSharp.Roslyn.CSharp"
+    ],
+    "OmniSharp.Roslyn.CSharp.Services.Intellisense": [
+      "OmniSharp.Roslyn.CSharp"
+    ],
+    "OmniSharp.Roslyn.CSharp.Services.Navigation": [
+      "OmniSharp.Roslyn.CSharp"
+    ],
+    "OmniSharp.Roslyn.CSharp.Services.Refactoring": [
+      "OmniSharp.Roslyn.CSharp"
+    ],
+    "OmniSharp.Roslyn.CSharp.Services.Refactoring.V2": [
+      "OmniSharp.Roslyn.CSharp"
+    ],
+    "OmniSharp.Roslyn.CSharp.Services.SemanticHighlight": [
+      "OmniSharp.Roslyn.CSharp"
+    ],
+    "OmniSharp.Roslyn.CSharp.Services.Signatures": [
+      "OmniSharp.Roslyn.CSharp"
+    ],
+    "OmniSharp.Roslyn.CSharp.Services.Structure": [
+      "OmniSharp.Roslyn.CSharp"
+    ],
+    "OmniSharp.Roslyn.CSharp.Services.TestCommands": [
+      "OmniSharp.Roslyn.CSharp"
+    ],
+    "OmniSharp.Roslyn.CSharp.Services.Types": [
+      "OmniSharp.Roslyn.CSharp"
+    ],
+    "OmniSharp.Roslyn.CSharp.Workers.Diagnostics": [
+      "OmniSharp.Roslyn.CSharp"
+    ],
+    "OmniSharp.Roslyn.CSharp.Workers.Formatting": [
+      "OmniSharp.Roslyn.CSharp"
+    ],
+    "OmniSharp.Roslyn.EditorConfig": [
+      "OmniSharp.Roslyn"
+    ],
+    "OmniSharp.Roslyn.Extensions": [
+      "OmniSharp.Roslyn"
+    ],
+    "OmniSharp.Roslyn.Models": [
+      "OmniSharp.Roslyn"
+    ],
+    "OmniSharp.Roslyn.Options": [
+      "OmniSharp.Roslyn"
+    ],
+    "OmniSharp.Roslyn.Utilities": [
+      "OmniSharp.Roslyn"
+    ],
+    "OmniSharp.Services": [
+      "OmniSharp.Abstractions",
+      "OmniSharp.Roslyn"
+    ],
+    "OmniSharp.Utilities": [
+      "OmniSharp.Roslyn",
+      "OmniSharp.Shared"
+    ],
+    "Roslyn.Collections.Immutable": [
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Roslyn.Utilities": [
+      "Microsoft.CodeAnalysis",
+      "Microsoft.CodeAnalysis.Scripting",
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "Serialize.Linq": [
+      "Serialize.Linq"
+    ],
+    "Serialize.Linq.Exceptions": [
+      "Serialize.Linq"
+    ],
+    "Serialize.Linq.Extensions": [
+      "Serialize.Linq"
+    ],
+    "Serialize.Linq.Factories": [
+      "Serialize.Linq"
+    ],
+    "Serialize.Linq.Interfaces": [
+      "Serialize.Linq"
+    ],
+    "Serialize.Linq.Internals": [
+      "Serialize.Linq"
+    ],
+    "Serialize.Linq.Nodes": [
+      "Serialize.Linq"
+    ],
+    "Serialize.Linq.Serializers": [
+      "Serialize.Linq"
+    ],
+    "System": [
+      "Microsoft.CSharp",
+      "Microsoft.Extensions.Configuration",
+      "Microsoft.Extensions.Configuration.Json",
+      "Microsoft.Extensions.DependencyInjection",
+      "Microsoft.Extensions.DependencyInjection.Abstractions",
+      "Microsoft.Extensions.FileSystemGlobbing",
+      "Microsoft.Extensions.Logging",
+      "Microsoft.Extensions.Logging.Abstractions",
+      "Microsoft.Extensions.Options",
+      "System.Collections",
+      "System.Collections.Concurrent",
+      "System.Collections.Immutable",
+      "System.Collections.NonGeneric",
+      "System.Collections.Specialized",
+      "System.ComponentModel",
+      "System.ComponentModel.Composition",
+      "System.ComponentModel.TypeConverter",
+      "System.Composition.Convention",
+      "System.Composition.Hosting",
+      "System.Composition.Runtime",
+      "System.Composition.TypedParts",
+      "System.Configuration.ConfigurationManager",
+      "System.Console",
+      "System.Data.Common",
+      "System.Diagnostics.DiagnosticSource",
+      "System.Diagnostics.TraceSource",
+      "System.Drawing.Primitives",
+      "System.IO.MemoryMappedFiles",
+      "System.Linq.Expressions",
+      "System.Linq.Queryable",
+      "System.Memory",
+      "System.Net.Http",
+      "System.ObjectModel",
+      "System.Private.CoreLib",
+      "System.Private.DataContractSerialization",
+      "System.Private.Uri",
+      "System.Private.Xml",
+      "System.Private.Xml.Linq",
+      "System.Reactive",
+      "System.Reflection.DispatchProxy",
+      "System.Reflection.Metadata",
+      "System.Runtime.InteropServices.JavaScript",
+      "System.Runtime.Numerics",
+      "System.Security.Cryptography",
+      "System.Security.Cryptography.ProtectedData",
+      "System.Security.Permissions",
+      "System.Text.Encoding.CodePages",
+      "System.Text.Encodings.Web",
+      "System.Text.Json",
+      "System.Text.RegularExpressions",
+      "System.Threading",
+      "System.Threading.Channels"
+    ],
+    "System.Buffers": [
+      "System.Memory",
+      "System.Private.CoreLib"
+    ],
+    "System.Buffers.Binary": [
+      "System.Private.CoreLib"
+    ],
+    "System.Buffers.Text": [
+      "System.Private.CoreLib"
+    ],
+    "System.CodeDom.Compiler": [
+      "System.Private.CoreLib"
+    ],
+    "System.Collections": [
+      "System.Collections",
+      "System.Collections.Concurrent",
+      "System.Collections.NonGeneric",
+      "System.ObjectModel",
+      "System.Private.CoreLib",
+      "System.Text.RegularExpressions"
+    ],
+    "System.Collections.Concurrent": [
+      "System.Collections.Concurrent",
+      "System.Private.CoreLib"
+    ],
+    "System.Collections.Generic": [
+      "System.Collections",
+      "System.Linq",
+      "System.Linq.Expressions",
+      "System.Private.CoreLib",
+      "System.Private.Uri",
+      "System.Text.RegularExpressions",
+      "System.Threading.Channels"
+    ],
+    "System.Collections.Immutable": [
+      "Microsoft.CodeAnalysis.AnalyzerUtilities",
+      "System.Collections.Immutable"
+    ],
+    "System.Collections.ObjectModel": [
+      "System.ObjectModel",
+      "System.Private.CoreLib"
+    ],
+    "System.Collections.Specialized": [
+      "System.Collections.Specialized",
+      "System.ObjectModel"
+    ],
+    "System.ComponentModel": [
+      "System.ComponentModel",
+      "System.ComponentModel.Composition",
+      "System.ComponentModel.Primitives",
+      "System.ComponentModel.TypeConverter",
+      "System.ObjectModel",
+      "System.Private.CoreLib"
+    ],
+    "System.ComponentModel.Composition": [
+      "System.ComponentModel.Composition"
+    ],
+    "System.ComponentModel.Composition.AttributedModel": [
+      "System.ComponentModel.Composition"
+    ],
+    "System.ComponentModel.Composition.Diagnostics": [
+      "System.ComponentModel.Composition"
+    ],
+    "System.ComponentModel.Composition.Hosting": [
+      "System.ComponentModel.Composition"
+    ],
+    "System.ComponentModel.Composition.Primitives": [
+      "System.ComponentModel.Composition"
+    ],
+    "System.ComponentModel.Composition.ReflectionModel": [
+      "System.ComponentModel.Composition"
+    ],
+    "System.ComponentModel.Design": [
+      "System.ComponentModel.TypeConverter"
+    ],
+    "System.ComponentModel.Design.Serialization": [
+      "System.ComponentModel.Primitives",
+      "System.ComponentModel.TypeConverter"
+    ],
+    "System.Composition": [
+      "System.Composition.AttributedModel",
+      "System.Composition.Runtime",
+      "System.Composition.TypedParts"
+    ],
+    "System.Composition.Convention": [
+      "System.Composition.AttributedModel",
+      "System.Composition.Convention",
+      "System.Composition.TypedParts"
+    ],
+    "System.Composition.Debugging": [
+      "System.Composition.TypedParts"
+    ],
+    "System.Composition.Diagnostics": [
+      "System.Composition.Convention"
+    ],
+    "System.Composition.Hosting": [
+      "System.Composition.Hosting",
+      "System.Composition.Runtime",
+      "System.Composition.TypedParts"
+    ],
+    "System.Composition.Hosting.Core": [
+      "System.Composition.Hosting",
+      "System.Composition.Runtime"
+    ],
+    "System.Composition.Hosting.Providers": [
+      "System.Composition.Hosting"
+    ],
+    "System.Composition.Hosting.Providers.CurrentScope": [
+      "System.Composition.Hosting"
+    ],
+    "System.Composition.Hosting.Providers.ExportFactory": [
+      "System.Composition.Hosting"
+    ],
+    "System.Composition.Hosting.Providers.ImportMany": [
+      "System.Composition.Hosting"
+    ],
+    "System.Composition.Hosting.Providers.Lazy": [
+      "System.Composition.Hosting"
+    ],
+    "System.Composition.Hosting.Providers.Metadata": [
+      "System.Composition.Hosting"
+    ],
+    "System.Composition.Hosting.Util": [
+      "System.Composition.Hosting"
+    ],
+    "System.Composition.Runtime.Util": [
+      "System.Composition.Runtime"
+    ],
+    "System.Composition.TypedParts": [
+      "System.Composition.TypedParts"
+    ],
+    "System.Composition.TypedParts.ActivationFeatures": [
+      "System.Composition.TypedParts"
+    ],
+    "System.Composition.TypedParts.Discovery": [
+      "System.Composition.TypedParts"
+    ],
+    "System.Composition.TypedParts.Util": [
+      "System.Composition.TypedParts"
+    ],
+    "System.Configuration": [
+      "System.Configuration.ConfigurationManager"
+    ],
+    "System.Configuration.Assemblies": [
+      "System.Private.CoreLib"
+    ],
+    "System.Configuration.Internal": [
+      "System.Configuration.ConfigurationManager"
+    ],
+    "System.Configuration.Provider": [
+      "System.Configuration.ConfigurationManager"
+    ],
+    "System.Data": [
+      "System.Data.Common"
+    ],
+    "System.Data.Common": [
+      "System.Data.Common",
+      "System.Security.Permissions"
+    ],
+    "System.Data.Odbc": [
+      "System.Security.Permissions"
+    ],
+    "System.Data.OleDb": [
+      "System.Security.Permissions"
+    ],
+    "System.Data.OracleClient": [
+      "System.Security.Permissions"
+    ],
+    "System.Data.SqlClient": [
+      "System.Security.Permissions"
+    ],
+    "System.Data.SqlTypes": [
+      "System.Data.Common"
+    ],
+    "System.Diagnostics": [
+      "System.Diagnostics.DiagnosticSource",
+      "System.Diagnostics.FileVersionInfo",
+      "System.Diagnostics.Process",
+      "System.Diagnostics.TraceSource",
+      "System.Private.CoreLib",
+      "System.Security.Permissions"
+    ],
+    "System.Diagnostics.CodeAnalysis": [
+      "Microsoft.CodeAnalysis.AnalyzerUtilities",
+      "System.Private.CoreLib"
+    ],
+    "System.Diagnostics.Contracts": [
+      "System.Private.CoreLib"
+    ],
+    "System.Diagnostics.Metrics": [
+      "System.Diagnostics.DiagnosticSource"
+    ],
+    "System.Diagnostics.Tracing": [
+      "System.Private.CoreLib"
+    ],
+    "System.Drawing": [
+      "System.ComponentModel.TypeConverter",
+      "System.Drawing.Primitives"
+    ],
+    "System.Drawing.Configuration": [
+      "System.Configuration.ConfigurationManager"
+    ],
+    "System.Drawing.Printing": [
+      "System.Security.Permissions"
+    ],
+    "System.Dynamic": [
+      "System.Linq.Expressions"
+    ],
+    "System.Dynamic.Utils": [
+      "System.Linq.Expressions"
+    ],
+    "System.Globalization": [
+      "System.Private.CoreLib",
+      "System.Runtime.Numerics"
+    ],
+    "System.IO": [
+      "System.Console",
+      "System.Net.Http",
+      "System.Private.CoreLib"
+    ],
+    "System.IO.Compression": [
+      "System.IO.Compression"
+    ],
+    "System.IO.Enumeration": [
+      "System.Private.CoreLib"
+    ],
+    "System.IO.Hashing": [
+      "Microsoft.CodeAnalysis",
+      "Microsoft.CodeAnalysis.Workspaces"
+    ],
+    "System.IO.Internal": [
+      "System.Configuration.ConfigurationManager"
+    ],
+    "System.IO.MemoryMappedFiles": [
+      "System.IO.MemoryMappedFiles"
+    ],
+    "System.IO.Strategies": [
+      "System.Private.CoreLib"
+    ],
+    "System.Linq": [
+      "Microsoft.CodeAnalysis",
+      "Microsoft.CodeAnalysis.Workspaces",
+      "System.Collections.Immutable",
+      "System.Linq",
+      "System.Linq.Expressions",
+      "System.Linq.Queryable"
+    ],
+    "System.Linq.Expressions": [
+      "System.Linq.Expressions"
+    ],
+    "System.Linq.Expressions.Compiler": [
+      "System.Linq.Expressions"
+    ],
+    "System.Linq.Expressions.Interpreter": [
+      "System.Linq.Expressions"
+    ],
+    "System.Net": [
+      "System.Net.Http",
+      "System.Net.Primitives",
+      "System.Net.Requests",
+      "System.Net.WebClient",
+      "System.Private.CoreLib",
+      "System.Security.Permissions"
+    ],
+    "System.Net.Http": [
+      "System.Net.Http"
+    ],
+    "System.Net.Http.Headers": [
+      "System.Net.Http"
+    ],
+    "System.Net.Http.Metrics": [
+      "System.Net.Http"
+    ],
+    "System.Net.Mail": [
+      "System.Security.Permissions"
+    ],
+    "System.Net.NetworkInformation": [
+      "System.Security.Permissions"
+    ],
+    "System.Net.PeerToPeer": [
+      "System.Security.Permissions"
+    ],
+    "System.Net.PeerToPeer.Collaboration": [
+      "System.Security.Permissions"
+    ],
+    "System.Numerics": [
+      "Microsoft.CodeAnalysis",
+      "Microsoft.CodeAnalysis.Workspaces",
+      "System.Private.CoreLib",
+      "System.Runtime.Numerics"
+    ],
+    "System.Numerics.Hashing": [
+      "Microsoft.CSharp",
+      "Microsoft.Extensions.FileSystemGlobbing",
+      "System.Composition.TypedParts"
+    ],
+    "System.Reactive": [
+      "System.Reactive"
+    ],
+    "System.Reactive.Concurrency": [
+      "System.Reactive"
+    ],
+    "System.Reactive.Disposables": [
+      "System.Reactive"
+    ],
+    "System.Reactive.Joins": [
+      "System.Reactive"
+    ],
+    "System.Reactive.Linq": [
+      "System.Reactive"
+    ],
+    "System.Reactive.Linq.ObservableImpl": [
+      "System.Reactive"
+    ],
+    "System.Reactive.PlatformServices": [
+      "System.Reactive"
+    ],
+    "System.Reactive.Subjects": [
+      "System.Reactive"
+    ],
+    "System.Reactive.Threading.Tasks": [
+      "System.Reactive"
+    ],
+    "System.Reflection": [
+      "System.Private.CoreLib",
+      "System.Reflection.DispatchProxy",
+      "System.Reflection.Metadata"
+    ],
+    "System.Reflection.Emit": [
+      "System.Private.CoreLib",
+      "System.Reflection.DispatchProxy"
+    ],
+    "System.Reflection.Internal": [
+      "System.Reflection.Metadata"
+    ],
+    "System.Reflection.Metadata": [
+      "System.Reflection.Metadata"
+    ],
+    "System.Reflection.Metadata.Ecma335": [
+      "System.Reflection.Metadata"
+    ],
+    "System.Reflection.PortableExecutable": [
+      "System.Reflection.Metadata"
+    ],
+    "System.Resources": [
+      "System.Private.CoreLib"
+    ],
+    "System.Runtime": [
+      "System.Private.CoreLib"
+    ],
+    "System.Runtime.CompilerServices": [
+      "Humanizer",
+      "ICSharpCode.Decompiler",
+      "Microsoft.CodeAnalysis",
+      "Microsoft.CodeAnalysis.AnalyzerUtilities",
+      "Microsoft.CodeAnalysis.CSharp",
+      "Microsoft.CodeAnalysis.CSharp.Features",
+      "Microsoft.CodeAnalysis.CSharp.Workspaces",
+      "Microsoft.CodeAnalysis.Features",
+      "Microsoft.CodeAnalysis.Scripting",
+      "Microsoft.CodeAnalysis.Workspaces",
+      "Microsoft.DiaSymReader",
+      "Newtonsoft.Json",
+      "OmniSharp.Abstractions",
+      "OmniSharp.Roslyn",
+      "OmniSharp.Roslyn.CSharp",
+      "Serialize.Linq",
+      "System.Linq.Expressions",
+      "System.Private.CoreLib",
+      "System.Reactive",
+      "System.Security.Cryptography.ProtectedData",
+      "System.Security.Permissions"
+    ],
+    "System.Runtime.ConstrainedExecution": [
+      "System.Private.CoreLib"
+    ],
+    "System.Runtime.ExceptionServices": [
+      "System.Private.CoreLib"
+    ],
+    "System.Runtime.InteropServices": [
+      "System.Collections.Immutable",
+      "System.Private.CoreLib",
+      "System.Runtime.InteropServices"
+    ],
+    "System.Runtime.InteropServices.ComTypes": [
+      "System.Private.CoreLib"
+    ],
+    "System.Runtime.InteropServices.JavaScript": [
+      "BlazorWorker.Extensions.JSRuntime",
+      "BlazorWorker.WorkerBackgroundService",
+      "BlazorWorker.WorkerCore",
+      "Microsoft.AspNetCore.Components.WebAssembly",
+      "System.Runtime.InteropServices.JavaScript"
+    ],
+    "System.Runtime.InteropServices.Marshalling": [
+      "System.Private.CoreLib"
+    ],
+    "System.Runtime.Intrinsics": [
+      "System.Private.CoreLib"
+    ],
+    "System.Runtime.Intrinsics.Arm": [
+      "System.Private.CoreLib"
+    ],
+    "System.Runtime.Intrinsics.Wasm": [
+      "System.Private.CoreLib"
+    ],
+    "System.Runtime.Intrinsics.X86": [
+      "System.Private.CoreLib"
+    ],
+    "System.Runtime.Loader": [
+      "System.Private.CoreLib"
+    ],
+    "System.Runtime.Remoting": [
+      "System.Private.CoreLib"
+    ],
+    "System.Runtime.Serialization": [
+      "System.Private.CoreLib",
+      "System.Private.DataContractSerialization",
+      "System.Runtime.Serialization.Formatters",
+      "System.Runtime.Serialization.Primitives"
+    ],
+    "System.Runtime.Serialization.DataContracts": [
+      "System.Private.DataContractSerialization"
+    ],
+    "System.Runtime.Serialization.Formatters": [
+      "System.Runtime.Serialization.Formatters"
+    ],
+    "System.Runtime.Serialization.Formatters.Binary": [
+      "System.Runtime.Serialization.Formatters"
+    ],
+    "System.Runtime.Serialization.Json": [
+      "System.Private.DataContractSerialization"
+    ],
+    "System.Runtime.Versioning": [
+      "System.Private.CoreLib"
+    ],
+    "System.Security": [
+      "Microsoft.CodeAnalysis",
+      "System.Configuration.ConfigurationManager",
+      "System.Private.CoreLib",
+      "System.Security.Permissions"
+    ],
+    "System.Security.AccessControl": [
+      "System.Security.AccessControl"
+    ],
+    "System.Security.Claims": [
+      "System.Security.Claims"
+    ],
+    "System.Security.Cryptography": [
+      "System.Private.CoreLib",
+      "System.Security.Cryptography",
+      "System.Security.Cryptography.ProtectedData"
+    ],
+    "System.Security.Cryptography.X509Certificates": [
+      "System.Security.Cryptography"
+    ],
+    "System.Security.Permissions": [
+      "System.Private.CoreLib",
+      "System.Security.Permissions"
+    ],
+    "System.Security.Policy": [
+      "System.Security.Permissions"
+    ],
+    "System.Security.Principal": [
+      "System.Private.CoreLib",
+      "System.Security.Claims",
+      "System.Security.Principal.Windows"
+    ],
+    "System.ServiceProcess": [
+      "System.Security.Permissions"
+    ],
+    "System.Text": [
+      "Microsoft.Extensions.Logging.Abstractions",
+      "System.Console",
+      "System.Net.Http",
+      "System.Private.CoreLib",
+      "System.Private.DataContractSerialization",
+      "System.Private.Uri",
+      "System.Private.Xml",
+      "System.Private.Xml.Linq",
+      "System.Runtime.Numerics",
+      "System.Text.Encoding.CodePages",
+      "System.Text.Encodings.Web",
+      "System.Text.RegularExpressions"
+    ],
+    "System.Text.Encodings.Web": [
+      "System.Text.Encodings.Web"
+    ],
+    "System.Text.Json": [
+      "System.Text.Json"
+    ],
+    "System.Text.Json.Nodes": [
+      "System.Text.Json"
+    ],
+    "System.Text.Json.Reflection": [
+      "System.Text.Json"
+    ],
+    "System.Text.Json.Serialization": [
+      "System.Text.Json"
+    ],
+    "System.Text.Json.Serialization.Converters": [
+      "System.Text.Json"
+    ],
+    "System.Text.Json.Serialization.Metadata": [
+      "System.Text.Json"
+    ],
+    "System.Text.RegularExpressions": [
+      "System.Text.RegularExpressions"
+    ],
+    "System.Text.RegularExpressions.Generated": [
+      "System.Private.DataContractSerialization",
+      "System.Private.Xml"
+    ],
+    "System.Text.RegularExpressions.Symbolic": [
+      "System.Text.RegularExpressions"
+    ],
+    "System.Text.Unicode": [
+      "System.Private.CoreLib",
+      "System.Text.Encodings.Web"
+    ],
+    "System.Threading": [
+      "System.Private.CoreLib",
+      "System.Text.RegularExpressions",
+      "System.Threading"
+    ],
+    "System.Threading.Channels": [
+      "System.Threading.Channels"
+    ],
+    "System.Threading.Tasks": [
+      "System.Private.CoreLib",
+      "System.Reactive",
+      "System.Threading.Tasks.Parallel"
+    ],
+    "System.Threading.Tasks.Sources": [
+      "System.Private.CoreLib"
+    ],
+    "System.Transactions": [
+      "System.Security.Permissions"
+    ],
+    "System.Xml": [
+      "System.Private.DataContractSerialization",
+      "System.Private.Xml"
+    ],
+    "System.Xml.Linq": [
+      "System.Private.Xml.Linq"
+    ],
+    "System.Xml.Schema": [
+      "System.Private.Xml"
+    ],
+    "System.Xml.Serialization": [
+      "System.Private.Xml"
+    ],
+    "System.Xml.Serialization.Configuration": [
+      "System.Private.Xml"
+    ],
+    "System.Xml.XPath": [
+      "System.Private.Xml",
+      "System.Private.Xml.Linq"
+    ],
+    "System.Xml.Xsl": [
+      "System.Private.Xml"
+    ],
+    "System.Xml.Xsl.Runtime": [
+      "System.Private.Xml"
+    ],
+    "WebAssembly.JSInterop": [
+      "Microsoft.JSInterop.WebAssembly"
+    ]
+  }
+}

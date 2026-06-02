@@ -39,11 +39,17 @@
     <PropertyGroup>
       <RoslynWorkspacesAssembly>$(PublishDir)wwwroot/_framework/Microsoft.CodeAnalysis.Workspaces.dll</RoslynWorkspacesAssembly>
       <RoslynBrowserStoragePatcher>$(MSBuildProjectDirectory)/../../tools/RoslynBrowserStoragePatcher/RoslynBrowserStoragePatcher.csproj</RoslynBrowserStoragePatcher>
+      <OmniSharpNamespaceIndexer>$(MSBuildProjectDirectory)/../../tools/OmniSharpNamespaceIndexer/OmniSharpNamespaceIndexer.csproj</OmniSharpNamespaceIndexer>
+      <OmniSharpFrameworkDirectory>$(PublishDir)wwwroot/_framework</OmniSharpFrameworkDirectory>
     </PropertyGroup>
 
     <Exec
       Condition="Exists('$(RoslynWorkspacesAssembly)')"
       Command="dotnet run --project &quot;$(RoslynBrowserStoragePatcher)&quot; -- &quot;$(RoslynWorkspacesAssembly)&quot;" />
+
+    <Exec
+      Condition="Exists('$(OmniSharpFrameworkDirectory)')"
+      Command="dotnet run --project &quot;$(OmniSharpNamespaceIndexer)&quot; -- &quot;$(OmniSharpFrameworkDirectory)&quot;" />
   </Target>
 
 </Project>
