@@ -12049,6 +12049,7 @@ json.dumps(sorted(_imports))
     entryPath?: string;
     runtimePaths?: string[];
     runtimeContents?: string[];
+    includeNamespaces?: string[];
   }): Promise<any> => new Promise((resolve, reject) => {
     if (csharpInteractiveWorkerRunRejectRef.current) {
       reject(new Error('C# interactive runner is already active.'));
@@ -12672,6 +12673,15 @@ finally:
     return csharpRuntimeReadyRef.current;
   };
 
+  const includeCSharpRuntimeNamespaces = async (
+    BrowserCSharp: BrowserCSharpModule['BrowserCSharp'],
+    namespaceNames = loadSavedCSharpNamespaces()
+  ) => {
+    const namespaces = [...new Set(namespaceNames.map(name => name.trim()).filter(Boolean))];
+    if (namespaces.length === 0) return [];
+    return BrowserCSharp.includeNamespaces(namespaces);
+  };
+
   const runCSharp = async (code: string, fileId: string) => {
     try {
       if (settings.csharpIOMode === 'interactive-output-panel') {
@@ -12693,6 +12703,10 @@ finally:
         await ensureCSharpRuntime();
       }
       const BrowserCSharp = csharpModule?.BrowserCSharp;
+      const runtimeIncludeNamespaces = loadSavedCSharpNamespaces();
+      if (BrowserCSharp) {
+        await includeCSharpRuntimeNamespaces(BrowserCSharp, runtimeIncludeNamespaces);
+      }
       const contextId = getCSharpScriptContextId(fileId);
       const sourceItem = filesRef.current.find(item => item.id === fileId && item.type === 'file');
       const sourcePath = sourceItem ? getFsItemPath(filesRef.current, sourceItem.id) : 'Program.cs';
@@ -12722,6 +12736,7 @@ finally:
               entryPath: runtimeProjectFiles[0].path,
               runtimePaths: runtimeFilesWithCurrentSource.map(file => file.path),
               runtimeContents: runtimeFilesWithCurrentSource.map(file => file.content),
+              includeNamespaces: runtimeIncludeNamespaces,
             });
           }
           if (settings.csharpExecutionMode === 'script-context') {
@@ -12730,12 +12745,13 @@ finally:
               code,
               contextId,
               resetContext: settings.csharpResetScriptContextBeforeRun,
+              includeNamespaces: runtimeIncludeNamespaces,
             });
           }
           if (settings.csharpExecutionMode === 'script') {
-            return runCSharpInInteractiveWorker({ mode: 'script', code });
+            return runCSharpInInteractiveWorker({ mode: 'script', code, includeNamespaces: runtimeIncludeNamespaces });
           }
-          return runCSharpInInteractiveWorker({ mode: 'regular', code });
+          return runCSharpInInteractiveWorker({ mode: 'regular', code, includeNamespaces: runtimeIncludeNamespaces });
         }
 
         if (!BrowserCSharp) {
@@ -12829,6 +12845,10 @@ finally:
         await ensureCSharpRuntime();
       }
       const BrowserCSharp = csharpModule?.BrowserCSharp;
+      const runtimeIncludeNamespaces = loadSavedCSharpNamespaces();
+      if (BrowserCSharp) {
+        await includeCSharpRuntimeNamespaces(BrowserCSharp, runtimeIncludeNamespaces);
+      }
       const note = settings.csharpExecutionMode === 'regular'
         ? ''
         : ' Project run uses regular C# compilation.';
@@ -12860,6 +12880,7 @@ finally:
             entryPath: normalizeRuntimeWorkspacePath(entryFile.path, entryFile.name || 'Program.cs'),
             runtimePaths: runtimeFilesWithCurrentSources.map(file => file.path),
             runtimeContents: runtimeFilesWithCurrentSources.map(file => file.content),
+            includeNamespaces: runtimeIncludeNamespaces,
           })
           : BrowserCSharp!.executeRegularProjectWithFiles(
             runtimeProjectFiles.map(file => file.path),
@@ -17724,6 +17745,22 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
           }
 
           const lines = [result.message || `Finished processing '${namespaceName}'.`];
+          if (result.success) {
+            try {
+              const { BrowserCSharp } = await getBrowserCSharpModule();
+              await ensureCSharpRuntime();
+              const runtimeResults = await includeCSharpRuntimeNamespaces(BrowserCSharp, [namespaceName]);
+              const runtimeResult = runtimeResults[0];
+              if (runtimeResult?.message) {
+                lines.push(runtimeResult.message);
+              }
+              if (runtimeResult?.addedAssemblies && runtimeResult.addedAssemblies.length > 0) {
+                lines.push(`Added runtime references: ${runtimeResult.addedAssemblies.join(', ')}`);
+              }
+            } catch (err) {
+              lines.push(`Runtime include error: ${err instanceof Error ? err.message : String(err)}`);
+            }
+          }
           if (result.matchedAssemblies && result.matchedAssemblies.length > 0) {
             lines.push(`Matched assemblies: ${result.matchedAssemblies.join(', ')}`);
           }

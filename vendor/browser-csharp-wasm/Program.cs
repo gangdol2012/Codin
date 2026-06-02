@@ -6,6 +6,7 @@ using System.Linq;
 using System.Net.Http;
 using System.Reflection;
 using System.Text;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Components.WebAssembly.Hosting;
@@ -20,27 +21,21 @@ namespace BrowserCSharp
 	public static class Program
 	{
 		private const string frameworkBinUri = "_framework/_bin";
+		private const string namespaceIndexUri = "_framework/_bin/codecraft-namespace-index.json";
 		private const string codecraftWorkspaceRoot = "/workspace";
-		private static readonly IImmutableSet<string> references = ImmutableHashSet.Create(
+		private static readonly IImmutableSet<string> autoIncludedReferenceKeys = ImmutableHashSet.Create(
 			"mscorlib",
 			"netstandard",
-			"System",
 			"System.Core",
-			"System.Collections",
 			"System.Net.Http",
 			"System.Memory"
 		);
-		private static readonly IEnumerable<string> defaultUsings = new[]
-		{
-			"System",
-			"System.Collections",
-			"System.Collections.Generic",
-			"System.Text",
-			"System.Linq",
-			"System.Net.Http"
-		};
 
+		private static readonly SemaphoreSlim referenceGate = new SemaphoreSlim(1, 1);
+		private static readonly HashSet<string> loadedReferenceAssemblyNames = new HashSet<string>(StringComparer.Ordinal);
 		private static Task<PortableExecutableReference[]> loadedReferences;
+		private static string runtimeBaseUri;
+		private static NamespaceIndexDocument namespaceIndex;
 
 		private static IJSRuntime jsRuntime;
 
@@ -52,7 +47,8 @@ namespace BrowserCSharp
 			WebAssemblyHost host = builder.Build();
 			jsRuntime = (IJSRuntime)host.Services.GetService(typeof(IJSRuntime));
 
-			loadedReferences = GetReferences(builder.HostEnvironment.BaseAddress);
+			runtimeBaseUri = builder.HostEnvironment.BaseAddress;
+			loadedReferences = GetReferences(runtimeBaseUri);
 			loadedReferences.GetAwaiter().OnCompleted(notifyJS);
 
 			static void notifyJS()
@@ -70,43 +66,197 @@ namespace BrowserCSharp
 
 		private static Task<PortableExecutableReference[]> GetReferences(string baseUri)
 		{
+			async Task<PortableExecutableReference[]> loadReferences()
+			{
+				using HttpClient client = new HttpClient();
+				client.BaseAddress = new Uri(baseUri);
+				await referenceGate.WaitAsync().ConfigureAwait(false);
+				try
+				{
+					namespaceIndex = await LoadNamespaceIndex(client).ConfigureAwait(false);
+					IReadOnlyCollection<string> assemblyNames = ResolveAssemblyNamesForIncludeKeys(namespaceIndex, autoIncludedReferenceKeys);
+					if (assemblyNames.Count == 0)
+					{
+						throw new Exception("Could not resolve auto-included references from runtime namespace index.");
+					}
+
+					PortableExecutableReference[] references = await LoadMetadataReferences(client, assemblyNames, loadedReferenceAssemblyNames).ConfigureAwait(false);
+					loadedReferenceAssemblyNames.Clear();
+					foreach (string assemblyName in assemblyNames)
+					{
+						loadedReferenceAssemblyNames.Add(assemblyName);
+					}
+					return references;
+				}
+				finally
+				{
+					referenceGate.Release();
+				}
+			}
+
+			return loadReferences();
+		}
+
+		private static async Task<PortableExecutableReference[]> LoadMetadataReferences(
+			HttpClient client,
+			IEnumerable<string> assemblyNames,
+			ISet<string> excludedAssemblyNames = null)
+		{
 			static PortableExecutableReference toReference(Task<Stream> completedTask)
 			{
 				if (completedTask.IsCompletedSuccessfully)
 				{
 					return MetadataReference.CreateFromStream(completedTask.Result);
 				}
-				else
-				{
-					throw new Exception("Could not load a reference required for runtime compilation.", completedTask.Exception);
-				}
+
+				throw new Exception("Could not load a reference required for runtime compilation.", completedTask.Exception);
 			}
 
-			HttpClient client = new HttpClient();
-			client.BaseAddress = new Uri(baseUri);
-
 			IDictionary<string, Task<PortableExecutableReference>> foundReferences = new Dictionary<string, Task<PortableExecutableReference>>();
-
-			foreach (string assemblyName in references)
+			foreach (string assemblyName in assemblyNames.Where(name => !String.IsNullOrWhiteSpace(name)).Distinct(StringComparer.Ordinal))
 			{
+				if (excludedAssemblyNames != null && excludedAssemblyNames.Contains(assemblyName))
+				{
+					continue;
+				}
+
 				Task<PortableExecutableReference> task = client.GetStreamAsync(Path.Join(frameworkBinUri, $"{assemblyName}.dll")).ContinueWith(toReference);
 				foundReferences.Add(assemblyName, task);
 			}
 
-			if (references.All(foundReferences.ContainsKey))
+			return await Task.WhenAll(foundReferences.Values).ConfigureAwait(false);
+		}
+
+		private static async Task<NamespaceIndexDocument> LoadNamespaceIndex(HttpClient client)
+		{
+			using Stream stream = await client.GetStreamAsync(namespaceIndexUri).ConfigureAwait(false);
+			NamespaceIndexDocument index = await JsonSerializer.DeserializeAsync<NamespaceIndexDocument>(
+				stream,
+				new JsonSerializerOptions { PropertyNameCaseInsensitive = true }
+			).ConfigureAwait(false);
+
+			if (index == null || index.Namespaces == null || index.Assemblies == null)
 			{
-				Task<PortableExecutableReference[]> allTask = Task.WhenAll(foundReferences.Values);
-				allTask.GetAwaiter().OnCompleted(client.Dispose);
-				return allTask;
+				throw new Exception("Runtime namespace index is empty or invalid.");
 			}
-			else
+
+			return index;
+		}
+
+		private static IReadOnlyCollection<string> ResolveAssemblyNamesForIncludeKeys(NamespaceIndexDocument index, IEnumerable<string> includeKeys)
+		{
+			SortedSet<string> assemblyNames = new SortedSet<string>(StringComparer.Ordinal);
+			SortedSet<string> indexedAssemblyNames = new SortedSet<string>(index.Assemblies.Where(name => !String.IsNullOrWhiteSpace(name)), StringComparer.Ordinal);
+
+			foreach (string includeKey in includeKeys.Where(key => !String.IsNullOrWhiteSpace(key)))
 			{
-				client.Dispose();
-				return Task.FromException<PortableExecutableReference[]>(
-					new Exception("Could not find all required references for runtime compilation. " +
-						$"Missing references: {String.Join(", ", references.Except(foundReferences.Keys))}")
-				);
+				foreach (KeyValuePair<string, string[]> entry in index.Namespaces)
+				{
+					if (!NamespaceMatches(entry.Key, includeKey))
+					{
+						continue;
+					}
+
+					foreach (string assemblyName in entry.Value.Where(name => !String.IsNullOrWhiteSpace(name)))
+					{
+						assemblyNames.Add(assemblyName);
+					}
+				}
+
+				foreach (string assemblyName in indexedAssemblyNames)
+				{
+					if (NamespaceMatches(assemblyName, includeKey))
+					{
+						assemblyNames.Add(assemblyName);
+					}
+				}
 			}
+
+			return assemblyNames.ToArray();
+		}
+
+		private static bool NamespaceMatches(string candidate, string includeKey)
+		{
+			if (candidate.Equals(includeKey, StringComparison.Ordinal))
+			{
+				return true;
+			}
+
+			return candidate.StartsWith(includeKey + ".", StringComparison.Ordinal);
+		}
+
+		[JSInvokable]
+		public static Task<NamespaceIncludeResult> IncludeNamespace(string namespaceName)
+		{
+			async Task<NamespaceIncludeResult> execute()
+			{
+				string trimmedNamespace = (namespaceName ?? String.Empty).Trim();
+				if (String.IsNullOrWhiteSpace(trimmedNamespace))
+				{
+					return new NamespaceIncludeResult(trimmedNamespace, Array.Empty<string>(), Array.Empty<string>(), false, "Namespace is required.");
+				}
+
+				await loadedReferences.ConfigureAwait(false);
+				using HttpClient client = new HttpClient();
+				client.BaseAddress = new Uri(runtimeBaseUri);
+				await referenceGate.WaitAsync().ConfigureAwait(false);
+				try
+				{
+					namespaceIndex = namespaceIndex ?? await LoadNamespaceIndex(client).ConfigureAwait(false);
+					IReadOnlyCollection<string> matchingAssemblyNames = ResolveAssemblyNamesForIncludeKeys(
+						namespaceIndex,
+						new[] { trimmedNamespace }
+					);
+
+					if (matchingAssemblyNames.Count == 0)
+					{
+						return new NamespaceIncludeResult(
+							trimmedNamespace,
+							Array.Empty<string>(),
+							Array.Empty<string>(),
+							false,
+							$"No runtime assemblies matched namespace '{trimmedNamespace}'."
+						);
+					}
+
+					PortableExecutableReference[] currentReferences = loadedReferences.Result;
+					PortableExecutableReference[] addedReferences = await LoadMetadataReferences(
+						client,
+						matchingAssemblyNames,
+						loadedReferenceAssemblyNames
+					).ConfigureAwait(false);
+					List<string> addedAssemblyNames = matchingAssemblyNames
+						.Where(assemblyName => !loadedReferenceAssemblyNames.Contains(assemblyName))
+						.ToList();
+
+					if (addedReferences.Length > 0)
+					{
+						foreach (string assemblyName in addedAssemblyNames)
+						{
+							loadedReferenceAssemblyNames.Add(assemblyName);
+						}
+						loadedReferences = Task.FromResult(currentReferences.Concat(addedReferences).ToArray());
+					}
+
+					string message = addedAssemblyNames.Count > 0
+						? $"Included {addedAssemblyNames.Count} runtime assembly reference(s) for '{trimmedNamespace}'."
+						: $"Namespace '{trimmedNamespace}' was already available to the runtime or did not add new references.";
+
+					return new NamespaceIncludeResult(
+						trimmedNamespace,
+						addedAssemblyNames,
+						matchingAssemblyNames,
+						true,
+						message
+					);
+				}
+				finally
+				{
+					referenceGate.Release();
+				}
+			}
+
+			return Task.Run(execute);
 		}
 
 		[JSInvokable]
@@ -514,16 +664,9 @@ namespace BrowserCSharp
 		{
 			string[] lines = userCode.Replace("\r\n", "\n").Split('\n');
 			string body = String.Join("\n", lines.Select(l => "        " + l));
-			return $@"using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Text;
-using System.Net.Http;
-using System.Threading.Tasks;
-
-internal static class __CodeCraftEntry
+			return $@"internal static class __CodeCraftEntry
 {{
-    private static async Task Main(string[] args)
+    private static async System.Threading.Tasks.Task Main(string[] args)
     {{
 {body}
     }}
@@ -543,7 +686,7 @@ internal static class __CodeCraftEntry
 			SyntaxTree[] syntaxTrees = sourceFiles
 				.Select(file => CSharpSyntaxTree.ParseText(file.Value ?? String.Empty, parseOptions, path: file.Key))
 				.ToArray();
-			CSharpCompilationOptions options = new CSharpCompilationOptions(OutputKind.ConsoleApplication, usings: defaultUsings)
+			CSharpCompilationOptions options = new CSharpCompilationOptions(OutputKind.ConsoleApplication)
 				.WithPlatform(Platform.AnyCpu)
 				.WithOptimizationLevel(OptimizationLevel.Release);
 			string mainTypeName = InferRegularProjectMainTypeName(syntaxTrees, entryPath);
@@ -734,7 +877,7 @@ internal static class __CodeCraftEntry
 				Path.GetRandomFileName(),
 				CSharpSyntaxTree.ParseText(code, CSharpParseOptions.Default.WithKind(SourceCodeKind.Script).WithLanguageVersion(LanguageVersion.Preview)),
 				await loadedReferences.ConfigureAwait(false),
-				new CSharpCompilationOptions(outputKind: OutputKind.DynamicallyLinkedLibrary, usings: defaultUsings),
+				new CSharpCompilationOptions(outputKind: OutputKind.DynamicallyLinkedLibrary),
 				context?.Compilation
 			);
 
@@ -934,6 +1077,35 @@ internal static class __CodeCraftEntry
 						return exception;
 				}
 			}
+		}
+
+		private sealed class NamespaceIndexDocument
+		{
+			public string[] Assemblies { get; set; }
+			public Dictionary<string, string[]> Namespaces { get; set; }
+		}
+
+		public sealed class NamespaceIncludeResult
+		{
+			public NamespaceIncludeResult(
+				string namespaceName,
+				IReadOnlyCollection<string> addedAssemblies,
+				IReadOnlyCollection<string> matchedAssemblies,
+				bool success,
+				string message)
+			{
+				NamespaceName = namespaceName;
+				AddedAssemblies = addedAssemblies.ToArray();
+				MatchedAssemblies = matchedAssemblies.ToArray();
+				Success = success;
+				Message = message;
+			}
+
+			public string NamespaceName { get; }
+			public string[] AddedAssemblies { get; }
+			public string[] MatchedAssemblies { get; }
+			public bool Success { get; }
+			public string Message { get; }
 		}
 	}
 }

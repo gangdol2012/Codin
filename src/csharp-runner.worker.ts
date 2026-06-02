@@ -20,6 +20,7 @@ type RuntimeMessage = {
   entryPath?: string;
   runtimePaths?: string[];
   runtimeContents?: string[];
+  includeNamespaces?: string[];
 };
 
 function toRootedFrameworkUrl(value: string) {
@@ -254,6 +255,13 @@ function ensureRuntime() {
 
 async function invokeBrowserCSharp(message: RuntimeMessage) {
   await ensureRuntime();
+
+  for (const namespaceName of message.includeNamespaces || []) {
+    const trimmedNamespace = namespaceName.trim();
+    if (trimmedNamespace) {
+      await DotNet.invokeMethodAsync('BrowserCSharp', 'IncludeNamespace', trimmedNamespace);
+    }
+  }
 
   switch (message.mode) {
     case 'script':

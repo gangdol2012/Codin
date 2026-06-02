@@ -15,4 +15,15 @@
 	<ItemGroup>
 		<BlazorLinkerDescriptor Include="LinkerConfig.xml" />
 	</ItemGroup>
+
+	<Target Name="GenerateCodeCraftNamespaceIndex" AfterTargets="Publish">
+		<PropertyGroup>
+			<CodeCraftNamespaceIndexer>$(MSBuildProjectDirectory)/../../tools/OmniSharpNamespaceIndexer/OmniSharpNamespaceIndexer.csproj</CodeCraftNamespaceIndexer>
+			<CodeCraftFrameworkBinDirectory>$(PublishDir)wwwroot/_framework/_bin</CodeCraftFrameworkBinDirectory>
+		</PropertyGroup>
+
+		<Exec
+			Condition="Exists('$(CodeCraftFrameworkBinDirectory)')"
+			Command="dotnet run --project &quot;$(CodeCraftNamespaceIndexer)&quot; -- &quot;$(CodeCraftFrameworkBinDirectory)&quot;" />
+	</Target>
 </Project>

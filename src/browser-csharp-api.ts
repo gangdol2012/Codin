@@ -25,6 +25,20 @@ export const BrowserCSharp = {
   OnReady: BrowserCSharpBase.OnReady,
   ExecuteScript: BrowserCSharpBase.ExecuteScript,
 
+  includeNamespace(namespaceName: string): Promise<NamespaceIncludeResult> {
+    return invoke<NamespaceIncludeResult>('IncludeNamespace', namespaceName);
+  },
+
+  async includeNamespaces(namespaceNames: string[]): Promise<NamespaceIncludeResult[]> {
+    const results: NamespaceIncludeResult[] = [];
+    for (const namespaceName of namespaceNames) {
+      const trimmedNamespace = namespaceName.trim();
+      if (!trimmedNamespace) continue;
+      results.push(await this.includeNamespace(trimmedNamespace));
+    }
+    return results;
+  },
+
   /** Same as `ExecuteScript(code, contextId)` — explicit name for REPL-style runs. */
   executeScriptInContext(code: string, contextId: string): Promise<ScriptResult> {
     return BrowserCSharpBase.ExecuteScript(code, contextId);
@@ -107,6 +121,14 @@ export const BrowserCSharp = {
 export interface RuntimeFileSnapshot {
   path: string;
   content: string;
+}
+
+export interface NamespaceIncludeResult {
+  namespaceName?: string;
+  success?: boolean;
+  addedAssemblies?: string[];
+  matchedAssemblies?: string[];
+  message?: string;
 }
 
 export type { ScriptResult } from 'browser-csharp';

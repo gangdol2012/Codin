@@ -97,18 +97,8 @@ public class OmniSharpProject
 
     public static List<MetadataReference> MetadataReferences = new List<MetadataReference>();
     private static HashSet<string> ReferencedAssemblyNames = new HashSet<string>(StringComparer.Ordinal);
-    private static readonly string[] DefaultUsings =
-    {
-        "System",
-        "System.Collections",
-        "System.Collections.Generic",
-        "System.Text",
-        "System.Linq",
-        "System.Net.Http",
-        "System.Threading.Tasks"
-    };
 
-    private static readonly string[] DefaultReferenceAssemblyNames =
+    private static readonly string[] AutoIncludedReferenceKeys =
     {
         "System.Console",
         "System.Linq",
@@ -116,8 +106,6 @@ public class OmniSharpProject
         "System.Private.CoreLib",
         "System.Runtime",
         "System.Threading.Tasks",
-        "System",
-        "System.Collections",
         "netstandard"
     };
 
@@ -127,7 +115,6 @@ public class OmniSharpProject
 
     private static readonly CSharpCompilationOptions CompilationOptions = new CSharpCompilationOptions(
             OutputKind.ConsoleApplication,
-            usings: DefaultUsings,
             concurrentBuild: false,
             optimizationLevel: OptimizationLevel.Debug)
         .WithPlatform(Platform.AnyCpu);
@@ -152,29 +139,9 @@ public class OmniSharpProject
 
         if (MetadataReferences.Count == 0)
         {
-            foreach (var assemblyName in DefaultReferenceAssemblyNames)
+            foreach (var referenceKey in AutoIncludedReferenceKeys)
             {
-                try
-                {
-                    if (ReferencedAssemblyNames.Contains(assemblyName))
-                    {
-                        continue;
-                    }
-
-                    var metadataReference = await mh.GetAssemblyMetadataReference(assemblyName);
-                    if (metadataReference == null)
-                    {
-                        Console.WriteLine($"Did not get metadata ref {assemblyName}");
-                        continue;
-                    }
-
-                    MetadataReferences.Add(metadataReference);
-                    ReferencedAssemblyNames.Add(assemblyName);
-                }
-                catch (Exception e)
-                {
-                    Console.WriteLine($"Could not add metadata reference for {assemblyName}: {e.Message}");
-                }
+                await AddMetadataReferencesForIncludeKey(referenceKey, mh);
             }
         }
 
@@ -310,10 +277,31 @@ public class OmniSharpProject
             );
         }
 
-        var helper = new AssemblyMetadataHelper(Uri);
-        var addedAssemblyNames = new List<string>();
+        var addedAssemblyNames = await AddMetadataReferencesForIncludeKey(namespaceName, new AssemblyMetadataHelper(Uri), matchingAssemblyNames);
 
-        foreach (var assemblyName in matchingAssemblyNames)
+        ApplyMetadataReferencesToWorkspace();
+
+        var success = matchingAssemblyNames.Count > 0;
+        var message = addedAssemblyNames.Count > 0
+            ? $"Included {addedAssemblyNames.Count} assembly reference(s) for '{namespaceName}'."
+            : $"Namespace '{namespaceName}' was already available or did not add new metadata references.";
+
+        return new NamespaceIncludeResult(
+            namespaceName,
+            addedAssemblyNames,
+            matchingAssemblyNames,
+            success,
+            message
+        );
+    }
+
+    private async Task<IReadOnlyList<string>> AddMetadataReferencesForIncludeKey(
+        string includeKey,
+        AssemblyMetadataHelper helper,
+        IReadOnlyCollection<string>? matchingAssemblyNames = null)
+    {
+        var addedAssemblyNames = new List<string>();
+        foreach (var assemblyName in matchingAssemblyNames ?? GetAssemblyNamesForNamespace(includeKey))
         {
             if (string.IsNullOrWhiteSpace(assemblyName) || ReferencedAssemblyNames.Contains(assemblyName))
             {
@@ -338,20 +326,7 @@ public class OmniSharpProject
             }
         }
 
-        ApplyMetadataReferencesToWorkspace();
-
-        var success = matchingAssemblyNames.Count > 0;
-        var message = addedAssemblyNames.Count > 0
-            ? $"Included {addedAssemblyNames.Count} assembly reference(s) for '{namespaceName}'."
-            : $"Namespace '{namespaceName}' was already available or did not add new metadata references.";
-
-        return new NamespaceIncludeResult(
-            namespaceName,
-            addedAssemblyNames,
-            matchingAssemblyNames,
-            success,
-            message
-        );
+        return addedAssemblyNames;
     }
 
     private IReadOnlyCollection<string> GetAssemblyNamesForNamespace(string namespaceName)

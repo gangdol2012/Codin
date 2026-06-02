@@ -24,6 +24,7 @@ const localDotnetDir = resolve(root, 'node_modules', '.cache', 'codecraft-dotnet
 const localDotnet = resolve(localDotnetDir, process.platform === 'win32' ? 'dotnet.exe' : 'dotnet');
 const dotnetInstallScript = resolve(localDotnetDir, 'dotnet-install.sh');
 const requiredBrowserCSharpMethods = [
+  'IncludeNamespace',
   'ClearScriptContext',
   'HasScriptContext',
   'ExecuteRegular',
