@@ -62,6 +62,7 @@ import 'flexlayout-react/style/dark.css';
 import * as Tooltip from '@radix-ui/react-tooltip';
 import * as Separator from '@radix-ui/react-separator';
 import type * as TypeScript from 'typescript';
+import coinstantLogo from '../coinstant-logo.jpg';
 import type {
   CSharpIdeDebugEvent,
   CSharpIdeDebugFeatureSnapshot,
@@ -21147,10 +21148,8 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
           <div className="flex min-w-0 flex-1 items-center gap-1 overflow-hidden">
             {/* Logo */}
             <div className="flex items-center gap-2 font-semibold text-white shrink-0 pr-2">
-              <div className="w-6 h-6 bg-indigo-600 rounded-md flex items-center justify-center">
-                <Code2 size={14} />
-              </div>
-              <span className="text-sm tracking-wide hidden sm:inline-block text-zinc-100">CodeCraft</span>
+              <img src={coinstantLogo} alt="<cod/in> logo" className="w-6 h-6 rounded-md object-cover" />
+              <span className="text-sm tracking-wide hidden sm:inline-block text-zinc-100">{'<cod/in>'}</span>
             </div>
 
             <Separator.Root orientation="vertical" className="h-5 w-px bg-zinc-800 mx-1 shrink-0" />
