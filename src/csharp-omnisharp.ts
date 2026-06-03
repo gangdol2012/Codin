@@ -929,6 +929,7 @@ function csharpContextualCompletionCacheKey(
   position: monaco.Position,
   context: monaco.languages.CompletionContext,
   request: any,
+  projectRequest: CSharpSerializedProjectRequest,
   completionEnvironmentVersion: number
 ): string {
   const triggerCharacter = typeof context.triggerCharacter === 'string' ? context.triggerCharacter : '';
@@ -941,6 +942,7 @@ function csharpContextualCompletionCacheKey(
     csharpCompletionFastHash(snapshot.code),
     request.CompletionTrigger,
     request.TriggerCharacter ?? '',
+    projectRequest.fileKey,
     context.triggerKind,
     triggerCharacter,
     previousCharacter,
@@ -1980,6 +1982,7 @@ class CSharpLanguageService {
     model: monaco.editor.ITextModel,
     snapshot: CSharpCompletionRequestSnapshot,
     request: unknown,
+    projectRequest: CSharpSerializedProjectRequest,
     requestSerial: number,
     callId: string
   ): Promise<unknown | typeof CSHARP_STALE_COMPLETION_RESPONSE> {
@@ -2001,7 +2004,7 @@ class CSharpLanguageService {
         return CSHARP_STALE_COMPLETION_RESPONSE;
       }
 
-      return this.omnisharp!('GetCompletionAsync', snapshot.code, request);
+      return this.omnisharp!('GetCompletionAsync', snapshot.code, request, projectRequest.serialized);
     });
 
     this.completionDispatchTail = run.then(() => undefined, () => undefined);
@@ -2467,12 +2470,14 @@ class CSharpLanguageService {
     snapshot.structuralVersion = this.completionStructuralVersion;
 
     const request = csharpOmniSharpCompletionRequest(model, position, context);
+    const projectRequest = this.createSerializedDiagnosticProjectRequest(model);
     const cacheKey = csharpContextualCompletionCacheKey(
       model,
       snapshot,
       position,
       context,
       request,
+      projectRequest,
       this.completionEnvironmentVersion,
     );
 
@@ -2497,6 +2502,7 @@ class CSharpLanguageService {
         offset: snapshot.offset,
         cacheKey,
         contextualCompletionFixVersion: CSHARP_CONTEXTUAL_COMPLETION_FIX_VERSION,
+        project: this.summarizeProjectRequest(projectRequest.request),
       },
     });
 
@@ -2505,7 +2511,7 @@ class CSharpLanguageService {
 
     if (!entryPromise) {
       entryPromise = (async (): Promise<CSharpCompletionCacheEntry | null> => {
-        const response = await this.enqueueCompletionRuntimeCall(model, snapshot, request, requestSerial, callId);
+        const response = await this.enqueueCompletionRuntimeCall(model, snapshot, request, projectRequest, requestSerial, callId);
         if (response === CSHARP_STALE_COMPLETION_RESPONSE) {
           return null;
         }

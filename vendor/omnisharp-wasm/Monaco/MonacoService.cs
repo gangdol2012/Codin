@@ -140,10 +140,15 @@ $@"using System;
 
     public async Task<byte[]> GetCompletionAsync(string code, string completionRequestString)
     {
+        return await GetCompletionAsync(code, completionRequestString, string.Empty);
+    }
+
+    public async Task<byte[]> GetCompletionAsync(string code, string completionRequestString, string projectRequestString)
+    {
         return await RunCompletionAsync(async () =>
         {
             var completionRequest = DeserializeRequest<CompletionRequest>(completionRequestString);
-            var document = await UpdateDocumentAsync(_completionProject, code);
+            var document = await UpdateCompletionDocumentAsync(code, projectRequestString);
             var completionResponse = await _completionService.Handle(completionRequest, document);
 
             return Payload(completionResponse, "GetCompletionAsync");
@@ -591,6 +596,29 @@ $@"using System;
     Task<Document> UpdateDocumentAsync(OmniSharpProject project, string code)
     {
         return project.UpdateDocumentAsync(code);
+    }
+
+    Task<Document> UpdateCompletionDocumentAsync(string code, string projectRequestString)
+    {
+        if (string.IsNullOrWhiteSpace(projectRequestString))
+        {
+            return _completionProject.UpdateDocumentAsync(code);
+        }
+
+        try
+        {
+            var request = DeserializeRequest<DiagnosticProjectRequest>(projectRequestString);
+            var files = (request.Files ?? Array.Empty<DiagnosticProjectFileDto>())
+                .Where(file => !string.IsNullOrWhiteSpace(file.Path))
+                .Select(file => new OmniSharpProject.SourceFileSnapshot(file.Path, file.Content ?? string.Empty))
+                .ToArray();
+            return _completionProject.UpdateProjectDocumentsAsync(code, request.CurrentPath, files);
+        }
+        catch (Exception e)
+        {
+            Console.WriteLine($"Could not deserialize completion project snapshot: {e.Message}");
+            return _completionProject.UpdateDocumentAsync(code);
+        }
     }
 
     Task<Document> UpdateDiagnosticDocumentAsync(string code, string diagnosticRequestString)
