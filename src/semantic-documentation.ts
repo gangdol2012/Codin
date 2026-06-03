@@ -16,7 +16,6 @@ export interface SemanticDocumentationItem {
   containerName?: string;
   header: string;
   path: string;
-  code?: string;
   documentation: string;
   generatedAt: number;
 }
@@ -91,7 +90,6 @@ interface CSharpValueMember {
   containerName: string;
   header: string;
   path: string;
-  code: string;
   spanStart: number;
   spanEnd: number;
 }
@@ -179,29 +177,6 @@ export async function deleteSemanticDocumentationRecord(
 export function formatSemanticDocumentationTimestamp(timestamp?: number) {
   if (!timestamp) return 'Never';
   return new Date(timestamp).toLocaleString();
-}
-
-export function formatSemanticDocumentationItemMarkdown(item: SemanticDocumentationItem) {
-  const code = item.code?.trim();
-  if (!code) return item.documentation;
-
-  const documentation = stripSemanticDocumentationHeader(item);
-  return `${item.header}
-
-\`\`\`csharp
-${code}
-\`\`\`
-
-${documentation}`.trim();
-}
-
-function stripSemanticDocumentationHeader(item: SemanticDocumentationItem) {
-  const header = item.header.trim();
-  const documentation = item.documentation.trim();
-  if (!header || documentation === header) return '';
-  if (documentation.startsWith(`${header}\n\n`)) return documentation.slice(header.length).trim();
-  if (documentation.startsWith(`${header}\n`)) return documentation.slice(header.length).trim();
-  return documentation;
 }
 
 export function getSemanticDocumentationProgressLabel(record: SemanticDocumentationRecord | null | undefined) {
@@ -420,7 +395,6 @@ function createDocumentationItem(
     containerName: 'containerName' in source ? source.containerName : undefined,
     header: source.header,
     path: source.path,
-    code: 'code' in source ? source.code.trim() : undefined,
     documentation: `${source.header}\n\n${documentation}`.trim(),
     generatedAt: Date.now(),
   };
@@ -605,7 +579,6 @@ function parseCSharpTypeMembers(
               containerName: typeDecl.name,
               header: accessorHeader,
               path: file.path,
-              code: source.slice(headerStart, closeBrace + 1),
               spanStart: headerStart,
               spanEnd: closeBrace + 1,
             });
@@ -621,12 +594,11 @@ function parseCSharpTypeMembers(
       depth = Math.max(0, depth - 1);
     } else if (ch === ';' && depth === 0) {
       const statementStart = findMemberHeaderStart(clean, segmentStart, i);
-      const rawStatement = source.slice(statementStart, i + 1);
-      const statement = normalizeHeader(rawStatement);
-      for (const field of parseFieldDeclarations(statement, rawStatement, file.path, typeDecl.name, statementStart)) {
+      const statement = normalizeHeader(source.slice(statementStart, i + 1));
+      for (const field of parseFieldDeclarations(statement, file.path, typeDecl.name, statementStart)) {
         valueMembers.push(field);
       }
-      const expressionProperty = parseExpressionProperty(statement, rawStatement, file.path, typeDecl.name, statementStart);
+      const expressionProperty = parseExpressionProperty(statement, file.path, typeDecl.name, statementStart);
       if (expressionProperty) valueMembers.push(expressionProperty);
       segmentStart = i + 1;
     }
@@ -687,7 +659,7 @@ function parsePropertyAccessors(
   return members;
 }
 
-function parseFieldDeclarations(statement: string, code: string, path: string, containerName: string, offset: number) {
+function parseFieldDeclarations(statement: string, path: string, containerName: string, offset: number) {
   if (!statement || statement.includes('(') || statement.includes('=>')) return [];
   if (/\b(get|set|init|add|remove)\b/.test(statement)) return [];
   const withoutAttrs = statement.replace(/^\s*(?:\[[^\]]+\]\s*)+/, '').trim();
@@ -705,13 +677,12 @@ function parseFieldDeclarations(statement: string, code: string, path: string, c
     containerName,
     header: withoutSemi.endsWith(name) ? withoutSemi : `${withoutSemi} ${name}`,
     path,
-    code,
     spanStart: offset,
-    spanEnd: offset + code.length,
+    spanEnd: offset + statement.length,
   }];
 }
 
-function parseExpressionProperty(statement: string, code: string, path: string, containerName: string, offset: number): CSharpValueMember | null {
+function parseExpressionProperty(statement: string, path: string, containerName: string, offset: number): CSharpValueMember | null {
   if (!statement.includes('=>')) return null;
   const beforeArrow = normalizeHeader(statement.split('=>')[0] || '');
   const name = extractPropertyName(beforeArrow);
@@ -723,9 +694,8 @@ function parseExpressionProperty(statement: string, code: string, path: string, 
     containerName,
     header: `${beforeArrow} { get; }`,
     path,
-    code,
     spanStart: offset,
-    spanEnd: offset + code.length,
+    spanEnd: offset + statement.length,
   };
 }
 
