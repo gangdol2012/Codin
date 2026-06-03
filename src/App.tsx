@@ -77,6 +77,9 @@ import {
   loadSemanticDocumentationRecord,
   parseCSharpSemanticDocumentationProject,
   runSemanticDocumentationGeneration,
+  type CSharpMethodMember,
+  type CSharpTypeDeclaration,
+  type CSharpValueMember,
   type SemanticDocumentationItem,
   type SemanticDocumentationRecord,
   type SemanticDocumentationSourceFile,
@@ -150,6 +153,8 @@ const PROJECTS_STORAGE_KEY = 'codecraft-projects';
 const ACTIVE_PROJECT_STORAGE_KEY = 'codecraft-active-project-id';
 const PROJECT_STORAGE_PREFIX = 'codecraft-project';
 const DEFAULT_PROJECT_ID = 'default';
+const PROJECT_DATA_DB_NAME = 'codecraft-project-data';
+const PROJECT_DATA_STORE_NAME = 'data';
 const PYTHON_CACHE_DB_NAME = 'codecraft-python-cache';
 const PYTHON_CACHE_STORE_NAME = 'pyodide-package-meta';
 const PYTHON_CACHE_PACKAGE_META_KEY = 'packages';
@@ -294,6 +299,31 @@ function isProjectDbKeyForCurrentProject(key: IDBValidKey, projectId = getActive
 function unscopedProjectDbKey(key: string, projectId = getActiveProjectId()) {
   const prefix = `${projectId}::`;
   return key.startsWith(prefix) ? key.slice(prefix.length) : key;
+}
+
+function getLegacyProjectStorageKeys(baseKey: string, projectId = getActiveProjectId()) {
+  const keys = [getProjectStorageKey(baseKey, projectId)];
+  if (projectId === DEFAULT_PROJECT_ID) keys.push(baseKey);
+  return keys;
+}
+
+function removeLegacyProjectStorageValue(baseKey: string, projectId = getActiveProjectId()) {
+  for (const key of getLegacyProjectStorageKeys(baseKey, projectId)) {
+    localStorage.removeItem(key);
+  }
+}
+
+function openProjectDataDB(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(PROJECT_DATA_DB_NAME, 1);
+    req.onupgradeneeded = () => {
+      if (!req.result.objectStoreNames.contains(PROJECT_DATA_STORE_NAME)) {
+        req.result.createObjectStore(PROJECT_DATA_STORE_NAME);
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
 }
 
 function openSyncDB(): Promise<IDBDatabase> {
@@ -970,7 +1000,7 @@ const STORAGE_KEYS = {
 
 const PROJECT_LOCAL_STORAGE_KEYS = [
   ...Object.entries(STORAGE_KEYS)
-    .filter(([key]) => key !== 'gitState')
+    .filter(([key]) => key !== 'gitState' && key !== 'files')
     .map(([, value]) => value),
   SYNC_META_KEY,
 ];
@@ -2442,13 +2472,13 @@ const nugetListTool: AssistantToolDefinition = {
 
 const codinGetTool: AssistantToolDefinition = {
   name: "codinGet",
-  description: "Get a C# type or member source snippet by exact CodeCraft path, such as Calculator or Calculator.Foo.",
+  description: "Get a C# type or member source snippet by exact C# symbol path, such as Calculator, Calculator.Foo, or MyNamespace.Calculator.Foo.",
   parameters: {
     type: 'object',
     properties: {
       symbolPath: {
         type: 'string',
-        description: "Exact C# symbol path to retrieve. Use TypeName for types and TypeName.MemberName for members.",
+        description: "Exact C# symbol path to retrieve. Use TypeName for global-namespace types, Namespace.TypeName for namespaced types, and append .MemberName for members.",
       },
     },
     required: ['symbolPath'],
@@ -2645,6 +2675,7 @@ interface CodeCraftUserDataExport {
   exportedAt: string;
   localStorage: Record<string, string>;
   indexedDB: {
+    files?: FSItem[];
     npmPackages: StoredNpmPackage[];
     pyodidePackageMeta: Record<string, SerializedCachedPyodidePackageMeta>;
     pyodidePackageSnapshot: SerializedCachedPyodideEnvironmentSnapshot | null;
@@ -3807,6 +3838,90 @@ async function clearStoredSyncHandles(projectId = getActiveProjectId()) {
   });
 }
 
+function normalizeStoredProjectFiles(raw: unknown): FSItem[] | null {
+  if (!Array.isArray(raw)) return null;
+  return raw.map((file: FSItem) => (
+    file?.type === 'file' && file.name
+      ? { ...file, language: langFromFilename(file.name) }
+      : file
+  ));
+}
+
+function parseStoredProjectFilesValue(value: string | null): FSItem[] | null {
+  if (value == null) return null;
+  try {
+    return normalizeStoredProjectFiles(JSON.parse(value));
+  } catch {
+    return null;
+  }
+}
+
+function loadLegacySavedProjectFiles(projectId = getActiveProjectId()): FSItem[] | null {
+  for (const key of getLegacyProjectStorageKeys(STORAGE_KEYS.files, projectId)) {
+    const parsed = parseStoredProjectFilesValue(localStorage.getItem(key));
+    if (parsed) return parsed;
+  }
+  return null;
+}
+
+function loadInitialProjectFiles(projectId = getActiveProjectId()) {
+  return loadLegacySavedProjectFiles(projectId) || INITIAL_FILES;
+}
+
+async function loadStoredProjectFiles(projectId = getActiveProjectId()): Promise<FSItem[] | null> {
+  try {
+    const db = await openProjectDataDB();
+    const stored = await new Promise<unknown>((resolve, reject) => {
+      const tx = db.transaction(PROJECT_DATA_STORE_NAME, 'readonly');
+      const req = tx.objectStore(PROJECT_DATA_STORE_NAME).get(getProjectDbKey(STORAGE_KEYS.files, projectId));
+      tx.oncomplete = () => resolve(req.result);
+      tx.onerror = () => reject(tx.error);
+      req.onerror = () => reject(req.error);
+    });
+    const normalized = normalizeStoredProjectFiles(stored);
+    if (normalized) {
+      removeLegacyProjectStorageValue(STORAGE_KEYS.files, projectId);
+      return normalized;
+    }
+  } catch {
+    return loadLegacySavedProjectFiles(projectId);
+  }
+
+  const legacy = loadLegacySavedProjectFiles(projectId);
+  if (legacy) {
+    await saveStoredProjectFiles(legacy, projectId);
+    return legacy;
+  }
+
+  return null;
+}
+
+async function saveStoredProjectFiles(files: FSItem[], projectId = getActiveProjectId()) {
+  const db = await openProjectDataDB();
+  const snapshot = normalizeStoredProjectFiles(files) || [];
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction(PROJECT_DATA_STORE_NAME, 'readwrite');
+    tx.objectStore(PROJECT_DATA_STORE_NAME).put(snapshot, getProjectDbKey(STORAGE_KEYS.files, projectId));
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+  removeLegacyProjectStorageValue(STORAGE_KEYS.files, projectId);
+}
+
+async function deleteStoredProjectFiles(projectId = getActiveProjectId()) {
+  try {
+    const db = await openProjectDataDB();
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(PROJECT_DATA_STORE_NAME, 'readwrite');
+      tx.objectStore(PROJECT_DATA_STORE_NAME).delete(getProjectDbKey(STORAGE_KEYS.files, projectId));
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  } finally {
+    removeLegacyProjectStorageValue(STORAGE_KEYS.files, projectId);
+  }
+}
+
 function getCodeCraftLocalStorageSnapshot(projectId = getActiveProjectId()) {
   const snapshot: Record<string, string> = {};
   for (const baseKey of PROJECT_LOCAL_STORAGE_KEYS) {
@@ -3829,6 +3944,7 @@ function replaceCodeCraftLocalStorageSnapshot(snapshot: Record<string, string>, 
 async function deleteCodeCraftProjectData(projectId: string) {
   replaceCodeCraftLocalStorageSnapshot({}, projectId);
   await Promise.all([
+    deleteStoredProjectFiles(projectId),
     replaceAllStoredNpmPackages([], projectId),
     savePersistedPyodidePackageMetaCache({}, projectId),
     savePersistedPyodidePackageSnapshot(null, projectId),
@@ -3840,14 +3956,17 @@ async function deleteCodeCraftProjectData(projectId: string) {
 async function createCodeCraftUserDataExport(
   localStorageOverrides: Record<string, string> = {},
   projectId = getActiveProjectId(),
-  gitStateOverride?: GitRepositoryState
+  gitStateOverride?: GitRepositoryState,
+  projectFilesOverride?: FSItem[]
 ): Promise<CodeCraftUserDataExport> {
   const [
+    storedProjectFiles,
     npmPackages,
     pyodidePackageMeta,
     pyodidePackageSnapshot,
     storedGitState,
   ] = await Promise.all([
+    projectFilesOverride ? Promise.resolve(projectFilesOverride) : loadStoredProjectFiles(projectId).catch(() => null),
     loadAllStoredNpmPackages(projectId).catch(() => []),
     loadPersistedPyodidePackageMetaCache(projectId).catch(() => ({})),
     loadPersistedPyodidePackageSnapshot(projectId).catch(() => null),
@@ -3863,6 +3982,7 @@ async function createCodeCraftUserDataExport(
       ...localStorageOverrides,
     },
     indexedDB: {
+      files: normalizeStoredProjectFiles(storedProjectFiles) || [],
       npmPackages,
       pyodidePackageMeta: serializeCachedPyodidePackageMetaRecord(pyodidePackageMeta),
       pyodidePackageSnapshot: serializeCachedPyodideEnvironmentSnapshot(pyodidePackageSnapshot),
@@ -3896,6 +4016,14 @@ async function restoreCodeCraftUserDataExport(raw: unknown, projectId = getActiv
   const indexedDBSnapshot = backup.indexedDB && typeof backup.indexedDB === 'object'
     ? backup.indexedDB
     : null;
+  const indexedDBFiles = normalizeStoredProjectFiles(indexedDBSnapshot?.files);
+  const legacyLocalStorageFiles = parseStoredProjectFilesValue(localStorageSnapshot[STORAGE_KEYS.files] || null);
+  if (indexedDBFiles || legacyLocalStorageFiles) {
+    await saveStoredProjectFiles(indexedDBFiles || legacyLocalStorageFiles || [], projectId);
+  } else {
+    await deleteStoredProjectFiles(projectId);
+  }
+
   let gitStateSnapshot: unknown = indexedDBSnapshot?.gitState;
   if (!gitStateSnapshot && localStorageSnapshot[STORAGE_KEYS.gitState]) {
     try {
@@ -5787,6 +5915,8 @@ interface AppSettings {
   docsFindIncludeAccessorDocs: boolean;
 }
 
+type AssistantDocumentationLookupByChatId = Record<string, boolean>;
+
 const loadSavedAssistantChats = (): AssistantChat[] => {
   const saved = localStorage.getItem(getProjectStorageKey(STORAGE_KEYS.assistantChats));
   if (!saved) return [{ id: INITIAL_ASSISTANT_CHAT_ID, name: DEFAULT_ASSISTANT_CHAT_NAME, messages: [] }];
@@ -7296,16 +7426,18 @@ const FileTreeItem = React.memo(({ item, depth = 0 }: { item: FSItem; depth?: nu
 export default function App() {
   const [projects, setProjects] = useState<CodeCraftProjectMeta[]>(() => loadProjectRegistry());
   const [activeProjectId, setActiveProjectIdState] = useState(() => getActiveProjectId());
+  const filesMutationVersionRef = useRef(0);
+  const projectFilesPersistenceReadyRef = useRef(false);
   const [isProjectMenuOpen, setIsProjectMenuOpen] = useState(false);
   const [projectMenuStatus, setProjectMenuStatus] = useState('');
   const [renamingProjectId, setRenamingProjectId] = useState<string | null>(null);
   const [renamingProjectName, setRenamingProjectName] = useState('');
-  const [files, setFiles] = useState<FSItem[]>(() => {
-    const saved = localStorage.getItem(getProjectStorageKey(STORAGE_KEYS.files));
-    if (!saved) return INITIAL_FILES;
-    const parsed: FSItem[] = JSON.parse(saved);
-    return parsed.map(f => f.type === 'file' && f.name ? { ...f, language: langFromFilename(f.name) } : f);
-  });
+  const [files, setFilesState] = useState<FSItem[]>(() => loadInitialProjectFiles(activeProjectId));
+  const setFiles = useCallback<React.Dispatch<React.SetStateAction<FSItem[]>>>((nextFiles) => {
+    filesMutationVersionRef.current += 1;
+    setFilesState(nextFiles);
+  }, []);
+  const [projectFilesHydrated, setProjectFilesHydrated] = useState(false);
   const [activeFileId, setActiveFileId] = useState<string>('');
   const [output, setOutput] = useState<string>('Click "Run" or "Project Run" to see output...');
   const [executionStartupStatus, setExecutionStartupStatus] = useState('');
@@ -7331,6 +7463,7 @@ export default function App() {
   const [assistantAttachmentStatusByChatId, setAssistantAttachmentStatusByChatId] = useState<Record<string, string>>({});
   const [assistantTokenEstimates, setAssistantTokenEstimates] = useState<Record<string, AssistantTokenEstimate>>({});
   const [assistantTurnUsageByChatId, setAssistantTurnUsageByChatId] = useState<Record<string, AssistantTurnUsage>>({});
+  const [assistantDocumentationLookupByChatId, setAssistantDocumentationLookupByChatId] = useState<AssistantDocumentationLookupByChatId>({});
   const [loadingAssistantChatId, setLoadingAssistantChatId] = useState<string | null>(null);
   const [assistantHistoryOpenByChatId, setAssistantHistoryOpenByChatId] = useState<Record<string, boolean>>({});
   const [outputPreviewHtml, setOutputPreviewHtml] = useState<string | null>(null);
@@ -8899,6 +9032,40 @@ export default function App() {
 
   useEffect(() => {
     let cancelled = false;
+    const projectId = activeProjectId;
+    const startedMutationVersion = filesMutationVersionRef.current;
+    projectFilesPersistenceReadyRef.current = false;
+    setProjectFilesHydrated(false);
+
+    loadStoredProjectFiles(projectId)
+      .then(stored => {
+        if (cancelled) return;
+        const mutatedDuringHydration = filesMutationVersionRef.current !== startedMutationVersion;
+        const nextFiles = stored && !mutatedDuringHydration
+          ? stored
+          : filesRef.current;
+        if (stored && !mutatedDuringHydration) {
+          filesRef.current = stored;
+          setFilesState(stored);
+        }
+        projectFilesPersistenceReadyRef.current = true;
+        setProjectFilesHydrated(true);
+        void saveStoredProjectFiles(nextFiles, projectId);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        projectFilesPersistenceReadyRef.current = true;
+        setProjectFilesHydrated(true);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [activeProjectId]);
+
+  useEffect(() => {
+    if (!projectFilesHydrated) return;
+    let cancelled = false;
     loadAllSyncHandles().then(async handles => {
       if (cancelled) return;
       for (const [folderId, handle] of handles) {
@@ -8925,7 +9092,7 @@ export default function App() {
       }
     });
     return () => { cancelled = true; };
-  }, []);
+  }, [projectFilesHydrated]);
 
   useEffect(() => {
     const timeoutId = window.setTimeout(() => {
@@ -9058,16 +9225,14 @@ export default function App() {
   useEffect(() => {
     if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
     saveTimerRef.current = setTimeout(() => {
-      if (settings.autoSave) {
-        localStorage.setItem(getProjectStorageKey(STORAGE_KEYS.files), JSON.stringify(filesRef.current));
-      }
+      if (settings.autoSave && projectFilesPersistenceReadyRef.current) void saveStoredProjectFiles(filesRef.current, activeProjectId);
       for (const folderId of syncHandlesRef.current.keys()) {
         if (!syncInitializedRef.current.has(folderId)) continue;
         syncToDisk(folderId);
       }
     }, 1000);
     return () => { if (saveTimerRef.current) clearTimeout(saveTimerRef.current); };
-  }, [files, settings.autoSave]);
+  }, [activeProjectId, files, settings.autoSave]);
 
   useEffect(() => {
     localStorage.setItem(getProjectStorageKey(STORAGE_KEYS.assistantChats), JSON.stringify(assistantChats));
@@ -9128,6 +9293,17 @@ export default function App() {
       }
       return changed ? next : prev;
     });
+    setAssistantDocumentationLookupByChatId(prev => {
+      const next: AssistantDocumentationLookupByChatId = {};
+      let changed = false;
+      for (const chatId of chatIds) {
+        if (prev[chatId]) next[chatId] = true;
+      }
+      for (const chatId of Object.keys(prev)) {
+        if (!chatIds.has(chatId)) changed = true;
+      }
+      return changed ? next : prev;
+    });
   }, [assistantChats]);
 
   useEffect(() => {
@@ -9178,6 +9354,11 @@ export default function App() {
             : false;
       const estimateHasAssistantTools = getAssistantSupportsLocalTools(estimateProvider, estimateModel);
       draftChats.forEach(({ chatId, chat, draft, attachments }) => {
+        const estimateUseSemanticDocumentationFirst =
+          estimateHasAssistantTools
+          && getSemanticDocumentationFiles().length > 0
+          && !!semanticDocumentationVisibleRecord?.items.length
+          && !!assistantDocumentationLookupByChatId[chatId];
         const projectedOutputTokens = assistantTurnUsageByChatId[chatId]?.outputTokenCount || DEFAULT_ASSISTANT_ESTIMATED_OUTPUT_TOKENS;
         const assistantFiles = files.map(file => ({ ...file }));
         const assistantActiveItemId = activeItem?.id || activeFileId || '';
@@ -9192,6 +9373,8 @@ export default function App() {
           useChainOfThought: estimateUseChainOfThought,
           maxChainOfThoughtDepth: effectiveAssistantMaxChainOfThoughtDepth,
           hasAssistantTools: estimateHasAssistantTools,
+          useSemanticDocumentationFirst: estimateUseSemanticDocumentationFirst,
+          hasCSharpSemanticDocumentation: estimateUseSemanticDocumentationFirst,
         });
 
         setAssistantTokenEstimates(prev => ({
@@ -9279,6 +9462,9 @@ export default function App() {
     settings.assistantShowUsagePopup,
     settings.assistantUseChainOfThought,
     assistantAttachmentsByChatId,
+    assistantDocumentationLookupByChatId,
+    semanticDocumentationActive,
+    semanticDocumentationDraft,
     terminalCwd,
     effectiveAssistantMaxChainOfThoughtDepth,
   ]);
@@ -9395,6 +9581,8 @@ export default function App() {
     hasAssistantTools?: boolean;
     toolProgressNotes?: string[];
     assistantLiveNotes?: string[];
+    useSemanticDocumentationFirst?: boolean;
+    hasCSharpSemanticDocumentation?: boolean;
   }) {
     const {
       chatId,
@@ -9408,6 +9596,8 @@ export default function App() {
       hasAssistantTools = true,
       toolProgressNotes = [],
       assistantLiveNotes = [],
+      useSemanticDocumentationFirst = false,
+      hasCSharpSemanticDocumentation = false,
     } = params;
 
     const getPathFromSnapshot = (id: string | undefined): string => {
@@ -9476,6 +9666,13 @@ export default function App() {
     const assistantCodingGuidance = `
         C# runtime constraint: Do not generate or modify code that sets System.Console.OutputEncoding, Console.OutputEncoding, or similar console encoding properties. CodeCraft manages console output encoding internally.
         When local tools are available, use docsGet for exact generated semantic-documentation lookups by item name. Use docsFind only for natural-language documentation search.
+        ${useSemanticDocumentationFirst && hasCSharpSemanticDocumentation ? `
+        The user enabled documentation-first lookup for this C# request.
+        Before answering, editing, or inspecting source for a C# type/member/behavior, first run docsFind with only the natural-language description and hideReason=true. Do not set typeLimit, memberLimit, or hideDocumentation.
+        If using the terminal command directly, the only docs find option you may add is --hide-reason: docs find --hide-reason <description>.
+        After docsFind returns results, use codinGet with the exact C# symbol path from the chosen documentation result before relying on or modifying the source code.
+        If docsFind returns no usable documentation result, explain that briefly, then continue with normal project inspection.
+        ` : ''}
     `;
 
     if (useChainOfThought && hasAssistantTools) {
@@ -14158,7 +14355,7 @@ finally:
 
   const DOCS_FIND_USAGE = 'Usage: docs find [--types N] [--members N] [--hide-reason] [--hide-docs] <description>';
   const DOCS_GET_USAGE = 'Usage: docs get <item-name>';
-  const CODIN_GET_USAGE = 'Usage: codin get <CSharpType[.Member]>';
+  const CODIN_GET_USAGE = 'Usage: codin get <CSharpSymbolPath>';
 
   interface CodinGetMatch {
     kind: string;
@@ -14176,6 +14373,14 @@ finally:
     (sourceFilesByPath.get(path) || '').slice(start, end).replace(/\s+$/, '')
   );
 
+  const getCodinGetTypeSymbolPath = (typeDecl: CSharpTypeDeclaration) => (
+    typeDecl.fullName || typeDecl.name
+  );
+
+  const getCodinGetMemberSymbolPath = (member: CSharpValueMember | CSharpMethodMember) => (
+    `${member.containerFullName || member.containerName}.${member.name}`
+  );
+
   const executeCodinGetCommand = (rawArgs: string[]): string[] => {
     const query = rawArgs.join(' ').trim().replace(/:$/, '');
     if (!query) return [CODIN_GET_USAGE];
@@ -14188,39 +14393,36 @@ finally:
     const parsed = parseCSharpSemanticDocumentationProject(sourceFiles);
     const sourceFilesByPath = new Map(sourceFiles.map(file => [file.path, file.content]));
     const matches: CodinGetMatch[] = [];
-    const isMemberQuery = query.includes('.');
 
-    if (!isMemberQuery) {
-      for (const typeDecl of parsed.types) {
-        if (typeDecl.name !== query) continue;
-        matches.push({
-          kind: typeDecl.kind,
-          symbolPath: typeDecl.name,
-          sourcePath: typeDecl.path,
-          code: getCodinGetSourceSlice(sourceFilesByPath, typeDecl.path, typeDecl.spanStart, typeDecl.spanEnd),
-        });
-      }
-    } else {
-      for (const member of parsed.valueMembers) {
-        const symbolPath = `${member.containerName}.${member.name}`;
-        if (symbolPath !== query) continue;
-        matches.push({
-          kind: member.kind,
-          symbolPath,
-          sourcePath: member.path,
-          code: getCodinGetSourceSlice(sourceFilesByPath, member.path, member.spanStart, member.spanEnd),
-        });
-      }
-      for (const member of parsed.methodMembers) {
-        const symbolPath = `${member.containerName}.${member.name}`;
-        if (symbolPath !== query) continue;
-        matches.push({
-          kind: member.kind,
-          symbolPath,
-          sourcePath: member.path,
-          code: getCodinGetSourceSlice(sourceFilesByPath, member.path, member.spanStart, member.spanEnd),
-        });
-      }
+    for (const typeDecl of parsed.types) {
+      const symbolPath = getCodinGetTypeSymbolPath(typeDecl);
+      if (symbolPath !== query) continue;
+      matches.push({
+        kind: typeDecl.kind,
+        symbolPath,
+        sourcePath: typeDecl.path,
+        code: getCodinGetSourceSlice(sourceFilesByPath, typeDecl.path, typeDecl.spanStart, typeDecl.spanEnd),
+      });
+    }
+    for (const member of parsed.valueMembers) {
+      const symbolPath = getCodinGetMemberSymbolPath(member);
+      if (symbolPath !== query) continue;
+      matches.push({
+        kind: member.kind,
+        symbolPath,
+        sourcePath: member.path,
+        code: getCodinGetSourceSlice(sourceFilesByPath, member.path, member.spanStart, member.spanEnd),
+      });
+    }
+    for (const member of parsed.methodMembers) {
+      const symbolPath = getCodinGetMemberSymbolPath(member);
+      if (symbolPath !== query) continue;
+      matches.push({
+        kind: member.kind,
+        symbolPath,
+        sourcePath: member.path,
+        code: getCodinGetSourceSlice(sourceFilesByPath, member.path, member.spanStart, member.spanEnd),
+      });
     }
 
     if (matches.length === 0) return ['no matches'];
@@ -14309,8 +14511,15 @@ finally:
     return active || draft || semanticDocumentationActive || semanticDocumentationDraft;
   };
 
+  const getSemanticDocumentationItemSymbolPathFromId = (item: SemanticDocumentationItem) => {
+    const parts = item.id.split(':');
+    return parts.length >= 4 && parts[2] ? parts[2] : '';
+  };
+
   const formatDocsFindFullName = (item: SemanticDocumentationItem) => (
-    item.containerName ? `${item.containerName}.${item.name}` : item.name
+    item.symbolPath
+    || getSemanticDocumentationItemSymbolPathFromId(item)
+    || (item.containerName ? `${item.containerName}.${item.name}` : item.name)
   );
 
   const escapeDocsGetPatternCharacter = (value: string) => (
@@ -14729,6 +14938,11 @@ finally:
       const model = settings.assistantModel.trim();
       const apiKey = assistantConfiguredApiKey;
       const assistantSupportsLocalTools = getAssistantSupportsLocalTools(provider, model);
+      const submittedUseSemanticDocumentationFirst =
+        assistantSupportsLocalTools
+        && getSemanticDocumentationFiles().length > 0
+        && !!semanticDocumentationVisibleRecord?.items.length
+        && !!assistantDocumentationLookupByChatId[chatId];
       const assistantTools = assistantSupportsLocalTools
         ? buildAssistantToolSet(effectiveAssistantUseChainOfThought)
         : [];
@@ -14804,6 +15018,8 @@ finally:
         hasAssistantTools: assistantSupportsLocalTools,
         toolProgressNotes,
         assistantLiveNotes,
+        useSemanticDocumentationFirst: submittedUseSemanticDocumentationFirst,
+        hasCSharpSemanticDocumentation: submittedUseSemanticDocumentationFirst,
       });
 
       const waitForAssistantRequestRateLimit = async () => {
@@ -15369,7 +15585,7 @@ finally:
             'Standard commands: ls, pwd, cd, mkdir, touch, open, cat, rm, clear, help, date, echo, whoami',
             'Documentation: docs find [--types N] [--members N] [--hide-reason] [--hide-docs] <description>',
             'Documentation: docs get <item-name>',
-            'Code navigation: codin get <CSharpType[.Member]> (C#)',
+            'Code navigation: codin get <CSharpSymbolPath> (C#)',
             'Python: pip install <package> [-force] | pip upgrade <package> [-version <ver>] | pip uninstall <package> | pip include <module> | pip list',
             'JavaScript/TypeScript: npm install <package...> | npm uninstall <package...> | npm include <module> [url] | npm remove <module> | npm list',
             'C#: nuget include <namespace> | nuget list',
@@ -18781,7 +18997,7 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
         setTerminalOutput([...newOutput, 'Usage: nuget include <namespace> | nuget list']);
       }
     } else if (cmd === 'help') {
-      setTerminalOutput([...newOutput, 'Standard commands: ls, pwd, cd, mkdir, touch, open, cat, rm, clear, help, date, echo', 'Documentation: docs find [--types N] [--members N] [--hide-reason] [--hide-docs] <description>', 'Documentation: docs get <item-name>', 'Code navigation: codin get <CSharpType[.Member]> (C#)', 'Source control: git status|add|restore|reset|commit|log|show|branch|checkout|switch|merge|tag|stash|remote|fetch|pull|push|ls-remote|clean|diff|config|rev-parse|clone, gh auth|repo|pr|issue', 'Python: pip install <package> [-force] | pip upgrade <package> [-version <ver>] | pip uninstall <package> | pip include <module> | pip list', 'JavaScript/TypeScript: npm install <package...> | npm uninstall <package...> | npm include <module> [url] | npm remove <module> | npm list', 'C#: nuget include <namespace> | nuget list', 'JavaScript/TypeScript: use Run or Project Run on .js, .jsx, .ts, and .tsx files', 'C/C++: use Run or Project Run on .c, .cpp, .cc, .cxx, and matching header files', 'Java: use Run or Project Run on .java files']);
+      setTerminalOutput([...newOutput, 'Standard commands: ls, pwd, cd, mkdir, touch, open, cat, rm, clear, help, date, echo', 'Documentation: docs find [--types N] [--members N] [--hide-reason] [--hide-docs] <description>', 'Documentation: docs get <item-name>', 'Code navigation: codin get <CSharpSymbolPath> (C#)', 'Source control: git status|add|restore|reset|commit|log|show|branch|checkout|switch|merge|tag|stash|remote|fetch|pull|push|ls-remote|clean|diff|config|rev-parse|clone, gh auth|repo|pr|issue', 'Python: pip install <package> [-force] | pip upgrade <package> [-version <ver>] | pip uninstall <package> | pip include <module> | pip list', 'JavaScript/TypeScript: npm install <package...> | npm uninstall <package...> | npm include <module> [url] | npm remove <module> | npm list', 'C#: nuget include <namespace> | nuget list', 'JavaScript/TypeScript: use Run or Project Run on .js, .jsx, .ts, and .tsx files', 'C/C++: use Run or Project Run on .c, .cpp, .cc, .cxx, and matching header files', 'Java: use Run or Project Run on .java files']);
     } else if (cmd === 'date') {
       setTerminalOutput([...newOutput, new Date().toLocaleString()]);
     } else if (cmd === 'echo') {
@@ -19201,7 +19417,6 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
   };
 
   const getLiveUserDataLocalStorageOverrides = () => ({
-    [STORAGE_KEYS.files]: JSON.stringify(filesRef.current),
     [STORAGE_KEYS.settings]: JSON.stringify(settings),
     [STORAGE_KEYS.assistantChats]: JSON.stringify(assistantChats),
     [STORAGE_KEYS.layout]: JSON.stringify(layoutModel.toJson()),
@@ -19213,6 +19428,7 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
     for (const [key, value] of Object.entries(overrides)) {
       localStorage.setItem(getProjectStorageKey(key, projectId), value);
     }
+    await saveStoredProjectFiles(filesRef.current, projectId);
     await saveStoredGitState(gitStateRef.current, projectId);
     setProjects(touchProjectUpdatedAt(projectId));
   };
@@ -19381,7 +19597,7 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
       } else {
         await persistPyodidePackageMetaCache();
       }
-      const backup = await createCodeCraftUserDataExport(getLiveUserDataLocalStorageOverrides(), activeProjectId, gitStateRef.current);
+      const backup = await createCodeCraftUserDataExport(getLiveUserDataLocalStorageOverrides(), activeProjectId, gitStateRef.current, filesRef.current);
       const blob = new Blob([JSON.stringify(backup, null, 2)], { type: 'application/json' });
       const url = URL.createObjectURL(blob);
       const link = document.createElement('a');
@@ -20802,6 +21018,10 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
       const tokenEstimate = assistantTokenEstimates[chatId];
       const lastTurnUsage = assistantTurnUsageByChatId[chatId];
       const assistantStatusLabel = `${getAssistantProviderLabel(settings.assistantProvider)} · ${settings.assistantModel || 'No model selected'}`;
+      const assistantCanUseDocumentationFirst =
+        getAssistantSupportsLocalTools(settings.assistantProvider, settings.assistantModel.trim())
+        && getSemanticDocumentationFiles().length > 0
+        && !!semanticDocumentationVisibleRecord?.items.length;
 
       return (
         <div
@@ -20998,6 +21218,25 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
               </div>
             )}
             <div className="relative flex flex-col gap-2">
+              {assistantCanUseDocumentationFirst && (
+                <label className="flex items-start gap-2 rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-left">
+                  <input
+                    type="checkbox"
+                    checked={!!assistantDocumentationLookupByChatId[chatId]}
+                    onChange={(event) => setAssistantDocumentationLookupByChatId(prev => ({
+                      ...prev,
+                      [chatId]: event.target.checked,
+                    }))}
+                    className="mt-0.5 h-4 w-4 rounded border-white/20 bg-black/30 accent-indigo-500"
+                  />
+                  <span className="min-w-0">
+                    <span className="block text-xs font-medium text-zinc-200">Look at C# docs first</span>
+                    <span className="block text-[10px] text-zinc-500">
+                      Runs `docs find --hide-reason`, then `codin get` for the selected symbol.
+                    </span>
+                  </span>
+                </label>
+              )}
               <textarea
                 value={chatInput}
                 onChange={(e) => setAssistantInputs(prev => ({ ...prev, [chatId]: e.target.value }))}

@@ -14,6 +14,7 @@ export interface SemanticDocumentationItem {
   kind: SemanticDocumentationItemKind;
   name: string;
   containerName?: string;
+  symbolPath?: string;
   header: string;
   path: string;
   documentation: string;
@@ -73,6 +74,8 @@ export interface ParsedCSharpProject {
 export interface CSharpTypeDeclaration {
   id: string;
   name: string;
+  namespaceName: string;
+  fullName: string;
   kind: string;
   header: string;
   path: string;
@@ -88,6 +91,7 @@ export interface CSharpValueMember {
   kind: 'field' | 'property';
   name: string;
   containerName: string;
+  containerFullName: string;
   header: string;
   path: string;
   spanStart: number;
@@ -99,6 +103,7 @@ export interface CSharpMethodMember {
   kind: 'method' | 'accessor';
   name: string;
   containerName: string;
+  containerFullName: string;
   header: string;
   path: string;
   code: string;
@@ -115,6 +120,12 @@ const CSHARP_CONTROL_CALLS = new Set([
   'throw', 'new', 'typeof', 'sizeof', 'nameof', 'checked', 'unchecked', 'fixed',
 ]);
 const CSHARP_TYPE_KEYWORDS = new Set(['class', 'struct', 'interface', 'enum', 'record']);
+
+interface CSharpNamespaceSpan {
+  name: string;
+  bodyStart: number;
+  bodyEnd: number;
+}
 
 function openSemanticDocumentationDB(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
@@ -393,6 +404,7 @@ function createDocumentationItem(
     kind,
     name: source.name,
     containerName: 'containerName' in source ? source.containerName : undefined,
+    symbolPath: 'fullName' in source ? source.fullName : `${source.containerFullName}.${source.name}`,
     header: source.header,
     path: source.path,
     documentation: `${source.header}\n\n${documentation}`.trim(),
@@ -507,6 +519,7 @@ function parseCSharpProject(files: SemanticDocumentationSourceFile[]): ParsedCSh
 function parseCSharpTypes(file: SemanticDocumentationSourceFile, clean: string): CSharpTypeDeclaration[] {
   const source = file.content;
   const types: CSharpTypeDeclaration[] = [];
+  const namespaceSpans = collectCSharpNamespaceSpans(clean);
   const pattern = /\b(?:(?:public|private|protected|internal|static|abstract|sealed|partial|readonly|unsafe|ref)\s+)*(?:(record)\s+(class|struct)?|(class|struct|interface|enum))\s+([A-Za-z_]\w*)([^{};]*)\{/g;
   let match: RegExpExecArray | null;
   while ((match = pattern.exec(clean))) {
@@ -515,11 +528,15 @@ function parseCSharpTypes(file: SemanticDocumentationSourceFile, clean: string):
     if (closeBrace < 0) continue;
     const kind = match[1] ? `record${match[2] ? ` ${match[2]}` : ''}` : (match[3] || 'type');
     const name = match[4] || '';
+    const namespaceName = getCSharpNamespaceAt(namespaceSpans, match.index);
+    const fullName = namespaceName ? `${namespaceName}.${name}` : name;
     const header = normalizeHeader(source.slice(match.index, braceIndex));
-    const id = `type:${file.path}:${name}:${match.index}`;
+    const id = `type:${file.path}:${fullName}:${match.index}`;
     types.push({
       id,
       name,
+      namespaceName,
+      fullName,
       kind,
       header,
       path: file.path,
@@ -557,10 +574,11 @@ function parseCSharpTypeMembers(
         if (isMethodLikeHeader(header)) {
           const methodName = extractMethodName(header) || typeDecl.name;
           methodMembers.push({
-            id: `method:${file.path}:${typeDecl.name}.${methodName}:${headerStart}`,
+            id: `method:${file.path}:${typeDecl.fullName}.${methodName}:${headerStart}`,
             kind: 'method',
             name: methodName,
             containerName: typeDecl.name,
+            containerFullName: typeDecl.fullName,
             header,
             path: file.path,
             code: source.slice(headerStart, closeBrace + 1),
@@ -573,10 +591,11 @@ function parseCSharpTypeMembers(
           if (propertyName) {
             const accessorHeader = buildPropertyAccessorHeader(header, source.slice(i + 1, closeBrace));
             valueMembers.push({
-              id: `property:${file.path}:${typeDecl.name}.${propertyName}:${headerStart}`,
+              id: `property:${file.path}:${typeDecl.fullName}.${propertyName}:${headerStart}`,
               kind: 'property',
               name: propertyName,
               containerName: typeDecl.name,
+              containerFullName: typeDecl.fullName,
               header: accessorHeader,
               path: file.path,
               spanStart: headerStart,
@@ -595,10 +614,10 @@ function parseCSharpTypeMembers(
     } else if (ch === ';' && depth === 0) {
       const statementStart = findMemberHeaderStart(clean, segmentStart, i);
       const statement = normalizeHeader(source.slice(statementStart, i + 1));
-      for (const field of parseFieldDeclarations(statement, file.path, typeDecl.name, statementStart)) {
+      for (const field of parseFieldDeclarations(statement, file.path, typeDecl.name, typeDecl.fullName, statementStart)) {
         valueMembers.push(field);
       }
-      const expressionProperty = parseExpressionProperty(statement, file.path, typeDecl.name, statementStart);
+      const expressionProperty = parseExpressionProperty(statement, file.path, typeDecl.name, typeDecl.fullName, statementStart);
       if (expressionProperty) valueMembers.push(expressionProperty);
       segmentStart = i + 1;
     }
@@ -644,10 +663,11 @@ function parsePropertyAccessors(
       }
     }
     members.push({
-      id: `accessor:${file.path}:${typeDecl.name}.${propertyName}.${accessorName}:${absoluteStart}`,
+      id: `accessor:${file.path}:${typeDecl.fullName}.${propertyName}.${accessorName}:${absoluteStart}`,
       kind: 'accessor',
       name: `${propertyName}.${accessorName}`,
       containerName: typeDecl.name,
+      containerFullName: typeDecl.fullName,
       header: `${propertyHeader} ${accessorName}`,
       path: file.path,
       code,
@@ -659,7 +679,13 @@ function parsePropertyAccessors(
   return members;
 }
 
-function parseFieldDeclarations(statement: string, path: string, containerName: string, offset: number) {
+function parseFieldDeclarations(
+  statement: string,
+  path: string,
+  containerName: string,
+  containerFullName: string,
+  offset: number,
+) {
   if (!statement || statement.includes('(') || statement.includes('=>')) return [];
   if (/\b(get|set|init|add|remove)\b/.test(statement)) return [];
   const withoutAttrs = statement.replace(/^\s*(?:\[[^\]]+\]\s*)+/, '').trim();
@@ -671,10 +697,11 @@ function parseFieldDeclarations(statement: string, path: string, containerName: 
   if (!nameMatch) return [];
   const name = nameMatch[1];
   return [{
-    id: `field:${path}:${containerName}.${name}:${offset}`,
+    id: `field:${path}:${containerFullName}.${name}:${offset}`,
     kind: 'field' as const,
     name,
     containerName,
+    containerFullName,
     header: withoutSemi.endsWith(name) ? withoutSemi : `${withoutSemi} ${name}`,
     path,
     spanStart: offset,
@@ -682,16 +709,23 @@ function parseFieldDeclarations(statement: string, path: string, containerName: 
   }];
 }
 
-function parseExpressionProperty(statement: string, path: string, containerName: string, offset: number): CSharpValueMember | null {
+function parseExpressionProperty(
+  statement: string,
+  path: string,
+  containerName: string,
+  containerFullName: string,
+  offset: number,
+): CSharpValueMember | null {
   if (!statement.includes('=>')) return null;
   const beforeArrow = normalizeHeader(statement.split('=>')[0] || '');
   const name = extractPropertyName(beforeArrow);
   if (!name) return null;
   return {
-    id: `property:${path}:${containerName}.${name}:${offset}`,
+    id: `property:${path}:${containerFullName}.${name}:${offset}`,
     kind: 'property',
     name,
     containerName,
+    containerFullName,
     header: `${beforeArrow} { get; }`,
     path,
     spanStart: offset,
@@ -723,6 +757,47 @@ function buildPropertyAccessorHeader(header: string, body: string) {
   const accessors = [...body.matchAll(/\b(?:(public|private|protected|internal)\s+)?(get|set|init)\b/g)]
     .map(match => `${match[1] ? `${match[1]} ` : ''}${match[2]};`);
   return `${normalizeHeader(header)} { ${accessors.join(' ')} }`;
+}
+
+function collectCSharpNamespaceSpans(clean: string): CSharpNamespaceSpan[] {
+  const spans: CSharpNamespaceSpan[] = [];
+  const namespaceNamePattern = '[A-Za-z_]\\w*(?:\\s*\\.\\s*[A-Za-z_]\\w*)*';
+  const blockPattern = new RegExp(`\\bnamespace\\s+(${namespaceNamePattern})\\s*\\{`, 'g');
+  const fileScopedPattern = new RegExp(`\\bnamespace\\s+(${namespaceNamePattern})\\s*;`, 'g');
+  let match: RegExpExecArray | null;
+
+  while ((match = blockPattern.exec(clean))) {
+    const braceIndex = clean.indexOf('{', match.index);
+    const closeBrace = findMatchingBrace(clean, braceIndex);
+    if (braceIndex < 0 || closeBrace < 0) continue;
+    spans.push({
+      name: normalizeCSharpNamespaceName(match[1] || ''),
+      bodyStart: braceIndex + 1,
+      bodyEnd: closeBrace,
+    });
+    blockPattern.lastIndex = match.index + Math.max(1, match[0].length);
+  }
+
+  while ((match = fileScopedPattern.exec(clean))) {
+    const semicolonIndex = clean.indexOf(';', match.index);
+    if (semicolonIndex < 0) continue;
+    spans.push({
+      name: normalizeCSharpNamespaceName(match[1] || ''),
+      bodyStart: semicolonIndex + 1,
+      bodyEnd: clean.length,
+    });
+    fileScopedPattern.lastIndex = match.index + Math.max(1, match[0].length);
+  }
+
+  return spans.filter(span => span.name).sort((left, right) => left.bodyStart - right.bodyStart);
+}
+
+function getCSharpNamespaceAt(spans: CSharpNamespaceSpan[], index: number) {
+  return spans
+    .filter(span => span.bodyStart <= index && index < span.bodyEnd)
+    .sort((left, right) => left.bodyStart - right.bodyStart)
+    .map(span => span.name)
+    .join('.');
 }
 
 function collectValueMemberReferences(parsed: ParsedCSharpProject, member: CSharpValueMember) {
@@ -770,17 +845,17 @@ function buildMethodGraph(methodMembers: CSharpMethodMember[]) {
 function resolveEntryPointType(parsed: ParsedCSharpProject, entryPoint: string) {
   const trimmed = entryPoint.trim();
   if (trimmed) {
-    const exact = parsed.types.find(type => type.name === trimmed || type.header.includes(trimmed));
+    const exact = parsed.types.find(type => type.fullName === trimmed || (!type.namespaceName && type.name === trimmed) || type.header.includes(trimmed));
     if (exact) return exact;
   }
   const mainMethod = parsed.methodMembers.find(member => member.name === 'Main');
-  const mainType = mainMethod ? parsed.types.find(type => type.name === mainMethod.containerName) : null;
+  const mainType = mainMethod ? parsed.types.find(type => type.fullName === mainMethod.containerFullName) : null;
   return mainType || parsed.types[0];
 }
 
 function collectMethodGenerationComponents(parsed: ParsedCSharpProject, entryType: CSharpTypeDeclaration) {
   const byId = new Map(parsed.methodMembers.map(member => [member.id, member]));
-  const roots = parsed.methodMembers.filter(member => member.containerName === entryType.name);
+  const roots = parsed.methodMembers.filter(member => member.containerFullName === entryType.fullName);
   const reachable = new Set<string>();
   const visitReachable = (id: string) => {
     if (reachable.has(id)) return;
@@ -943,6 +1018,10 @@ function findNextNonWhitespace(source: string, index: number) {
 
 function normalizeHeader(header: string) {
   return header.replace(/\s+/g, ' ').trim();
+}
+
+function normalizeCSharpNamespaceName(name: string) {
+  return name.replace(/\s*\.\s*/g, '.').replace(/\s+/g, '').replace(/^\.+|\.+$/g, '');
 }
 
 function normalizeProjectPath(path: string) {
