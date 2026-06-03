@@ -61,7 +61,7 @@ export interface SemanticDocumentationGenerateOptions {
   onProgress?: (progress: SemanticDocumentationProgress) => void;
 }
 
-interface ParsedCSharpProject {
+export interface ParsedCSharpProject {
   files: SemanticDocumentationSourceFile[];
   types: CSharpTypeDeclaration[];
   valueMembers: CSharpValueMember[];
@@ -70,7 +70,7 @@ interface ParsedCSharpProject {
   sourceFingerprint: string;
 }
 
-interface CSharpTypeDeclaration {
+export interface CSharpTypeDeclaration {
   id: string;
   name: string;
   kind: string;
@@ -83,7 +83,7 @@ interface CSharpTypeDeclaration {
   bodyEnd: number;
 }
 
-interface CSharpValueMember {
+export interface CSharpValueMember {
   id: string;
   kind: 'field' | 'property';
   name: string;
@@ -94,7 +94,7 @@ interface CSharpValueMember {
   spanEnd: number;
 }
 
-interface CSharpMethodMember {
+export interface CSharpMethodMember {
   id: string;
   kind: 'method' | 'accessor';
   name: string;

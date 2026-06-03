@@ -1638,11 +1638,30 @@ function normalizeCursorLocalToolName(value: unknown) {
       return 'terminalDate';
     case 'echo':
       return 'terminalEcho';
+    case 'command':
+    case 'runcommand':
+    case 'executecommand':
+    case 'terminal':
+    case 'terminalcommand':
+    case 'runterminalcommand':
+    case 'executeterminalcommand':
+    case 'shell':
+    case 'shellcommand':
+    case 'bash':
+      return 'runTerminalCommand';
     case 'docsfind':
     case 'documentationfind':
     case 'finddocs':
     case 'finddocumentation':
       return 'docsFind';
+    case 'docsget':
+    case 'documentationget':
+    case 'getdocs':
+    case 'getdocumentation':
+      return 'docsGet';
+    case 'codinget':
+    case 'codin':
+      return 'codinGet';
     default:
       return rawName;
   }
@@ -1699,6 +1718,13 @@ function normalizeCursorLocalToolArgs(toolName: string, value: unknown): Record<
     };
   }
 
+  if (toolName === 'runTerminalCommand') {
+    return {
+      ...source,
+      command: source.command ?? source.cmd ?? source.text ?? source.input ?? source.shell ?? source.terminal ?? source.query,
+    };
+  }
+
   if (toolName === 'docsFind') {
     return {
       ...source,
@@ -1707,6 +1733,20 @@ function normalizeCursorLocalToolArgs(toolName: string, value: unknown): Record<
       memberLimit: source.memberLimit ?? source.members ?? source.memberMatches ?? source.memberCount,
       hideReason: source.hideReason ?? source.noReason,
       hideDocumentation: source.hideDocumentation ?? source.hideDocs ?? source.noDocs,
+    };
+  }
+
+  if (toolName === 'docsGet') {
+    return {
+      ...source,
+      itemName: source.itemName ?? source.name ?? source.path ?? source.query ?? source.text,
+    };
+  }
+
+  if (toolName === 'codinGet') {
+    return {
+      ...source,
+      symbolPath: source.symbolPath ?? source.path ?? source.query ?? source.name ?? source.text,
     };
   }
 
@@ -2062,14 +2102,14 @@ const moveItemTool: AssistantToolDefinition = {
 
 const runTerminalCommandTool: AssistantToolDefinition = {
   name: "runTerminalCommand",
-  description: "Run a command in the built-in terminal emulator.",
+  description: "Run any command supported by the built-in terminal emulator, including git, gh, docs, codin, pip, npm, nuget, and help.",
   parameters: {
     type: 'object',
-    description: "Run a command in the built-in terminal emulator.",
+    description: "Run any command supported by the built-in terminal emulator.",
     properties: {
       command: {
         type: 'string',
-        description: "Terminal command text to execute.",
+        description: "Terminal command text to execute exactly as it would be typed in CodeCraft's terminal.",
       },
     },
     required: ["command"],
@@ -2399,6 +2439,21 @@ const nugetListTool: AssistantToolDefinition = {
   },
 };
 
+const codinGetTool: AssistantToolDefinition = {
+  name: "codinGet",
+  description: "Get a C# type or member source snippet by exact CodeCraft path, such as Calculator or Calculator.Foo.",
+  parameters: {
+    type: 'object',
+    properties: {
+      symbolPath: {
+        type: 'string',
+        description: "Exact C# symbol path to retrieve. Use TypeName for types and TypeName.MemberName for members.",
+      },
+    },
+    required: ['symbolPath'],
+  },
+};
+
 const docsFindTool: AssistantToolDefinition = {
   name: "docsFind",
   description: "Find generated C# semantic documentation that matches a natural-language description.",
@@ -2431,6 +2486,21 @@ const docsFindTool: AssistantToolDefinition = {
   },
 };
 
+const docsGetTool: AssistantToolDefinition = {
+  name: "docsGet",
+  description: "Get generated C# semantic documentation for an exact item name, with _ as a one-character wildcard and * as an any-length wildcard.",
+  parameters: {
+    type: 'object',
+    properties: {
+      itemName: {
+        type: 'string',
+        description: "Exact item name to retrieve, optionally using _ for one character and * for any-length wildcard matches.",
+      },
+    },
+    required: ['itemName'],
+  },
+};
+
 const STANDARD_ASSISTANT_TOOLS: AssistantToolDefinition[] = [
   proposeEditTool,
   navigateToTool,
@@ -2440,6 +2510,8 @@ const STANDARD_ASSISTANT_TOOLS: AssistantToolDefinition[] = [
   moveItemTool,
   lsTool,
   runTerminalCommandTool,
+  codinGetTool,
+  docsGetTool,
   docsFindTool,
 ];
 
@@ -2451,6 +2523,7 @@ const CHAIN_OF_THOUGHT_ASSISTANT_TOOLS: AssistantToolDefinition[] = [
   deleteItemTool,
   moveItemTool,
   lsTool,
+  runTerminalCommandTool,
   terminalPwdTool,
   terminalCdTool,
   terminalMkdirTool,
@@ -2474,6 +2547,8 @@ const CHAIN_OF_THOUGHT_ASSISTANT_TOOLS: AssistantToolDefinition[] = [
   npmListTool,
   nugetIncludeTool,
   nugetListTool,
+  codinGetTool,
+  docsGetTool,
   docsFindTool,
 ];
 
@@ -9399,6 +9474,7 @@ export default function App() {
     `;
     const assistantCodingGuidance = `
         C# runtime constraint: Do not generate or modify code that sets System.Console.OutputEncoding, Console.OutputEncoding, or similar console encoding properties. CodeCraft manages console output encoding internally.
+        When local tools are available, use docsGet for exact generated semantic-documentation lookups by item name. Use docsFind only for natural-language documentation search.
     `;
 
     if (useChainOfThought && hasAssistantTools) {
@@ -9407,7 +9483,9 @@ export default function App() {
         Internal Chat ID: ${chatId}
         Keep continuity with the existing chat history for this chat.
         You are in tool-driven Chain of Thought mode.
-        Use the discrete local terminal tools to inspect the project one command at a time instead of assuming unseen files or folders.
+        Use local terminal tools to inspect the project one command at a time instead of assuming unseen files or folders.
+        Use docsGet when the user asks for generated documentation for an exact item name.
+        Use runTerminalCommand for any command supported by CodeCraft's built-in terminal, including source-control, package, documentation, and navigation commands.
         When you want to change code, use 'proposeEdit' so the user can review it.
         Keep user-facing explanations separate from tool and edit logs.
         If you need more context, discover it through the available terminal tools.
@@ -9480,7 +9558,7 @@ export default function App() {
         Context: You are an AI coding assistant inside CodeCraft IDE.
         Internal Chat ID: ${chatId}
         Keep continuity with the existing chat history for this chat.
-        You have access to tools to propose edits, navigate, move cursor, directly create/delete/move files or folders, and run built-in terminal commands.
+        You have access to tools to propose edits, navigate, move cursor, directly create/delete/move files or folders, retrieve generated documentation with docsGet, and run built-in terminal commands.
         Do not suggest terminal-style commands for filesystem operations when a tool can be used, unless the user specifically asks for it.
         When you want to change code, use 'proposeEdit' so the user can review it.
         You may use multiple tool calls in a single response when the task needs several actions.
@@ -14078,6 +14156,83 @@ finally:
   }
 
   const DOCS_FIND_USAGE = 'Usage: docs find [--types N] [--members N] [--hide-reason] [--hide-docs] <description>';
+  const DOCS_GET_USAGE = 'Usage: docs get <item-name>';
+  const CODIN_GET_USAGE = 'Usage: codin get <CSharpType[.Member]>';
+
+  interface CodinGetMatch {
+    kind: string;
+    symbolPath: string;
+    sourcePath: string;
+    code: string;
+  }
+
+  const splitTerminalSnippetLines = (text: string) => {
+    const normalized = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+    return normalized.length > 0 ? normalized.split('\n') : [''];
+  };
+
+  const getCodinGetSourceSlice = (sourceFilesByPath: Map<string, string>, path: string, start: number, end: number) => (
+    (sourceFilesByPath.get(path) || '').slice(start, end).replace(/\s+$/, '')
+  );
+
+  const executeCodinGetCommand = (rawArgs: string[]): string[] => {
+    const query = rawArgs.join(' ').trim().replace(/:$/, '');
+    if (!query) return [CODIN_GET_USAGE];
+
+    const sourceFiles = getSemanticDocumentationFiles();
+    if (sourceFiles.length === 0) {
+      return ['codin get currently supports C# only, and no C# files were found.'];
+    }
+
+    const parsed = parseCSharpSemanticDocumentationProject(sourceFiles);
+    const sourceFilesByPath = new Map(sourceFiles.map(file => [file.path, file.content]));
+    const matches: CodinGetMatch[] = [];
+    const isMemberQuery = query.includes('.');
+
+    if (!isMemberQuery) {
+      for (const typeDecl of parsed.types) {
+        if (typeDecl.name !== query) continue;
+        matches.push({
+          kind: typeDecl.kind,
+          symbolPath: typeDecl.name,
+          sourcePath: typeDecl.path,
+          code: getCodinGetSourceSlice(sourceFilesByPath, typeDecl.path, typeDecl.spanStart, typeDecl.spanEnd),
+        });
+      }
+    } else {
+      for (const member of parsed.valueMembers) {
+        const symbolPath = `${member.containerName}.${member.name}`;
+        if (symbolPath !== query) continue;
+        matches.push({
+          kind: member.kind,
+          symbolPath,
+          sourcePath: member.path,
+          code: getCodinGetSourceSlice(sourceFilesByPath, member.path, member.spanStart, member.spanEnd),
+        });
+      }
+      for (const member of parsed.methodMembers) {
+        const symbolPath = `${member.containerName}.${member.name}`;
+        if (symbolPath !== query) continue;
+        matches.push({
+          kind: member.kind,
+          symbolPath,
+          sourcePath: member.path,
+          code: getCodinGetSourceSlice(sourceFilesByPath, member.path, member.spanStart, member.spanEnd),
+        });
+      }
+    }
+
+    if (matches.length === 0) return ['no matches'];
+    if (matches.length === 1) return splitTerminalSnippetLines(matches[0].code);
+
+    const lines = [`${matches.length} matches:`];
+    matches.forEach((match, index) => {
+      if (index > 0) lines.push('');
+      lines.push(`--- ${match.symbolPath} [${match.kind}] ${match.sourcePath} ---`);
+      lines.push(...splitTerminalSnippetLines(match.code));
+    });
+    return lines;
+  };
 
   const parseDocsFindCommandOptions = (rawArgs: string[]): DocsFindCommandOptions => {
     const descriptionParts: string[] = [];
@@ -14156,6 +14311,51 @@ finally:
   const formatDocsFindFullName = (item: SemanticDocumentationItem) => (
     item.containerName ? `${item.containerName}.${item.name}` : item.name
   );
+
+  const escapeDocsGetPatternCharacter = (value: string) => (
+    value.replace(/[\\^$+?.()|[\]{}]/g, '\\$&')
+  );
+
+  const buildDocsGetNameMatcher = (pattern: string) => {
+    const source = Array.from(pattern)
+      .map(char => {
+        if (char === '_') return '.';
+        if (char === '*') return '.*';
+        return escapeDocsGetPatternCharacter(char);
+      })
+      .join('');
+    return new RegExp(`^${source}$`);
+  };
+
+  const docsGetCandidateName = (item: SemanticDocumentationItem, query: string) => (
+    query.includes('.') ? formatDocsFindFullName(item) : item.name
+  );
+
+  const executeDocsGetCommand = async (rawArgs: string[]): Promise<string[]> => {
+    const query = rawArgs.join(' ').trim();
+    if (!query) return [DOCS_GET_USAGE];
+
+    const record = await getSemanticDocumentationRecordForFind();
+    if (!record || record.items.length === 0) {
+      return ['No semantic documentation is available. Open Semantic Documentation and generate C# docs first.'];
+    }
+
+    const matcher = buildDocsGetNameMatcher(query);
+    const matches = record.items
+      .filter(item => matcher.test(docsGetCandidateName(item, query)))
+      .sort((left, right) => formatDocsFindFullName(left).localeCompare(formatDocsFindFullName(right)));
+
+    if (matches.length === 0) return [`No documentation matched \`${query}\`.`];
+    if (matches.length === 1) return splitTerminalSnippetLines(matches[0].documentation);
+
+    const lines = [`${matches.length} documentation matches for \`${query}\`:`];
+    matches.forEach((item, index) => {
+      if (index > 0) lines.push('');
+      lines.push(`--- ${formatDocsFindFullName(item)} [${item.kind}] ${item.path} ---`);
+      lines.push(...splitTerminalSnippetLines(item.documentation));
+    });
+    return lines;
+  };
 
   const formatDocsFindCandidateBlock = (candidate: DocsFindCandidate) => (
     [
@@ -14938,6 +15138,38 @@ finally:
           }
         }
 
+        if (call.name === 'docsGet') {
+          const itemName = typeof args.itemName === 'string' ? args.itemName.trim() : '';
+          const command = `docs get${itemName ? ` ${quoteTerminalArg(itemName)}` : ''}`;
+          try {
+            const lines = await executeDocsGetCommand(itemName ? [itemName] : []);
+            appendTerminalCommandResult(command, lines);
+            return {
+              summary: itemName
+                ? `Retrieved documentation for \`${itemName}\`.`
+                : 'docs get needs an item name.',
+              detail: lines.join('\n'),
+              result: {
+                ok: itemName.length > 0,
+                itemName,
+                output: lines,
+              },
+            };
+          } catch (error) {
+            const message = `docs get error: ${error instanceof Error ? error.message : String(error)}`;
+            appendTerminalCommandResult(command, [message]);
+            return {
+              summary: message,
+              detail: message,
+              result: {
+                ok: false,
+                itemName,
+                error: message,
+              },
+            };
+          }
+        }
+
         if (call.name === 'runTerminalCommand') {
           const { command } = args as any;
           if (typeof command === 'string' && command.trim()) {
@@ -15135,6 +15367,8 @@ finally:
           const helpLines = [
             'Standard commands: ls, pwd, cd, mkdir, touch, open, cat, rm, clear, help, date, echo, whoami',
             'Documentation: docs find [--types N] [--members N] [--hide-reason] [--hide-docs] <description>',
+            'Documentation: docs get <item-name>',
+            'Code navigation: codin get <CSharpType[.Member]> (C#)',
             'Python: pip install <package> [-force] | pip upgrade <package> [-version <ver>] | pip uninstall <package> | pip include <module> | pip list',
             'JavaScript/TypeScript: npm install <package...> | npm uninstall <package...> | npm include <module> [url] | npm remove <module> | npm list',
             'C#: nuget include <namespace> | nuget list',
@@ -15253,6 +15487,15 @@ finally:
 
         if (call.name === 'nugetList') {
           return runRawTerminalCommand('nuget list', 'Listed included C# namespaces.', 'Listed included C# namespaces.');
+        }
+
+        if (call.name === 'codinGet') {
+          const symbolPath = typeof args.symbolPath === 'string' ? args.symbolPath.trim() : '';
+          if (!symbolPath) {
+            return { summary: 'codin get needs a C# symbol path.', detail: 'codin get needs a C# symbol path.', result: { ok: false } };
+          }
+          const command = `codin get ${quoteTerminalArg(symbolPath)}`;
+          return runRawTerminalCommand(command, `Retrieved \`${symbolPath}\` with codin get.`, `Retrieved ${symbolPath} with codin get.`);
         }
 
         return {
@@ -17677,8 +17920,25 @@ finally:
         } catch (error) {
           setTerminalOutput(prev => [...prev, `docs find error: ${error instanceof Error ? error.message : String(error)}`]);
         }
+      } else if (subCmd === 'get') {
+        try {
+          setTerminalOutput([...newOutput, ...await executeDocsGetCommand(args.slice(2))]);
+        } catch (error) {
+          setTerminalOutput([...newOutput, `docs get error: ${error instanceof Error ? error.message : String(error)}`]);
+        }
       } else {
-        setTerminalOutput([...newOutput, DOCS_FIND_USAGE]);
+        setTerminalOutput([...newOutput, DOCS_FIND_USAGE, DOCS_GET_USAGE]);
+      }
+    } else if (cmd === 'codin') {
+      const subCmd = (args[1] || '').toLowerCase();
+      if (subCmd === 'get') {
+        try {
+          setTerminalOutput([...newOutput, ...executeCodinGetCommand(args.slice(2))]);
+        } catch (error) {
+          setTerminalOutput([...newOutput, `codin get error: ${error instanceof Error ? error.message : String(error)}`]);
+        }
+      } else {
+        setTerminalOutput([...newOutput, CODIN_GET_USAGE]);
       }
     } else if (cmd === 'pip') {
       const subCmd = args[1];
@@ -18520,7 +18780,7 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
         setTerminalOutput([...newOutput, 'Usage: nuget include <namespace> | nuget list']);
       }
     } else if (cmd === 'help') {
-      setTerminalOutput([...newOutput, 'Standard commands: ls, pwd, cd, mkdir, touch, open, cat, rm, clear, help, date, echo', 'Documentation: docs find [--types N] [--members N] [--hide-reason] [--hide-docs] <description>', 'Source control: git status|add|restore|reset|commit|log|show|branch|checkout|switch|merge|tag|stash|remote|fetch|pull|push|ls-remote|clean|diff|config|rev-parse|clone, gh auth|repo|pr|issue', 'Python: pip install <package> [-force] | pip upgrade <package> [-version <ver>] | pip uninstall <package> | pip include <module> | pip list', 'JavaScript/TypeScript: npm install <package...> | npm uninstall <package...> | npm include <module> [url] | npm remove <module> | npm list', 'C#: nuget include <namespace> | nuget list', 'JavaScript/TypeScript: use Run or Project Run on .js, .jsx, .ts, and .tsx files', 'C/C++: use Run or Project Run on .c, .cpp, .cc, .cxx, and matching header files', 'Java: use Run or Project Run on .java files']);
+      setTerminalOutput([...newOutput, 'Standard commands: ls, pwd, cd, mkdir, touch, open, cat, rm, clear, help, date, echo', 'Documentation: docs find [--types N] [--members N] [--hide-reason] [--hide-docs] <description>', 'Documentation: docs get <item-name>', 'Code navigation: codin get <CSharpType[.Member]> (C#)', 'Source control: git status|add|restore|reset|commit|log|show|branch|checkout|switch|merge|tag|stash|remote|fetch|pull|push|ls-remote|clean|diff|config|rev-parse|clone, gh auth|repo|pr|issue', 'Python: pip install <package> [-force] | pip upgrade <package> [-version <ver>] | pip uninstall <package> | pip include <module> | pip list', 'JavaScript/TypeScript: npm install <package...> | npm uninstall <package...> | npm include <module> [url] | npm remove <module> | npm list', 'C#: nuget include <namespace> | nuget list', 'JavaScript/TypeScript: use Run or Project Run on .js, .jsx, .ts, and .tsx files', 'C/C++: use Run or Project Run on .c, .cpp, .cc, .cxx, and matching header files', 'Java: use Run or Project Run on .java files']);
     } else if (cmd === 'date') {
       setTerminalOutput([...newOutput, new Date().toLocaleString()]);
     } else if (cmd === 'echo') {
@@ -19774,7 +20034,7 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
           <button onClick={() => setTerminalOutput([])} className="absolute top-2 right-4 text-[10px] px-2 py-1 rounded bg-white/5 hover:bg-white/10 text-zinc-500 hover:text-white transition-all z-10 opacity-0 group-hover:opacity-100 backdrop-blur-sm cursor-pointer">Reset</button>
           <div ref={terminalContainerRef} className="flex-1 p-4 font-mono text-sm overflow-y-auto flex flex-col custom-scrollbar">
             <div className="space-y-1 mb-2">
-              {terminalOutput.map((line, i) => <div key={i} className="text-zinc-400">{line}</div>)}
+              {terminalOutput.map((line, i) => <div key={i} className="text-zinc-400 whitespace-pre-wrap">{line}</div>)}
             </div>
             <div className="flex items-center gap-2">
               <span className="text-zinc-500 font-mono text-xs">{terminalCwd ? getPath(terminalCwd) : '~'}</span>
