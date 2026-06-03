@@ -72,9 +72,11 @@ import {
   deleteSemanticDocumentationRecord,
   formatSemanticDocumentationTimestamp,
   getSemanticDocumentationProgressLabel,
+  limitSemanticPrompt,
   loadSemanticDocumentationRecord,
   parseCSharpSemanticDocumentationProject,
   runSemanticDocumentationGeneration,
+  type SemanticDocumentationItem,
   type SemanticDocumentationRecord,
   type SemanticDocumentationSourceFile,
 } from './semantic-documentation';
@@ -760,6 +762,10 @@ const MAX_ASSISTANT_REQUEST_RATE_LIMIT_PER_MINUTE = 120;
 const DEFAULT_ASSISTANT_ESTIMATED_OUTPUT_TOKENS = 1024;
 const DEFAULT_AUTO_DOCUMENTATION_PROMPT_TOKEN_LIMIT = 24000;
 const MAX_AUTO_DOCUMENTATION_PROMPT_TOKEN_LIMIT = 256000;
+const DEFAULT_DOCS_FIND_TYPE_MATCH_COUNT = 3;
+const DEFAULT_DOCS_FIND_MEMBER_MATCH_COUNT = 10;
+const MAX_DOCS_FIND_TYPE_MATCH_COUNT = 25;
+const MAX_DOCS_FIND_MEMBER_MATCH_COUNT = 50;
 const CURSOR_AGENTS_API_BASE_URL = 'https://api.cursor.com';
 const CURSOR_AGENTS_GITHUB_REPOSITORY_URL = 'https://github.com/gangdol2012/repository';
 const CODECRAFT_DELEGATE_SERVER_URL = 'https://codecraft-delegate.codecraftide.workers.dev/delegate';
@@ -5650,6 +5656,9 @@ interface AppSettings {
   autoDocumentationModel: string;
   autoDocumentationEntryPoint: string;
   autoDocumentationPromptTokenLimit: number;
+  docsFindTypeMatchCount: number;
+  docsFindMemberMatchCount: number;
+  docsFindIncludeAccessorDocs: boolean;
 }
 
 const loadSavedAssistantChats = (): AssistantChat[] => {
@@ -5760,6 +5769,9 @@ const DEFAULT_SETTINGS: AppSettings = {
   autoDocumentationModel: getAssistantDefaultModel('gemini'),
   autoDocumentationEntryPoint: 'Program',
   autoDocumentationPromptTokenLimit: DEFAULT_AUTO_DOCUMENTATION_PROMPT_TOKEN_LIMIT,
+  docsFindTypeMatchCount: DEFAULT_DOCS_FIND_TYPE_MATCH_COUNT,
+  docsFindMemberMatchCount: DEFAULT_DOCS_FIND_MEMBER_MATCH_COUNT,
+  docsFindIncludeAccessorDocs: true,
 };
 
 const LEGACY_CSHARP_AUTHORING_SOURCE_KEY = 'csharp' + 'Intelli' + 'SageSource';
@@ -6794,6 +6806,16 @@ function normalizeAutoDocumentationPromptTokenLimit(value: number) {
   return Math.min(MAX_AUTO_DOCUMENTATION_PROMPT_TOKEN_LIMIT, Math.max(1024, Math.floor(value)));
 }
 
+function normalizeDocsFindTypeMatchCount(value: number) {
+  if (!Number.isFinite(value)) return DEFAULT_DOCS_FIND_TYPE_MATCH_COUNT;
+  return Math.min(MAX_DOCS_FIND_TYPE_MATCH_COUNT, Math.max(1, Math.floor(value)));
+}
+
+function normalizeDocsFindMemberMatchCount(value: number) {
+  if (!Number.isFinite(value)) return DEFAULT_DOCS_FIND_MEMBER_MATCH_COUNT;
+  return Math.min(MAX_DOCS_FIND_MEMBER_MATCH_COUNT, Math.max(1, Math.floor(value)));
+}
+
 function normalizeRuntimeIOMode(value: unknown): RuntimeIOMode {
   return value === 'interactive-output-panel' ? 'interactive-output-panel' : 'alert-output';
 }
@@ -7271,6 +7293,17 @@ export default function App() {
           ? merged.autoDocumentationPromptTokenLimit
           : DEFAULT_SETTINGS.autoDocumentationPromptTokenLimit
       ),
+      docsFindTypeMatchCount: normalizeDocsFindTypeMatchCount(
+        typeof merged.docsFindTypeMatchCount === 'number'
+          ? merged.docsFindTypeMatchCount
+          : DEFAULT_SETTINGS.docsFindTypeMatchCount
+      ),
+      docsFindMemberMatchCount: normalizeDocsFindMemberMatchCount(
+        typeof merged.docsFindMemberMatchCount === 'number'
+          ? merged.docsFindMemberMatchCount
+          : DEFAULT_SETTINGS.docsFindMemberMatchCount
+      ),
+      docsFindIncludeAccessorDocs: merged.docsFindIncludeAccessorDocs !== false,
     };
   });
   const [settingsPipPackages, setSettingsPipPackages] = useState<SavedPipPackage[]>(() => loadSavedPipPackages());
@@ -13975,6 +14008,271 @@ finally:
     }))
   );
 
+  interface DocsFindCandidate {
+    item: SemanticDocumentationItem;
+    documentation: string;
+  }
+
+  interface DocsFindSelection {
+    id: string;
+    reason: string;
+  }
+
+  const getSemanticDocumentationRecordForFind = async () => {
+    const [active, draft] = await Promise.all([
+      loadSemanticDocumentationRecord(activeProjectId, 'csharp', 'active'),
+      loadSemanticDocumentationRecord(activeProjectId, 'csharp', 'draft'),
+    ]);
+    return active || draft || semanticDocumentationActive || semanticDocumentationDraft;
+  };
+
+  const formatDocsFindFullName = (item: SemanticDocumentationItem) => (
+    item.containerName ? `${item.containerName}.${item.name}` : item.name
+  );
+
+  const formatDocsFindCandidateBlock = (candidate: DocsFindCandidate) => (
+    [
+      `ID: ${candidate.item.id}`,
+      `Kind: ${candidate.item.kind}`,
+      `Name: ${formatDocsFindFullName(candidate.item)}`,
+      `Path: ${candidate.item.path}`,
+      `Documentation:\n${candidate.documentation}`,
+    ].join('\n')
+  );
+
+  const extractDocsFindJson = (response: string) => {
+    const cleaned = response.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
+    const direct = safeJsonParse(cleaned);
+    if (Object.keys(direct).length > 0 || cleaned === '{}') return direct;
+    const objectStart = cleaned.indexOf('{');
+    const objectEnd = cleaned.lastIndexOf('}');
+    if (objectStart >= 0 && objectEnd > objectStart) {
+      const parsed = safeJsonParse(cleaned.slice(objectStart, objectEnd + 1));
+      if (Object.keys(parsed).length > 0 || cleaned.slice(objectStart, objectEnd + 1) === '{}') return parsed;
+    }
+    const arrayStart = cleaned.indexOf('[');
+    const arrayEnd = cleaned.lastIndexOf(']');
+    if (arrayStart >= 0 && arrayEnd > arrayStart) {
+      try {
+        return JSON.parse(cleaned.slice(arrayStart, arrayEnd + 1));
+      } catch {
+        return {};
+      }
+    }
+    return {};
+  };
+
+  const parseDocsFindSelections = (
+    response: string,
+    candidates: DocsFindCandidate[],
+    limit: number,
+  ): DocsFindSelection[] => {
+    const byId = new Map(candidates.map(candidate => [candidate.item.id, candidate]));
+    const byName = new Map(candidates.map(candidate => [formatDocsFindFullName(candidate.item), candidate]));
+    const parsed = extractDocsFindJson(response);
+    const rawMatches = Array.isArray(parsed)
+      ? parsed
+      : Array.isArray((parsed as any).matches)
+        ? (parsed as any).matches
+        : Array.isArray((parsed as any).results)
+          ? (parsed as any).results
+          : Array.isArray((parsed as any).items)
+            ? (parsed as any).items
+            : [];
+    const selected: DocsFindSelection[] = [];
+    const seen = new Set<string>();
+
+    const pushSelection = (idOrName: string, reason?: string) => {
+      const direct = byId.get(idOrName);
+      const byFullName = byName.get(idOrName);
+      const bySimpleName = candidates.find(candidate => candidate.item.name === idOrName);
+      const candidate = direct || byFullName || bySimpleName;
+      if (!candidate || seen.has(candidate.item.id)) return;
+      seen.add(candidate.item.id);
+      selected.push({
+        id: candidate.item.id,
+        reason: typeof reason === 'string' && reason.trim() ? reason.trim() : 'Selected by the ranking model.',
+      });
+    };
+
+    for (const match of rawMatches) {
+      if (selected.length >= limit) break;
+      if (typeof match === 'string') {
+        pushSelection(match);
+        continue;
+      }
+      if (!match || typeof match !== 'object') continue;
+      const idOrName = typeof match.id === 'string'
+        ? match.id
+        : typeof match.name === 'string'
+          ? match.name
+          : typeof match.item === 'string'
+            ? match.item
+            : '';
+      pushSelection(idOrName, typeof match.reason === 'string' ? match.reason : undefined);
+    }
+
+    if (selected.length > 0) return selected.slice(0, limit);
+
+    for (const candidate of candidates) {
+      if (selected.length >= limit) break;
+      const fullName = formatDocsFindFullName(candidate.item);
+      if (response.includes(candidate.item.id) || response.includes(fullName) || response.includes(candidate.item.name)) {
+        pushSelection(candidate.item.id, 'Selected from a non-JSON model response.');
+      }
+    }
+
+    return selected.slice(0, limit);
+  };
+
+  const buildDocsFindRankingPrompt = (
+    description: string,
+    candidates: DocsFindCandidate[],
+    limit: number,
+    stage: string,
+  ) => limitSemanticPrompt(
+    `You are ranking generated C# semantic documentation for an IDE terminal command.\n` +
+    `User description: ${description}\n\n` +
+    `${stage}\n` +
+    `Choose up to ${limit} best matching candidate IDs, in best-first order. Use semantic meaning, not only lexical overlap.\n` +
+    `Return ONLY JSON in this exact shape: {"matches":[{"id":"candidate id","reason":"short reason"}]}\n\n` +
+    `Candidates:\n\n${candidates.map(formatDocsFindCandidateBlock).join('\n\n---\n\n')}`,
+    effectiveAutoDocumentationPromptTokenLimit,
+  );
+
+  const collectDocsFindMemberCandidates = (
+    record: SemanticDocumentationRecord,
+    typeSelections: DocsFindSelection[],
+  ): DocsFindCandidate[] => {
+    const selectedTypeNames = new Set(
+      typeSelections
+        .map(selection => record.items.find(item => item.id === selection.id))
+        .filter((item): item is SemanticDocumentationItem => !!item)
+        .map(item => item.name)
+    );
+    const accessorDocsByProperty = new Map<string, string[]>();
+    if (settings.docsFindIncludeAccessorDocs) {
+      for (const item of record.items) {
+        if (item.kind !== 'accessor' || !item.containerName) continue;
+        const propertyName = item.name.split('.')[0];
+        if (!propertyName) continue;
+        const key = `${item.containerName}.${propertyName}`;
+        const docs = accessorDocsByProperty.get(key) || [];
+        docs.push(`[${item.name}]\n${item.documentation}`);
+        accessorDocsByProperty.set(key, docs);
+      }
+    }
+
+    return record.items
+      .filter(item => item.kind !== 'type' && item.containerName && selectedTypeNames.has(item.containerName))
+      .map(item => {
+        const accessorDocs = item.kind === 'property'
+          ? accessorDocsByProperty.get(`${item.containerName}.${item.name}`) || []
+          : [];
+        return {
+          item,
+          documentation: accessorDocs.length > 0
+            ? `${item.documentation}\n\nAccessor documentation:\n${accessorDocs.join('\n\n')}`
+            : item.documentation,
+        };
+      });
+  };
+
+  const formatDocsFindResultLines = (
+    title: string,
+    selections: DocsFindSelection[],
+    candidates: DocsFindCandidate[],
+  ) => {
+    const candidateById = new Map(candidates.map(candidate => [candidate.item.id, candidate]));
+    const lines = [title];
+    selections.forEach((selection, index) => {
+      const candidate = candidateById.get(selection.id);
+      if (!candidate) return;
+      lines.push(`${index + 1}. ${formatDocsFindFullName(candidate.item)} [${candidate.item.kind}]`);
+      lines.push(`   Path: ${candidate.item.path}`);
+      lines.push(`   Reason: ${selection.reason}`);
+      lines.push('   Documentation:');
+      for (const line of candidate.documentation.split('\n')) {
+        lines.push(`     ${line}`);
+      }
+    });
+    return lines;
+  };
+
+  const executeDocsFindCommand = async (description: string): Promise<string[]> => {
+    const query = description.trim();
+    if (!query) return ['Usage: docs find <description>'];
+    const record = await getSemanticDocumentationRecordForFind();
+    if (!record || record.items.length === 0) {
+      return ['No semantic documentation is available. Open Semantic Documentation and generate C# docs first.'];
+    }
+
+    const typeCandidates = record.items
+      .filter(item => item.kind === 'type')
+      .map(item => ({ item, documentation: item.documentation }));
+    if (typeCandidates.length === 0) {
+      return ['No type documentation is available. Regenerate semantic documentation first.'];
+    }
+
+    const typeLimit = normalizeDocsFindTypeMatchCount(settings.docsFindTypeMatchCount);
+    const memberLimit = normalizeDocsFindMemberMatchCount(settings.docsFindMemberMatchCount);
+    const stage1Response = await requestSemanticDocumentationText(buildDocsFindRankingPrompt(
+      query,
+      typeCandidates,
+      typeLimit,
+      'Stage 1: rank classes, structs, enums, interfaces, records, and similar top-level type documentation.',
+    ));
+    const typeSelections = parseDocsFindSelections(stage1Response, typeCandidates, typeLimit);
+    if (typeSelections.length === 0) {
+      return ['The model did not return any matching types. Try a more specific description.'];
+    }
+
+    const memberCandidates = collectDocsFindMemberCandidates(record, typeSelections);
+    if (memberCandidates.length === 0) {
+      const selectedNames = typeSelections
+        .map(selection => typeCandidates.find(candidate => candidate.item.id === selection.id)?.item.name)
+        .filter(Boolean)
+        .join(', ');
+      return [`No documented members were found below the selected type${typeSelections.length === 1 ? '' : 's'}: ${selectedNames}.`];
+    }
+
+    const stage2Response = await requestSemanticDocumentationText(buildDocsFindRankingPrompt(
+      query,
+      memberCandidates,
+      memberLimit,
+      'Stage 2: rank fields, properties, methods, accessors, and similar member documentation below the selected types.',
+    ));
+    const memberSelections = parseDocsFindSelections(stage2Response, memberCandidates, memberLimit);
+    if (memberSelections.length === 0) {
+      return ['The model did not return any matching members. Try a more specific description.'];
+    }
+
+    const stage2Candidates = memberSelections
+      .map(selection => memberCandidates.find(candidate => candidate.item.id === selection.id))
+      .filter((candidate): candidate is DocsFindCandidate => !!candidate);
+    const stage3Response = await requestSemanticDocumentationText(buildDocsFindRankingPrompt(
+      query,
+      stage2Candidates,
+      1,
+      'Stage 3: choose the single best final documentation match from the Stage 2 results.',
+    ));
+    const bestSelection = parseDocsFindSelections(stage3Response, stage2Candidates, 1);
+    const finalSelection = bestSelection.length > 0 ? bestSelection : memberSelections.slice(0, 1);
+
+    const selectedTypeNames = typeSelections
+      .map(selection => typeCandidates.find(candidate => candidate.item.id === selection.id)?.item.name)
+      .filter(Boolean)
+      .join(', ');
+    return [
+      `Docs find: ${query}`,
+      `Selected type scope: ${selectedTypeNames}`,
+      '',
+      ...formatDocsFindResultLines(`Step 2 results (top ${memberSelections.length}):`, memberSelections, memberCandidates),
+      '',
+      ...formatDocsFindResultLines('Step 3 best match:', finalSelection, stage2Candidates),
+    ];
+  };
+
   const startSemanticDocumentationGeneration = async (forceNewDraft = false) => {
     if (isSemanticDocumentationRunning) return;
     setIsSemanticDocumentationOpen(true);
@@ -14676,6 +14974,7 @@ finally:
         if (call.name === 'terminalHelp') {
           const helpLines = [
             'Standard commands: ls, pwd, cd, mkdir, touch, open, cat, rm, clear, help, date, echo, whoami',
+            'Documentation: docs find <description>',
             'Python: pip install <package> [-force] | pip upgrade <package> [-version <ver>] | pip uninstall <package> | pip include <module> | pip list',
             'JavaScript/TypeScript: npm install <package...> | npm uninstall <package...> | npm include <module> [url] | npm remove <module> | npm list',
             'C#: nuget include <namespace> | nuget list',
@@ -17208,6 +17507,20 @@ finally:
       } catch (error) {
         setTerminalOutput([...newOutput, `gh: ${error instanceof Error ? error.message : String(error)}`]);
       }
+    } else if (cmd === 'docs') {
+      const subCmd = (args[1] || '').toLowerCase();
+      if (subCmd === 'find') {
+        const description = args.slice(2).join(' ');
+        setTerminalOutput([...newOutput, `Finding documentation matches with ${getAssistantProviderLabel(settings.assistantProvider)} · ${effectiveAutoDocumentationModel || 'no model'}...`]);
+        try {
+          const lines = await executeDocsFindCommand(description);
+          setTerminalOutput(prev => [...prev, ...lines]);
+        } catch (error) {
+          setTerminalOutput(prev => [...prev, `docs find error: ${error instanceof Error ? error.message : String(error)}`]);
+        }
+      } else {
+        setTerminalOutput([...newOutput, 'Usage: docs find <description>']);
+      }
     } else if (cmd === 'pip') {
       const subCmd = args[1];
       const pkg = args[2];
@@ -18048,7 +18361,7 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
         setTerminalOutput([...newOutput, 'Usage: nuget include <namespace> | nuget list']);
       }
     } else if (cmd === 'help') {
-      setTerminalOutput([...newOutput, 'Standard commands: ls, pwd, cd, mkdir, touch, open, cat, rm, clear, help, date, echo', 'Source control: git status|add|restore|reset|commit|log|show|branch|checkout|switch|merge|tag|stash|remote|fetch|pull|push|ls-remote|clean|diff|config|rev-parse|clone, gh auth|repo|pr|issue', 'Python: pip install <package> [-force] | pip upgrade <package> [-version <ver>] | pip uninstall <package> | pip include <module> | pip list', 'JavaScript/TypeScript: npm install <package...> | npm uninstall <package...> | npm include <module> [url] | npm remove <module> | npm list', 'C#: nuget include <namespace> | nuget list', 'JavaScript/TypeScript: use Run or Project Run on .js, .jsx, .ts, and .tsx files', 'C/C++: use Run or Project Run on .c, .cpp, .cc, .cxx, and matching header files', 'Java: use Run or Project Run on .java files']);
+      setTerminalOutput([...newOutput, 'Standard commands: ls, pwd, cd, mkdir, touch, open, cat, rm, clear, help, date, echo', 'Documentation: docs find <description>', 'Source control: git status|add|restore|reset|commit|log|show|branch|checkout|switch|merge|tag|stash|remote|fetch|pull|push|ls-remote|clean|diff|config|rev-parse|clone, gh auth|repo|pr|issue', 'Python: pip install <package> [-force] | pip upgrade <package> [-version <ver>] | pip uninstall <package> | pip include <module> | pip list', 'JavaScript/TypeScript: npm install <package...> | npm uninstall <package...> | npm include <module> [url] | npm remove <module> | npm list', 'C#: nuget include <namespace> | nuget list', 'JavaScript/TypeScript: use Run or Project Run on .js, .jsx, .ts, and .tsx files', 'C/C++: use Run or Project Run on .c, .cpp, .cc, .cxx, and matching header files', 'Java: use Run or Project Run on .java files']);
     } else if (cmd === 'date') {
       setTerminalOutput([...newOutput, new Date().toLocaleString()]);
     } else if (cmd === 'echo') {
@@ -21321,6 +21634,71 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
                         Current effective limit: {effectiveAutoDocumentationPromptTokenLimit > 0 ? `${effectiveAutoDocumentationPromptTokenLimit.toLocaleString()} tokens` : 'Unlimited'}. Use 0 for virtually unlimited prompts.
                       </div>
                     </label>
+
+                    <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)] gap-4">
+                      <label className="block space-y-2">
+                        <div className="text-xs font-medium uppercase tracking-wide text-zinc-500">Docs Find Type Matches</div>
+                        <input
+                          type="number"
+                          min={1}
+                          max={MAX_DOCS_FIND_TYPE_MATCH_COUNT}
+                          step={1}
+                          value={settings.docsFindTypeMatchCount}
+                          onChange={(e) => setSettings(current => ({
+                            ...current,
+                            docsFindTypeMatchCount: normalizeDocsFindTypeMatchCount(Number(e.target.value)),
+                          }))}
+                          className="w-full rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-sm text-white outline-none transition-colors focus:border-indigo-500"
+                        />
+                        <div className="text-xs text-zinc-500">
+                          Stage 1 selects this many classes, structs, enums, interfaces, records, and similar types. Current: {normalizeDocsFindTypeMatchCount(settings.docsFindTypeMatchCount)}.
+                        </div>
+                      </label>
+
+                      <label className="block space-y-2">
+                        <div className="text-xs font-medium uppercase tracking-wide text-zinc-500">Docs Find Member Matches</div>
+                        <input
+                          type="number"
+                          min={1}
+                          max={MAX_DOCS_FIND_MEMBER_MATCH_COUNT}
+                          step={1}
+                          value={settings.docsFindMemberMatchCount}
+                          onChange={(e) => setSettings(current => ({
+                            ...current,
+                            docsFindMemberMatchCount: normalizeDocsFindMemberMatchCount(Number(e.target.value)),
+                          }))}
+                          className="w-full rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-sm text-white outline-none transition-colors focus:border-indigo-500"
+                        />
+                        <div className="text-xs text-zinc-500">
+                          Stage 2 outputs this many fields, properties, methods, accessors, and similar members. Current: {normalizeDocsFindMemberMatchCount(settings.docsFindMemberMatchCount)}.
+                        </div>
+                      </label>
+                    </div>
+
+                    <div className="flex items-center justify-between gap-4 rounded-xl border border-white/10 bg-black/20 px-4 py-3">
+                      <div>
+                        <div className="text-sm font-medium text-white">Include Accessor Docs</div>
+                        <div className="text-xs text-zinc-500">
+                          Adds getter, setter, and init documentation beneath property candidates during `docs find`.
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setSettings(current => ({
+                          ...current,
+                          docsFindIncludeAccessorDocs: !current.docsFindIncludeAccessorDocs,
+                        }))}
+                        className={cn(
+                          "w-10 h-5 rounded-full transition-all relative",
+                          settings.docsFindIncludeAccessorDocs ? "bg-indigo-600" : "bg-zinc-700"
+                        )}
+                      >
+                        <div className={cn(
+                          "absolute top-1 w-3 h-3 bg-white rounded-full transition-all",
+                          settings.docsFindIncludeAccessorDocs ? "right-1" : "left-1"
+                        )} />
+                      </button>
+                    </div>
                   </div>
                 </section>
 

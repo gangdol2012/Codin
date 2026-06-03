@@ -464,7 +464,7 @@ function parseGroupedMethodDocumentation(response: string, component: CSharpMeth
   return result;
 }
 
-function limitSemanticPrompt(prompt: string, tokenLimit: number) {
+export function limitSemanticPrompt(prompt: string, tokenLimit: number) {
   if (!Number.isFinite(tokenLimit) || tokenLimit <= 0) return prompt;
   const charLimit = Math.max(4000, Math.floor(tokenLimit * 4));
   if (prompt.length <= charLimit) return prompt;
