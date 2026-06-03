@@ -900,7 +900,7 @@ const OPENAI_CHAT_PROVIDER_CONFIGS: Partial<Record<AssistantProvider, AssistantO
   deepseek: {
     endpoint: 'https://api.deepseek.com/chat/completions',
     requestLabel: 'DeepSeek request failed.',
-    supportsLocalTools: model => !/^deepseek-reasoner$/i.test(model.trim()),
+    supportsLocalTools: true,
     defaultMaxTokens: 8192,
   },
   mistral: {
@@ -942,7 +942,7 @@ const OPENAI_CHAT_PROVIDER_CONFIGS: Partial<Record<AssistantProvider, AssistantO
   perplexity: {
     endpoint: 'https://api.perplexity.ai/chat/completions',
     requestLabel: 'Perplexity request failed.',
-    supportsLocalTools: false,
+    supportsLocalTools: true,
     defaultMaxTokens: 8192,
   },
 };
@@ -1638,6 +1638,11 @@ function normalizeCursorLocalToolName(value: unknown) {
       return 'terminalDate';
     case 'echo':
       return 'terminalEcho';
+    case 'docsfind':
+    case 'documentationfind':
+    case 'finddocs':
+    case 'finddocumentation':
+      return 'docsFind';
     default:
       return rawName;
   }
@@ -1691,6 +1696,17 @@ function normalizeCursorLocalToolArgs(toolName: string, value: unknown): Record<
     return {
       ...source,
       text: source.text ?? source.message ?? '',
+    };
+  }
+
+  if (toolName === 'docsFind') {
+    return {
+      ...source,
+      description: source.description ?? source.query ?? source.prompt ?? source.text,
+      typeLimit: source.typeLimit ?? source.types ?? source.typeMatches ?? source.typeCount,
+      memberLimit: source.memberLimit ?? source.members ?? source.memberMatches ?? source.memberCount,
+      hideReason: source.hideReason ?? source.noReason,
+      hideDocumentation: source.hideDocumentation ?? source.hideDocs ?? source.noDocs,
     };
   }
 
@@ -2383,6 +2399,38 @@ const nugetListTool: AssistantToolDefinition = {
   },
 };
 
+const docsFindTool: AssistantToolDefinition = {
+  name: "docsFind",
+  description: "Find generated C# semantic documentation that matches a natural-language description.",
+  parameters: {
+    type: 'object',
+    description: "Run the docs find semantic documentation search.",
+    properties: {
+      description: {
+        type: 'string',
+        description: "Natural-language description of the C# type or member behavior to find.",
+      },
+      typeLimit: {
+        type: 'number',
+        description: "Optional number of type matches to rank before member ranking.",
+      },
+      memberLimit: {
+        type: 'number',
+        description: "Optional number of final member matches to return.",
+      },
+      hideReason: {
+        type: 'boolean',
+        description: "Whether to hide model selection reasons in the result.",
+      },
+      hideDocumentation: {
+        type: 'boolean',
+        description: "Whether to hide documentation excerpts in the result.",
+      },
+    },
+    required: ['description'],
+  },
+};
+
 const STANDARD_ASSISTANT_TOOLS: AssistantToolDefinition[] = [
   proposeEditTool,
   navigateToTool,
@@ -2392,6 +2440,7 @@ const STANDARD_ASSISTANT_TOOLS: AssistantToolDefinition[] = [
   moveItemTool,
   lsTool,
   runTerminalCommandTool,
+  docsFindTool,
 ];
 
 const CHAIN_OF_THOUGHT_ASSISTANT_TOOLS: AssistantToolDefinition[] = [
@@ -2425,6 +2474,7 @@ const CHAIN_OF_THOUGHT_ASSISTANT_TOOLS: AssistantToolDefinition[] = [
   npmListTool,
   nugetIncludeTool,
   nugetListTool,
+  docsFindTool,
 ];
 
 // Utility for tailwind classes
@@ -14018,6 +14068,83 @@ finally:
     reason: string;
   }
 
+  interface DocsFindCommandOptions {
+    description: string;
+    typeLimit: number;
+    memberLimit: number;
+    hideReason: boolean;
+    hideDocumentation: boolean;
+    errors: string[];
+  }
+
+  const DOCS_FIND_USAGE = 'Usage: docs find [--types N] [--members N] [--hide-reason] [--hide-docs] <description>';
+
+  const parseDocsFindCommandOptions = (rawArgs: string[]): DocsFindCommandOptions => {
+    const descriptionParts: string[] = [];
+    const errors: string[] = [];
+    let typeLimit = normalizeDocsFindTypeMatchCount(settings.docsFindTypeMatchCount);
+    let memberLimit = normalizeDocsFindMemberMatchCount(settings.docsFindMemberMatchCount);
+    let hideReason = false;
+    let hideDocumentation = false;
+
+    const readCountOption = (index: number, label: string, normalize: (value: number) => number) => {
+      const value = rawArgs[index + 1];
+      if (!value || value.startsWith('-')) {
+        errors.push(`${label} needs a number.`);
+        return { value: normalize(Number.NaN), consumed: 0 };
+      }
+      const parsed = Number(value);
+      if (!Number.isFinite(parsed)) {
+        errors.push(`${label} must be a number.`);
+        return { value: normalize(Number.NaN), consumed: 1 };
+      }
+      return { value: normalize(parsed), consumed: 1 };
+    };
+
+    for (let index = 0; index < rawArgs.length; index += 1) {
+      const arg = rawArgs[index];
+      if (!arg) continue;
+      if (arg === '--') {
+        descriptionParts.push(...rawArgs.slice(index + 1));
+        break;
+      }
+      if (arg === '--hide-reason' || arg === '--no-reason') {
+        hideReason = true;
+        continue;
+      }
+      if (arg === '--hide-docs' || arg === '--hide-documentation' || arg === '--no-docs' || arg === '--no-documentation') {
+        hideDocumentation = true;
+        continue;
+      }
+      if (arg === '--types' || arg === '--type-matches' || arg === '--type-count' || arg === '--classes' || arg === '-t') {
+        const parsed = readCountOption(index, arg, normalizeDocsFindTypeMatchCount);
+        typeLimit = parsed.value;
+        index += parsed.consumed;
+        continue;
+      }
+      if (arg === '--members' || arg === '--member-matches' || arg === '--member-count' || arg === '-m') {
+        const parsed = readCountOption(index, arg, normalizeDocsFindMemberMatchCount);
+        memberLimit = parsed.value;
+        index += parsed.consumed;
+        continue;
+      }
+      if (arg.startsWith('-')) {
+        errors.push(`Unknown docs find option: ${arg}`);
+        continue;
+      }
+      descriptionParts.push(arg);
+    }
+
+    return {
+      description: descriptionParts.join(' ').trim(),
+      typeLimit,
+      memberLimit,
+      hideReason,
+      hideDocumentation,
+      errors,
+    };
+  };
+
   const getSemanticDocumentationRecordForFind = async () => {
     const [active, draft] = await Promise.all([
       loadSemanticDocumentationRecord(activeProjectId, 'csharp', 'active'),
@@ -14182,6 +14309,7 @@ finally:
     title: string,
     selections: DocsFindSelection[],
     candidates: DocsFindCandidate[],
+    options: Pick<DocsFindCommandOptions, 'hideReason' | 'hideDocumentation'>,
   ) => {
     const candidateById = new Map(candidates.map(candidate => [candidate.item.id, candidate]));
     const lines = [title];
@@ -14190,18 +14318,24 @@ finally:
       if (!candidate) return;
       lines.push(`${index + 1}. ${formatDocsFindFullName(candidate.item)} [${candidate.item.kind}]`);
       lines.push(`   Path: ${candidate.item.path}`);
-      lines.push(`   Reason: ${selection.reason}`);
-      lines.push('   Documentation:');
-      for (const line of candidate.documentation.split('\n')) {
-        lines.push(`     ${line}`);
+      if (!options.hideReason) {
+        lines.push(`   Reason: ${selection.reason}`);
+      }
+      if (!options.hideDocumentation) {
+        lines.push('   Documentation:');
+        for (const line of candidate.documentation.split('\n')) {
+          lines.push(`     ${line}`);
+        }
       }
     });
     return lines;
   };
 
-  const executeDocsFindCommand = async (description: string): Promise<string[]> => {
-    const query = description.trim();
-    if (!query) return ['Usage: docs find <description>'];
+  const executeDocsFindCommand = async (rawArgs: string[]): Promise<string[]> => {
+    const commandOptions = parseDocsFindCommandOptions(rawArgs);
+    const query = commandOptions.description;
+    if (commandOptions.errors.length > 0) return [...commandOptions.errors, DOCS_FIND_USAGE];
+    if (!query) return [DOCS_FIND_USAGE];
     const record = await getSemanticDocumentationRecordForFind();
     if (!record || record.items.length === 0) {
       return ['No semantic documentation is available. Open Semantic Documentation and generate C# docs first.'];
@@ -14214,15 +14348,13 @@ finally:
       return ['No type documentation is available. Regenerate semantic documentation first.'];
     }
 
-    const typeLimit = normalizeDocsFindTypeMatchCount(settings.docsFindTypeMatchCount);
-    const memberLimit = normalizeDocsFindMemberMatchCount(settings.docsFindMemberMatchCount);
     const stage1Response = await requestSemanticDocumentationText(buildDocsFindRankingPrompt(
       query,
       typeCandidates,
-      typeLimit,
+      commandOptions.typeLimit,
       'Stage 1: rank classes, structs, enums, interfaces, records, and similar top-level type documentation.',
     ));
-    const typeSelections = parseDocsFindSelections(stage1Response, typeCandidates, typeLimit);
+    const typeSelections = parseDocsFindSelections(stage1Response, typeCandidates, commandOptions.typeLimit);
     if (typeSelections.length === 0) {
       return ['The model did not return any matching types. Try a more specific description.'];
     }
@@ -14239,25 +14371,13 @@ finally:
     const stage2Response = await requestSemanticDocumentationText(buildDocsFindRankingPrompt(
       query,
       memberCandidates,
-      memberLimit,
-      'Stage 2: rank fields, properties, methods, accessors, and similar member documentation below the selected types.',
+      commandOptions.memberLimit,
+      'Final stage: rank fields, properties, methods, accessors, and similar member documentation below the selected types.',
     ));
-    const memberSelections = parseDocsFindSelections(stage2Response, memberCandidates, memberLimit);
+    const memberSelections = parseDocsFindSelections(stage2Response, memberCandidates, commandOptions.memberLimit);
     if (memberSelections.length === 0) {
       return ['The model did not return any matching members. Try a more specific description.'];
     }
-
-    const stage2Candidates = memberSelections
-      .map(selection => memberCandidates.find(candidate => candidate.item.id === selection.id))
-      .filter((candidate): candidate is DocsFindCandidate => !!candidate);
-    const stage3Response = await requestSemanticDocumentationText(buildDocsFindRankingPrompt(
-      query,
-      stage2Candidates,
-      1,
-      'Stage 3: choose the single best final documentation match from the Stage 2 results.',
-    ));
-    const bestSelection = parseDocsFindSelections(stage3Response, stage2Candidates, 1);
-    const finalSelection = bestSelection.length > 0 ? bestSelection : memberSelections.slice(0, 1);
 
     const selectedTypeNames = typeSelections
       .map(selection => typeCandidates.find(candidate => candidate.item.id === selection.id)?.item.name)
@@ -14267,9 +14387,7 @@ finally:
       `Docs find: ${query}`,
       `Selected type scope: ${selectedTypeNames}`,
       '',
-      ...formatDocsFindResultLines(`Step 2 results (top ${memberSelections.length}):`, memberSelections, memberCandidates),
-      '',
-      ...formatDocsFindResultLines('Step 3 best match:', finalSelection, stage2Candidates),
+      ...formatDocsFindResultLines(`Final results (top ${memberSelections.length}):`, memberSelections, memberCandidates, commandOptions),
     ];
   };
 
@@ -14778,6 +14896,48 @@ finally:
           };
         }
 
+        if (call.name === 'docsFind') {
+          const description = typeof args.description === 'string' ? args.description.trim() : '';
+          const rawDocsFindArgs: string[] = [];
+          if (typeof args.typeLimit === 'number' && Number.isFinite(args.typeLimit)) {
+            rawDocsFindArgs.push('--types', String(args.typeLimit));
+          }
+          if (typeof args.memberLimit === 'number' && Number.isFinite(args.memberLimit)) {
+            rawDocsFindArgs.push('--members', String(args.memberLimit));
+          }
+          if (args.hideReason === true) rawDocsFindArgs.push('--hide-reason');
+          if (args.hideDocumentation === true) rawDocsFindArgs.push('--hide-docs');
+          if (description) rawDocsFindArgs.push(description);
+          const command = `docs find${rawDocsFindArgs.length > 0 ? ` ${rawDocsFindArgs.map(quoteTerminalArg).join(' ')}` : ''}`;
+          try {
+            const lines = await executeDocsFindCommand(rawDocsFindArgs);
+            appendTerminalCommandResult(command, lines);
+            return {
+              summary: description
+                ? `Found documentation matches for \`${description}\`.`
+                : 'docs find needs a description.',
+              detail: lines.join('\n'),
+              result: {
+                ok: true,
+                query: description,
+                output: lines,
+              },
+            };
+          } catch (error) {
+            const message = `docs find error: ${error instanceof Error ? error.message : String(error)}`;
+            appendTerminalCommandResult(command, [message]);
+            return {
+              summary: message,
+              detail: message,
+              result: {
+                ok: false,
+                query: description,
+                error: message,
+              },
+            };
+          }
+        }
+
         if (call.name === 'runTerminalCommand') {
           const { command } = args as any;
           if (typeof command === 'string' && command.trim()) {
@@ -14974,7 +15134,7 @@ finally:
         if (call.name === 'terminalHelp') {
           const helpLines = [
             'Standard commands: ls, pwd, cd, mkdir, touch, open, cat, rm, clear, help, date, echo, whoami',
-            'Documentation: docs find <description>',
+            'Documentation: docs find [--types N] [--members N] [--hide-reason] [--hide-docs] <description>',
             'Python: pip install <package> [-force] | pip upgrade <package> [-version <ver>] | pip uninstall <package> | pip include <module> | pip list',
             'JavaScript/TypeScript: npm install <package...> | npm uninstall <package...> | npm include <module> [url] | npm remove <module> | npm list',
             'C#: nuget include <namespace> | nuget list',
@@ -17510,16 +17670,15 @@ finally:
     } else if (cmd === 'docs') {
       const subCmd = (args[1] || '').toLowerCase();
       if (subCmd === 'find') {
-        const description = args.slice(2).join(' ');
         setTerminalOutput([...newOutput, `Finding documentation matches with ${getAssistantProviderLabel(settings.assistantProvider)} · ${effectiveAutoDocumentationModel || 'no model'}...`]);
         try {
-          const lines = await executeDocsFindCommand(description);
+          const lines = await executeDocsFindCommand(args.slice(2));
           setTerminalOutput(prev => [...prev, ...lines]);
         } catch (error) {
           setTerminalOutput(prev => [...prev, `docs find error: ${error instanceof Error ? error.message : String(error)}`]);
         }
       } else {
-        setTerminalOutput([...newOutput, 'Usage: docs find <description>']);
+        setTerminalOutput([...newOutput, DOCS_FIND_USAGE]);
       }
     } else if (cmd === 'pip') {
       const subCmd = args[1];
@@ -18361,7 +18520,7 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
         setTerminalOutput([...newOutput, 'Usage: nuget include <namespace> | nuget list']);
       }
     } else if (cmd === 'help') {
-      setTerminalOutput([...newOutput, 'Standard commands: ls, pwd, cd, mkdir, touch, open, cat, rm, clear, help, date, echo', 'Documentation: docs find <description>', 'Source control: git status|add|restore|reset|commit|log|show|branch|checkout|switch|merge|tag|stash|remote|fetch|pull|push|ls-remote|clean|diff|config|rev-parse|clone, gh auth|repo|pr|issue', 'Python: pip install <package> [-force] | pip upgrade <package> [-version <ver>] | pip uninstall <package> | pip include <module> | pip list', 'JavaScript/TypeScript: npm install <package...> | npm uninstall <package...> | npm include <module> [url] | npm remove <module> | npm list', 'C#: nuget include <namespace> | nuget list', 'JavaScript/TypeScript: use Run or Project Run on .js, .jsx, .ts, and .tsx files', 'C/C++: use Run or Project Run on .c, .cpp, .cc, .cxx, and matching header files', 'Java: use Run or Project Run on .java files']);
+      setTerminalOutput([...newOutput, 'Standard commands: ls, pwd, cd, mkdir, touch, open, cat, rm, clear, help, date, echo', 'Documentation: docs find [--types N] [--members N] [--hide-reason] [--hide-docs] <description>', 'Source control: git status|add|restore|reset|commit|log|show|branch|checkout|switch|merge|tag|stash|remote|fetch|pull|push|ls-remote|clean|diff|config|rev-parse|clone, gh auth|repo|pr|issue', 'Python: pip install <package> [-force] | pip upgrade <package> [-version <ver>] | pip uninstall <package> | pip include <module> | pip list', 'JavaScript/TypeScript: npm install <package...> | npm uninstall <package...> | npm include <module> [url] | npm remove <module> | npm list', 'C#: nuget include <namespace> | nuget list', 'JavaScript/TypeScript: use Run or Project Run on .js, .jsx, .ts, and .tsx files', 'C/C++: use Run or Project Run on .c, .cpp, .cc, .cxx, and matching header files', 'Java: use Run or Project Run on .java files']);
     } else if (cmd === 'date') {
       setTerminalOutput([...newOutput, new Date().toLocaleString()]);
     } else if (cmd === 'echo') {
