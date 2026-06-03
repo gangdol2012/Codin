@@ -68,6 +68,16 @@ import type {
   CSharpIdeDebugSnapshot,
   CSharpOmniSharpSource,
 } from './csharp-omnisharp';
+import {
+  deleteSemanticDocumentationRecord,
+  formatSemanticDocumentationTimestamp,
+  getSemanticDocumentationProgressLabel,
+  loadSemanticDocumentationRecord,
+  parseCSharpSemanticDocumentationProject,
+  runSemanticDocumentationGeneration,
+  type SemanticDocumentationRecord,
+  type SemanticDocumentationSourceFile,
+} from './semantic-documentation';
 
 const APP_VERSION = __APP_VERSION__;
 
@@ -748,6 +758,8 @@ const MAX_ASSISTANT_CHAIN_OF_THOUGHT_DEPTH = 64;
 const DEFAULT_ASSISTANT_REQUEST_RATE_LIMIT_PER_MINUTE = 0;
 const MAX_ASSISTANT_REQUEST_RATE_LIMIT_PER_MINUTE = 120;
 const DEFAULT_ASSISTANT_ESTIMATED_OUTPUT_TOKENS = 1024;
+const DEFAULT_AUTO_DOCUMENTATION_PROMPT_TOKEN_LIMIT = 24000;
+const MAX_AUTO_DOCUMENTATION_PROMPT_TOKEN_LIMIT = 256000;
 const CURSOR_AGENTS_API_BASE_URL = 'https://api.cursor.com';
 const CURSOR_AGENTS_GITHUB_REPOSITORY_URL = 'https://github.com/gangdol2012/repository';
 const CODECRAFT_DELEGATE_SERVER_URL = 'https://codecraft-delegate.codecraftide.workers.dev/delegate';
@@ -5635,6 +5647,9 @@ interface AppSettings {
   assistantShowUsagePopup: boolean;
   assistantMaxChainOfThoughtDepth: number;
   assistantRequestRateLimitPerMinute: number;
+  autoDocumentationModel: string;
+  autoDocumentationEntryPoint: string;
+  autoDocumentationPromptTokenLimit: number;
 }
 
 const loadSavedAssistantChats = (): AssistantChat[] => {
@@ -5742,6 +5757,9 @@ const DEFAULT_SETTINGS: AppSettings = {
   assistantShowUsagePopup: true,
   assistantMaxChainOfThoughtDepth: DEFAULT_ASSISTANT_TOOL_PASSES,
   assistantRequestRateLimitPerMinute: DEFAULT_ASSISTANT_REQUEST_RATE_LIMIT_PER_MINUTE,
+  autoDocumentationModel: getAssistantDefaultModel('gemini'),
+  autoDocumentationEntryPoint: 'Program',
+  autoDocumentationPromptTokenLimit: DEFAULT_AUTO_DOCUMENTATION_PROMPT_TOKEN_LIMIT,
 };
 
 const LEGACY_CSHARP_AUTHORING_SOURCE_KEY = 'csharp' + 'Intelli' + 'SageSource';
@@ -6770,6 +6788,12 @@ function normalizeExecutionTimeoutMs(value: number) {
   return Math.max(0, Math.floor(value));
 }
 
+function normalizeAutoDocumentationPromptTokenLimit(value: number) {
+  if (!Number.isFinite(value)) return DEFAULT_AUTO_DOCUMENTATION_PROMPT_TOKEN_LIMIT;
+  if (value <= 0) return 0;
+  return Math.min(MAX_AUTO_DOCUMENTATION_PROMPT_TOKEN_LIMIT, Math.max(1024, Math.floor(value)));
+}
+
 function normalizeRuntimeIOMode(value: unknown): RuntimeIOMode {
   return value === 'interactive-output-panel' ? 'interactive-output-panel' : 'alert-output';
 }
@@ -7199,6 +7223,9 @@ export default function App() {
     const assistantModel = typeof merged.assistantModel === 'string' && merged.assistantModel.trim()
       ? merged.assistantModel.trim()
       : getAssistantDefaultModel(assistantProvider);
+    const autoDocumentationModel = typeof merged.autoDocumentationModel === 'string' && merged.autoDocumentationModel.trim()
+      ? merged.autoDocumentationModel.trim()
+      : getAssistantDefaultModel(assistantProvider);
     return {
       ...cleanedMerged,
       javascriptExecutionTimeoutMs: normalizeExecutionTimeoutMs(merged.javascriptExecutionTimeoutMs),
@@ -7237,6 +7264,13 @@ export default function App() {
             ? merged.assistantCotMessageRateLimitPerMinute
             : DEFAULT_SETTINGS.assistantRequestRateLimitPerMinute
       ),
+      autoDocumentationModel,
+      autoDocumentationEntryPoint: typeof merged.autoDocumentationEntryPoint === 'string' ? merged.autoDocumentationEntryPoint : DEFAULT_SETTINGS.autoDocumentationEntryPoint,
+      autoDocumentationPromptTokenLimit: normalizeAutoDocumentationPromptTokenLimit(
+        typeof merged.autoDocumentationPromptTokenLimit === 'number'
+          ? merged.autoDocumentationPromptTokenLimit
+          : DEFAULT_SETTINGS.autoDocumentationPromptTokenLimit
+      ),
     };
   });
   const [settingsPipPackages, setSettingsPipPackages] = useState<SavedPipPackage[]>(() => loadSavedPipPackages());
@@ -7271,6 +7305,12 @@ export default function App() {
   const [csharpIdeDebugSnapshot, setCSharpIdeDebugSnapshot] = useState<CSharpIdeDebugSnapshot | null>(null);
   const [activeCSharpIdeDebugFeature, setActiveCSharpIdeDebugFeature] = useState('overview');
   const [showAssistantApiKey, setShowAssistantApiKey] = useState(false);
+  const [isSemanticDocumentationOpen, setIsSemanticDocumentationOpen] = useState(false);
+  const [semanticDocumentationActive, setSemanticDocumentationActive] = useState<SemanticDocumentationRecord | null>(null);
+  const [semanticDocumentationDraft, setSemanticDocumentationDraft] = useState<SemanticDocumentationRecord | null>(null);
+  const [semanticDocumentationMessage, setSemanticDocumentationMessage] = useState('');
+  const [semanticDocumentationSelectedItemId, setSemanticDocumentationSelectedItemId] = useState<string | null>(null);
+  const [isSemanticDocumentationRunning, setIsSemanticDocumentationRunning] = useState(false);
   const [syncMeta, setSyncMeta] = useState<SyncMeta[]>(loadSyncMeta);
   const pendingEdit = pendingEdits[0] ?? null;
   const editorRef = useRef<any>(null);
@@ -7336,6 +7376,7 @@ export default function App() {
   const syncInitializedRef = useRef<Set<string>>(new Set());
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const assistantRequestRateNextSlotAtRef = useRef(0);
+  const semanticDocumentationAbortRef = useRef<AbortController | null>(null);
   const [activeSyncIds, setActiveSyncIds] = useState<Set<string>>(new Set());
   const persistedPipIncludesRestoredRef = useRef(false);
   const persistedCSharpNamespacesRestoredRef = useRef<CSharpOmniSharpSource | null>(null);
@@ -7355,6 +7396,12 @@ export default function App() {
   const effectiveAssistantMaxChainOfThoughtDepth = normalizeAssistantMaxChainOfThoughtDepth(settings.assistantMaxChainOfThoughtDepth);
   const effectiveAssistantRequestRateLimitPerMinute = normalizeAssistantRequestRateLimitPerMinute(settings.assistantRequestRateLimitPerMinute);
   const assistantConfiguredApiKey = settings.assistantApiKey.trim();
+  const effectiveAutoDocumentationModel = settings.autoDocumentationModel.trim() || getAssistantDefaultModel(settings.assistantProvider);
+  const effectiveAutoDocumentationPromptTokenLimit = normalizeAutoDocumentationPromptTokenLimit(settings.autoDocumentationPromptTokenLimit);
+  const semanticDocumentationVisibleRecord = semanticDocumentationActive || semanticDocumentationDraft;
+  const semanticDocumentationSelectedItem = semanticDocumentationVisibleRecord?.items.find(item => item.id === semanticDocumentationSelectedItemId)
+    || semanticDocumentationVisibleRecord?.items[0]
+    || null;
   const activeEditorTabNode: any = activeEditorTabId ? layoutModel.getNodeById(activeEditorTabId) : null;
   const activeEditorTabItemId =
     activeEditorTabNode?.getComponent?.() === 'editor'
@@ -7791,6 +7838,27 @@ export default function App() {
       .filter(file => !!file.path)
       .sort((left, right) => left.path.localeCompare(right.path));
   }, []);
+
+  const refreshSemanticDocumentationRecords = useCallback(async () => {
+    const [activeRecord, draftRecord] = await Promise.all([
+      loadSemanticDocumentationRecord(activeProjectId, 'csharp', 'active'),
+      loadSemanticDocumentationRecord(activeProjectId, 'csharp', 'draft'),
+    ]);
+    setSemanticDocumentationActive(activeRecord);
+    setSemanticDocumentationDraft(draftRecord);
+    setSemanticDocumentationSelectedItemId(current => (
+      current
+      && (activeRecord?.items.some(item => item.id === current) || draftRecord?.items.some(item => item.id === current))
+        ? current
+        : activeRecord?.items[0]?.id || draftRecord?.items[0]?.id || null
+    ));
+  }, [activeProjectId]);
+
+  useEffect(() => {
+    void refreshSemanticDocumentationRecords().catch(error => {
+      setSemanticDocumentationMessage(`Could not load semantic documentation: ${error instanceof Error ? error.message : String(error)}`);
+    });
+  }, [refreshSemanticDocumentationRecords]);
 
   const refreshPythonDiagnostics = useCallback(async () => {
     const editor = pythonDiagnosticsEditorRef.current;
@@ -9246,6 +9314,9 @@ export default function App() {
         ${projectFileContents || '(no file contents available)'}
         ${omittedProjectFileCount > 0 ? `\n        (${omittedProjectFileCount} additional project file${omittedProjectFileCount === 1 ? '' : 's'} omitted from this prompt budget.)` : ''}
     `;
+    const assistantCodingGuidance = `
+        C# runtime constraint: Do not generate or modify code that sets System.Console.OutputEncoding, Console.OutputEncoding, or similar console encoding properties. CodeCraft manages console output encoding internally.
+    `;
 
     if (useChainOfThought && hasAssistantTools) {
       return `
@@ -9258,6 +9329,7 @@ export default function App() {
         Keep user-facing explanations separate from tool and edit logs.
         If you need more context, discover it through the available terminal tools.
         You have at most ${maxChainOfThoughtDepth} tool rounds available for this turn, so prioritize your steps.
+        ${assistantCodingGuidance}
 
         Current terminal working directory: ${assistantTerminalCwd ? `/${getPathFromSnapshot(assistantTerminalCwd)}` : '/'}
         ${projectWorkspaceContext}
@@ -9281,6 +9353,7 @@ export default function App() {
         Keep continuity with the existing chat history for this chat.
         The selected provider/model supports reasoning, but CodeCraft cannot expose its local tools through this provider/model.
         Reason carefully, keep conclusions user-facing, and avoid claiming you changed files unless a tool is available to do it.
+        ${assistantCodingGuidance}
 
         Current terminal working directory: ${assistantTerminalCwd ? `/${getPathFromSnapshot(assistantTerminalCwd)}` : '/'}
         ${projectWorkspaceContext}
@@ -9303,6 +9376,7 @@ export default function App() {
         Internal Chat ID: ${chatId}
         Keep continuity with the existing chat history for this chat.
         CodeCraft cannot expose its local tools through this provider/model, so answer from the visible workspace context below and avoid claiming you changed files.
+        ${assistantCodingGuidance}
 
         Current terminal working directory: ${assistantTerminalCwd ? `/${getPathFromSnapshot(assistantTerminalCwd)}` : '/'}
         ${projectWorkspaceContext}
@@ -9331,6 +9405,7 @@ export default function App() {
         Do not save every explanation for one final summary if the work is happening in multiple steps.
         If you need the contents of another file before editing it, navigate to it first. On the next tool round in the same turn, the updated active item and its content will be shown to you.
         If more than one action is needed, emit all needed tool calls in order in the same response instead of stopping after the first action.
+        ${assistantCodingGuidance}
 
         ${projectWorkspaceContext}
 
@@ -13767,6 +13842,197 @@ finally:
       normalized.reasoning = message.reasoning;
     }
     return normalized;
+  };
+
+  const waitForSemanticDocumentationRequestRateLimit = async () => {
+    if (effectiveAssistantRequestRateLimitPerMinute <= 0) return;
+    const intervalMs = 60_000 / effectiveAssistantRequestRateLimitPerMinute;
+    const now = Date.now();
+    const waitMs = Math.max(0, assistantRequestRateNextSlotAtRef.current - now);
+    if (waitMs > 0) {
+      await new Promise(resolve => window.setTimeout(resolve, waitMs));
+    }
+    assistantRequestRateNextSlotAtRef.current = Date.now() + intervalMs;
+  };
+
+  const requestSemanticDocumentationText = async (prompt: string) => {
+    const provider = settings.assistantProvider;
+    const model = effectiveAutoDocumentationModel;
+    const apiKey = assistantConfiguredApiKey;
+    if (!apiKey) {
+      throw new Error(`Add your ${getAssistantApiKeyLabel(provider)} in Settings before generating semantic documentation.`);
+    }
+    if (!model) {
+      throw new Error('Choose an autodocumentation model in Settings before generating semantic documentation.');
+    }
+    if (provider === 'cursor') {
+      throw new Error('Cursor Agents cannot be used for semantic documentation generation. Choose a direct API provider.');
+    }
+
+    await waitForSemanticDocumentationRequestRateLimit();
+
+    if (provider === 'gemini') {
+      const ai = new GoogleGenAI({ apiKey });
+      const response = await ai.models.generateContent({
+        model,
+        contents: [{ role: 'user', parts: [{ text: prompt }] }],
+        config: { maxOutputTokens: 4096 } as any,
+      });
+      return extractGeminiVisibleText(response);
+    }
+
+    if (provider === 'openai') {
+      const payload: any = {
+        model,
+        input: [{ role: 'user', content: [{ type: 'input_text', text: prompt }] }],
+        max_output_tokens: 4096,
+      };
+      if (getAssistantReasoningControl(provider, model) !== 'always_off') {
+        payload.reasoning = { effort: 'none' };
+      }
+      const response = await fetch('https://api.openai.com/v1/responses', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify(payload),
+      });
+      const responseJson = await response.json();
+      if (!response.ok) throw new Error(responseJson?.error?.message || 'OpenAI request failed.');
+      return extractOpenAIVisibleText(responseJson);
+    }
+
+    if (provider === 'anthropic') {
+      const response = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': apiKey,
+          'anthropic-version': '2023-06-01',
+        },
+        body: JSON.stringify({
+          model,
+          max_tokens: 4096,
+          messages: [{ role: 'user', content: prompt }],
+        }),
+      });
+      const responseJson = await response.json();
+      if (!response.ok) throw new Error(responseJson?.error?.message || 'Anthropic request failed.');
+      return extractAnthropicVisibleText(responseJson);
+    }
+
+    const responsesConfig = getOpenAIResponsesProviderConfig(provider);
+    if (responsesConfig) {
+      const response = await fetch(responsesConfig.endpoint, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify({
+          model,
+          input: [{ role: 'user', content: [{ type: 'input_text', text: prompt }] }],
+          max_output_tokens: 4096,
+        }),
+      });
+      const responseJson = await response.json();
+      if (!response.ok) throw new Error(responseJson?.error?.message || responsesConfig.requestLabel);
+      return extractOpenAIVisibleText(responseJson);
+    }
+
+    const chatConfig = getOpenAIChatProviderConfig(provider);
+    if (chatConfig) {
+      const maxTokenKey = provider === 'cerebras' || provider === 'groq'
+        ? 'max_completion_tokens'
+        : 'max_tokens';
+      const response = await fetch(chatConfig.endpoint, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify({
+          model,
+          messages: [{ role: 'user', content: prompt }],
+          [maxTokenKey]: Math.min(chatConfig.defaultMaxTokens, 4096),
+          ...getOpenAIChatReasoningRequestOptions(provider, model, false),
+        }),
+      });
+      const responseJson = await response.json();
+      if (!response.ok) throw new Error(responseJson?.error?.message || chatConfig.requestLabel);
+      return extractOpenAIChatVisibleText(responseJson);
+    }
+
+    throw new Error(`${getAssistantProviderLabel(provider)} is not wired for semantic documentation generation.`);
+  };
+
+  const getSemanticDocumentationFiles = (): SemanticDocumentationSourceFile[] => (
+    getCSharpProjectFileSnapshots().map(file => ({
+      path: file.path,
+      content: file.content,
+      language: 'csharp',
+    }))
+  );
+
+  const startSemanticDocumentationGeneration = async (forceNewDraft = false) => {
+    if (isSemanticDocumentationRunning) return;
+    setIsSemanticDocumentationOpen(true);
+    setSemanticDocumentationMessage(forceNewDraft ? 'Starting regeneration...' : 'Starting semantic documentation generation...');
+
+    const sourceFiles = getSemanticDocumentationFiles();
+    try {
+      parseCSharpSemanticDocumentationProject(sourceFiles);
+    } catch (error) {
+      setSemanticDocumentationMessage(error instanceof Error ? error.message : String(error));
+      return;
+    }
+
+    const abortController = new AbortController();
+    semanticDocumentationAbortRef.current = abortController;
+    setIsSemanticDocumentationRunning(true);
+
+    try {
+      await runSemanticDocumentationGeneration({
+        projectId: activeProjectId,
+        provider: settings.assistantProvider,
+        model: effectiveAutoDocumentationModel,
+        entryPoint: settings.autoDocumentationEntryPoint.trim(),
+        promptTokenLimit: effectiveAutoDocumentationPromptTokenLimit,
+        files: sourceFiles,
+        existingDraft: semanticDocumentationDraft,
+        forceNewDraft,
+        signal: abortController.signal,
+        requestDocumentation: requestSemanticDocumentationText,
+        onProgress: ({ record, message }) => {
+          setSemanticDocumentationDraft(record.kind === 'draft' ? record : null);
+          setSemanticDocumentationMessage(message);
+          setSemanticDocumentationSelectedItemId(current => current || record.items[0]?.id || null);
+        },
+      });
+      await refreshSemanticDocumentationRecords();
+      setSemanticDocumentationMessage('Semantic documentation is active.');
+    } catch (error) {
+      setSemanticDocumentationMessage(`Semantic documentation failed: ${error instanceof Error ? error.message : String(error)}`);
+      await refreshSemanticDocumentationRecords();
+    } finally {
+      if (semanticDocumentationAbortRef.current === abortController) {
+        semanticDocumentationAbortRef.current = null;
+      }
+      setIsSemanticDocumentationRunning(false);
+    }
+  };
+
+  const pauseSemanticDocumentationGeneration = () => {
+    semanticDocumentationAbortRef.current?.abort();
+    setSemanticDocumentationMessage('Pausing after the current request completes...');
+  };
+
+  const discardSemanticDocumentationDraft = async () => {
+    if (isSemanticDocumentationRunning) return;
+    await deleteSemanticDocumentationRecord(activeProjectId, 'csharp', 'draft');
+    setSemanticDocumentationDraft(null);
+    setSemanticDocumentationMessage('Discarded draft semantic documentation progress.');
   };
 
   const applyAssistantUsage = (
@@ -20423,6 +20689,31 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
             <Tooltip.Root>
               <Tooltip.Trigger asChild>
                 <button
+                  onClick={() => setIsSemanticDocumentationOpen(true)}
+                  aria-label="Semantic Documentation"
+                  className={cn(
+                    "inline-flex items-center justify-center h-8 w-8 rounded-md transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-zinc-600",
+                    semanticDocumentationDraft
+                      ? "text-amber-300 hover:text-amber-200 hover:bg-zinc-800"
+                      : semanticDocumentationActive
+                        ? "text-emerald-300 hover:text-emerald-200 hover:bg-zinc-800"
+                        : "text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800"
+                  )}
+                >
+                  <FileText size={16} />
+                </button>
+              </Tooltip.Trigger>
+              <Tooltip.Portal>
+                <Tooltip.Content sideOffset={6} className="z-50 overflow-hidden rounded-md bg-zinc-900 border border-zinc-700 px-3 py-1.5 text-xs text-zinc-200 shadow-md animate-in fade-in-0 zoom-in-95 data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=closed]:zoom-out-95">
+                  Semantic Documentation
+                  <Tooltip.Arrow className="fill-zinc-700" />
+                </Tooltip.Content>
+              </Tooltip.Portal>
+            </Tooltip.Root>
+
+            <Tooltip.Root>
+              <Tooltip.Trigger asChild>
+                <button
                   onClick={() => setIsSettingsOpen(true)}
                   className="inline-flex items-center justify-center h-8 w-8 rounded-md text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800 transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-zinc-600"
                 >
@@ -20609,6 +20900,184 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
         )}
       </AnimatePresence>
 
+      {isSemanticDocumentationOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm">
+          <motion.div
+            initial={{ opacity: 0, scale: 0.98 }}
+            animate={{ opacity: 1, scale: 1 }}
+            className="flex h-[min(780px,90vh)] w-full max-w-6xl flex-col overflow-hidden rounded-2xl border border-white/10 bg-[rgb(28,28,28)] shadow-2xl"
+          >
+            <div className="flex items-center justify-between gap-4 border-b border-white/10 px-5 py-4">
+              <div className="min-w-0">
+                <div className="flex items-center gap-2 text-lg font-semibold text-white">
+                  <FileText size={20} className="text-emerald-300" />
+                  Semantic Documentation
+                </div>
+                <div className="mt-1 truncate text-xs text-zinc-500">
+                  C# only for now · {getAssistantProviderLabel(settings.assistantProvider)} · {effectiveAutoDocumentationModel || 'No autodocumentation model'}
+                </div>
+              </div>
+              <div className="flex shrink-0 items-center gap-2">
+                {isSemanticDocumentationRunning ? (
+                  <button
+                    type="button"
+                    onClick={pauseSemanticDocumentationGeneration}
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs font-medium text-amber-200 transition-colors hover:bg-amber-500/20"
+                  >
+                    <RefreshCw size={14} className="animate-spin" />
+                    Pause
+                  </button>
+                ) : (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => void startSemanticDocumentationGeneration(false)}
+                      className="inline-flex items-center gap-1.5 rounded-lg border border-emerald-500/30 bg-emerald-600 px-3 py-2 text-xs font-medium text-white transition-colors hover:bg-emerald-500"
+                    >
+                      <Play size={14} />
+                      {semanticDocumentationDraft ? 'Resume' : semanticDocumentationActive ? 'Start New Draft' : 'Start'}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void startSemanticDocumentationGeneration(true)}
+                      className="inline-flex items-center gap-1.5 rounded-lg border border-indigo-500/30 bg-indigo-600 px-3 py-2 text-xs font-medium text-white transition-colors hover:bg-indigo-500"
+                    >
+                      <RefreshCw size={14} />
+                      Regenerate
+                    </button>
+                    <button
+                      type="button"
+                      disabled={!semanticDocumentationDraft}
+                      onClick={() => void discardSemanticDocumentationDraft()}
+                      className="inline-flex items-center gap-1.5 rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-xs font-medium text-zinc-300 transition-colors hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      <Trash2 size={14} />
+                      Discard Draft
+                    </button>
+                  </>
+                )}
+                <button
+                  type="button"
+                  onClick={() => setIsSemanticDocumentationOpen(false)}
+                  aria-label="Close semantic documentation"
+                  className="rounded-lg p-2 text-zinc-500 transition-colors hover:bg-white/10 hover:text-white"
+                >
+                  <X size={18} />
+                </button>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 gap-3 border-b border-white/10 px-5 py-3 text-xs md:grid-cols-3">
+              <div className="rounded-xl border border-white/10 bg-white/5 px-3 py-2">
+                <div className="text-[10px] uppercase tracking-wide text-zinc-500">Active</div>
+                <div className="mt-1 text-zinc-200">{getSemanticDocumentationProgressLabel(semanticDocumentationActive)}</div>
+                <div className="mt-1 text-[10px] text-zinc-500">
+                  Updated {formatSemanticDocumentationTimestamp(semanticDocumentationActive?.updatedAt)}
+                </div>
+              </div>
+              <div className="rounded-xl border border-white/10 bg-white/5 px-3 py-2">
+                <div className="text-[10px] uppercase tracking-wide text-zinc-500">Draft</div>
+                <div className="mt-1 text-zinc-200">{getSemanticDocumentationProgressLabel(semanticDocumentationDraft)}</div>
+                <div className="mt-1 text-[10px] text-zinc-500">
+                  Active docs stay visible until a draft completes.
+                </div>
+              </div>
+              <div className="rounded-xl border border-white/10 bg-white/5 px-3 py-2">
+                <div className="text-[10px] uppercase tracking-wide text-zinc-500">Status</div>
+                <div className="mt-1 text-zinc-200">{semanticDocumentationMessage || 'Idle'}</div>
+                <div className="mt-1 text-[10px] text-zinc-500">
+                  Prompt limit {effectiveAutoDocumentationPromptTokenLimit > 0 ? effectiveAutoDocumentationPromptTokenLimit.toLocaleString() : 'unlimited'}
+                </div>
+              </div>
+            </div>
+
+            <div className="min-h-0 flex-1 grid grid-cols-1 md:grid-cols-[280px_minmax(0,1fr)]">
+              <div className="min-h-0 border-r border-white/10">
+                <div className="border-b border-white/10 px-3 py-2 text-[10px] font-medium uppercase tracking-wide text-zinc-500">
+                  Items ({semanticDocumentationVisibleRecord?.items.length || 0})
+                </div>
+                <div className="max-h-full overflow-y-auto p-2 custom-scrollbar">
+                  {semanticDocumentationVisibleRecord?.items.length ? (
+                    semanticDocumentationVisibleRecord.items.map(item => (
+                      <button
+                        key={item.id}
+                        type="button"
+                        onClick={() => setSemanticDocumentationSelectedItemId(item.id)}
+                        className={cn(
+                          "mb-1 w-full rounded-lg border px-2 py-2 text-left transition-colors last:mb-0",
+                          semanticDocumentationSelectedItem?.id === item.id
+                            ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-100"
+                            : "border-white/10 bg-white/5 text-zinc-300 hover:bg-white/10 hover:text-white"
+                        )}
+                      >
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="min-w-0 truncate text-xs font-medium">
+                            {item.containerName ? `${item.containerName}.` : ''}{item.name}
+                          </span>
+                          <span className="shrink-0 rounded bg-black/30 px-1.5 py-0.5 text-[10px] text-zinc-500">
+                            {item.kind}
+                          </span>
+                        </div>
+                        <div className="mt-1 truncate text-[10px] text-zinc-500">{item.path}</div>
+                      </button>
+                    ))
+                  ) : (
+                    <div className="px-3 py-8 text-center text-sm text-zinc-500">
+                      No semantic documentation yet.
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              <div className="min-h-0 overflow-y-auto p-5 custom-scrollbar">
+                {semanticDocumentationSelectedItem ? (
+                  <div className="mx-auto max-w-4xl">
+                    <div className="mb-4">
+                      <div className="flex flex-wrap items-center gap-2 text-xs text-zinc-500">
+                        <span>{semanticDocumentationSelectedItem.kind}</span>
+                        <span>·</span>
+                        <span>{semanticDocumentationSelectedItem.path}</span>
+                        <span>·</span>
+                        <span>{formatSemanticDocumentationTimestamp(semanticDocumentationSelectedItem.generatedAt)}</span>
+                      </div>
+                      <h3 className="mt-2 text-xl font-semibold text-white">
+                        {semanticDocumentationSelectedItem.containerName ? `${semanticDocumentationSelectedItem.containerName}.` : ''}{semanticDocumentationSelectedItem.name}
+                      </h3>
+                    </div>
+                    <div className="rounded-xl border border-white/10 bg-black/20 p-4 prose prose-invert prose-sm max-w-none text-zinc-300">
+                      <ReactMarkdown
+                        components={{
+                          code({ node, inline, className, children, ...props }: any) {
+                            return (
+                              <code
+                                className={cn(
+                                  "rounded bg-black/40 px-1.5 py-0.5 font-mono text-xs text-emerald-200",
+                                  !inline && "block overflow-x-auto border border-white/10 p-3",
+                                  className
+                                )}
+                                {...props}
+                              >
+                                {children}
+                              </code>
+                            );
+                          }
+                        }}
+                      >
+                        {semanticDocumentationSelectedItem.documentation}
+                      </ReactMarkdown>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="flex h-full items-center justify-center text-sm text-zinc-500">
+                    Start semantic documentation generation to populate this view.
+                  </div>
+                )}
+              </div>
+            </div>
+          </motion.div>
+        </div>
+      )}
+
       {/* Settings Modal */}
       <AnimatePresence>
         {isSettingsOpen && (
@@ -20647,6 +21116,7 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
                               ...current,
                               assistantProvider: nextProvider,
                               assistantModel: getAssistantDefaultModel(nextProvider),
+                              autoDocumentationModel: getAssistantDefaultModel(nextProvider),
                             }));
                           }}
                           className="w-full rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-sm text-white outline-none transition-colors focus:border-indigo-500"
@@ -20791,6 +21261,64 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
                       />
                       <div className="text-xs text-zinc-500">
                         Limits outbound assistant provider requests per minute across all providers and reasoning modes. Use 0 for unlimited; when the limit is reached, CodeCraft waits and then continues automatically. Current effective rate: {effectiveAssistantRequestRateLimitPerMinute > 0 ? `${effectiveAssistantRequestRateLimitPerMinute}/min` : 'Unlimited'}.
+                      </div>
+                    </label>
+                  </div>
+                </section>
+
+                <section>
+                  <h4 className="text-xs font-bold uppercase tracking-widest text-zinc-500 mb-4">Semantic Documentation</h4>
+                  <div className="rounded-2xl border border-white/10 bg-white/5 p-4 space-y-4">
+                    <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)] gap-4">
+                      <label className="block space-y-2">
+                        <div className="text-xs font-medium uppercase tracking-wide text-zinc-500">Autodocumentation Model</div>
+                        <input
+                          list="auto-documentation-model-options"
+                          value={settings.autoDocumentationModel}
+                          onChange={(e) => setSettings(current => ({ ...current, autoDocumentationModel: e.target.value }))}
+                          placeholder="Enter or choose a model"
+                          className="w-full rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-sm text-white outline-none transition-colors focus:border-indigo-500"
+                        />
+                        <datalist id="auto-documentation-model-options">
+                          {ASSISTANT_MODEL_PRESETS[settings.assistantProvider].map(option => (
+                            <option key={option.id} value={option.id}>{option.label}</option>
+                          ))}
+                        </datalist>
+                        <div className="text-xs text-zinc-500">
+                          Uses the selected AI provider API key, but this model is separate from the chat assistant model.
+                        </div>
+                      </label>
+
+                      <label className="block space-y-2">
+                        <div className="text-xs font-medium uppercase tracking-wide text-zinc-500">Entry Point Class</div>
+                        <input
+                          value={settings.autoDocumentationEntryPoint}
+                          onChange={(e) => setSettings(current => ({ ...current, autoDocumentationEntryPoint: e.target.value }))}
+                          placeholder="Program"
+                          className="w-full rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-sm text-white outline-none transition-colors focus:border-indigo-500"
+                        />
+                        <div className="text-xs text-zinc-500">
+                          Stage 3 starts from this C# class. If it is not found, CodeCraft falls back to a class containing `Main`, then the first discovered type.
+                        </div>
+                      </label>
+                    </div>
+
+                    <label className="block space-y-2">
+                      <div className="text-xs font-medium uppercase tracking-wide text-zinc-500">Per-Prompt Token Limit</div>
+                      <input
+                        type="number"
+                        min={0}
+                        max={MAX_AUTO_DOCUMENTATION_PROMPT_TOKEN_LIMIT}
+                        step={1024}
+                        value={settings.autoDocumentationPromptTokenLimit}
+                        onChange={(e) => setSettings(current => ({
+                          ...current,
+                          autoDocumentationPromptTokenLimit: normalizeAutoDocumentationPromptTokenLimit(Number(e.target.value)),
+                        }))}
+                        className="w-full rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-sm text-white outline-none transition-colors focus:border-indigo-500"
+                      />
+                      <div className="text-xs text-zinc-500">
+                        Current effective limit: {effectiveAutoDocumentationPromptTokenLimit > 0 ? `${effectiveAutoDocumentationPromptTokenLimit.toLocaleString()} tokens` : 'Unlimited'}. Use 0 for virtually unlimited prompts.
                       </div>
                     </label>
                   </div>
