@@ -70,6 +70,7 @@ import type {
 } from './csharp-omnisharp';
 import {
   deleteSemanticDocumentationRecord,
+  formatSemanticDocumentationItemMarkdown,
   formatSemanticDocumentationTimestamp,
   getSemanticDocumentationProgressLabel,
   loadSemanticDocumentationRecord,
@@ -21063,7 +21064,7 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
                           }
                         }}
                       >
-                        {semanticDocumentationSelectedItem.documentation}
+                        {formatSemanticDocumentationItemMarkdown(semanticDocumentationSelectedItem)}
                       </ReactMarkdown>
                     </div>
                   </div>
