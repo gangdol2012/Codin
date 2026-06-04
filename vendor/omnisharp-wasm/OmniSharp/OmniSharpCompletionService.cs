@@ -115,24 +115,15 @@ public class OmniSharpCompletionService
 
     public async Task<CompletionResponse> Handle(CompletionRequest request, Document document)
     {
-        return await HandleCompletionRequest(request, document, force: false);
-    }
-
-    public async Task<CompletionResponse> HandleForce(CompletionRequest request, Document document)
-    {
-        return await HandleCompletionRequest(request, document, force: true);
-    }
-
-    private async Task<CompletionResponse> HandleCompletionRequest(CompletionRequest request, Document document, bool force)
-    {
         cancellationTokenSource.Cancel();
         cancellationTokenSource = new CancellationTokenSource();
         cancellationToken = cancellationTokenSource.Token;
-        _logger.LogTrace(force ? "Forced completions requested" : "Completions requested");
+        _logger.LogTrace("Completions requested");
         lock (_lock)
         {
             _lastCompletion = null;
         }
+
 
         if (document is null)
         {
@@ -140,30 +131,6 @@ public class OmniSharpCompletionService
             return new CompletionResponse { Items = ImmutableArray<CompletionItem>.Empty };
         }
 
-        var response = await HandleCore(request, document);
-        if (!force || response.Items.Count > 0)
-        {
-            return response;
-        }
-
-        var internalResponse = await HandleCore(request, document, useInternalCompletion: true);
-        if (internalResponse.Items.Count > 0)
-        {
-            return internalResponse;
-        }
-
-        return await TryHandleForcedPrefixlessCompletion(request, document) ?? response;
-    }
-
-    private async Task<CompletionResponse> HandleCore(
-        CompletionRequest request,
-        Document document,
-        SourceText? replacementSourceText = null,
-        TextSpan? replacementSpan = null,
-        int? lastCompletionPosition = null,
-        bool suppressTypedTextFilter = false,
-        bool useInternalCompletion = false)
-    {
         var sourceText = await document.GetTextAsync();
         var position = sourceText.GetTextPosition(request);
 
@@ -182,27 +149,14 @@ public class OmniSharpCompletionService
             return new CompletionResponse { Items = ImmutableArray<CompletionItem>.Empty };
         }
 
-        bool expandedItemsAvailable;
-        CSharpCompletionList? completions;
-        if (useInternalCompletion)
-        {
-            (completions, expandedItemsAvailable) = await completionService.GetCompletionsInternalAsync(
-                document,
-                position,
-                getCompletionTrigger(includeTriggerCharacter: false),
-                cancellationToken: cancellationToken);
-        }
-        else
-        {
-            expandedItemsAvailable = false;
-            completions = await completionService.GetCompletionsAsync(
-                document,
-                position,
-                getCompletionTrigger(includeTriggerCharacter: false),
-                cancellationToken: cancellationToken
+        var expandedItemsAvailable = false;
+        var completions = await completionService.GetCompletionsAsync(
+            document,
+            position,
+            getCompletionTrigger(includeTriggerCharacter: false),
+            cancellationToken: cancellationToken
 
-                );
-        }
+            );
         _logger.LogTrace("Found {0} completions for {1}:{2},{3}",
                          completions?.Items.IsDefaultOrEmpty != true ? 0 : completions.Items.Length,
                          request.FileName,
@@ -224,15 +178,16 @@ public class OmniSharpCompletionService
         var typedSpan = completionService.GetDefaultCompletionListSpan(sourceText, position);
         string typedText = sourceText.GetSubText(typedSpan).ToString();
 
-        ImmutableArray<string> filteredItems = !suppressTypedTextFilter && typedText != string.Empty
+        ImmutableArray<string> filteredItems = typedText != string.Empty
             ? completionService.FilterItems(document, completions.Items, typedText).SelectAsArray(i => i.DisplayText)
             : ImmutableArray<string>.Empty;
         _logger.LogTrace("Completions filled in");
 
         lock (_lock)
         {
-            _lastCompletion = (completions, request.FileName, lastCompletionPosition ?? position);
+            _lastCompletion = (completions, request.FileName, position);
         }
+
 
         var triggerCharactersBuilder = ImmutableArray.CreateBuilder<char>(completions.Rules.DefaultCommitCharacters.Length);
         var completionsBuilder = ImmutableArray.CreateBuilder<CompletionItem>(completions.Items.Length);
@@ -245,10 +200,8 @@ public class OmniSharpCompletionService
         bool expectingImportedItems = expandedItemsAvailable && _workspace.Options.GetOption(CompletionItemExtensions.ShowItemsFromUnimportedNamespaces, LanguageNames.CSharp) == true;
         var syntax = await document.GetSyntaxTreeAsync();
 
-        var responseSourceText = replacementSourceText ?? sourceText;
-        var responseSpan = replacementSpan ?? typedSpan;
-        var replacingSpanStartPosition = responseSourceText.Lines.GetLinePosition(responseSpan.Start);
-        var replacingSpanEndPosition = responseSourceText.Lines.GetLinePosition(responseSpan.End);
+        var replacingSpanStartPosition = sourceText.Lines.GetLinePosition(typedSpan.Start);
+        var replacingSpanEndPosition = sourceText.Lines.GetLinePosition(typedSpan.End);
 
         for (int i = 0; i < completions.Items.Length; i++)
         {
@@ -521,124 +474,6 @@ public class OmniSharpCompletionService
 
             return (beforeText + "$0" + afterText, InsertTextFormat.Snippet);
         }
-    }
-
-    private async Task<CompletionResponse?> TryHandleForcedPrefixlessCompletion(CompletionRequest request, Document document)
-    {
-        var sourceText = await document.GetTextAsync(cancellationToken);
-        var position = sourceText.GetTextPosition(request);
-        if (!await IsForceablePrefixlessCompletionContext(document, sourceText, position))
-        {
-            return null;
-        }
-
-        const string probeText = "a";
-        var forcedText = sourceText.WithChanges(new TextChange(new TextSpan(position, 0), probeText));
-        var forcedDocument = document.WithText(forcedText);
-        var forcedPosition = position + probeText.Length;
-        var forcedLinePosition = forcedText.Lines.GetLinePosition(forcedPosition);
-        var forcedRequest = new CompletionRequest
-        {
-            FileName = request.FileName,
-            Line = forcedLinePosition.Line,
-            Column = forcedLinePosition.Character,
-            CompletionTrigger = CompletionTriggerKind.Invoked
-        };
-
-        var forcedResponse = await HandleCore(
-            forcedRequest,
-            forcedDocument,
-            replacementSourceText: sourceText,
-            replacementSpan: new TextSpan(position, 0),
-            lastCompletionPosition: position,
-            suppressTypedTextFilter: true,
-            useInternalCompletion: true);
-
-        return forcedResponse.Items.Count > 0 ? forcedResponse : null;
-    }
-
-    private async Task<bool> IsForceablePrefixlessCompletionContext(Document document, SourceText sourceText, int position)
-    {
-        if (position < 0 || position > sourceText.Length)
-        {
-            return false;
-        }
-
-        if (position > 0 && IsIdentifierPart(sourceText[position - 1]))
-        {
-            return false;
-        }
-
-        if (position < sourceText.Length && IsIdentifierPart(sourceText[position]))
-        {
-            return false;
-        }
-
-        var root = await document.GetSyntaxRootAsync(cancellationToken);
-        if (root is null)
-        {
-            return true;
-        }
-
-        if (IsInsideNonCompletionTriviaOrLiteral(root, position))
-        {
-            return false;
-        }
-
-        var previous = PreviousNonWhitespace(sourceText, position);
-        return previous is null || previous.Value switch
-        {
-            '.' or '"' or '\'' or '/' => false,
-            ')' or ']' => false,
-            _ => true
-        };
-    }
-
-    private static bool IsInsideNonCompletionTriviaOrLiteral(SyntaxNode root, int position)
-    {
-        if (root.FullSpan.Length == 0)
-        {
-            return false;
-        }
-
-        var lookupPosition = Math.Max(root.FullSpan.Start, Math.Min(position, root.FullSpan.End) - 1);
-        var trivia = root.FindTrivia(lookupPosition, findInsideTrivia: true);
-        if (trivia.IsKind(SyntaxKind.SingleLineCommentTrivia) ||
-            trivia.IsKind(SyntaxKind.MultiLineCommentTrivia) ||
-            trivia.IsKind(SyntaxKind.SingleLineDocumentationCommentTrivia) ||
-            trivia.IsKind(SyntaxKind.MultiLineDocumentationCommentTrivia) ||
-            trivia.IsKind(SyntaxKind.DisabledTextTrivia))
-        {
-            return true;
-        }
-
-        var token = root.FindToken(lookupPosition);
-        return position > token.SpanStart &&
-            position <= token.Span.End &&
-            (token.IsKind(SyntaxKind.StringLiteralToken) ||
-             token.IsKind(SyntaxKind.CharacterLiteralToken) ||
-             token.IsKind(SyntaxKind.InterpolatedStringTextToken));
-    }
-
-    private static char? PreviousNonWhitespace(SourceText sourceText, int position)
-    {
-        for (var index = Math.Min(position, sourceText.Length) - 1; index >= 0; index--)
-        {
-            var character = sourceText[index];
-            if (!char.IsWhiteSpace(character))
-            {
-                return character;
-            }
-        }
-
-        return null;
-    }
-
-    private static bool IsIdentifierPart(char character)
-    {
-        return character == '_' ||
-            char.IsLetterOrDigit(character) ||
-            character >= 128;
     }
 
     public async Task<CompletionResolveResponse> Handle(CompletionResolveRequest request, Document document)
