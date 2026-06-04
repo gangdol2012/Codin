@@ -155,6 +155,23 @@ $@"using System;
         });
     }
 
+    public async Task<byte[]> GetCompletionForceAsync(string code, string completionRequestString)
+    {
+        return await GetCompletionForceAsync(code, completionRequestString, string.Empty);
+    }
+
+    public async Task<byte[]> GetCompletionForceAsync(string code, string completionRequestString, string projectRequestString)
+    {
+        return await RunCompletionAsync(async () =>
+        {
+            var completionRequest = DeserializeRequest<CompletionRequest>(completionRequestString);
+            var document = await UpdateCompletionDocumentAsync(code, projectRequestString);
+            var completionResponse = await _completionService.HandleForce(completionRequest, document);
+
+            return Payload(completionResponse, "GetCompletionForceAsync");
+        });
+    }
+
     public async Task<byte[]> GetCompletionResolveAsync(string completionResolveRequestString)
     {
         return await RunCompletionAsync(async () =>
