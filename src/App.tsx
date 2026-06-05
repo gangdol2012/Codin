@@ -37,7 +37,6 @@ import {
   CopyPlus,
   ClipboardPaste,
   Pencil,
-  Bug,
   Activity,
   Database,
   GitBranch,
@@ -65,7 +64,6 @@ import type * as TypeScript from 'typescript';
 import coinstantLogo from '../coinstant-logo.jpg';
 import type {
   CSharpIdeDebugEvent,
-  CSharpIdeDebugFeatureSnapshot,
   CSharpIdeDebugSnapshot,
   CSharpOmniSharpSource,
 } from './csharp-omnisharp';
@@ -7595,7 +7593,6 @@ export default function App() {
   const [settingsUserDataBusy, setSettingsUserDataBusy] = useState(false);
   const [settingsUserDataStatus, setSettingsUserDataStatus] = useState('');
   const [csharpIdeDebugSnapshot, setCSharpIdeDebugSnapshot] = useState<CSharpIdeDebugSnapshot | null>(null);
-  const [activeCSharpIdeDebugFeature, setActiveCSharpIdeDebugFeature] = useState('overview');
   const [showAssistantApiKey, setShowAssistantApiKey] = useState(false);
   const [isSemanticDocumentationOpen, setIsSemanticDocumentationOpen] = useState(false);
   const [semanticDocumentationActive, setSemanticDocumentationActive] = useState<SemanticDocumentationRecord | null>(null);
@@ -8094,7 +8091,7 @@ export default function App() {
     try {
       await navigator.clipboard?.writeText(JSON.stringify(csharpIdeDebugSnapshot, null, 2));
     } catch (error) {
-      console.warn('Failed to copy C# IDE debug snapshot:', error);
+      console.warn('Failed to copy C# completion preload debug snapshot:', error);
     }
   }, [csharpIdeDebugSnapshot]);
 
@@ -19839,15 +19836,12 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
     if (!settings.csharpIdeDebugMode || getProjectFileLanguageForRuntime(tabItem) !== 'csharp') return null;
 
     const snapshot = csharpIdeDebugSnapshot;
-    const features = snapshot?.features ?? [];
-    const hasSelectedFeature = features.some(feature => feature.key === activeCSharpIdeDebugFeature);
-    const selectedFeatureKey = activeCSharpIdeDebugFeature === 'overview' || hasSelectedFeature
-      ? activeCSharpIdeDebugFeature
-      : 'overview';
-    const selectedFeature = features.find(feature => feature.key === selectedFeatureKey) ?? null;
-    const timelineEvents = selectedFeature
-      ? [...selectedFeature.events].reverse()
-      : [...(snapshot?.events ?? [])].slice(-80).reverse();
+    const preload = snapshot?.completionPreload ?? null;
+    const lastRequest = preload?.lastRequest ?? null;
+    const timelineEvents = (snapshot?.events ?? [])
+      .filter(event => event.featureKey === 'completionPreload' || event.feature === 'completion.predictive')
+      .slice(-40)
+      .reverse();
 
     const renderJsonBlock = (title: string, value: unknown, emptyLabel = 'No data recorded yet.') => (
       <div className="min-w-0 rounded-lg border border-white/10 bg-black/30">
@@ -19860,42 +19854,35 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
       </div>
     );
 
-    const renderFeatureMetrics = (feature: CSharpIdeDebugFeatureSnapshot) => (
-      <div className="grid grid-cols-2 lg:grid-cols-6 gap-2 text-[10px]">
-        <div className="rounded-lg border border-white/10 bg-white/5 px-2 py-1.5">
-          <div className="text-zinc-500">Events</div>
-          <div className="mt-1 text-zinc-100">{feature.eventCount}</div>
-        </div>
-        <div className="rounded-lg border border-white/10 bg-white/5 px-2 py-1.5">
-          <div className="text-zinc-500">Provider / Runtime</div>
-          <div className="mt-1 text-zinc-100">{feature.providerCallCount} / {feature.runtimeCallCount}</div>
-        </div>
-        <div className="rounded-lg border border-white/10 bg-white/5 px-2 py-1.5">
-          <div className="text-zinc-500">Errors</div>
-          <div className={cn("mt-1", feature.errorCount ? "text-red-300" : "text-zinc-100")}>{feature.errorCount}</div>
-        </div>
-        <div className="rounded-lg border border-white/10 bg-white/5 px-2 py-1.5">
-          <div className="text-zinc-500">Warnings</div>
-          <div className={cn("mt-1", feature.warningCount ? "text-amber-300" : "text-zinc-100")}>{feature.warningCount}</div>
-        </div>
-        <div className="rounded-lg border border-white/10 bg-white/5 px-2 py-1.5">
-          <div className="text-zinc-500">Avg / Max</div>
-          <div className="mt-1 text-zinc-100">{formatCSharpDebugDuration(feature.averageDurationMs)} / {formatCSharpDebugDuration(feature.maxDurationMs)}</div>
-        </div>
-        <div className="rounded-lg border border-white/10 bg-white/5 px-2 py-1.5">
-          <div className="text-zinc-500">In Flight</div>
-          <div className={cn("mt-1", feature.inFlightCount ? "text-indigo-300" : "text-zinc-100")}>{feature.inFlightCount}</div>
-        </div>
+    const preloadStatusClass = (status: string | undefined) => {
+      if (status === 'failed') return 'text-red-300';
+      if (status === 'invalidated' || status === 'stale' || status === 'empty') return 'text-amber-300';
+      if (status === 'cached' || status === 'served') return 'text-emerald-300';
+      if (status === 'running' || status === 'scheduled') return 'text-indigo-300';
+      return 'text-zinc-300';
+    };
+
+    const renderMetric = (label: string, value: React.ReactNode, icon?: React.ReactNode, className?: string) => (
+      <div className="rounded-lg border border-white/10 bg-white/5 px-2 py-1.5">
+        <div className="flex items-center gap-1 text-zinc-500">{icon}{label}</div>
+        <div className={cn("mt-1 truncate text-zinc-200", className)}>{value}</div>
+      </div>
+    );
+
+    const renderDetail = (label: string, value: React.ReactNode, className?: string) => (
+      <div className="grid grid-cols-[8.5rem_minmax(0,1fr)] gap-2 border-b border-white/5 py-1 last:border-b-0">
+        <div className="text-zinc-500">{label}</div>
+        <div className={cn("min-w-0 break-words text-zinc-200", className)}>{value}</div>
       </div>
     );
 
     return (
-      <div className="absolute right-3 bottom-3 z-20 w-[min(1080px,calc(100%-1.5rem))] max-h-[72%] overflow-hidden rounded-xl border border-indigo-400/30 bg-zinc-950/95 shadow-2xl backdrop-blur">
+      <div className="absolute right-3 bottom-3 z-20 w-[min(840px,calc(100%-1.5rem))] max-h-[72%] overflow-hidden rounded-xl border border-indigo-400/30 bg-zinc-950/95 shadow-2xl backdrop-blur">
         <div className="flex items-center justify-between gap-3 border-b border-white/10 px-3 py-2">
           <div className="flex items-center gap-2 min-w-0">
-            <Bug size={14} className="text-indigo-300 shrink-0" />
+            <Activity size={14} className="text-indigo-300 shrink-0" />
             <div className="min-w-0">
-              <div className="text-xs font-semibold text-white">C# IDE Debug</div>
+              <div className="text-xs font-semibold text-white">C# Completion Preload Debugger</div>
               <div className="text-[10px] text-zinc-500 truncate">
                 {snapshot?.activeModel?.path ?? getPath(tabItem.id)}
               </div>
@@ -19920,201 +19907,102 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
           </div>
         </div>
 
-        {snapshot ? (
-          <div className="max-h-[calc(72vh-2.5rem)] overflow-hidden">
+        {snapshot && preload ? (
+          <div className="max-h-[calc(72vh-2.5rem)] overflow-y-auto p-3 custom-scrollbar">
             <div className="border-b border-white/10 px-3 py-2">
-              <div className="grid grid-cols-2 lg:grid-cols-5 gap-2 text-[10px]">
-                <div className="rounded-lg border border-white/10 bg-white/5 px-2 py-1.5">
-                  <div className="flex items-center gap-1 text-zinc-500"><Activity size={10} /> Runtime</div>
-                  <div className="mt-1 text-zinc-200">
-                    {snapshot.runtime.hasOmniSharpBridge ? 'Bridge ready' : snapshot.runtime.initializationPending ? 'Initializing' : 'Bridge missing'}
-                  </div>
-                </div>
-                <div className="rounded-lg border border-white/10 bg-white/5 px-2 py-1.5">
-                  <div className="flex items-center gap-1 text-zinc-500"><FileCode size={10} /> C# Files</div>
-                  <div className="mt-1 text-zinc-200">{snapshot.project.csharpFileCount}/{snapshot.project.providerFileCount}</div>
-                </div>
-                <div className="rounded-lg border border-white/10 bg-white/5 px-2 py-1.5">
-                  <div className="flex items-center gap-1 text-zinc-500"><Database size={10} /> Cache</div>
-                  <div className="mt-1 text-zinc-200">
-                    C {snapshot.cache.completionCacheSize} · D {snapshot.cache.diagnosticCacheMarkerCount}
-                  </div>
-                </div>
-                <div className="rounded-lg border border-white/10 bg-white/5 px-2 py-1.5">
-                  <div className="flex items-center gap-1 text-zinc-500"><History size={10} /> Events</div>
-                  <div className="mt-1 text-zinc-200">{snapshot.events.length}</div>
-                </div>
-                <div className="rounded-lg border border-white/10 bg-white/5 px-2 py-1.5">
-                  <div className="text-zinc-500">Active Version</div>
-                  <div className="mt-1 text-zinc-200">
-                    {snapshot.activeModel ? `v${snapshot.activeModel.versionId} · ${snapshot.activeModel.hash}` : 'No C# model'}
-                  </div>
-                </div>
+              <div className="text-sm font-semibold text-white">{preload.summary}</div>
+              <div className="mt-1 text-[11px] text-zinc-500">
+                Runtime {snapshot.runtime.hasOmniSharpBridge ? 'ready' : snapshot.runtime.initializationPending ? 'initializing' : 'missing'} · serial {preload.serial} · generated {formatCSharpDebugTimestamp(snapshot.generatedAt)}
               </div>
             </div>
 
-            <div className="flex max-h-[calc(72vh-8.25rem)] min-h-0">
-              <div className="w-52 shrink-0 overflow-y-auto border-r border-white/10 p-2 custom-scrollbar">
-                <button
-                  type="button"
-                  onClick={() => setActiveCSharpIdeDebugFeature('overview')}
-                  className={cn(
-                    "mb-1 w-full rounded-lg px-2 py-1.5 text-left text-[11px] transition-colors",
-                    selectedFeatureKey === 'overview' ? "bg-indigo-500/20 text-indigo-100" : "text-zinc-400 hover:bg-white/5 hover:text-white"
-                  )}
-                >
-                  <div className="font-medium">Overview</div>
-                  <div className="text-[10px] text-zinc-500">All features</div>
-                </button>
-                {features.map(feature => (
-                  <button
-                    key={feature.key}
-                    type="button"
-                    onClick={() => setActiveCSharpIdeDebugFeature(feature.key)}
-                    className={cn(
-                      "mb-1 w-full rounded-lg px-2 py-1.5 text-left text-[11px] transition-colors",
-                      selectedFeatureKey === feature.key ? "bg-indigo-500/20 text-indigo-100" : "text-zinc-400 hover:bg-white/5 hover:text-white"
-                    )}
-                  >
-                    <div className="flex items-center justify-between gap-2">
-                      <span className="truncate font-medium">{feature.label}</span>
-                      <span className={cn(
-                        "shrink-0",
-                        feature.errorCount ? "text-red-300" : feature.warningCount ? "text-amber-300" : "text-zinc-600"
-                      )}>
-                        {feature.eventCount}
-                      </span>
-                    </div>
-                    <div className="mt-0.5 flex items-center justify-between gap-2 text-[10px] text-zinc-500">
-                      <span className="truncate">{feature.category}</span>
-                      <span>{formatCSharpDebugDuration(feature.lastDurationMs)}</span>
-                    </div>
-                  </button>
-                ))}
-              </div>
+            <div className="mt-3 grid grid-cols-2 lg:grid-cols-4 gap-2 text-[10px]">
+              {renderMetric('State', preload.state, <Activity size={10} />, preloadStatusClass(preload.state))}
+              {renderMetric('Candidate', lastRequest?.candidate ?? preload.activePlan?.candidate ?? 'none', <FileCode size={10} />)}
+              {renderMetric('Prefix', lastRequest?.prefix ?? preload.activePlan?.prefix ?? 'none', <Hash size={10} />)}
+              {renderMetric('Preload Cache', `${preload.cacheEntries.length}/${preload.cacheLimit}`, <Database size={10} />)}
+            </div>
 
-              <div className="min-w-0 flex-1 overflow-y-auto p-3 custom-scrollbar">
-                {selectedFeature ? (
-                  <div className="space-y-3">
-                    <div>
-                      <div className="flex items-start justify-between gap-3">
-                        <div>
-                          <div className="text-sm font-semibold text-white">{selectedFeature.label}</div>
-                          <div className="mt-1 text-[11px] leading-relaxed text-zinc-500">{selectedFeature.description}</div>
-                        </div>
-                        <div className="shrink-0 rounded-lg border border-white/10 bg-white/5 px-2 py-1 text-[10px] text-zinc-400">
-                          {selectedFeature.category} · last {formatCSharpDebugTimestamp(selectedFeature.lastEventAt)}
-                        </div>
-                      </div>
-                    </div>
-
-                    {renderFeatureMetrics(selectedFeature)}
-
-                    <div className="grid grid-cols-1 lg:grid-cols-2 gap-2">
-                      {renderJsonBlock('Phase Counts', selectedFeature.phases)}
-                      {renderJsonBlock('Level Counts', selectedFeature.levels)}
-                    </div>
-
-                    <div className="grid grid-cols-1 xl:grid-cols-2 gap-2">
-                      {renderJsonBlock('Last Request', selectedFeature.lastRequest)}
-                      {renderJsonBlock('Last Response', selectedFeature.lastResponse)}
-                      {renderJsonBlock('Last Error', selectedFeature.lastError)}
-                      {renderJsonBlock('Last Environment', selectedFeature.lastEnvironment)}
-                    </div>
+            <div className="mt-3 grid grid-cols-1 lg:grid-cols-2 gap-3">
+              <div className="rounded-lg border border-white/10 bg-black/30 px-3 py-2 text-[11px]">
+                <div className="mb-1.5 text-[10px] font-medium uppercase tracking-wide text-zinc-500">Last Preload Request</div>
+                {lastRequest ? (
+                  <div>
+                    {renderDetail('Status', lastRequest.status, preloadStatusClass(lastRequest.status))}
+                    {renderDetail('Candidate', lastRequest.candidate)}
+                    {renderDetail('Typed prefix', lastRequest.prefix)}
+                    {renderDetail('Assumed text', lastRequest.assumedText)}
+                    {renderDetail('Items', lastRequest.itemCount ?? 'n/a')}
+                    {renderDetail('Duration', formatCSharpDebugDuration(lastRequest.durationMs))}
+                    {renderDetail('Cache age', typeof lastRequest.cacheAgeMs === 'number' ? `${lastRequest.cacheAgeMs}ms` : 'n/a')}
+                    {renderDetail('Position', lastRequest.line && lastRequest.column ? `${lastRequest.line}:${lastRequest.column}` : 'n/a')}
+                    {renderDetail('Serial', lastRequest.serial)}
+                    {renderDetail('Reason', lastRequest.reason ?? 'n/a')}
                   </div>
                 ) : (
-                  <div className="space-y-3">
-                    <div>
-                      <div className="text-sm font-semibold text-white">Overview</div>
-                      <div className="mt-1 text-[11px] leading-relaxed text-zinc-500">
-                        Full C# IDE debug state grouped by feature. Pick a feature tab to inspect its request/response timeline.
-                      </div>
-                    </div>
-
-                    <div className="grid grid-cols-1 xl:grid-cols-2 gap-2">
-                      {renderJsonBlock('Runtime', snapshot.runtime)}
-                      {renderJsonBlock('Active Model', snapshot.activeModel)}
-                      {renderJsonBlock('Cache', snapshot.cache)}
-                      {renderJsonBlock('Last Diagnostic Project Request', snapshot.project.lastDiagnosticRequest)}
-                    </div>
-
-                    <div className="rounded-lg border border-white/10 bg-black/30 px-2 py-1.5 text-[10px]">
-                      <div className="text-zinc-500">Project Snapshot</div>
-                      <div className="mt-1 space-y-1">
-                        {snapshot.project.files.map(file => (
-                          <div key={file.path} className="flex items-center justify-between gap-2 text-zinc-300">
-                            <span className="truncate">{file.path}</span>
-                            <span className="shrink-0 text-zinc-500">
-                              {file.lines} lines · {file.length} chars · {file.hash}{file.hasMonacoModel ? ' · model' : ''}
-                            </span>
-                          </div>
-                        ))}
-                        {snapshot.project.files.length === 0 ? (
-                          <div className="text-zinc-500">No C# files reported by the project provider.</div>
-                        ) : null}
-                        {snapshot.project.providerError ? (
-                          <div className="text-red-300">{snapshot.project.providerError}</div>
-                        ) : null}
-                      </div>
-                    </div>
-
-                    <div className="grid grid-cols-1 lg:grid-cols-2 gap-2">
-                      {features.map(feature => (
-                        <button
-                          key={feature.key}
-                          type="button"
-                          onClick={() => setActiveCSharpIdeDebugFeature(feature.key)}
-                          className="rounded-lg border border-white/10 bg-black/30 px-2 py-2 text-left transition-colors hover:bg-white/5"
-                        >
-                          <div className="flex items-center justify-between gap-2">
-                            <div className="text-xs font-medium text-zinc-100">{feature.label}</div>
-                            <div className={cn("text-[10px]", feature.errorCount ? "text-red-300" : feature.warningCount ? "text-amber-300" : "text-zinc-500")}>
-                              {feature.eventCount} events
-                            </div>
-                          </div>
-                          <div className="mt-1 text-[10px] text-zinc-500">
-                            {feature.category} · {feature.providerCallCount} provider · {feature.runtimeCallCount} runtime · avg {formatCSharpDebugDuration(feature.averageDurationMs)}
-                          </div>
-                        </button>
-                      ))}
-                    </div>
-                  </div>
+                  <div className="text-zinc-500">No preload request recorded yet.</div>
                 )}
-
-                <div className="mt-3 space-y-2">
-                  <div className="text-[10px] font-medium uppercase tracking-wide text-zinc-500">
-                    {selectedFeature ? `${selectedFeature.label} Timeline` : 'Recent Timeline'}
-                  </div>
-                  {timelineEvents.map(event => (
-                    <div key={event.id} className="rounded-lg border border-white/10 bg-black/30 px-2 py-1.5">
-                      <div className="flex items-center justify-between gap-2 text-[10px]">
-                        <div className="min-w-0">
-                          <span className={cn("font-semibold", getCSharpDebugLevelClass(event.level))}>
-                            {event.featureLabel ?? event.feature}
-                          </span>
-                          <span className="text-zinc-500"> · {event.feature} · {event.phase}</span>
-                        </div>
-                        <div className="shrink-0 text-zinc-500">
-                          {event.durationMs != null ? formatCSharpDebugDuration(event.durationMs) : formatCSharpDebugTimestamp(event.timestamp)}
-                        </div>
-                      </div>
-                      <div className="mt-1 text-[10px] text-zinc-300">{event.message}</div>
-                      <pre className="mt-1 max-h-40 overflow-auto rounded bg-black/40 p-1.5 text-[10px] leading-snug text-zinc-500 custom-scrollbar">
-                        {stringifyCSharpDebugValue(getCSharpDebugEventPayload(event))}
-                      </pre>
-                    </div>
-                  ))}
-                  {timelineEvents.length === 0 ? (
-                    <div className="rounded-lg border border-white/10 bg-black/30 px-2 py-2 text-[11px] text-zinc-500">
-                      No events recorded for this tab yet.
-                    </div>
-                  ) : null}
-                </div>
               </div>
+
+              <div className="rounded-lg border border-white/10 bg-black/30 px-3 py-2 text-[11px]">
+                <div className="mb-1.5 text-[10px] font-medium uppercase tracking-wide text-zinc-500">Current Preload Source</div>
+                {preload.source ? (
+                  <div>
+                    {renderDetail('Suggestions', preload.source.suggestionCount)}
+                    {renderDetail('Environment', preload.source.environmentVersion)}
+                    {renderDetail('Project key', preload.source.projectFileKey || 'active file only', 'text-[10px] text-zinc-400')}
+                    {renderDetail('Candidates', preload.source.candidateSample.length ? preload.source.candidateSample.join(', ') : 'none')}
+                  </div>
+                ) : (
+                  <div className="text-zinc-500">No remembered completion source yet.</div>
+                )}
+              </div>
+            </div>
+
+            <div className="mt-3 grid grid-cols-1 xl:grid-cols-2 gap-2">
+              {renderJsonBlock('Active Plan', preload.activePlan)}
+              {renderJsonBlock('Cached Preloads', preload.cacheEntries)}
+              {renderJsonBlock('Last Request Details', preload.lastRequest)}
+              {renderJsonBlock('Cache State', {
+                completionCacheSize: snapshot.cache.completionCacheSize,
+                predictiveCompletionCacheSize: snapshot.cache.predictiveCompletionCacheSize,
+                predictiveCompletionActivePlan: snapshot.cache.predictiveCompletionActivePlan,
+                completionEnvironmentVersion: snapshot.cache.completionEnvironmentVersion,
+                timerPending: preload.timerPending,
+                delayMs: preload.delayMs,
+              })}
+            </div>
+
+            <div className="mt-3 space-y-2">
+              <div className="text-[10px] font-medium uppercase tracking-wide text-zinc-500">Preload Timeline</div>
+              {timelineEvents.map(event => (
+                <div key={event.id} className="rounded-lg border border-white/10 bg-black/30 px-2 py-1.5">
+                  <div className="flex items-center justify-between gap-2 text-[10px]">
+                    <div className="min-w-0">
+                      <span className={cn("font-semibold", getCSharpDebugLevelClass(event.level))}>
+                        {event.featureLabel ?? event.feature}
+                      </span>
+                      <span className="text-zinc-500"> · {event.phase}</span>
+                    </div>
+                    <div className="shrink-0 text-zinc-500">
+                      {event.durationMs != null ? formatCSharpDebugDuration(event.durationMs) : formatCSharpDebugTimestamp(event.timestamp)}
+                    </div>
+                  </div>
+                  <div className="mt-1 text-[10px] text-zinc-300">{event.message}</div>
+                  <pre className="mt-1 max-h-36 overflow-auto rounded bg-black/40 p-1.5 text-[10px] leading-snug text-zinc-500 custom-scrollbar">
+                    {stringifyCSharpDebugValue(getCSharpDebugEventPayload(event))}
+                  </pre>
+                </div>
+              ))}
+              {timelineEvents.length === 0 ? (
+                <div className="rounded-lg border border-white/10 bg-black/30 px-2 py-2 text-[11px] text-zinc-500">
+                  No preload events recorded for this tab yet.
+                </div>
+              ) : null}
             </div>
           </div>
         ) : (
-          <div className="p-3 text-xs text-zinc-400">Waiting for the C# language service to load.</div>
+          <div className="p-3 text-xs text-zinc-400">Waiting for the C# completion preload debugger to load.</div>
         )}
       </div>
     );
@@ -22613,9 +22501,9 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
 
                       <div className="flex items-center justify-between gap-4 rounded-xl border border-white/10 bg-black/20 px-4 py-3">
                         <div>
-                          <div className="text-sm font-medium text-white">C# IDE Debug Mode</div>
+                          <div className="text-sm font-medium text-white">C# Completion Preload Debugger</div>
                           <div className="text-xs text-zinc-500">
-                            Records provider calls, OmniSharp requests, project snapshots, caches, timing, and failures.
+                            Shows the speculative candidate, preload status, cache replay, timing, and last request details.
                           </div>
                         </div>
                         <button
