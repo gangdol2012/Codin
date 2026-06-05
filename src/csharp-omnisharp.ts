@@ -3174,6 +3174,8 @@ class CSharpLanguageService {
     if (endOffset !== currentOffset || startOffset > endOffset) return null;
 
     const snapshot = this.getModelTextSnapshot(model);
+    if (snapshot.code.charAt(endOffset) === '.') return null;
+
     const replacement = `${candidate}.`;
     const code = snapshot.code.slice(0, startOffset) + replacement + snapshot.code.slice(endOffset);
     const offset = startOffset + replacement.length;
@@ -3260,11 +3262,18 @@ class CSharpLanguageService {
     if (!this.omnisharp || !this.editor || !this.model || this.model.isDisposed()) return;
 
     await this.completionDispatchTail;
+    const currentPlan = this.model && !this.model.isDisposed()
+      ? this.createPredictiveCompletionPlan(this.model)
+      : null;
     if (
       serial !== this.predictiveCompletionSerial ||
       this.predictiveCompletionPlan?.key !== plan.key ||
-      this.predictiveCompletionCache.has(plan.key)
+      this.predictiveCompletionCache.has(plan.key) ||
+      currentPlan?.key !== plan.key
     ) {
+      if (this.predictiveCompletionPlan?.key === plan.key) {
+        this.predictiveCompletionPlan = null;
+      }
       this.setPredictiveCompletionLastRequest(plan, serial, 'stale', {
         finishedAt: new Date().toISOString(),
         reason: 'Preload did not start because a newer preload plan or cached result replaced it.',
@@ -3334,16 +3343,25 @@ class CSharpLanguageService {
           ? 'Preload returned items, but a newer preload plan replaced it before caching.'
           : undefined,
       });
+      const completionPreloadStatus: CSharpCompletionPreloadStatus = shouldCache
+        ? 'cached'
+        : itemCount > 0
+          ? 'stale'
+          : 'empty';
       this.recordDebugEvent({
         feature: 'completion.predictive',
         phase: 'provider-end',
         callId,
-        level: itemCount > 0 ? 'success' : 'warning',
-        message: itemCount > 0 ? 'C# predictive completion preload cached.' : 'C# predictive completion returned no items.',
+        level: shouldCache ? 'success' : 'warning',
+        message: completionPreloadStatus === 'cached'
+          ? 'C# predictive completion preload cached.'
+          : completionPreloadStatus === 'stale'
+            ? 'C# predictive completion preload became stale before caching.'
+            : 'C# predictive completion returned no items.',
         durationMs: Math.round((this.now() - startedAt) * 10) / 10,
         response: {
           itemCount,
-          cached: itemCount > 0,
+          cached: shouldCache,
         },
       });
     } catch (error) {
@@ -3633,7 +3651,24 @@ class CSharpLanguageService {
 
     try {
       const entry = await entryPromise;
-      if (!entry || model.isDisposed()) return this.emptyCompletionList();
+      if (!entry || model.isDisposed()) {
+        this.recordDebugEvent({
+          feature: 'completion',
+          phase: 'provider-end',
+          level: 'warning',
+          callId,
+          durationMs: Math.round((this.now() - startedAt) * 10) / 10,
+          message: 'C# completion provider returned no usable result because the request became stale.',
+          response: {
+            itemCount: 0,
+            stale: true,
+            modelDisposed: model.isDisposed(),
+            completionTrigger: request.CompletionTrigger,
+            triggerCharacter: request.TriggerCharacter,
+          },
+        });
+        return this.emptyCompletionList();
+      }
 
       this.cacheCompletionResult(cacheKey, entry);
       this.completionWorkerStateKey = cacheKey;
