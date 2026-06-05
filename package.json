@@ -1,7 +1,7 @@
 {
   "name": "codecraft-ide",
   "private": true,
-  "version": "0.0.0",
+  "version": "1.2.3",
   "type": "module",
   "scripts": {
     "prepare": "node scripts/build-minimal-typeshed.mjs && node scripts/sync-browser-csharp-runtime.mjs --best-effort && node scripts/sync-omnisharp-runtime.mjs && node scripts/sync-pyodide-runtime.mjs",
