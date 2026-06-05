@@ -44,7 +44,8 @@ import {
   Hash,
   RefreshCw,
   CloudUpload,
-  KeyRound
+  KeyRound,
+  Zap
 } from 'lucide-react';
 import Editor, { DiffEditor } from '@monaco-editor/react';
 import { configureMonacoSuggestionAcceptance } from './monaco-suggest';
@@ -19838,6 +19839,7 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
     const snapshot = csharpIdeDebugSnapshot;
     const preload = snapshot?.completionPreload ?? null;
     const lastRequest = preload?.lastRequest ?? null;
+    const lastLookup = preload?.lastLookup ?? null;
     const timelineEvents = (snapshot?.events ?? [])
       .filter(event => event.featureKey === 'completionPreload' || event.feature === 'completion.predictive')
       .slice(-40)
@@ -19859,6 +19861,13 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
       if (status === 'invalidated' || status === 'stale' || status === 'empty') return 'text-amber-300';
       if (status === 'cached' || status === 'served') return 'text-emerald-300';
       if (status === 'running' || status === 'scheduled') return 'text-indigo-300';
+      return 'text-zinc-300';
+    };
+
+    const preloadLookupClass = (outcome: string | undefined) => {
+      if (outcome === 'runtime-unavailable') return 'text-red-300';
+      if (outcome === 'predictive-miss' || outcome === 'predictive-empty' || outcome === 'runtime-fallback') return 'text-amber-300';
+      if (outcome === 'predictive-hit' || outcome === 'normal-cache-hit') return 'text-emerald-300';
       return 'text-zinc-300';
     };
 
@@ -19916,8 +19925,9 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
               </div>
             </div>
 
-            <div className="mt-3 grid grid-cols-2 lg:grid-cols-4 gap-2 text-[10px]">
+            <div className="mt-3 grid grid-cols-2 lg:grid-cols-5 gap-2 text-[10px]">
               {renderMetric('State', preload.state, <Activity size={10} />, preloadStatusClass(preload.state))}
+              {renderMetric('Replay', lastLookup?.outcome ?? 'none', <Zap size={10} />, preloadLookupClass(lastLookup?.outcome))}
               {renderMetric('Candidate', lastRequest?.candidate ?? preload.activePlan?.candidate ?? 'none', <FileCode size={10} />)}
               {renderMetric('Prefix', lastRequest?.prefix ?? preload.activePlan?.prefix ?? 'none', <Hash size={10} />)}
               {renderMetric('Preload Cache', `${preload.cacheEntries.length}/${preload.cacheLimit}`, <Database size={10} />)}
@@ -19959,10 +19969,32 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
               </div>
             </div>
 
+            <div className="mt-3 rounded-lg border border-white/10 bg-black/30 px-3 py-2 text-[11px]">
+              <div className="mb-1.5 text-[10px] font-medium uppercase tracking-wide text-zinc-500">Last Replay Lookup</div>
+              {lastLookup ? (
+                <div>
+                  {renderDetail('Outcome', lastLookup.outcome, preloadLookupClass(lastLookup.outcome))}
+                  {renderDetail('Actual prefix', lastLookup.filterPrefix || 'empty')}
+                  {renderDetail('Previous char', lastLookup.previousCharacter || 'none')}
+                  {renderDetail('Items', lastLookup.matchedItemCount ?? 'n/a')}
+                  {renderDetail('Cache age', typeof lastLookup.cacheAgeMs === 'number' ? `${lastLookup.cacheAgeMs}ms` : 'n/a')}
+                  {renderDetail('Position', `${lastLookup.line}:${lastLookup.column}`)}
+                  {renderDetail('Trigger', `${lastLookup.completionTrigger}${lastLookup.triggerCharacter ? ` '${lastLookup.triggerCharacter}'` : ''}`)}
+                  {renderDetail('Active plan match', lastLookup.activePlanMatches ? 'yes' : 'no', lastLookup.activePlanMatches ? 'text-emerald-300' : 'text-zinc-300')}
+                  {renderDetail('Last request match', lastLookup.lastRequestMatches ? 'yes' : 'no', lastLookup.lastRequestMatches ? 'text-emerald-300' : 'text-zinc-300')}
+                  {renderDetail('Reason', lastLookup.reason ?? lastLookup.outcomeText)}
+                  {lastLookup.mismatchHints.length ? renderDetail('Mismatch hints', lastLookup.mismatchHints.join(' '), 'text-amber-300') : null}
+                </div>
+              ) : (
+                <div className="text-zinc-500">No replay lookup recorded yet.</div>
+              )}
+            </div>
+
             <div className="mt-3 grid grid-cols-1 xl:grid-cols-2 gap-2">
               {renderJsonBlock('Active Plan', preload.activePlan)}
               {renderJsonBlock('Cached Preloads', preload.cacheEntries)}
               {renderJsonBlock('Last Request Details', preload.lastRequest)}
+              {renderJsonBlock('Last Replay Lookup', preload.lastLookup)}
               {renderJsonBlock('Cache State', {
                 completionCacheSize: snapshot.cache.completionCacheSize,
                 predictiveCompletionCacheSize: snapshot.cache.predictiveCompletionCacheSize,

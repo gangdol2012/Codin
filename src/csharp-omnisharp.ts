@@ -82,6 +82,11 @@ interface CSharpPredictiveCompletionCacheEntry {
   completionListKey: string;
   codeHash: string;
   offset: number;
+  candidate: string;
+  prefix: string;
+  assumedText: string;
+  projectCurrentPath: string;
+  projectFileKey: string;
   itemCount: number;
   createdAt: number;
 }
@@ -157,8 +162,52 @@ export interface CSharpCompletionPreloadCacheEntrySnapshot {
   completionListKey: string;
   codeHash: string;
   offset: number;
+  candidate: string;
+  prefix: string;
+  assumedText: string;
+  projectCurrentPath: string;
+  projectFileKey: string;
   itemCount: number;
   ageMs: number;
+}
+
+export type CSharpCompletionPreloadLookupOutcome =
+  | 'normal-cache-hit'
+  | 'predictive-hit'
+  | 'predictive-miss'
+  | 'predictive-empty'
+  | 'runtime-fallback'
+  | 'runtime-unavailable';
+
+export interface CSharpCompletionPreloadLookupSnapshot {
+  outcome: CSharpCompletionPreloadLookupOutcome;
+  outcomeText: string;
+  checkedAt: string;
+  key: string;
+  cacheKey: string;
+  codeHash: string;
+  offset: number;
+  line: number;
+  column: number;
+  filterPrefix: string;
+  previousCharacter: string;
+  completionTrigger: unknown;
+  triggerCharacter?: string;
+  contextTriggerKind: number;
+  contextTriggerCharacter?: string;
+  projectCurrentPath: string;
+  projectFileKey: string;
+  predictiveCacheSize: number;
+  activePlanKey: string | null;
+  activePlanMatches: boolean;
+  lastRequestKey: string | null;
+  lastRequestMatches: boolean;
+  cachedEntry: CSharpCompletionPreloadCacheEntrySnapshot | null;
+  relatedCacheEntries: CSharpCompletionPreloadCacheEntrySnapshot[];
+  mismatchHints: string[];
+  matchedItemCount?: number;
+  cacheAgeMs?: number;
+  reason?: string;
 }
 
 export interface CSharpCompletionPreloadDebugSnapshot {
@@ -172,6 +221,7 @@ export interface CSharpCompletionPreloadDebugSnapshot {
   source: CSharpCompletionPreloadSourceSnapshot | null;
   cacheEntries: CSharpCompletionPreloadCacheEntrySnapshot[];
   lastRequest: CSharpCompletionPreloadRequestSnapshot | null;
+  lastLookup: CSharpCompletionPreloadLookupSnapshot | null;
 }
 
 export type CSharpIdeDebugLevel = 'info' | 'success' | 'warning' | 'error';
@@ -1145,6 +1195,7 @@ class CSharpLanguageService {
   private predictiveCompletionSerial = 0;
   private predictiveCompletionPlan: CSharpPredictiveCompletionPlan | null = null;
   private predictiveCompletionLastRequest: CSharpCompletionPreloadRequestSnapshot | null = null;
+  private predictiveCompletionLastLookup: CSharpCompletionPreloadLookupSnapshot | null = null;
   private runtimeResponseCache = new Map<string, Promise<unknown> | unknown>();
   private diagnosticCacheKey: string | null = null;
   private diagnosticCacheMarkers: monaco.editor.IMarkerData[] = [];
@@ -1614,9 +1665,12 @@ class CSharpLanguageService {
     this.notifyDebugChanged();
   }
 
-  private invalidatePredictiveCompletionLastRequest(reason: string) {
+  private invalidatePredictiveCompletionLastRequest(reason: string, options?: { includeCached?: boolean }) {
     const lastRequest = this.predictiveCompletionLastRequest;
-    if (!lastRequest || !['scheduled', 'running', 'cached'].includes(lastRequest.status)) return;
+    const invalidatableStatuses = options?.includeCached
+      ? ['scheduled', 'running', 'cached']
+      : ['scheduled', 'running'];
+    if (!lastRequest || !invalidatableStatuses.includes(lastRequest.status)) return;
     const invalidatedAt = new Date().toISOString();
     this.predictiveCompletionLastRequest = {
       ...lastRequest,
@@ -1649,22 +1703,236 @@ class CSharpLanguageService {
     this.notifyDebugChanged();
   }
 
-  private getPredictiveCompletionDebugSnapshot(): CSharpCompletionPreloadDebugSnapshot {
-    const activePlan = this.predictiveCompletionPlan
-      ? this.summarizePredictiveCompletionPlan(this.predictiveCompletionPlan)
-      : null;
-    const cacheEntries = [...this.predictiveCompletionCache.entries()].map(([key, entry]) => ({
+  private summarizePredictiveCompletionCacheEntry(
+    key: string,
+    entry: CSharpPredictiveCompletionCacheEntry
+  ): CSharpCompletionPreloadCacheEntrySnapshot {
+    return {
       key,
       completionListKey: entry.completionListKey,
       codeHash: entry.codeHash,
       offset: entry.offset,
+      candidate: entry.candidate,
+      prefix: entry.prefix,
+      assumedText: entry.assumedText,
+      projectCurrentPath: entry.projectCurrentPath,
+      projectFileKey: entry.projectFileKey,
       itemCount: entry.itemCount,
       ageMs: Date.now() - entry.createdAt,
-    }));
+    };
+  }
+
+  private noteEquivalentPredictiveCompletionPlan(
+    plan: CSharpPredictiveCompletionPlan,
+    source: 'active-plan' | 'cached-preload',
+    cacheEntry?: CSharpPredictiveCompletionCacheEntry
+  ) {
+    const planSnapshot = this.summarizePredictiveCompletionPlan(plan);
+    const previous = this.predictiveCompletionLastRequest;
+    const shouldReplacePreviousWithCached = cacheEntry
+      && previous?.key === plan.key
+      && ['invalidated', 'stale', 'failed', 'empty'].includes(previous.status);
+    if (previous?.key === plan.key && !shouldReplacePreviousWithCached) {
+      const itemCount = previous.itemCount ?? cacheEntry?.itemCount;
+      const statusText = cacheEntry && previous.status !== 'served'
+        ? `Preload ready for '${planSnapshot.assumedText}' with ${itemCount ?? 0} items. Current prefix '${planSnapshot.prefix}' maps to the same preload key.`
+        : this.predictiveCompletionStatusText(previous.status, planSnapshot, {
+          itemCount,
+          cacheAgeMs: previous.cacheAgeMs,
+          reason: previous.reason,
+        });
+      this.predictiveCompletionLastRequest = {
+        ...previous,
+        ...planSnapshot,
+        statusText,
+        itemCount,
+        cached: previous.cached ?? !!cacheEntry,
+      };
+      this.notifyDebugChanged();
+    } else if (cacheEntry) {
+      this.predictiveCompletionLastRequest = {
+        ...planSnapshot,
+        status: 'cached',
+        statusText: `Preload ready for '${planSnapshot.assumedText}' with ${cacheEntry.itemCount} items. Current prefix '${planSnapshot.prefix}' maps to an existing cached preload.`,
+        serial: this.predictiveCompletionSerial,
+        callId: `completion.predictive-${this.predictiveCompletionSerial}`,
+        finishedAt: new Date(cacheEntry.createdAt).toISOString(),
+        itemCount: cacheEntry.itemCount,
+        cached: true,
+      };
+      this.notifyDebugChanged();
+    }
+    this.recordDebugEvent({
+      feature: 'completion.predictive',
+      phase: 'plan-equivalent',
+      level: 'info',
+      message: source === 'cached-preload'
+        ? 'C# predictive preload plan already has a cached result for the current prefix.'
+        : 'C# predictive preload plan is unchanged for the current prefix.',
+      request: {
+        source,
+        candidate: plan.candidate,
+        prefix: plan.prefix,
+        key: plan.key,
+        itemCount: cacheEntry?.itemCount,
+      },
+    });
+  }
+
+  private predictiveCompletionLookupOutcomeText(
+    outcome: CSharpCompletionPreloadLookupOutcome,
+    details: {
+      previousCharacter: string;
+      matchedItemCount?: number;
+      cacheAgeMs?: number;
+      reason?: string;
+    }
+  ) {
+    const atText = details.previousCharacter
+      ? ` after '${details.previousCharacter}'`
+      : '';
+    if (outcome === 'normal-cache-hit') {
+      return 'Normal completion cache served this request before predictive preload replay was needed.';
+    }
+    if (outcome === 'predictive-hit') {
+      return `Predictive preload replay hit${atText} and served ${details.matchedItemCount ?? 0} items${typeof details.cacheAgeMs === 'number' ? ` from a ${details.cacheAgeMs}ms old cache entry` : ''}.`;
+    }
+    if (outcome === 'predictive-empty') {
+      return details.reason ?? 'Predictive preload key matched, but converting the cached response produced no usable completion items.';
+    }
+    if (outcome === 'runtime-fallback') {
+      return details.reason ?? 'Predictive preload replay missed, so CodeCraft is calling OmniSharp normally.';
+    }
+    if (outcome === 'runtime-unavailable') {
+      return details.reason ?? 'Predictive preload replay missed and the OmniSharp runtime was not available.';
+    }
+    return details.reason ?? 'No predictive preload cache entry matched this completion request.';
+  }
+
+  private buildPredictiveCompletionLookupSnapshot(
+    model: monaco.editor.ITextModel,
+    snapshot: CSharpCompletionRequestSnapshot,
+    position: monaco.Position,
+    context: monaco.languages.CompletionContext,
+    request: any,
+    projectRequest: CSharpSerializedProjectRequest,
+    key: string,
+    cacheKey: string,
+    outcome: CSharpCompletionPreloadLookupOutcome,
+    details: {
+      matchedItemCount?: number;
+      cacheAgeMs?: number;
+      reason?: string;
+      cachedEntry?: CSharpPredictiveCompletionCacheEntry | null;
+    } = {}
+  ): CSharpCompletionPreloadLookupSnapshot {
+    const codeHash = csharpCompletionFastHash(snapshot.code);
+    const filterRange = this.getCompletionFilterRangeAtPosition(model, position);
+    const filterPrefix = model.getValueInRange(filterRange);
+    const previousCharacter = csharpCompletionCharacterBefore(model, position) ?? '';
+    const cachedEntry = details.cachedEntry ?? this.predictiveCompletionCache.get(key) ?? null;
+    const cachedEntrySnapshot = cachedEntry
+      ? this.summarizePredictiveCompletionCacheEntry(key, cachedEntry)
+      : null;
+    const relatedCacheEntries = [...this.predictiveCompletionCache.entries()]
+      .filter(([entryKey, entry]) => (
+        entryKey === key ||
+        entry.codeHash === codeHash ||
+        entry.offset === snapshot.offset ||
+        entry.projectFileKey === projectRequest.fileKey
+      ))
+      .slice(0, 6)
+      .map(([entryKey, entry]) => this.summarizePredictiveCompletionCacheEntry(entryKey, entry));
+    const mismatchHints: string[] = [];
+    if (!cachedEntry) {
+      if (this.predictiveCompletionCache.size === 0) {
+        mismatchHints.push('No predictive preload entries are cached.');
+      } else if (relatedCacheEntries.length === 0) {
+        mismatchHints.push('Cached preload entries exist, but none share this request code hash, offset, or project key.');
+      } else {
+        if (relatedCacheEntries.some(entry => entry.codeHash === codeHash && entry.offset !== snapshot.offset)) {
+          mismatchHints.push('A cached preload has the same code hash but a different cursor offset.');
+        }
+        if (relatedCacheEntries.some(entry => entry.offset === snapshot.offset && entry.codeHash !== codeHash)) {
+          mismatchHints.push('A cached preload has the same cursor offset but different code text.');
+        }
+        if (relatedCacheEntries.some(entry => entry.projectFileKey !== projectRequest.fileKey)) {
+          mismatchHints.push('A cached preload has a different project file key.');
+        }
+        if (!mismatchHints.length) {
+          mismatchHints.push('Related cached preloads exist, but the full replay key did not match.');
+        }
+      }
+    }
+    const activePlanKey = this.predictiveCompletionPlan?.key ?? null;
+    const lastRequestKey = this.predictiveCompletionLastRequest?.key ?? null;
+    return {
+      outcome,
+      outcomeText: this.predictiveCompletionLookupOutcomeText(outcome, {
+        previousCharacter,
+        matchedItemCount: details.matchedItemCount,
+        cacheAgeMs: details.cacheAgeMs,
+        reason: details.reason,
+      }),
+      checkedAt: new Date().toISOString(),
+      key,
+      cacheKey,
+      codeHash,
+      offset: snapshot.offset,
+      line: position.lineNumber,
+      column: position.column,
+      filterPrefix,
+      previousCharacter,
+      completionTrigger: request.CompletionTrigger,
+      triggerCharacter: request.TriggerCharacter,
+      contextTriggerKind: context.triggerKind,
+      contextTriggerCharacter: typeof context.triggerCharacter === 'string' ? context.triggerCharacter : undefined,
+      projectCurrentPath: projectRequest.currentPath,
+      projectFileKey: projectRequest.fileKey,
+      predictiveCacheSize: this.predictiveCompletionCache.size,
+      activePlanKey,
+      activePlanMatches: activePlanKey === key,
+      lastRequestKey,
+      lastRequestMatches: lastRequestKey === key,
+      cachedEntry: cachedEntrySnapshot,
+      relatedCacheEntries,
+      mismatchHints,
+      matchedItemCount: details.matchedItemCount,
+      cacheAgeMs: details.cacheAgeMs,
+      reason: details.reason,
+    };
+  }
+
+  private setPredictiveCompletionLastLookup(
+    lookup: CSharpCompletionPreloadLookupSnapshot,
+    level: CSharpIdeDebugLevel = lookup.outcome === 'predictive-hit' || lookup.outcome === 'normal-cache-hit'
+      ? 'success'
+      : lookup.outcome === 'runtime-fallback' || lookup.outcome === 'predictive-miss'
+        ? 'warning'
+        : 'info'
+  ) {
+    this.predictiveCompletionLastLookup = lookup;
+    this.recordDebugEvent({
+      feature: 'completion.predictive',
+      phase: `lookup-${lookup.outcome}`,
+      level,
+      message: lookup.outcomeText,
+      request: lookup,
+    });
+    this.notifyDebugChanged();
+  }
+
+  private getPredictiveCompletionDebugSnapshot(): CSharpCompletionPreloadDebugSnapshot {
+    const activePlan = this.predictiveCompletionPlan
+      ? this.summarizePredictiveCompletionPlan(this.predictiveCompletionPlan)
+      : null;
+    const cacheEntries = [...this.predictiveCompletionCache.entries()]
+      .map(([key, entry]) => this.summarizePredictiveCompletionCacheEntry(key, entry));
     const lastRequest = this.predictiveCompletionLastRequest;
     const state: CSharpCompletionPreloadStatus = lastRequest?.status
       ?? (this.predictiveCompletionTimer ? 'scheduled' : activePlan ? 'running' : cacheEntries.length ? 'cached' : 'idle');
     const summary = lastRequest?.statusText
+      ?? this.predictiveCompletionLastLookup?.outcomeText
       ?? (cacheEntries.length
         ? `No active preload. ${cacheEntries.length} cached preload result${cacheEntries.length === 1 ? '' : 's'} available.`
         : 'No completion preload request has been recorded yet.');
@@ -1679,6 +1947,7 @@ class CSharpLanguageService {
       source: this.summarizePredictiveCompletionSource(),
       cacheEntries,
       lastRequest,
+      lastLookup: this.predictiveCompletionLastLookup,
     };
   }
 
@@ -2086,7 +2355,7 @@ class CSharpLanguageService {
     }
     this.invalidatePredictiveCompletionLastRequest(clearCache
       ? 'Preload invalidated because completion result caches were cleared.'
-      : 'Preload invalidated because the current editor state no longer matches a preload plan.');
+      : 'Preload invalidated because the current editor state no longer matches a preload plan.', { includeCached: clearCache });
     this.predictiveCompletionPlan = null;
     this.predictiveCompletionSource = null;
     if (clearCache) {
@@ -2841,7 +3110,13 @@ class CSharpLanguageService {
       return;
     }
 
-    if (this.predictiveCompletionPlan?.key === plan.key || this.predictiveCompletionCache.has(plan.key)) {
+    if (this.predictiveCompletionPlan?.key === plan.key) {
+      this.noteEquivalentPredictiveCompletionPlan(plan, 'active-plan');
+      return;
+    }
+    const cachedPlan = this.predictiveCompletionCache.get(plan.key);
+    if (cachedPlan) {
+      this.noteEquivalentPredictiveCompletionPlan(plan, 'cached-preload', cachedPlan);
       return;
     }
 
@@ -3040,6 +3315,11 @@ class CSharpLanguageService {
           completionListKey: plan.completionListKey,
           codeHash: plan.codeHash,
           offset: plan.offset,
+          candidate: plan.candidate,
+          prefix: plan.prefix,
+          assumedText: `${plan.candidate}.`,
+          projectCurrentPath: plan.projectRequest.currentPath,
+          projectFileKey: plan.projectRequest.fileKey,
           itemCount,
           createdAt: Date.now(),
         });
@@ -3165,16 +3445,32 @@ class CSharpLanguageService {
       projectRequest,
       this.completionEnvironmentVersion,
     );
+    const predictiveKey = this.predictiveCompletionKeyForCurrentRequest(model, snapshot, position, request, projectRequest);
 
     const cached = this.completionCache.get(cacheKey);
     if (cached) {
+      this.setPredictiveCompletionLastLookup(this.buildPredictiveCompletionLookupSnapshot(
+        model,
+        snapshot,
+        position,
+        context,
+        request,
+        projectRequest,
+        predictiveKey,
+        cacheKey,
+        'normal-cache-hit',
+        {
+          matchedItemCount: cached.suggestions.length,
+          reason: 'Normal completion result cache matched this exact request before predictive preload replay was needed.',
+        },
+      ));
       this.rememberPredictiveCompletionSource(model, projectRequest, cached);
       this.refreshPredictiveCompletion(model);
       return this.toCompletionList(cached);
     }
 
-    const predictiveKey = this.predictiveCompletionKeyForCurrentRequest(model, snapshot, position, request, projectRequest);
     const predictive = this.predictiveCompletionCache.get(predictiveKey);
+    let preloadFallbackReason = 'No predictive preload cache entry matched this completion request.';
     if (predictive) {
       const entry = this.completionEntryFromResponse(
         model,
@@ -3191,6 +3487,22 @@ class CSharpLanguageService {
         this.rememberPredictiveCompletionSource(model, projectRequest, entry);
         this.refreshPredictiveCompletion(model);
         this.markPredictiveCompletionServed(predictiveKey, entry.suggestions.length, ageMs, cacheKey);
+        this.setPredictiveCompletionLastLookup(this.buildPredictiveCompletionLookupSnapshot(
+          model,
+          snapshot,
+          position,
+          context,
+          request,
+          projectRequest,
+          predictiveKey,
+          cacheKey,
+          'predictive-hit',
+          {
+            matchedItemCount: entry.suggestions.length,
+            cacheAgeMs: ageMs,
+            cachedEntry: predictive,
+          },
+        ));
         this.recordDebugEvent({
           feature: 'completion.predictive',
           phase: 'cache-hit',
@@ -3206,13 +3518,72 @@ class CSharpLanguageService {
         });
         return this.toCompletionList(entry);
       }
+      preloadFallbackReason = 'Predictive preload key matched, but converting the cached response produced no usable completion items.';
+      this.setPredictiveCompletionLastLookup(this.buildPredictiveCompletionLookupSnapshot(
+        model,
+        snapshot,
+        position,
+        context,
+        request,
+        projectRequest,
+        predictiveKey,
+        cacheKey,
+        'predictive-empty',
+        {
+          cachedEntry: predictive,
+          reason: preloadFallbackReason,
+        },
+      ), 'warning');
       this.predictiveCompletionCache.delete(predictiveKey);
+    } else {
+      this.setPredictiveCompletionLastLookup(this.buildPredictiveCompletionLookupSnapshot(
+        model,
+        snapshot,
+        position,
+        context,
+        request,
+        projectRequest,
+        predictiveKey,
+        cacheKey,
+        'predictive-miss',
+        {
+          reason: preloadFallbackReason,
+        },
+      ), 'warning');
     }
 
     const runtimeReady = await this.ensureLocalOmniSharpRuntime();
     if (!runtimeReady || !this.omnisharp || model.isDisposed()) {
+      this.setPredictiveCompletionLastLookup(this.buildPredictiveCompletionLookupSnapshot(
+        model,
+        snapshot,
+        position,
+        context,
+        request,
+        projectRequest,
+        predictiveKey,
+        cacheKey,
+        'runtime-unavailable',
+        {
+          reason: `${preloadFallbackReason} OmniSharp runtime was unavailable, so no normal fallback could run.`,
+        },
+      ), 'error');
       return this.emptyCompletionList();
     }
+    this.setPredictiveCompletionLastLookup(this.buildPredictiveCompletionLookupSnapshot(
+      model,
+      snapshot,
+      position,
+      context,
+      request,
+      projectRequest,
+      predictiveKey,
+      cacheKey,
+      'runtime-fallback',
+      {
+        reason: `${preloadFallbackReason} Calling OmniSharp normally for this request.`,
+      },
+    ), 'warning');
 
     const requestSerial = ++this.completionRequestSerial;
     const callId = 'completion-' + requestSerial;
