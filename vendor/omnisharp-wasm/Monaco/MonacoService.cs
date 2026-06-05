@@ -24,12 +24,15 @@ public class MonacoService
     #region Fields
 
     OmniSharpProject _completionProject = null!;
+    OmniSharpProject _speculativeCompletionProject = null!;
     OmniSharpProject _diagnosticProject = null!;
     OmniSharpCompletionService _completionService = null!;
+    OmniSharpCompletionService _speculativeCompletionService = null!;
     OmniSharpSignatureHelpService _signatureService = null!;
     OmniSharpQuickInfoProvider _quickInfoProvider = null!;
     CodeActionProviderSet? _codeActionProviderSet;
     readonly SemaphoreSlim _completionGate = new(1, 1);
+    readonly SemaphoreSlim _speculativeCompletionGate = new(1, 1);
     readonly SemaphoreSlim _diagnosticGate = new(1, 1);
 
     readonly JsonSerializerOptions jsonOptions = new JsonSerializerOptions
@@ -127,6 +130,8 @@ $@"using System;
     {
         _completionProject = new OmniSharpProject(uri);
         await _completionProject.Init();
+        _speculativeCompletionProject = new OmniSharpProject(uri);
+        await _speculativeCompletionProject.Init();
         _diagnosticProject = new OmniSharpProject(uri);
         await _diagnosticProject.Init();
 
@@ -134,6 +139,7 @@ $@"using System;
         var formattingOptions = new OmniSharp.Options.FormattingOptions();
 
         _completionService = new OmniSharpCompletionService(_completionProject.Workspace, formattingOptions, loggerFactory);
+        _speculativeCompletionService = new OmniSharpCompletionService(_speculativeCompletionProject.Workspace, formattingOptions, loggerFactory);
         _signatureService = new OmniSharpSignatureHelpService(_completionProject.Workspace);
         _quickInfoProvider = new OmniSharpQuickInfoProvider(_diagnosticProject.Workspace, formattingOptions, loggerFactory);
     }
@@ -164,6 +170,30 @@ $@"using System;
             var completionResponse = await _completionService.Handle(completionResolveRequest, document);
 
             return Payload(completionResponse, "GetCompletionResolveAsync");
+        });
+    }
+
+    public async Task<byte[]> GetSpeculativeCompletionAsync(string code, string completionRequestString, string projectRequestString, string completionListKey)
+    {
+        return await RunSpeculativeCompletionAsync(async () =>
+        {
+            var completionRequest = DeserializeRequest<CompletionRequest>(completionRequestString);
+            var document = await UpdateSpeculativeCompletionDocumentAsync(code, projectRequestString);
+            var completionResponse = await _speculativeCompletionService.Handle(completionRequest, document, completionListKey);
+
+            return Payload(completionResponse, "GetSpeculativeCompletionAsync");
+        });
+    }
+
+    public async Task<byte[]> GetSpeculativeCompletionResolveAsync(string completionResolveRequestString, string completionListKey)
+    {
+        return await RunSpeculativeCompletionAsync(async () =>
+        {
+            var completionResolveRequest = DeserializeRequest<CompletionResolveRequest>(completionResolveRequestString);
+            var document = _speculativeCompletionProject.Workspace.CurrentSolution.GetDocument(_speculativeCompletionProject.DocumentId)!;
+            var completionResponse = await _speculativeCompletionService.Handle(completionResolveRequest, document, completionListKey);
+
+            return Payload(completionResponse, "GetSpeculativeCompletionResolveAsync");
         });
     }
 
@@ -535,21 +565,25 @@ $@"using System;
     public async Task<byte[]> IncludeNamespaceAsync(string namespaceName)
     {
         await _completionGate.WaitAsync();
+        await _speculativeCompletionGate.WaitAsync();
         await _diagnosticGate.WaitAsync();
         try
         {
             var completionResult = await _completionProject.IncludeNamespaceAsync(namespaceName);
+            var speculativeCompletionResult = await _speculativeCompletionProject.IncludeNamespaceAsync(namespaceName);
             var diagnosticResult = await _diagnosticProject.IncludeNamespaceAsync(namespaceName);
 
             var response = new
             {
                 namespaceName = completionResult.NamespaceName,
-                success = completionResult.Success || diagnosticResult.Success,
+                success = completionResult.Success || speculativeCompletionResult.Success || diagnosticResult.Success,
                 addedAssemblies = completionResult.AddedAssemblies
+                    .Concat(speculativeCompletionResult.AddedAssemblies)
                     .Concat(diagnosticResult.AddedAssemblies)
                     .Distinct(StringComparer.Ordinal)
                     .ToArray(),
                 matchedAssemblies = completionResult.MatchedAssemblies
+                    .Concat(speculativeCompletionResult.MatchedAssemblies)
                     .Concat(diagnosticResult.MatchedAssemblies)
                     .Distinct(StringComparer.Ordinal)
                     .ToArray(),
@@ -563,6 +597,7 @@ $@"using System;
         finally
         {
             _diagnosticGate.Release();
+            _speculativeCompletionGate.Release();
             _completionGate.Release();
         }
     }
@@ -577,6 +612,19 @@ $@"using System;
         finally
         {
             _completionGate.Release();
+        }
+    }
+
+    async Task<byte[]> RunSpeculativeCompletionAsync(Func<Task<byte[]>> action)
+    {
+        await _speculativeCompletionGate.WaitAsync();
+        try
+        {
+            return await action();
+        }
+        finally
+        {
+            _speculativeCompletionGate.Release();
         }
     }
 
@@ -600,9 +648,19 @@ $@"using System;
 
     Task<Document> UpdateCompletionDocumentAsync(string code, string projectRequestString)
     {
+        return UpdateCompletionDocumentAsync(_completionProject, code, projectRequestString, "completion");
+    }
+
+    Task<Document> UpdateSpeculativeCompletionDocumentAsync(string code, string projectRequestString)
+    {
+        return UpdateCompletionDocumentAsync(_speculativeCompletionProject, code, projectRequestString, "speculative completion");
+    }
+
+    Task<Document> UpdateCompletionDocumentAsync(OmniSharpProject project, string code, string projectRequestString, string label)
+    {
         if (string.IsNullOrWhiteSpace(projectRequestString))
         {
-            return _completionProject.UpdateDocumentAsync(code);
+            return project.UpdateDocumentAsync(code);
         }
 
         try
@@ -612,12 +670,12 @@ $@"using System;
                 .Where(file => !string.IsNullOrWhiteSpace(file.Path))
                 .Select(file => new OmniSharpProject.SourceFileSnapshot(file.Path, file.Content ?? string.Empty))
                 .ToArray();
-            return _completionProject.UpdateProjectDocumentsAsync(code, request.CurrentPath, files);
+            return project.UpdateProjectDocumentsAsync(code, request.CurrentPath, files);
         }
         catch (Exception e)
         {
-            Console.WriteLine($"Could not deserialize completion project snapshot: {e.Message}");
-            return _completionProject.UpdateDocumentAsync(code);
+            Console.WriteLine($"Could not deserialize {label} project snapshot: {e.Message}");
+            return project.UpdateDocumentAsync(code);
         }
     }
 

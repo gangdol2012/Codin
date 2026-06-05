@@ -59,6 +59,10 @@ public class OmniSharpCompletionService
 
 
 {
+    private const int CompletionListCacheLimit = 8;
+
+    private record CompletionResolveState(CSharpCompletionList Completions, Document Document, string FileName, int Position);
+
     private static readonly Dictionary<string, CompletionItemKind> s_roslynTagToCompletionItemKind = new Dictionary<string, CompletionItemKind>()
         {
             { WellKnownTags.Public, CompletionItemKind.Keyword },
@@ -102,26 +106,32 @@ public class OmniSharpCompletionService
     private readonly ILogger _logger;
 
     private readonly object _lock = new object();
-    private (CSharpCompletionList Completions, string FileName, int position)? _lastCompletion = null;
-    private static CancellationTokenSource cancellationTokenSource = new CancellationTokenSource();
-    private CancellationToken cancellationToken = cancellationTokenSource.Token;
+    private CompletionResolveState? _lastCompletion = null;
+    private readonly Dictionary<string, CompletionResolveState> _completionListsByKey = new(StringComparer.Ordinal);
+    private readonly Queue<string> _completionListKeys = new();
+    private CancellationTokenSource cancellationTokenSource = new CancellationTokenSource();
+    private CancellationToken cancellationToken;
 
     public OmniSharpCompletionService(AdhocWorkspace workspace, FormattingOptions formattingOptions, ILoggerFactory loggerFactory)
     {
         _workspace = workspace;
         _formattingOptions = formattingOptions;
         _logger = loggerFactory.CreateLogger<OmniSharpCompletionService>();
+        cancellationToken = cancellationTokenSource.Token;
     }
 
-    public async Task<CompletionResponse> Handle(CompletionRequest request, Document document)
+    public async Task<CompletionResponse> Handle(CompletionRequest request, Document document, string? completionListKey = null)
     {
         cancellationTokenSource.Cancel();
         cancellationTokenSource = new CancellationTokenSource();
         cancellationToken = cancellationTokenSource.Token;
         _logger.LogTrace("Completions requested");
-        lock (_lock)
+        if (completionListKey is null)
         {
-            _lastCompletion = null;
+            lock (_lock)
+            {
+                _lastCompletion = null;
+            }
         }
 
 
@@ -185,7 +195,24 @@ public class OmniSharpCompletionService
 
         lock (_lock)
         {
-            _lastCompletion = (completions, request.FileName, position);
+            var resolveState = new CompletionResolveState(completions, document, request.FileName, position);
+            if (completionListKey is null)
+            {
+                _lastCompletion = resolveState;
+            }
+            else
+            {
+                _completionListsByKey[completionListKey] = resolveState;
+                _completionListKeys.Enqueue(completionListKey);
+                while (_completionListKeys.Count > CompletionListCacheLimit)
+                {
+                    var oldestKey = _completionListKeys.Dequeue();
+                    if (!_completionListKeys.Contains(oldestKey))
+                    {
+                        _completionListsByKey.Remove(oldestKey);
+                    }
+                }
+            }
         }
 
 
@@ -476,15 +503,26 @@ public class OmniSharpCompletionService
         }
     }
 
-    public async Task<CompletionResolveResponse> Handle(CompletionResolveRequest request, Document document)
+    public async Task<CompletionResolveResponse> Handle(CompletionResolveRequest request, Document document, string? completionListKey = null)
     {
-        if (_lastCompletion is null)
+        CompletionResolveState? completionState;
+        lock (_lock)
+        {
+            completionState = completionListKey is null
+                ? _lastCompletion
+                : _completionListsByKey.TryGetValue(completionListKey, out var keyedCompletion)
+                    ? keyedCompletion
+                    : null;
+        }
+
+        if (completionState is null)
         {
             _logger.LogError("Cannot call completion/resolve before calling completion!");
             return new CompletionResolveResponse { Item = request.Item };
         }
 
-        var (completions, fileName, position) = _lastCompletion.Value;
+        var (completions, completionDocument, fileName, position) = completionState;
+        document = completionDocument ?? document;
 
         if (request.Item is null
             || request.Item.Data >= completions.Items.Length

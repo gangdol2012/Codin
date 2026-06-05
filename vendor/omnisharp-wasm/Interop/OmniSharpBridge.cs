@@ -21,6 +21,10 @@ public class MonacoServiceWrapper {
                     : await worker.RunAsync(a => a.GetCompletionAsync(args[0], args[1]));
             case "GetCompletionResolveAsync":
                 return await worker.RunAsync(a => a.GetCompletionResolveAsync(args[0]));
+            case "GetSpeculativeCompletionAsync":
+                return await worker.RunAsync(a => a.GetSpeculativeCompletionAsync(args[0], args[1], args[2], args[3]));
+            case "GetSpeculativeCompletionResolveAsync":
+                return await worker.RunAsync(a => a.GetSpeculativeCompletionResolveAsync(args[0], args[1]));
             case "GetSignatureHelpAsync":
                 return await worker.RunAsync(a => a.GetSignatureHelpAsync(args[0], args[1]));
             case "GetQuickInfoAsync":

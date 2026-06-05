@@ -69,6 +69,35 @@ interface CSharpSerializedProjectRequest {
   currentPath: string;
 }
 
+interface CSharpPredictiveCompletionSource {
+  modelUri: string;
+  projectFileKey: string;
+  environmentVersion: number;
+  suggestions: monaco.languages.CompletionItem[];
+  lspItems: any[];
+}
+
+interface CSharpPredictiveCompletionCacheEntry {
+  response: unknown;
+  completionListKey: string;
+  codeHash: string;
+  offset: number;
+  itemCount: number;
+  createdAt: number;
+}
+
+interface CSharpPredictiveCompletionPlan {
+  key: string;
+  completionListKey: string;
+  code: string;
+  codeHash: string;
+  offset: number;
+  request: any;
+  projectRequest: CSharpSerializedProjectRequest;
+  candidate: string;
+  prefix: string;
+}
+
 export type CSharpIdeDebugLevel = 'info' | 'success' | 'warning' | 'error';
 
 export interface CSharpIdeDebugEvent {
@@ -176,6 +205,8 @@ export interface CSharpIdeDebugOptions {
 }
 
 const CSHARP_COMPLETION_CACHE_LIMIT = 32;
+const CSHARP_PREDICTIVE_COMPLETION_CACHE_LIMIT = 4;
+const CSHARP_PREDICTIVE_COMPLETION_DELAY_MS = 35;
 const CSHARP_RUNTIME_RESPONSE_CACHE_LIMIT = 64;
 const CSHARP_DEBUG_EVENT_LIMIT = 500;
 const CSHARP_DEBUG_FEATURE_EVENT_LIMIT = 120;
@@ -950,6 +981,28 @@ function csharpContextualCompletionCacheKey(
   ].join('|');
 }
 
+function csharpPredictiveCompletionCacheKey(
+  modelUri: string,
+  codeHash: string,
+  offset: number,
+  request: any,
+  projectRequest: CSharpSerializedProjectRequest,
+  completionEnvironmentVersion: number,
+  previousCharacter: string
+): string {
+  return [
+    'omnisharp-predictive-v1',
+    modelUri,
+    offset,
+    codeHash,
+    request.CompletionTrigger,
+    request.TriggerCharacter ?? '',
+    projectRequest.fileKey,
+    previousCharacter,
+    completionEnvironmentVersion,
+  ].join('|');
+}
+
 function csharpCompletionMergeResolvedItem(
   original: monaco.languages.CompletionItem,
   converted: monaco.languages.CompletionItem | null
@@ -982,6 +1035,7 @@ class CSharpLanguageService {
     lateContext: CSharpLateCompletionContext;
   }>();
   private completionResolveResponseCache = new WeakMap<object, Promise<unknown>>();
+  private completionResolveSpeculativeKeys = new WeakMap<object, string>();
   private editor: monaco.editor.IStandaloneCodeEditor | null = null;
   private model: monaco.editor.ITextModel | null = null;
   private projectFilesProvider: CSharpProjectFilesProvider = () => [];
@@ -995,6 +1049,11 @@ class CSharpLanguageService {
   private completionEnvironmentVersion = 0;
   private completionWorkerStateKey: string | null = null;
   private completionCache = new Map<string, CSharpCompletionCacheEntry>();
+  private predictiveCompletionCache = new Map<string, CSharpPredictiveCompletionCacheEntry>();
+  private predictiveCompletionSource: CSharpPredictiveCompletionSource | null = null;
+  private predictiveCompletionTimer: ReturnType<typeof setTimeout> | null = null;
+  private predictiveCompletionSerial = 0;
+  private predictiveCompletionPlan: CSharpPredictiveCompletionPlan | null = null;
   private runtimeResponseCache = new Map<string, Promise<unknown> | unknown>();
   private diagnosticCacheKey: string | null = null;
   private diagnosticCacheMarkers: monaco.editor.IMarkerData[] = [];
@@ -1339,6 +1398,8 @@ class CSharpLanguageService {
         completionRequestSerial: this.completionRequestSerial,
         diagnosticRequestSerial: this.diagnosticRequestSerial,
         completionCacheSize: this.completionCache.size,
+        predictiveCompletionCacheSize: this.predictiveCompletionCache.size,
+        predictiveCompletionPending: !!this.predictiveCompletionPlan,
         completionEnvironmentVersion: this.completionEnvironmentVersion,
         completionWorkerStateKey: this.completionWorkerStateKey,
         diagnosticCacheKey: this.diagnosticCacheKey,
@@ -1727,6 +1788,7 @@ class CSharpLanguageService {
     this.lastCompletionContexts.clear();
     if (!options?.preserveResultCaches) {
       this.completionCache.clear();
+      this.clearPredictiveCompletionState(true);
       this.runtimeResponseCache.clear();
     }
     this.diagnosticCacheKey = null;
@@ -1743,6 +1805,19 @@ class CSharpLanguageService {
     });
   }
 
+  private clearPredictiveCompletionState(clearCache: boolean) {
+    this.predictiveCompletionSerial += 1;
+    if (this.predictiveCompletionTimer) {
+      clearTimeout(this.predictiveCompletionTimer);
+      this.predictiveCompletionTimer = null;
+    }
+    this.predictiveCompletionPlan = null;
+    this.predictiveCompletionSource = null;
+    if (clearCache) {
+      this.predictiveCompletionCache.clear();
+    }
+  }
+
   private cacheCompletionResult(key: string, entry: CSharpCompletionCacheEntry) {
     if (!entry.suggestions.length) return;
     this.completionCache.set(key, entry);
@@ -1750,6 +1825,16 @@ class CSharpLanguageService {
       const oldestKey = this.completionCache.keys().next().value;
       if (!oldestKey) break;
       this.completionCache.delete(oldestKey);
+    }
+  }
+
+  private cachePredictiveCompletionResult(key: string, entry: CSharpPredictiveCompletionCacheEntry) {
+    if (!entry.itemCount) return;
+    this.predictiveCompletionCache.set(key, entry);
+    while (this.predictiveCompletionCache.size > CSHARP_PREDICTIVE_COMPLETION_CACHE_LIMIT) {
+      const oldestKey = this.predictiveCompletionCache.keys().next().value;
+      if (!oldestKey) break;
+      this.predictiveCompletionCache.delete(oldestKey);
     }
   }
 
@@ -2207,6 +2292,7 @@ class CSharpLanguageService {
               model: this.summarizeModel(model),
             });
             this.requestDiagnostics(model);
+            this.refreshPredictiveCompletion(model);
             if (shouldTriggerMemberCompletion) {
               window.setTimeout(() => this.triggerMemberCompletion(model), 25);
             }
@@ -2448,6 +2534,298 @@ class CSharpLanguageService {
     this.editor.trigger('csharp-omnisharp', 'editor.action.triggerSuggest', {});
   }
 
+  private rememberPredictiveCompletionSource(
+    model: monaco.editor.ITextModel,
+    projectRequest: CSharpSerializedProjectRequest,
+    entry: CSharpCompletionCacheEntry
+  ) {
+    if (!entry.suggestions.length || entry.suggestions.length !== entry.lspItems.length) {
+      this.predictiveCompletionSource = null;
+      return;
+    }
+    this.predictiveCompletionSource = {
+      modelUri: model.uri.toString(),
+      projectFileKey: projectRequest.fileKey,
+      environmentVersion: this.completionEnvironmentVersion,
+      suggestions: entry.suggestions,
+      lspItems: entry.lspItems,
+    };
+  }
+
+  private refreshPredictiveCompletion(model: monaco.editor.ITextModel) {
+    const plan = this.createPredictiveCompletionPlan(model);
+    if (!plan) {
+      this.predictiveCompletionSerial += 1;
+      if (this.predictiveCompletionTimer) {
+        clearTimeout(this.predictiveCompletionTimer);
+        this.predictiveCompletionTimer = null;
+      }
+      this.predictiveCompletionPlan = null;
+      return;
+    }
+
+    if (this.predictiveCompletionPlan?.key === plan.key || this.predictiveCompletionCache.has(plan.key)) {
+      return;
+    }
+
+    this.predictiveCompletionSerial += 1;
+    if (this.predictiveCompletionTimer) {
+      clearTimeout(this.predictiveCompletionTimer);
+    }
+    const serial = this.predictiveCompletionSerial;
+    this.predictiveCompletionPlan = plan;
+    this.predictiveCompletionTimer = setTimeout(() => {
+      this.predictiveCompletionTimer = null;
+      void this.runPredictiveCompletion(plan, serial);
+    }, CSHARP_PREDICTIVE_COMPLETION_DELAY_MS);
+  }
+
+  private createPredictiveCompletionPlan(model: monaco.editor.ITextModel): CSharpPredictiveCompletionPlan | null {
+    const source = this.predictiveCompletionSource;
+    if (
+      !source ||
+      !this.editor ||
+      this.editor.getModel() !== model ||
+      model.isDisposed() ||
+      model.getLanguageId() !== 'csharp' ||
+      source.modelUri !== model.uri.toString() ||
+      source.environmentVersion !== this.completionEnvironmentVersion
+    ) {
+      return null;
+    }
+
+    const position = this.editor.getPosition();
+    if (!position || !this.isEditorAtPosition(model, position)) return null;
+
+    const projectRequest = this.createSerializedDiagnosticProjectRequest(model);
+    if (projectRequest.fileKey !== source.projectFileKey) return null;
+
+    const filterRange = this.getCompletionFilterRangeAtPosition(model, position);
+    const prefix = model.getValueInRange(filterRange);
+    if (!isValidCSharpCompletionFilterPrefix(prefix)) return null;
+
+    const candidate = this.selectPredictiveCompletionCandidate(source, prefix);
+    if (!candidate) return null;
+
+    const startOffset = model.getOffsetAt({
+      lineNumber: filterRange.startLineNumber,
+      column: filterRange.startColumn,
+    });
+    const endOffset = model.getOffsetAt({
+      lineNumber: filterRange.endLineNumber,
+      column: filterRange.endColumn,
+    });
+    const currentOffset = model.getOffsetAt(position);
+    if (endOffset !== currentOffset || startOffset > endOffset) return null;
+
+    const snapshot = this.getModelTextSnapshot(model);
+    const replacement = `${candidate}.`;
+    const code = snapshot.code.slice(0, startOffset) + replacement + snapshot.code.slice(endOffset);
+    const offset = startOffset + replacement.length;
+    const futurePosition = positionAtTextOffset(code, offset);
+    if (!futurePosition) return null;
+
+    const request = {
+      Line: Math.max(0, futurePosition.lineNumber - 1),
+      Column: Math.max(0, futurePosition.column - 1),
+      CompletionTrigger: 1,
+    };
+    const codeHash = csharpCompletionFastHash(code);
+    const key = csharpPredictiveCompletionCacheKey(
+      model.uri.toString(),
+      codeHash,
+      offset,
+      request,
+      projectRequest,
+      this.completionEnvironmentVersion,
+      '.',
+    );
+
+    return {
+      key,
+      completionListKey: `${key}:${Math.random().toString(36).slice(2)}`,
+      code,
+      codeHash,
+      offset,
+      request,
+      projectRequest,
+      candidate,
+      prefix,
+    };
+  }
+
+  private selectPredictiveCompletionCandidate(
+    source: CSharpPredictiveCompletionSource,
+    prefix: string
+  ): string | null {
+    const normalizedPrefix = prefix.startsWith('@') ? prefix.slice(1) : prefix;
+    const lowerPrefix = normalizedPrefix.toLocaleLowerCase();
+    if (!lowerPrefix) return null;
+
+    let fallback: string | null = null;
+    for (const suggestion of source.suggestions) {
+      if (!this.isPredictiveCompletionCandidateKind(suggestion.kind)) continue;
+      const candidate = this.predictiveCompletionCandidateText(suggestion);
+      if (!candidate) continue;
+      const normalizedCandidate = candidate.startsWith('@') ? candidate.slice(1) : candidate;
+      if (!normalizedCandidate.toLocaleLowerCase().startsWith(lowerPrefix)) continue;
+      if (suggestion.preselect) return candidate;
+      if (!fallback) fallback = candidate;
+    }
+    return fallback;
+  }
+
+  private predictiveCompletionCandidateText(item: monaco.languages.CompletionItem): string | null {
+    const label = csharpCompletionOptionalString(item.label);
+    const insertText = typeof item.insertText === 'string' && !/[.$]/.test(item.insertText)
+      ? item.insertText
+      : '';
+    const candidate = insertText && isValidCSharpCompletionFilterPrefix(insertText)
+      ? insertText
+      : label && isValidCSharpCompletionFilterPrefix(label)
+        ? label
+        : '';
+    return candidate && candidate.length <= 128 ? candidate : null;
+  }
+
+  private isPredictiveCompletionCandidateKind(kind: monaco.languages.CompletionItemKind | undefined): boolean {
+    return kind === monaco.languages.CompletionItemKind.Class
+      || kind === monaco.languages.CompletionItemKind.Struct
+      || kind === monaco.languages.CompletionItemKind.Interface
+      || kind === monaco.languages.CompletionItemKind.Enum
+      || kind === monaco.languages.CompletionItemKind.Module
+      || kind === monaco.languages.CompletionItemKind.Property
+      || kind === monaco.languages.CompletionItemKind.Field
+      || kind === monaco.languages.CompletionItemKind.Variable
+      || kind === monaco.languages.CompletionItemKind.Value;
+  }
+
+  private async runPredictiveCompletion(plan: CSharpPredictiveCompletionPlan, serial: number) {
+    if (serial !== this.predictiveCompletionSerial || this.predictiveCompletionCache.has(plan.key)) return;
+    if (!this.omnisharp || !this.editor || !this.model || this.model.isDisposed()) return;
+
+    await this.completionDispatchTail;
+    if (
+      serial !== this.predictiveCompletionSerial ||
+      this.predictiveCompletionPlan?.key !== plan.key ||
+      this.predictiveCompletionCache.has(plan.key)
+    ) {
+      return;
+    }
+
+    const startedAt = this.now();
+    const callId = `completion.predictive-${serial}`;
+    this.recordDebugEvent({
+      feature: 'completion.predictive',
+      phase: 'provider-start',
+      callId,
+      level: 'info',
+      message: 'C# predictive completion preload started.',
+      request: {
+        candidate: plan.candidate,
+        prefix: plan.prefix,
+        offset: plan.offset,
+        key: plan.key,
+        project: this.summarizeProjectRequest(plan.projectRequest.request),
+      },
+    });
+
+    try {
+      const response = await this.omnisharp(
+        'GetSpeculativeCompletionAsync',
+        plan.code,
+        plan.request,
+        plan.projectRequest.serialized,
+        plan.completionListKey,
+      );
+      const itemCount = csharpCompletionItemsFromResponse(response).length;
+      if (
+        serial === this.predictiveCompletionSerial &&
+        this.predictiveCompletionPlan?.key === plan.key &&
+        itemCount > 0
+      ) {
+        this.cachePredictiveCompletionResult(plan.key, {
+          response,
+          completionListKey: plan.completionListKey,
+          codeHash: plan.codeHash,
+          offset: plan.offset,
+          itemCount,
+          createdAt: Date.now(),
+        });
+      }
+      this.recordDebugEvent({
+        feature: 'completion.predictive',
+        phase: 'provider-end',
+        callId,
+        level: itemCount > 0 ? 'success' : 'warning',
+        message: itemCount > 0 ? 'C# predictive completion preload cached.' : 'C# predictive completion returned no items.',
+        durationMs: Math.round((this.now() - startedAt) * 10) / 10,
+        response: {
+          itemCount,
+          cached: itemCount > 0,
+        },
+      });
+    } catch (error) {
+      this.recordDebugEvent({
+        feature: 'completion.predictive',
+        phase: 'provider-error',
+        callId,
+        level: 'warning',
+        message: 'C# predictive completion preload failed.',
+        durationMs: Math.round((this.now() - startedAt) * 10) / 10,
+        error: summarizePrimitive(error),
+      });
+    }
+  }
+
+  private completionEntryFromResponse(
+    model: monaco.editor.ITextModel,
+    response: unknown,
+    defaultRange: monaco.IRange,
+    snapshot: CSharpCompletionRequestSnapshot,
+    lateContext: CSharpLateCompletionContext | null,
+    speculativeCompletionListKey?: string
+  ): CSharpCompletionCacheEntry {
+    const suggestions: monaco.languages.CompletionItem[] = [];
+    const lspItems: any[] = [];
+
+    for (const rawItem of csharpCompletionItemsFromResponse(response)) {
+      const suggestion = this.convertCompletion(model, rawItem, defaultRange, snapshot, lateContext);
+      if (!csharpCompletionItemIsUsable(suggestion)) continue;
+      if (speculativeCompletionListKey && rawItem && typeof rawItem === 'object') {
+        this.completionResolveSpeculativeKeys.set(rawItem, speculativeCompletionListKey);
+      }
+      suggestions.push(suggestion);
+      lspItems.push(rawItem);
+    }
+
+    return {
+      suggestions,
+      lspItems,
+      incomplete: csharpCompletionResponseIsIncomplete(response),
+      completionSnapshot: lateContext ? snapshot : undefined,
+      lateContext,
+    };
+  }
+
+  private predictiveCompletionKeyForCurrentRequest(
+    model: monaco.editor.ITextModel,
+    snapshot: CSharpCompletionRequestSnapshot,
+    position: monaco.Position,
+    request: any,
+    projectRequest: CSharpSerializedProjectRequest
+  ): string {
+    return csharpPredictiveCompletionCacheKey(
+      model.uri.toString(),
+      csharpCompletionFastHash(snapshot.code),
+      snapshot.offset,
+      request,
+      projectRequest,
+      this.completionEnvironmentVersion,
+      csharpCompletionCharacterBefore(model, position) ?? '',
+    );
+  }
+
   private toMarkerSeverity(severity: unknown): monaco.MarkerSeverity {
     if (typeof severity === 'number') {
       if (severity === monaco.MarkerSeverity.Error || severity >= 8) return monaco.MarkerSeverity.Error;
@@ -2482,7 +2860,45 @@ class CSharpLanguageService {
     );
 
     const cached = this.completionCache.get(cacheKey);
-    if (cached) return this.toCompletionList(cached);
+    if (cached) {
+      this.rememberPredictiveCompletionSource(model, projectRequest, cached);
+      this.refreshPredictiveCompletion(model);
+      return this.toCompletionList(cached);
+    }
+
+    const predictiveKey = this.predictiveCompletionKeyForCurrentRequest(model, snapshot, position, request, projectRequest);
+    const predictive = this.predictiveCompletionCache.get(predictiveKey);
+    if (predictive) {
+      const entry = this.completionEntryFromResponse(
+        model,
+        predictive.response,
+        this.getCompletionFilterRangeAtPosition(model, position),
+        snapshot,
+        null,
+        predictive.completionListKey,
+      );
+      if (entry.suggestions.length) {
+        this.cacheCompletionResult(cacheKey, entry);
+        this.completionWorkerStateKey = cacheKey;
+        this.rememberPredictiveCompletionSource(model, projectRequest, entry);
+        this.refreshPredictiveCompletion(model);
+        this.recordDebugEvent({
+          feature: 'completion.predictive',
+          phase: 'cache-hit',
+          level: 'success',
+          message: 'C# completion served from predictive preload.',
+          model: this.summarizeModel(model),
+          request: {
+            key: predictiveKey,
+            cacheKey,
+            itemCount: entry.suggestions.length,
+            ageMs: Date.now() - predictive.createdAt,
+          },
+        });
+        return this.toCompletionList(entry);
+      }
+      this.predictiveCompletionCache.delete(predictiveKey);
+    }
 
     const runtimeReady = await this.ensureLocalOmniSharpRuntime();
     if (!runtimeReady || !this.omnisharp || model.isDisposed()) {
@@ -2527,23 +2943,7 @@ class CSharpLanguageService {
         }
 
         const defaultRange = lateContext?.filterRange ?? this.getCompletionFilterRangeAtPosition(model, position);
-        const suggestions: monaco.languages.CompletionItem[] = [];
-        const lspItems: any[] = [];
-
-        for (const rawItem of csharpCompletionItemsFromResponse(response)) {
-          const suggestion = this.convertCompletion(model, rawItem, defaultRange, snapshot, lateContext);
-          if (!csharpCompletionItemIsUsable(suggestion)) continue;
-          suggestions.push(suggestion);
-          lspItems.push(rawItem);
-        }
-
-        return {
-          suggestions,
-          lspItems,
-          incomplete: csharpCompletionResponseIsIncomplete(response),
-          completionSnapshot: lateContext ? snapshot : undefined,
-          lateContext,
-        };
+        return this.completionEntryFromResponse(model, response, defaultRange, snapshot, lateContext);
       })().finally(() => {
         inflight.delete(cacheKey);
       });
@@ -2557,6 +2957,8 @@ class CSharpLanguageService {
 
       this.cacheCompletionResult(cacheKey, entry);
       this.completionWorkerStateKey = cacheKey;
+      this.rememberPredictiveCompletionSource(model, projectRequest, entry);
+      this.refreshPredictiveCompletion(model);
       this.recordDebugEvent({
         feature: 'completion',
         phase: 'provider-end',
@@ -2662,6 +3064,9 @@ class CSharpLanguageService {
 
   private getCompletionResolveResponse(lspItem: any): Promise<unknown> {
     if (!this.omnisharp) return Promise.resolve(false);
+    const speculativeCompletionListKey = lspItem && typeof lspItem === 'object'
+      ? this.completionResolveSpeculativeKeys.get(lspItem)
+      : undefined;
     if (!lspItem || typeof lspItem !== 'object') {
       return this.omnisharp('GetCompletionResolveAsync', { Item: lspItem });
     }
@@ -2669,7 +3074,11 @@ class CSharpLanguageService {
     const cached = this.completionResolveResponseCache.get(lspItem);
     if (cached) return cached;
 
-    const request = this.omnisharp('GetCompletionResolveAsync', { Item: lspItem }).then(response => {
+    const request = (
+      speculativeCompletionListKey
+        ? this.omnisharp('GetSpeculativeCompletionResolveAsync', { Item: lspItem }, speculativeCompletionListKey)
+        : this.omnisharp('GetCompletionResolveAsync', { Item: lspItem })
+    ).then(response => {
       if (!response) this.completionResolveResponseCache.delete(lspItem);
       return response;
     }, error => {
@@ -4255,6 +4664,21 @@ function offsetAtTextPosition(text: string, lineNumber: number, column: number) 
 
   const target = offset + column - 1;
   return target <= lineEnd ? target : null;
+}
+
+function positionAtTextOffset(text: string, targetOffset: number): monaco.Position | null {
+  if (targetOffset < 0 || targetOffset > text.length) return null;
+
+  let lineNumber = 1;
+  let lineStart = 0;
+  for (let offset = 0; offset < targetOffset; offset += 1) {
+    if (text.charCodeAt(offset) === 10) {
+      lineNumber += 1;
+      lineStart = offset + 1;
+    }
+  }
+
+  return new monaco.Position(lineNumber, targetOffset - lineStart + 1);
 }
 
 function addMarkKeyword(token: CSharpToken, type: CSharpSemanticTokenType, marks: Map<number, CSharpSemanticMark>) {
