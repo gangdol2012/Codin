@@ -3,8 +3,6 @@ dist
 .idea
 tools/**/bin/
 tools/**/obj/
-tests/**/bin/
-tests/**/obj/
 public/*
 !public/coi-serviceworker.js
 !public/ecj.jar
