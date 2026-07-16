@@ -5,12 +5,41 @@ const iframeId = `omnisharp-${Math.random().toString(36).slice(2)}`;
 type OmniSharpCall = (method: string, ...args: unknown[]) => Promise<any>;
 export type CSharpOmniSharpSource = 'local';
 
+interface CSharpOmniSharpBridgeErrorPayload {
+  __codecraftOmniSharpError: true;
+  method?: string;
+  name?: string;
+  message?: string;
+  stack?: string;
+}
+
+class CSharpOmniSharpBridgeError extends Error {
+  readonly payload: CSharpOmniSharpBridgeErrorPayload | false;
+  readonly method: string;
+
+  constructor(method: string, payload: CSharpOmniSharpBridgeErrorPayload | false) {
+    const message = payload === false
+      ? `${method} returned a false payload.`
+      : `${method} failed in OmniSharp: ${payload.message || payload.name || 'Unknown bridge error.'}`;
+    super(message);
+    this.name = 'CSharpOmniSharpBridgeError';
+    this.method = method;
+    this.payload = payload;
+  }
+}
+
 const CSHARP_OMNISHARP_URLS: Record<CSharpOmniSharpSource, string> = {
   local: '/omnisharp/index.html',
 };
 
 function normalizeCSharpOmniSharpSource(source: unknown): CSharpOmniSharpSource {
   return 'local';
+}
+
+function isCSharpOmniSharpBridgeErrorPayload(value: unknown): value is CSharpOmniSharpBridgeErrorPayload {
+  return !!value
+    && typeof value === 'object'
+    && (value as { __codecraftOmniSharpError?: unknown }).__codecraftOmniSharpError === true;
 }
 
 export function getCSharpOmniSharpUrl(source: CSharpOmniSharpSource) {
@@ -1952,6 +1981,11 @@ class CSharpLanguageService {
   }
 
   private summarizeError(error: unknown) {
+    if (error instanceof CSharpOmniSharpBridgeError && error.payload !== false) {
+      const payload = error.payload;
+      const bridgeName = payload.name ? ` (${payload.name})` : '';
+      return `${error.name}: ${payload.method ?? error.method}${bridgeName}: ${payload.message ?? error.message}`;
+    }
     if (error instanceof Error) {
       return `${error.name}: ${error.message}`;
     }
@@ -2061,6 +2095,15 @@ class CSharpLanguageService {
   private summarizeOmniSharpResponse(response: unknown): unknown {
     const result = response as any;
     if (!result) return result;
+    if (isCSharpOmniSharpBridgeErrorPayload(result)) {
+      return {
+        type: 'bridge-error',
+        method: result.method,
+        name: result.name,
+        message: result.message,
+        stackPreview: typeof result.stack === 'string' ? result.stack.slice(0, 1000) : undefined,
+      };
+    }
     if (Array.isArray(result)) return { type: 'array', length: result.length, sample: result.slice(0, 3).map(item => this.summarizeValue(item, 1)) };
     if (typeof result === 'object') {
       return {
@@ -2249,13 +2292,17 @@ class CSharpLanguageService {
               handled = true;
               window.removeEventListener('message', handleMessage);
               const payload = event.data.omnisharp.payload;
+              const bridgeError = isCSharpOmniSharpBridgeErrorPayload(payload);
+              const failed = payload === false || bridgeError;
               this.recordDebugEvent({
                 feature: method,
                 phase: 'runtime-response',
-                level: payload === false ? 'warning' : 'success',
-                message: payload === false
-                  ? `${method} returned a false payload.`
-                  : `${method} returned from OmniSharp.`,
+                level: failed ? 'error' : 'success',
+                message: bridgeError
+                  ? `${method} failed in OmniSharp: ${payload.message || payload.name || 'Unknown bridge error.'}`
+                  : payload === false
+                    ? `${method} returned a false payload.`
+                    : `${method} returned from OmniSharp.`,
                 callId,
                 durationMs: Math.round((this.now() - started) * 10) / 10,
                 response: this.summarizeOmniSharpResponse(payload),
@@ -2473,18 +2520,32 @@ class CSharpLanguageService {
     if (cached) return cached;
 
     const promise = this.omnisharp(method, snapshot.code, ...args).then(response => {
-      if (response === false || this.completionEnvironmentVersion !== environmentVersion) {
+      let checkedResponse: unknown;
+      try {
+        checkedResponse = this.requireOmniSharpResponse(method, response);
+      } catch (error) {
+        this.runtimeResponseCache.delete(key);
+        throw error;
+      }
+      if (this.completionEnvironmentVersion !== environmentVersion) {
         this.runtimeResponseCache.delete(key);
       } else {
-        this.cacheRuntimeResponse(key, response);
+        this.cacheRuntimeResponse(key, checkedResponse);
       }
-      return response;
+      return checkedResponse;
     }, error => {
       this.runtimeResponseCache.delete(key);
       throw error;
     });
     this.cacheRuntimeResponse(key, promise);
     return promise;
+  }
+
+  private requireOmniSharpResponse(method: string, response: unknown): unknown {
+    if (response === false || isCSharpOmniSharpBridgeErrorPayload(response)) {
+      throw new CSharpOmniSharpBridgeError(method, response);
+    }
+    return response;
   }
 
   private completionCacheKey(
@@ -2634,7 +2695,8 @@ class CSharpLanguageService {
         return CSHARP_STALE_COMPLETION_RESPONSE;
       }
 
-      return this.omnisharp!('GetCompletionAsync', snapshot.code, request, projectRequest.serialized);
+      const response = await this.omnisharp!('GetCompletionAsync', snapshot.code, request, projectRequest.serialized);
+      return this.requireOmniSharpResponse('GetCompletionAsync', response);
     });
 
     this.completionDispatchTail = run.then(() => undefined, () => undefined);
@@ -3154,6 +3216,17 @@ class CSharpLanguageService {
 
     const projectRequest = this.createSerializedDiagnosticProjectRequest(model);
     if (projectRequest.fileKey !== source.projectFileKey) return null;
+    const snapshot = this.getModelTextSnapshot(model);
+    const currentOffset = model.getOffsetAt(position);
+    const existingMemberAccessPlan = this.createPredictiveCompletionPlanForExistingMemberAccess(
+      model,
+      source,
+      projectRequest,
+      position,
+      snapshot,
+      currentOffset
+    );
+    if (existingMemberAccessPlan) return existingMemberAccessPlan;
 
     const filterRange = this.getCompletionFilterRangeAtPosition(model, position);
     const prefix = model.getValueInRange(filterRange);
@@ -3170,10 +3243,8 @@ class CSharpLanguageService {
       lineNumber: filterRange.endLineNumber,
       column: filterRange.endColumn,
     });
-    const currentOffset = model.getOffsetAt(position);
     if (endOffset !== currentOffset || startOffset > endOffset) return null;
 
-    const snapshot = this.getModelTextSnapshot(model);
     if (snapshot.code.charAt(endOffset) === '.') return null;
 
     const replacement = `${candidate}.`;
@@ -3204,6 +3275,69 @@ class CSharpLanguageService {
       code,
       codeHash,
       offset,
+      request,
+      projectRequest,
+      candidate,
+      prefix,
+    };
+  }
+
+  private createPredictiveCompletionPlanForExistingMemberAccess(
+    model: monaco.editor.ITextModel,
+    source: CSharpPredictiveCompletionSource,
+    projectRequest: CSharpSerializedProjectRequest,
+    position: monaco.Position,
+    snapshot: CSharpModelTextSnapshot,
+    currentOffset: number
+  ): CSharpPredictiveCompletionPlan | null {
+    if (currentOffset <= 0 || snapshot.code.charAt(currentOffset - 1) !== '.') return null;
+
+    const line = model.getLineContent(position.lineNumber);
+    const dotIndex = Math.max(0, Math.min(line.length - 1, position.column - 2));
+    if (line.charAt(dotIndex) !== '.') return null;
+
+    let startIndex = dotIndex;
+    while (startIndex > 0) {
+      const previous = retreatCodePoint(line, startIndex);
+      if (previous < 0 || !isIdentifierPart(line, previous)) break;
+      startIndex = previous;
+    }
+
+    if (startIndex > 0 && line[startIndex - 1] === '@') {
+      startIndex -= 1;
+    }
+
+    const prefix = line.slice(startIndex, dotIndex);
+    if (!isValidCSharpCompletionFilterPrefix(prefix)) return null;
+
+    const candidate = this.selectPredictiveCompletionCandidate(source, prefix);
+    if (!candidate) return null;
+    const normalizedPrefix = prefix.startsWith('@') ? prefix.slice(1) : prefix;
+    const normalizedCandidate = candidate.startsWith('@') ? candidate.slice(1) : candidate;
+    if (normalizedCandidate !== normalizedPrefix) return null;
+
+    const request = {
+      Line: Math.max(0, position.lineNumber - 1),
+      Column: Math.max(0, position.column - 1),
+      CompletionTrigger: 1,
+    };
+    const codeHash = csharpCompletionFastHash(snapshot.code);
+    const key = csharpPredictiveCompletionCacheKey(
+      model.uri.toString(),
+      codeHash,
+      currentOffset,
+      request,
+      projectRequest,
+      this.completionEnvironmentVersion,
+      '.',
+    );
+
+    return {
+      key,
+      completionListKey: `${key}:${Math.random().toString(36).slice(2)}`,
+      code: snapshot.code,
+      codeHash,
+      offset: currentOffset,
       request,
       projectRequest,
       candidate,
@@ -3303,13 +3437,13 @@ class CSharpLanguageService {
     });
 
     try {
-      const response = await this.omnisharp(
+      const response = this.requireOmniSharpResponse('GetSpeculativeCompletionAsync', await this.omnisharp(
         'GetSpeculativeCompletionAsync',
         plan.code,
         plan.request,
         plan.projectRequest.serialized,
         plan.completionListKey,
-      );
+      ));
       const itemCount = csharpCompletionItemsFromResponse(response).length;
       const shouldCache = (
         serial === this.predictiveCompletionSerial &&
@@ -4094,6 +4228,7 @@ class CSharpLanguageService {
     const index = this.getSemanticIndex(model);
     const actions: monaco.languages.CodeAction[] = [];
     const lineText = model.getLineContent(range.startLineNumber);
+    let omnisharpError: unknown = null;
 
     if (this.omnisharp) {
       try {
@@ -4109,7 +4244,17 @@ class CSharpLanguageService {
           projectRequest.serialized
         );
         actions.push(...this.convertCodeActions(model, response, context.markers));
-      } catch {
+      } catch (error) {
+        omnisharpError = error;
+        this.recordDebugEvent({
+          feature: 'codeActions',
+          phase: 'runtime-error',
+          level: 'error',
+          message: 'C# OmniSharp code actions failed.',
+          model: this.summarizeModel(model),
+          error: this.summarizeError(error),
+          environment: this.createDebugEnvironmentSnapshot(model),
+        });
         // Local actions below still cover the common cases.
       }
     }
@@ -4158,6 +4303,9 @@ class CSharpLanguageService {
       }
     }
 
+    if (!actions.length && omnisharpError) {
+      throw omnisharpError;
+    }
     if (!actions.length && isOnlyCodeActionKind(context.only, 'quickfix')) {
       return { actions: [], dispose() {} };
     }

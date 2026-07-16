@@ -475,51 +475,59 @@ $@"using System;
     {
         return await RunDiagnosticAsync(async () =>
         {
-            var document = await UpdateDiagnosticDocumentAsync(code, diagnosticRequestString);
-            var text = await document.GetTextAsync();
-            var source = text.ToString();
-            var actions = new List<CodeActionDto>();
-            var range = DeserializeRequest<RangeRequest>(rangeRequestString);
-            var requestSpan = ToTextSpan(text, range);
-            var diagnostics = await GetCompilerDiagnosticsAsync(document);
-
-            foreach (var diagnostic in diagnostics.Where(d => d.Location.SourceSpan.IntersectsWith(requestSpan) || requestSpan.Length == 0))
+            try
             {
-                var missingName = TryGetMissingSymbolName(diagnostic);
-                if (string.IsNullOrWhiteSpace(missingName))
+                var document = await UpdateDiagnosticDocumentAsync(code, diagnosticRequestString);
+                var text = await document.GetTextAsync();
+                var source = text.ToString();
+                var actions = new List<CodeActionDto>();
+                var range = DeserializeRequest<RangeRequest>(rangeRequestString);
+                var requestSpan = ToTextSpan(text, range);
+                var diagnostics = await GetCompilerDiagnosticsAsync(document);
+
+                foreach (var diagnostic in diagnostics.Where(d => d.Location.SourceSpan.IntersectsWith(requestSpan) || requestSpan.Length == 0))
                 {
-                    continue;
+                    var missingName = TryGetMissingSymbolName(diagnostic);
+                    if (string.IsNullOrWhiteSpace(missingName))
+                    {
+                        continue;
+                    }
+
+                    var namespaceName = await FindNamespaceForMissingSymbolAsync(document.Project, missingName);
+                    if (string.IsNullOrWhiteSpace(namespaceName) || HasUsing(source, namespaceName))
+                    {
+                        continue;
+                    }
+
+                    actions.Add(new CodeActionDto(
+                        $"Add using {namespaceName}",
+                        "quickfix",
+                        new[] { new MonacoTextEdit(new TextRange(new PositionDto(0, 0), new PositionDto(0, 0)), $"using {namespaceName};\n") },
+                        true));
                 }
 
-                var namespaceName = await FindNamespaceForMissingSymbolAsync(document.Project, missingName);
-                if (string.IsNullOrWhiteSpace(namespaceName) || HasUsing(source, namespaceName))
+                var organized = OrganizeUsings(source);
+                if (!string.Equals(organized, source, StringComparison.Ordinal))
                 {
-                    continue;
+                    actions.Add(new CodeActionDto(
+                        "Organize C# usings",
+                        "source.organizeImports",
+                        new[] { new MonacoTextEdit(ToRange(text, TextSpan.FromBounds(0, text.Length)), organized) },
+                        false));
                 }
 
-                actions.Add(new CodeActionDto(
-                    $"Add using {namespaceName}",
-                    "quickfix",
-                    new[] { new MonacoTextEdit(new TextRange(new PositionDto(0, 0), new PositionDto(0, 0)), $"using {namespaceName};\n") },
-                    true));
-            }
+                await AddRoslynCodeActionsAsync(document, requestSpan, diagnostics, actions);
 
-            var organized = OrganizeUsings(source);
-            if (!string.Equals(organized, source, StringComparison.Ordinal))
+                return Payload(actions
+                    .GroupBy(action => action.Title)
+                    .Select(group => group.First())
+                    .ToArray(), "GetCodeActionsAsync");
+            }
+            catch (Exception e)
             {
-                actions.Add(new CodeActionDto(
-                    "Organize C# usings",
-                    "source.organizeImports",
-                    new[] { new MonacoTextEdit(ToRange(text, TextSpan.FromBounds(0, text.Length)), organized) },
-                    false));
+                Console.WriteLine($"GetCodeActionsAsync failed: {e}");
+                return Payload(Array.Empty<CodeActionDto>(), "GetCodeActionsAsync");
             }
-
-            await AddRoslynCodeActionsAsync(document, requestSpan, diagnostics, actions);
-
-            return Payload(actions
-                .GroupBy(action => action.Title)
-                .Select(group => group.First())
-                .ToArray(), "GetCodeActionsAsync");
         });
     }
 

@@ -11,6 +11,13 @@ function registerService(monacoService) {
 
   const methods = {};
   const methodQueues = {};
+  const serializeError = (method, error) => ({
+    __codecraftOmniSharpError: true,
+    method,
+    name: error && typeof error.name === "string" ? error.name : typeof error,
+    message: error && typeof error.message === "string" ? error.message : String(error),
+    stack: error && typeof error.stack === "string" ? error.stack.slice(0, 4000) : undefined
+  });
 
   // Override the invokeMethod prototype
   // Biggest bottleneck here is marshalling JS to WASM for strings
@@ -69,7 +76,7 @@ function registerService(monacoService) {
         ).catch((error) => {
           console.warn(error);
           delete methods[method];
-          respond(false);
+          respond(serializeError(method, error));
           resolve();
         });
       });
