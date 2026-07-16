@@ -9,6 +9,8 @@
     "prebuild": "node scripts/build-minimal-typeshed.mjs && node scripts/sync-browser-csharp-runtime.mjs && node scripts/sync-omnisharp-runtime.mjs && node scripts/sync-pyodide-runtime.mjs",
     "csharp:browser:publish": "dotnet publish vendor/browser-csharp-wasm/BrowserCSharp.csproj -c Release -o vendor/browser-csharp-wasm/publish-out",
     "csharp:omnisharp:publish": "dotnet publish vendor/omnisharp-wasm/OmniSharpWasm.csproj -c Release",
+    "test:csharp-completion": "dotnet run --project tests/OmniSharpCompletion.Tests/OmniSharpCompletion.Tests.csproj -c Release",
+    "benchmark:csharp-completion": "dotnet run --project tests/OmniSharpCompletion.Tests/OmniSharpCompletion.Tests.csproj -c Release -- --benchmark",
     "dev": "vite",
     "delegate": "wrangler deploy",
     "delegate:dev": "wrangler dev",
