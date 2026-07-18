@@ -57,6 +57,9 @@ function codecraftMavenProxy() {
 
 export default defineConfig(() => {
   return {
+    // Every production URL must remain relative to the directory containing index.html.
+    // CodeCraft is deployed as a complete static tree and may live at any HTTPS subpath.
+    base: './',
     plugins: [codecraftMavenProxy(), react(), tailwindcss()],
     define: {
       __APP_VERSION__: JSON.stringify(appVersion),

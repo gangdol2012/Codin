@@ -11,9 +11,9 @@ namespace CodeCraft.OmniSharpWasm {
     IJSRuntime JS { get; set; }
     [Inject]
     IWorkerFactory workerFactory { get; set; }
-    protected override void OnInitialized()
+    protected override async Task OnInitializedAsync()
     {
-        OmniSharpWasm.Init(JS, NavigationManager, workerFactory);
+        await OmniSharpWasm.Init(JS, NavigationManager, workerFactory);
     }
 }
 }

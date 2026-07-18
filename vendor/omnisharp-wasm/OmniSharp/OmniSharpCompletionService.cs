@@ -33,7 +33,9 @@ using System.Collections.Immutable;
 using System.Composition;
 using System.Diagnostics;
 using System.Linq;
+using System.Runtime.CompilerServices;
 using System.Text;
+using System.Text.Json.Serialization;
 using System.Threading.Tasks;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.Completion;
@@ -59,9 +61,39 @@ public class OmniSharpCompletionService
 
 
 {
-    private const int CompletionListCacheLimit = 8;
+    // The caller sets this to the union of browser caches that can address this service.
+    // Keeping fewer entries would make a valid browser item silently lose resolve state;
+    // keeping more would pin Documents and Roslyn item graphs JS can no longer reach.
+    private readonly int _completionListCacheLimit;
 
-    private record CompletionResolveState(CSharpCompletionList Completions, Document Document, string FileName, int Position);
+    public sealed record CompactCompletionResponse(
+        [property: JsonPropertyName("v")] int Version,
+        [property: JsonPropertyName("x")] bool IsIncomplete,
+        [property: JsonPropertyName("r")] int[] DefaultRange,
+        [property: JsonPropertyName("c")] string[] CommitCharacterSets,
+        [property: JsonPropertyName("i")] object?[][] Items);
+
+    public sealed record CompletionRefilterResponse(bool Success, int[] PreselectedIndices);
+
+    private sealed class RoslynCompletionItemReferenceComparer : IEqualityComparer<Microsoft.CodeAnalysis.Completion.CompletionItem>
+    {
+        public static readonly RoslynCompletionItemReferenceComparer Instance = new();
+
+        public bool Equals(
+            Microsoft.CodeAnalysis.Completion.CompletionItem? left,
+            Microsoft.CodeAnalysis.Completion.CompletionItem? right) => ReferenceEquals(left, right);
+
+        public int GetHashCode(Microsoft.CodeAnalysis.Completion.CompletionItem item) =>
+            RuntimeHelpers.GetHashCode(item);
+    }
+
+    private record CompletionResolveState(
+        CSharpCompletionList Completions,
+        Document Document,
+        string FileName,
+        int Position,
+        Dictionary<Microsoft.CodeAnalysis.Completion.CompletionItem, int> ItemIndices,
+        int[] AlwaysPreselectedIndices);
 
     private static readonly Dictionary<string, CompletionItemKind> s_roslynTagToCompletionItemKind = new Dictionary<string, CompletionItemKind>()
         {
@@ -108,21 +140,99 @@ public class OmniSharpCompletionService
     private readonly object _lock = new object();
     private CompletionResolveState? _lastCompletion = null;
     private readonly Dictionary<string, CompletionResolveState> _completionListsByKey = new(StringComparer.Ordinal);
-    private readonly Queue<string> _completionListKeys = new();
+    private readonly LinkedList<string> _completionListKeys = new();
     private CancellationTokenSource cancellationTokenSource = new CancellationTokenSource();
     private CancellationToken cancellationToken;
 
-    public OmniSharpCompletionService(AdhocWorkspace workspace, FormattingOptions formattingOptions, ILoggerFactory loggerFactory)
+    public OmniSharpCompletionService(
+        AdhocWorkspace workspace,
+        FormattingOptions formattingOptions,
+        ILoggerFactory loggerFactory,
+        int completionListCacheLimit = 19)
     {
         _workspace = workspace;
         _formattingOptions = formattingOptions;
         _logger = loggerFactory.CreateLogger<OmniSharpCompletionService>();
+        _completionListCacheLimit = Math.Max(1, completionListCacheLimit);
         cancellationToken = cancellationTokenSource.Token;
+    }
+
+    private void TouchCompletionListLocked(string completionListKey)
+    {
+        // The list contains keys, not access events. Repeatedly resolving the active
+        // popup must not consume the capacity and evict unrelated reusable sessions.
+        _completionListKeys.Remove(completionListKey);
+        _completionListKeys.AddLast(completionListKey);
+        while (_completionListKeys.Count > _completionListCacheLimit)
+        {
+            var oldestKey = _completionListKeys.First!.Value;
+            _completionListKeys.RemoveFirst();
+            _completionListsByKey.Remove(oldestKey);
+        }
+    }
+
+    public void ReconcileCompletionLists(IEnumerable<string> retainedCompletionListKeys)
+    {
+        var retained = retainedCompletionListKeys.ToHashSet(StringComparer.Ordinal);
+        lock (_lock)
+        {
+            var staleKeys = _completionListsByKey.Keys
+                .Where(key => !retained.Contains(key))
+                .ToArray();
+            foreach (var staleKey in staleKeys)
+            {
+                _completionListsByKey.Remove(staleKey);
+                _completionListKeys.Remove(staleKey);
+            }
+        }
+    }
+
+    public void CancelPendingRequest()
+    {
+        // Speculative completion is an optimization. A normal authoring request must be
+        // able to cancel Roslyn work in the separate speculative workspace as soon as the
+        // worker's async continuation yields, instead of sitting behind a doomed preload.
+        try
+        {
+            cancellationTokenSource.Cancel();
+        }
+        catch (ObjectDisposedException)
+        {
+            // Handle may have replaced the source on the same synchronization context.
+        }
+    }
+
+    public async Task WarmUpAsync(
+        Document document,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        // Materialize the exact synchronized project first. The synthetic completion below
+        // then branches from an already-warm compilation tracker while exercising Roslyn's
+        // completion-provider/import indices without changing the user's document.
+        _ = await document.Project.GetCompilationAsync(cancellationToken);
+
+        const string warmUpCode = "class __CodeCraftCompletionWarmup { void M() { C";
+        var warmUpDocument = document.WithText(SourceText.From(warmUpCode));
+        var completionService = CSharpCompletionService.GetService(warmUpDocument);
+        if (completionService == null)
+        {
+            return;
+        }
+
+        // Force the expensive provider/import indices and the first compilation while the
+        // static runtime is loading, before an interactive keystroke is waiting on them.
+        _ = await completionService.GetCompletionsAsync(
+            warmUpDocument,
+            warmUpCode.Length,
+            CompletionTrigger.Invoke,
+            cancellationToken: cancellationToken);
     }
 
     public async Task<CompletionResponse> Handle(CompletionRequest request, Document document, string? completionListKey = null)
     {
         cancellationTokenSource.Cancel();
+        cancellationTokenSource.Dispose();
         cancellationTokenSource = new CancellationTokenSource();
         cancellationToken = cancellationTokenSource.Token;
         _logger.LogTrace("Completions requested");
@@ -168,7 +278,7 @@ public class OmniSharpCompletionService
 
             );
         _logger.LogTrace("Found {0} completions for {1}:{2},{3}",
-                         completions?.Items.IsDefaultOrEmpty != true ? 0 : completions.Items.Length,
+                         completions?.Items.IsDefaultOrEmpty == true ? 0 : completions?.Items.Length ?? 0,
                          request.FileName,
                          request.Line,
                          request.Column);
@@ -188,36 +298,19 @@ public class OmniSharpCompletionService
         var typedSpan = completionService.GetDefaultCompletionListSpan(sourceText, position);
         string typedText = sourceText.GetSubText(typedSpan).ToString();
 
-        ImmutableArray<string> filteredItems = typedText != string.Empty
-            ? completionService.FilterItems(document, completions.Items, typedText).SelectAsArray(i => i.DisplayText)
-            : ImmutableArray<string>.Empty;
+        HashSet<Microsoft.CodeAnalysis.Completion.CompletionItem>? filteredItems = typedText != string.Empty
+            ? completionService.FilterItems(document, completions.Items, typedText)
+                .ToHashSet(RoslynCompletionItemReferenceComparer.Instance)
+            : null;
         _logger.LogTrace("Completions filled in");
-
-        lock (_lock)
-        {
-            var resolveState = new CompletionResolveState(completions, document, request.FileName, position);
-            if (completionListKey is null)
-            {
-                _lastCompletion = resolveState;
-            }
-            else
-            {
-                _completionListsByKey[completionListKey] = resolveState;
-                _completionListKeys.Enqueue(completionListKey);
-                while (_completionListKeys.Count > CompletionListCacheLimit)
-                {
-                    var oldestKey = _completionListKeys.Dequeue();
-                    if (!_completionListKeys.Contains(oldestKey))
-                    {
-                        _completionListsByKey.Remove(oldestKey);
-                    }
-                }
-            }
-        }
-
 
         var triggerCharactersBuilder = ImmutableArray.CreateBuilder<char>(completions.Rules.DefaultCommitCharacters.Length);
         var completionsBuilder = ImmutableArray.CreateBuilder<CompletionItem>(completions.Items.Length);
+        var commitCharactersByRules = new Dictionary<CompletionItemRules, ImmutableArray<char>>();
+        var itemIndices = new Dictionary<Microsoft.CodeAnalysis.Completion.CompletionItem, int>(
+            completions.Items.Length,
+            RoslynCompletionItemReferenceComparer.Instance);
+        var alwaysPreselectedIndices = new List<int>();
 
         // If we don't encounter any unimported types, and the completion context thinks that some would be available, then
         // that completion provider is still creating the cache. We'll mark this completion list as not completed, and the
@@ -233,6 +326,11 @@ public class OmniSharpCompletionService
         for (int i = 0; i < completions.Items.Length; i++)
         {
             var completion = completions.Items[i];
+            itemIndices[completion] = i;
+            if (completion.Rules.MatchPriority == MatchPriority.Preselect)
+            {
+                alwaysPreselectedIndices.Add(i);
+            }
             var insertTextFormat = InsertTextFormat.PlainText;
             IReadOnlyList<LinePositionSpanTextChange>? additionalTextEdits = null;
             char sortTextPrepend = '0';
@@ -373,7 +471,11 @@ public class OmniSharpCompletionService
 
 
 
-            var commitCharacters = buildCommitCharacters(completions, completion.Rules.CommitCharacterRules, triggerCharactersBuilder);
+            if (!commitCharactersByRules.TryGetValue(completion.Rules, out var commitCharacters))
+            {
+                commitCharacters = buildCommitCharacters(completions, completion.Rules.CommitCharacterRules, triggerCharactersBuilder);
+                commitCharactersByRules[completion.Rules] = commitCharacters;
+            }
 
             completionsBuilder.Add(new CompletionItem
             {
@@ -394,9 +496,28 @@ public class OmniSharpCompletionService
                 Kind = getCompletionItemKind(completion.Tags),
                 Detail = completion.InlineDescription,
                 Data = i,
-                Preselect = completion.Rules.MatchPriority == MatchPriority.Preselect || filteredItems.Contains(completion.DisplayText),
+                Preselect = completion.Rules.MatchPriority == MatchPriority.Preselect || filteredItems?.Contains(completion) == true,
                 CommitCharacters = commitCharacters,
             });
+        }
+        lock (_lock)
+        {
+            var resolveState = new CompletionResolveState(
+                completions,
+                document,
+                request.FileName,
+                position,
+                itemIndices,
+                alwaysPreselectedIndices.ToArray());
+            if (completionListKey is null)
+            {
+                _lastCompletion = resolveState;
+            }
+            else
+            {
+                _completionListsByKey[completionListKey] = resolveState;
+                TouchCompletionListLocked(completionListKey);
+            }
         }
         return new CompletionResponse
         {
@@ -503,16 +624,153 @@ public class OmniSharpCompletionService
         }
     }
 
+    public CompactCompletionResponse Compact(CompletionResponse response)
+    {
+        if (response.Items.Count == 0)
+        {
+            return new CompactCompletionResponse(1, response.IsIncomplete, Array.Empty<int>(), Array.Empty<string>(), Array.Empty<object?[]>());
+        }
+
+        var firstEdit = response.Items[0].TextEdit;
+        var defaultRange = firstEdit == null
+            ? Array.Empty<int>()
+            : new[] { firstEdit.StartLine, firstEdit.StartColumn, firstEdit.EndLine, firstEdit.EndColumn };
+        var commitCharacterSets = new List<string>();
+        var commitCharacterSetIndexes = new Dictionary<string, int>(StringComparer.Ordinal);
+        var compactItems = new object?[response.Items.Count][];
+
+        for (var index = 0; index < response.Items.Count; index++)
+        {
+            var item = response.Items[index];
+            var edit = item.TextEdit;
+            object? range = null;
+            if (edit != null &&
+                (defaultRange.Length != 4 ||
+                 edit.StartLine != defaultRange[0] ||
+                 edit.StartColumn != defaultRange[1] ||
+                 edit.EndLine != defaultRange[2] ||
+                 edit.EndColumn != defaultRange[3]))
+            {
+                range = new[] { edit.StartLine, edit.StartColumn, edit.EndLine, edit.EndColumn };
+            }
+
+            object? additionalEdits = null;
+            if (item.AdditionalTextEdits is { Count: > 0 })
+            {
+                var edits = new object?[item.AdditionalTextEdits.Count][];
+                for (var editIndex = 0; editIndex < item.AdditionalTextEdits.Count; editIndex++)
+                {
+                    var additional = item.AdditionalTextEdits[editIndex];
+                    edits[editIndex] = new object?[]
+                    {
+                        additional.NewText,
+                        additional.StartLine,
+                        additional.StartColumn,
+                        additional.EndLine,
+                        additional.EndColumn,
+                    };
+                }
+                additionalEdits = edits;
+            }
+
+            var commitCharacters = item.CommitCharacters is { Count: > 0 }
+                ? new string(item.CommitCharacters.ToArray())
+                : string.Empty;
+            if (!commitCharacterSetIndexes.TryGetValue(commitCharacters, out var commitCharacterSetIndex))
+            {
+                commitCharacterSetIndex = commitCharacterSets.Count;
+                commitCharacterSets.Add(commitCharacters);
+                commitCharacterSetIndexes[commitCharacters] = commitCharacterSetIndex;
+            }
+
+            compactItems[index] = new object?[]
+            {
+                item.Label,
+                edit?.NewText == item.Label ? null : edit?.NewText,
+                range,
+                item.InsertTextFormat is null or InsertTextFormat.PlainText ? 0 : (int)item.InsertTextFormat.Value,
+                additionalEdits,
+                item.SortText,
+                item.FilterText,
+                (int)item.Kind,
+                item.Detail,
+                item.Data == index ? null : item.Data,
+                item.Preselect ? 1 : 0,
+                commitCharacterSetIndex,
+            };
+        }
+
+        return new CompactCompletionResponse(
+            1,
+            response.IsIncomplete,
+            defaultRange,
+            commitCharacterSets.ToArray(),
+            compactItems);
+    }
+
+    public CompletionRefilterResponse Refilter(string completionListKey, string filterText)
+    {
+        CompletionResolveState? completionState;
+        lock (_lock)
+        {
+            if (_completionListsByKey.TryGetValue(completionListKey, out var keyedCompletion))
+            {
+                completionState = keyedCompletion;
+                TouchCompletionListLocked(completionListKey);
+            }
+            else
+            {
+                completionState = null;
+            }
+        }
+
+        if (completionState == null)
+        {
+            return new CompletionRefilterResponse(false, Array.Empty<int>());
+        }
+
+        var completionService = CSharpCompletionService.GetService(completionState.Document);
+        if (completionService == null)
+        {
+            return new CompletionRefilterResponse(false, Array.Empty<int>());
+        }
+
+        var preselectedIndices = completionState.AlwaysPreselectedIndices.ToHashSet();
+        if (!string.IsNullOrEmpty(filterText))
+        {
+            foreach (var item in completionService.FilterItems(
+                completionState.Document,
+                completionState.Completions.Items,
+                filterText))
+            {
+                if (completionState.ItemIndices.TryGetValue(item, out var index))
+                {
+                    preselectedIndices.Add(index);
+                }
+            }
+        }
+
+        return new CompletionRefilterResponse(true, preselectedIndices.OrderBy(index => index).ToArray());
+    }
+
     public async Task<CompletionResolveResponse> Handle(CompletionResolveRequest request, Document document, string? completionListKey = null)
     {
         CompletionResolveState? completionState;
         lock (_lock)
         {
-            completionState = completionListKey is null
-                ? _lastCompletion
-                : _completionListsByKey.TryGetValue(completionListKey, out var keyedCompletion)
-                    ? keyedCompletion
-                    : null;
+            if (completionListKey is null)
+            {
+                completionState = _lastCompletion;
+            }
+            else if (_completionListsByKey.TryGetValue(completionListKey, out var keyedCompletion))
+            {
+                completionState = keyedCompletion;
+                TouchCompletionListLocked(completionListKey);
+            }
+            else
+            {
+                completionState = null;
+            }
         }
 
         if (completionState is null)
@@ -521,7 +779,7 @@ public class OmniSharpCompletionService
             return new CompletionResolveResponse { Item = request.Item };
         }
 
-        var (completions, completionDocument, fileName, position) = completionState;
+        var (completions, completionDocument, fileName, position, _, _) = completionState;
         document = completionDocument ?? document;
 
         if (request.Item is null

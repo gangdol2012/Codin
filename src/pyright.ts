@@ -84,7 +84,7 @@ function encodeUserFolderForPyrightTransport(folder: UserFolder): UserFolder {
 }
 
 async function loadMinimalTypeshed(): Promise<ArrayBuffer> {
-  const res = await fetch('/minimal-typeshed.zip');
+  const res = await fetch(new URL('minimal-typeshed.zip', document.baseURI));
   if (!res.ok) return undefined as any;
   return res.arrayBuffer();
 }
@@ -319,7 +319,7 @@ const includedModules = new Set<string>();
 
 async function ensureFullTypeshed(): Promise<void> {
   if (fullTypeshedData) return;
-  const res = await fetch('/typeshed-full.zip');
+  const res = await fetch(new URL('typeshed-full.zip', document.baseURI));
   if (!res.ok) throw new Error('Failed to fetch full typeshed');
   fullTypeshedData = new Uint8Array(await res.arrayBuffer());
   fullTypeshedCD = parseZipCD(fullTypeshedData);

@@ -7,6 +7,11 @@ declare const DotNet: {
 const workerScope = self as any;
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
+// Vite emits this worker under <static-root>/assets/ in production and serves it
+// under <static-root>/src/ in development. In both cases the parent directory is
+// the complete static application root.
+const workerAppBaseUrl = new URL('../', workerScope.location.href);
+const workerFrameworkBaseUrl = new URL('_framework/', workerAppBaseUrl);
 let runtimeReadyPromise: Promise<void> | null = null;
 
 type RuntimeMessage = {
@@ -23,40 +28,39 @@ type RuntimeMessage = {
   includeNamespaces?: string[];
 };
 
-function toRootedFrameworkUrl(value: string) {
-  if (value.startsWith('/_framework/')) return value;
-  if (value.startsWith('_framework/')) return `/${value}`;
-  if (value.startsWith('./_framework/')) return value.slice(1);
-  const nestedFrameworkIndex = value.indexOf('/_framework/');
-  if (nestedFrameworkIndex > 0) return value.slice(nestedFrameworkIndex);
-  return value;
+function toStaticFrameworkUrlObject(url: URL) {
+  if (url.origin !== workerScope.location.origin) return url;
+  const marker = '/_framework/';
+  const markerIndex = url.pathname.lastIndexOf(marker);
+  if (markerIndex < 0) return url;
+
+  const nextUrl = new URL(url.pathname.slice(markerIndex + marker.length), workerFrameworkBaseUrl);
+  nextUrl.search = url.search;
+  nextUrl.hash = url.hash;
+  return nextUrl;
 }
 
-function toRootedFrameworkUrlObject(url: URL) {
-  const rootedPath = toRootedFrameworkUrl(url.pathname.replace(/^\//, ''));
-  const normalizedPath = rootedPath.startsWith('/') ? rootedPath : `/${rootedPath}`;
-  if (normalizedPath === url.pathname) {
-    return url;
+function toStaticFrameworkUrl(value: string) {
+  try {
+    return toStaticFrameworkUrlObject(new URL(value, workerAppBaseUrl)).href;
+  } catch {
+    return value;
   }
-
-  const nextUrl = new URL(url.href);
-  nextUrl.pathname = normalizedPath;
-  return nextUrl;
 }
 
 function toWorkerFetchInput(input: RequestInfo | URL) {
   if (typeof input === 'string') {
-    return toRootedFrameworkUrl(input);
+    return toStaticFrameworkUrl(input);
   }
 
   if (input instanceof URL) {
-    return toRootedFrameworkUrlObject(input);
+    return toStaticFrameworkUrlObject(input);
   }
 
   if (typeof Request === 'function' && input instanceof Request) {
     const url = new URL(input.url);
-    const rootedUrl = toRootedFrameworkUrlObject(url);
-    return rootedUrl.href === input.url ? input : new Request(rootedUrl, input);
+    const staticUrl = toStaticFrameworkUrlObject(url);
+    return staticUrl.href === input.url ? input : new Request(staticUrl, input);
   }
 
   return input;
@@ -67,7 +71,7 @@ function installWorkerBrowserShims() {
     return;
   }
 
-  const blazorScriptSrc = `${workerScope.location.origin}/_framework/blazor.webassembly.js`;
+  const blazorScriptSrc = new URL('blazor.webassembly.js', workerFrameworkBaseUrl).href;
   const currentScript = {
     src: blazorScriptSrc,
     getAttribute(name: string) {
@@ -86,7 +90,7 @@ function installWorkerBrowserShims() {
       integrity: '',
       crossOrigin: '',
       set src(value: string) {
-        this._src = new URL(toRootedFrameworkUrl(value), workerScope.location.href).href;
+        this._src = toStaticFrameworkUrl(value);
       },
       get src() {
         return this._src;
@@ -108,7 +112,7 @@ function installWorkerBrowserShims() {
   workerScope.window = workerScope;
   workerScope.global = workerScope;
   workerScope.document = workerScope.document || {
-    baseURI: `${workerScope.location.origin}/`,
+    baseURI: workerAppBaseUrl.href,
     location: workerScope.location,
     currentScript,
     documentElement: {
@@ -124,7 +128,7 @@ function installWorkerBrowserShims() {
         const anchor = {
           _href: '',
           set href(value: string) {
-            this._href = new URL(toRootedFrameworkUrl(value), workerScope.location.href).href;
+            this._href = toStaticFrameworkUrl(value);
           },
           get href() {
             return this._href;
@@ -239,7 +243,7 @@ function ensureRuntime() {
     };
 
     try {
-      workerScope.importScripts('/_framework/blazor.webassembly.js');
+      workerScope.importScripts(new URL('blazor.webassembly.js', workerFrameworkBaseUrl).href);
     } catch (error) {
       reject(error);
     }

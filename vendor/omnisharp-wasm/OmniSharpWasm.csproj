@@ -4,6 +4,7 @@
     <TargetFramework>net8.0</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <WasmEnableWebcil>false</WasmEnableWebcil>
     <RootNamespace>CodeCraft.OmniSharpWasm</RootNamespace>
   </PropertyGroup>
@@ -35,12 +36,49 @@
     <None Remove="publish/**" />
   </ItemGroup>
 
-  <Target Name="PatchRoslynPersistentStorageForBrowser" AfterTargets="Publish">
+  <Target Name="PublishOmniSharpReferencePack">
+    <ItemGroup>
+      <_OmniSharpNetCoreTargetingPack
+        Include="@(ResolvedTargetingPack)"
+        Condition="'%(ResolvedTargetingPack.Identity)' == 'Microsoft.NETCore.App'" />
+      <_OmniSharpReferenceAssembly
+        Include="%(_OmniSharpNetCoreTargetingPack.PackageDirectory)/ref/$(TargetFramework)/*.dll" />
+    </ItemGroup>
+
+    <PropertyGroup>
+      <OmniSharpReferencePackDirectory>$(PublishDir)wwwroot/_framework/ref</OmniSharpReferencePackDirectory>
+    </PropertyGroup>
+
+    <Error
+      Condition="'@(_OmniSharpNetCoreTargetingPack)' == ''"
+      Text="Could not resolve the Microsoft.NETCore.App targeting pack for $(TargetFramework)." />
+    <Error
+      Condition="'@(_OmniSharpReferenceAssembly)' == ''"
+      Text="The Microsoft.NETCore.App targeting pack contains no $(TargetFramework) reference assemblies." />
+
+    <!-- This is a publish-time staging directory, not a runtime asset surface. Removing
+         it before each index pass prevents stale DLLs from a previous SDK patch from
+         entering the deterministic pack. The post-index target removes it again so the
+         static deployment does not retain a second loose copy of the complete pack. -->
+    <RemoveDir Directories="$(OmniSharpReferencePackDirectory)" />
+    <MakeDir Directories="$(OmniSharpReferencePackDirectory)" />
+    <Copy
+      SourceFiles="@(_OmniSharpReferenceAssembly)"
+      DestinationFolder="$(OmniSharpReferencePackDirectory)"
+      SkipUnchangedFiles="true" />
+  </Target>
+
+  <Target
+    Name="PatchRoslynPersistentStorageForBrowser"
+    AfterTargets="Publish"
+    DependsOnTargets="PublishOmniSharpReferencePack">
     <PropertyGroup>
       <RoslynWorkspacesAssembly>$(PublishDir)wwwroot/_framework/Microsoft.CodeAnalysis.Workspaces.dll</RoslynWorkspacesAssembly>
       <RoslynBrowserStoragePatcher>$(MSBuildProjectDirectory)/../../tools/RoslynBrowserStoragePatcher/RoslynBrowserStoragePatcher.csproj</RoslynBrowserStoragePatcher>
       <OmniSharpNamespaceIndexer>$(MSBuildProjectDirectory)/../../tools/OmniSharpNamespaceIndexer/OmniSharpNamespaceIndexer.csproj</OmniSharpNamespaceIndexer>
       <OmniSharpFrameworkDirectory>$(PublishDir)wwwroot/_framework</OmniSharpFrameworkDirectory>
+      <OmniSharpReferencePackDirectory>$(OmniSharpFrameworkDirectory)/ref</OmniSharpReferencePackDirectory>
+      <OmniSharpNamespaceIndex>$(OmniSharpFrameworkDirectory)/codecraft-namespace-index.json</OmniSharpNamespaceIndex>
     </PropertyGroup>
 
     <Exec
@@ -48,8 +86,15 @@
       Command="dotnet run --project &quot;$(RoslynBrowserStoragePatcher)&quot; -- &quot;$(RoslynWorkspacesAssembly)&quot;" />
 
     <Exec
-      Condition="Exists('$(OmniSharpFrameworkDirectory)')"
-      Command="dotnet run --project &quot;$(OmniSharpNamespaceIndexer)&quot; -- &quot;$(OmniSharpFrameworkDirectory)&quot;" />
+      Condition="Exists('$(OmniSharpReferencePackDirectory)')"
+      Command="dotnet run --project &quot;$(OmniSharpNamespaceIndexer)&quot; -- &quot;$(OmniSharpReferencePackDirectory)&quot; &quot;$(OmniSharpNamespaceIndex)&quot;" />
+
+    <!-- The indexer writes the packed binary and manifest outside this staging directory.
+         Remove loose DLLs only after a successful Exec; a failed index keeps its inputs for
+         diagnosis and fails publish before an incomplete static artifact can be shipped. -->
+    <RemoveDir
+      Directories="$(OmniSharpReferencePackDirectory)"
+      Condition="Exists('$(OmniSharpReferencePackDirectory)')" />
   </Target>
 
 </Project>

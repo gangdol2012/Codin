@@ -60,16 +60,29 @@ if (typeof window === 'undefined') {
     })());
   });
 } else if ('serviceWorker' in navigator) {
+  // Resolve from the script that was actually loaded, rather than the origin root.
+  // This keeps both the registration URL and its scope inside arbitrary static
+  // deployment prefixes such as /tools/codecraft/.
+  const loadedScriptUrl = document.currentScript?.src;
+  const serviceWorkerUrl = new URL(
+    loadedScriptUrl || './coi-serviceworker.js',
+    document.baseURI
+  );
+  const serviceWorkerScope = new URL('./', serviceWorkerUrl);
+  const reloadGuardKey = `coiReloadedBySelfAt:${serviceWorkerScope.pathname}`;
+
   if (window.crossOriginIsolated) {
     try {
+      localStorage.removeItem(reloadGuardKey);
       localStorage.removeItem('coiReloadedBySelfAt');
     } catch { }
   } else {
-    const serviceWorkerUrl = new URL('/coi-serviceworker.js', window.location.href);
-    const reloadGuardKey = 'coiReloadedBySelfAt';
     const reloadCooldownMs = 15_000;
 
-    navigator.serviceWorker.register(serviceWorkerUrl, { scope: '/', updateViaCache: 'none' }).then(registration => {
+    navigator.serviceWorker.register(serviceWorkerUrl.href, {
+      scope: serviceWorkerScope.href,
+      updateViaCache: 'none',
+    }).then(registration => {
       const clearReloadGuard = () => {
         try {
           localStorage.removeItem(reloadGuardKey);

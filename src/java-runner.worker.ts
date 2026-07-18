@@ -57,11 +57,15 @@ interface JavaCompileWorkerResult {
 
 const workerScope = self as any;
 const textEncoder = new TextEncoder();
+const workerAppBaseUrl = new URL('../', workerScope.location.href);
 const ECJ_COMPILER_VERSION = '3.26.0';
 const ECJ_COMPILER_PATH = '/str/ecj.jar';
 const ECJ_COMPILER_URLS = [
-  `/ecj.jar?v=${ECJ_COMPILER_VERSION}`,
-  `/__codecraft_maven/org/eclipse/jdt/ecj/${ECJ_COMPILER_VERSION}/ecj-${ECJ_COMPILER_VERSION}.jar`,
+  new URL(`ecj.jar?v=${ECJ_COMPILER_VERSION}`, workerAppBaseUrl).href,
+  new URL(
+    `__codecraft_maven/org/eclipse/jdt/ecj/${ECJ_COMPILER_VERSION}/ecj-${ECJ_COMPILER_VERSION}.jar`,
+    workerAppBaseUrl
+  ).href,
 ];
 let runtimeReadyPromise: Promise<void> | null = null;
 let runtimeVersion: JavaRuntimeVersion | null = null;

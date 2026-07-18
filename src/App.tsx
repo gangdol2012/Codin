@@ -8113,21 +8113,46 @@ export default function App() {
     return javaAuthoring;
   }, [getJavaAuthoringModule]);
 
+  const csharpProjectFileSnapshotsCacheRef = useRef<{
+    source: FSItem[];
+    value: Array<{ path: string; content: string; language: 'csharp' }>;
+    byId: Map<string, { path: string; content: string; language: 'csharp' }>;
+    revision: number;
+  } | null>(null);
+  const csharpProjectFileSnapshotsRevisionRef = useRef(0);
+
   const getCSharpProjectFileSnapshots = useCallback(() => {
     const currentFiles = filesRef.current;
-    return currentFiles
-      .filter((item): item is FSItem & { type: 'file' } => (
-        item.type === 'file'
-        && getProjectRuntimeLanguageForFile(item) === 'csharp'
-      ))
-      .map(file => ({
+    const cached = csharpProjectFileSnapshotsCacheRef.current;
+    if (cached?.source === currentFiles) return cached.value;
+
+    const byId = new Map<string, { path: string; content: string; language: 'csharp' }>();
+    const value: Array<{ path: string; content: string; language: 'csharp' }> = [];
+    for (const file of currentFiles) {
+      if (file.type !== 'file' || getProjectRuntimeLanguageForFile(file) !== 'csharp') continue;
+      const snapshot = {
         path: normalizeProjectPath(getFsItemPath(currentFiles, file.id)),
         content: file.content || '',
         language: 'csharp' as const,
-      }))
-      .filter(file => !!file.path)
-      .sort((left, right) => left.path.localeCompare(right.path));
+      };
+      if (!snapshot.path) continue;
+      byId.set(file.id, snapshot);
+      value.push(snapshot);
+    }
+    value.sort((left, right) => left.path.localeCompare(right.path));
+    csharpProjectFileSnapshotsCacheRef.current = {
+      source: currentFiles,
+      value,
+      byId,
+      revision: ++csharpProjectFileSnapshotsRevisionRef.current,
+    };
+    return value;
   }, []);
+
+  const getCSharpProjectFileSnapshotsRevision = useCallback(
+    () => csharpProjectFileSnapshotsCacheRef.current?.revision,
+    []
+  );
 
   const refreshSemanticDocumentationRecords = useCallback(async () => {
     const [activeRecord, draftRecord] = await Promise.all([
@@ -8176,11 +8201,20 @@ export default function App() {
     if (editorRef.current !== editor) return;
     if (editor.getModel?.()?.getLanguageId?.() !== 'csharp') return;
 
-    csharpAuthoring.csharpService.setupEditor(editor, getCSharpProjectFileSnapshots);
+    csharpAuthoring.csharpService.setupEditor(
+      editor,
+      getCSharpProjectFileSnapshots,
+      getCSharpProjectFileSnapshotsRevision
+    );
     void ensureCSharpAuthoringReady().catch(error => {
       console.warn('Failed to prepare C# language support:', error);
     });
-  }, [ensureCSharpAuthoringReady, getCSharpAuthoringModule, getCSharpProjectFileSnapshots]);
+  }, [
+    ensureCSharpAuthoringReady,
+    getCSharpAuthoringModule,
+    getCSharpProjectFileSnapshots,
+    getCSharpProjectFileSnapshotsRevision,
+  ]);
 
   useEffect(() => {
     void refreshCSharpDiagnostics();
@@ -8241,10 +8275,11 @@ export default function App() {
     if (languageId === 'csharp') {
       editor.updateOptions({
         quickSuggestions: {
-          other: false,
+          other: true,
           comments: false,
           strings: false,
         },
+        quickSuggestionsDelay: 0,
         wordBasedSuggestions: 'off',
         suggest: {
           showWords: false,
@@ -13086,7 +13121,7 @@ finally:
 
           const script = document.createElement('script');
           script.id = scriptId;
-          script.src = '/_framework/blazor.webassembly.js';
+          script.src = new URL('_framework/blazor.webassembly.js', document.baseURI).href;
           script.async = true;
           script.onerror = () => settle(false, new Error('Unable to load blazor.webassembly.js for C# runtime.'));
           document.body.appendChild(script);
@@ -18432,8 +18467,8 @@ json.dumps({
                     const wasmerSdk = await import('@wasmer/sdk');
                     await (wasmerSdk as any).init();
                     setTerminalOutput(prev => [...prev, '  Downloading clang compiler (~106MB)...']);
-                    const clangRes = await fetch('/clang.webc');
-                    if (!clangRes.ok) throw new Error('Failed to fetch /clang.webc');
+                    const clangRes = await fetch(new URL('clang.webc', document.baseURI));
+                    if (!clangRes.ok) throw new Error('Failed to fetch clang.webc');
                     const clangBytes = await clangRes.arrayBuffer();
                     const clang = await wasmerSdk.Wasmer.fromFile(new Uint8Array(clangBytes));
                     setTerminalOutput(prev => [...prev, `[Tier 3] Clang compiler loaded. Preparing source tree...`]);
@@ -18473,7 +18508,7 @@ _json.dumps(_result)
                     const hasPyHeaders = Object.keys(allFiles).some(p => p.startsWith('pyinclude/') && p.endsWith('.h'));
                     if (!hasPyHeaders) {
                       setTerminalOutput(prev => [...prev, '  Python headers not found in runtime, downloading CPython headers...']);
-                      const hdrRes = await fetch('/cpython-headers.zip');
+                      const hdrRes = await fetch(new URL('cpython-headers.zip', document.baseURI));
                       if (hdrRes.ok) {
                         const hdrZip = new Uint8Array(await hdrRes.arrayBuffer());
                         const hdrView = new DataView(hdrZip.buffer, hdrZip.byteOffset, hdrZip.byteLength);
@@ -19841,7 +19876,7 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
     const lastRequest = preload?.lastRequest ?? null;
     const lastLookup = preload?.lastLookup ?? null;
     const timelineEvents = (snapshot?.events ?? [])
-      .filter(event => event.featureKey === 'completionPreload' || event.feature === 'completion.predictive')
+      .filter(event => event.featureKey === 'completionPreload' || event.featureKey === 'completion')
       .slice(-40)
       .reverse();
 
@@ -19867,7 +19902,7 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
     const preloadLookupClass = (outcome: string | undefined) => {
       if (outcome === 'runtime-unavailable') return 'text-red-300';
       if (outcome === 'predictive-miss' || outcome === 'predictive-empty' || outcome === 'runtime-fallback') return 'text-amber-300';
-      if (outcome === 'predictive-hit' || outcome === 'normal-cache-hit') return 'text-emerald-300';
+      if (outcome === 'predictive-hit' || outcome === 'normal-cache-hit' || outcome === 'session-cache-hit') return 'text-emerald-300';
       return 'text-zinc-300';
     };
 
@@ -19997,6 +20032,7 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
               {renderJsonBlock('Last Replay Lookup', preload.lastLookup)}
               {renderJsonBlock('Cache State', {
                 completionCacheSize: snapshot.cache.completionCacheSize,
+                completionSessionCacheSize: snapshot.cache.completionSessionCacheSize,
                 predictiveCompletionCacheSize: snapshot.cache.predictiveCompletionCacheSize,
                 predictiveCompletionActivePlan: snapshot.cache.predictiveCompletionActivePlan,
                 completionEnvironmentVersion: snapshot.cache.completionEnvironmentVersion,
@@ -20151,7 +20187,21 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
                   value={tabItem.content}
                   onMount={handleEditorMount}
                   onChange={(value) => {
-                    setFiles(prev => prev.map(f => f.id === resolvedTabItemId ? { ...f, content: value || '' } : f));
+                    const nextContent = value || '';
+                    setFiles(prev => {
+                      const next = prev.map(f => f.id === resolvedTabItemId ? { ...f, content: nextContent } : f);
+                      const cachedCSharpProject = csharpProjectFileSnapshotsCacheRef.current;
+                      if (cachedCSharpProject?.source === prev) {
+                        // The editor model is sent separately from the project snapshot. Keep
+                        // the expensive sorted multi-file snapshot identity stable while only
+                        // its active entry changes; when this file later becomes a dependency,
+                        // its cached content is already current.
+                        const activeSnapshot = cachedCSharpProject.byId.get(resolvedTabItemId);
+                        if (activeSnapshot) activeSnapshot.content = nextContent;
+                        cachedCSharpProject.source = next;
+                      }
+                      return next;
+                    });
                   }}
                   options={buildSharedEditorOptions(settings.fontSize)}
                 />

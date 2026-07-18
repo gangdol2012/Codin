@@ -3,6 +3,7 @@ using System.Reflection;
 using System.Composition.Hosting;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CodeActions;
@@ -21,6 +22,12 @@ using OmniSharp.Options;
 
 public class MonacoService
 {
+    // JS retains six exact + six reusable normal lists. Speculative completion can also
+    // retain four not-yet-replayed predictive lists. Three safety slots cover a popup
+    // outside those maps, a just-returned list awaiting browser-cache publication, and
+    // the new in-flight key created after live-key reconciliation.
+    const int NormalCompletionListCacheLimit = 15;
+    const int SpeculativeCompletionListCacheLimit = 19;
     #region Fields
 
     OmniSharpProject _completionProject = null!;
@@ -34,6 +41,10 @@ public class MonacoService
     readonly SemaphoreSlim _completionGate = new(1, 1);
     readonly SemaphoreSlim _speculativeCompletionGate = new(1, 1);
     readonly SemaphoreSlim _diagnosticGate = new(1, 1);
+    CancellationTokenSource? _backgroundDiagnosticCancellation;
+    int _interactiveRequestEpoch;
+    string _completionProjectRevision = string.Empty;
+    string _speculativeProjectRevision = string.Empty;
 
     readonly JsonSerializerOptions jsonOptions = new JsonSerializerOptions
     {
@@ -95,7 +106,33 @@ public class MonacoService
     public record SemanticTokenDto(int StartLine, int StartColumn, int Length, string Type, string[] Modifiers);
     public record InlayHintDto(string Kind, string Label, PositionDto Position, bool PaddingLeft, bool PaddingRight);
     public record FoldingRangeDto(int Start, int End, string? Kind);
-    internal record ResponsePayload(object? Payload, string? Type);
+    internal record ResponsePayload(object? Payload, string? Type, int MetadataVersion);
+    public record MetadataStateResponse(
+        int Version,
+        bool FullyHydrated,
+        bool HydrationRunning);
+    public record ProjectSyncResponse(string ProjectStateKey, long PrimaryDocumentVersion, int PrimaryDocumentTextLength);
+    public record CompletionTextSyncRequest(
+        bool FullSync,
+        long ExpectedVersion,
+        int ExpectedOldTextLength,
+        int ExpectedNewTextLength,
+        string ProjectRevision,
+        OmniSharpProject.IncrementalTextChange[]? Changes);
+    public record CompletionTextSyncAck(
+        bool Success,
+        bool RequiresFullSync,
+        long Version,
+        int TextLength,
+        string? ProjectRevision,
+        string? Message);
+    public record SynchronizedCompletionResponse(
+        [property: JsonPropertyName("s")] CompletionTextSyncAck Sync,
+        [property: JsonPropertyName("p")] OmniSharpCompletionService.CompactCompletionResponse? Completion,
+        [property: JsonPropertyName("c")] bool Cancelled = false);
+    public record SpeculativeCancellationResponse(bool Cancelled);
+    public record BackgroundDiagnosticCancellationResponse(bool Cancelled);
+    record CompletionTextSyncApplication(CompletionTextSyncAck Acknowledgement, Document? Document);
     record CodeActionProviderSet(CodeFixProvider[] CodeFixProviders, CodeRefactoringProvider[] RefactoringProviders, IDisposable? Container);
 
     #endregion
@@ -126,22 +163,250 @@ $@"using System;
 
     #region Methods
 
-    public async void Init(string uri)
+    public async Task Init(string uri)
+    {
+        await InitializeProjectsAsync(uri);
+        InitializeServices();
+        await WarmUpCompletionAsync();
+    }
+
+    public async Task InitializeProjectsAsync(string uri)
+    {
+        CreateProjects(uri);
+        await InitializeStaticMetadataAsync();
+        await Task.WhenAll(
+            InitializeCompletionProjectAsync(),
+            InitializeSpeculativeCompletionProjectAsync(),
+            InitializeDiagnosticProjectAsync());
+    }
+
+    public void CreateProjects(string uri)
     {
         _completionProject = new OmniSharpProject(uri);
-        await _completionProject.Init();
         _speculativeCompletionProject = new OmniSharpProject(uri);
-        await _speculativeCompletionProject.Init();
         _diagnosticProject = new OmniSharpProject(uri);
-        await _diagnosticProject.Init();
+    }
 
+    public async Task<bool> InitializeStaticMetadataAsync()
+    {
+        // BlazorWorker's result-bearing async route is materially more reliable for a
+        // browser task that crosses many JS Promise continuations than its void-Task
+        // route. Returning an explicit acknowledgement also prevents the host from
+        // advancing until the atomically published metadata generation is observable.
+        await _completionProject.InitializeStaticMetadataAsync();
+        return true;
+    }
+
+    public async Task<bool> InitializeStaticAssetsAsync()
+    {
+        await _completionProject.InitializeStaticAssetsAsync();
+        return true;
+    }
+
+    public Task ValidateStaticAssetsAsync()
+    {
+        return _completionProject.ValidateStaticAssetsAsync();
+    }
+
+    public Task InitializeCompletionProjectAsync()
+    {
+        return _completionProject.Init();
+    }
+
+    public Task InitializeSpeculativeCompletionProjectAsync()
+    {
+        return _speculativeCompletionProject.Init();
+    }
+
+    public Task InitializeDiagnosticProjectAsync()
+    {
+        return _diagnosticProject.Init();
+    }
+
+    public void InitializeServices()
+    {
         var loggerFactory = LoggerFactory.Create(configure => { });
         var formattingOptions = new OmniSharp.Options.FormattingOptions();
 
-        _completionService = new OmniSharpCompletionService(_completionProject.Workspace, formattingOptions, loggerFactory);
-        _speculativeCompletionService = new OmniSharpCompletionService(_speculativeCompletionProject.Workspace, formattingOptions, loggerFactory);
+        _completionService = new OmniSharpCompletionService(
+            _completionProject.Workspace,
+            formattingOptions,
+            loggerFactory,
+            NormalCompletionListCacheLimit);
+        _speculativeCompletionService = new OmniSharpCompletionService(
+            _speculativeCompletionProject.Workspace,
+            formattingOptions,
+            loggerFactory,
+            SpeculativeCompletionListCacheLimit);
         _signatureService = new OmniSharpSignatureHelpService(_completionProject.Workspace);
         _quickInfoProvider = new OmniSharpQuickInfoProvider(_diagnosticProject.Workspace, formattingOptions, loggerFactory);
+    }
+
+    static async Task WarmUpCompletionProjectAsync(
+        OmniSharpProject project,
+        OmniSharpCompletionService service,
+        string label)
+    {
+        try
+        {
+            var warmUpDocument = project.Workspace.CurrentSolution
+                .GetDocument(project.DocumentId)!;
+            await service.WarmUpAsync(warmUpDocument);
+        }
+        catch (Exception e)
+        {
+            // Warm-up is an optimization only; an unusual provider failure must never
+            // make the full language service unavailable.
+            Console.WriteLine(
+                $"Could not warm {label} C# completion providers: {e.Message}");
+        }
+    }
+
+    public async Task WarmUpCompletionAsync()
+    {
+        // Normal and predictive completion have deliberately isolated Roslyn workspaces.
+        // Warm both against the final full-reference generation before registration so
+        // `C` and an immediately predicted `Console.` share the same no-JIT/no-index floor.
+        await WarmUpCompletionProjectAsync(
+            _completionProject,
+            _completionService,
+            "interactive");
+        await WarmUpCompletionProjectAsync(
+            _speculativeCompletionProject,
+            _speculativeCompletionService,
+            "speculative");
+    }
+
+    public async Task<byte[]> WarmUpCurrentCompletionProjectAsync()
+    {
+        return await RunCompletionAsync(async () =>
+        {
+            // This endpoint follows the synchronized interactive project contract. The
+            // speculative lane is warmed once at startup and owns a separate gate/state;
+            // touching it here could race predictive work and compile stale source.
+            await WarmUpCompletionProjectAsync(
+                _completionProject,
+                _completionService,
+                "current interactive");
+            return Payload(true, "WarmUpCurrentCompletionProjectAsync");
+        });
+    }
+
+    public Task<byte[]> BeginMetadataHydrationAsync()
+    {
+        return BeginMetadataHydrationAsync("BeginMetadataHydrationAsync");
+    }
+
+    public Task<byte[]> BeginMetadataHydrationAsync(string responseType)
+    {
+        _completionProject.BeginBackgroundMetadataHydration(
+            CommitAndWarmHydratedMetadataAsync);
+        return GetMetadataStateAsync(ValidatedMetadataResponseType(
+            responseType,
+            "BeginMetadataHydrationAsync"));
+    }
+
+    public Task<byte[]> GetMetadataStateAsync()
+    {
+        return GetMetadataStateAsync("GetMetadataStateAsync");
+    }
+
+    public Task<byte[]> GetMetadataStateAsync(string responseType)
+    {
+        var validatedResponseType = ValidatedMetadataResponseType(
+            responseType,
+            "GetMetadataStateAsync");
+        var state = _completionProject.GetMetadataHydrationState();
+        return Task.FromResult(Payload(
+            new MetadataStateResponse(
+                state.Version,
+                state.FullyHydrated,
+                state.HydrationRunning),
+            validatedResponseType));
+    }
+
+    static string ValidatedMetadataResponseType(string? responseType, string method)
+    {
+        if (string.Equals(responseType, method, StringComparison.Ordinal))
+        {
+            return method;
+        }
+
+        var prefix = method + ":";
+        if (responseType == null ||
+            !responseType.StartsWith(prefix, StringComparison.Ordinal) ||
+            responseType.Length > prefix.Length + 32 ||
+            responseType.AsSpan(prefix.Length).IsEmpty ||
+            !responseType.AsSpan(prefix.Length).ToString().All(char.IsAsciiDigit))
+        {
+            return method;
+        }
+        return responseType;
+    }
+
+    private async Task<OmniSharpProject.MetadataHydrationCommitResult>
+        CommitAndWarmHydratedMetadataAsync(
+        Func<Task<bool>> commitMetadataAsync,
+        Func<bool> interactivePriorityRequested)
+    {
+        var committed = false;
+        if (interactivePriorityRequested())
+        {
+            return new OmniSharpProject.MetadataHydrationCommitResult(false, false);
+        }
+        await _completionGate.WaitAsync();
+        try
+        {
+            if (interactivePriorityRequested())
+            {
+                return new OmniSharpProject.MetadataHydrationCommitResult(false, false);
+            }
+            await _speculativeCompletionGate.WaitAsync();
+            try
+            {
+                if (interactivePriorityRequested())
+                {
+                    return new OmniSharpProject.MetadataHydrationCommitResult(false, false);
+                }
+                await _diagnosticGate.WaitAsync();
+                try
+                {
+                    if (interactivePriorityRequested())
+                    {
+                        return new OmniSharpProject.MetadataHydrationCommitResult(false, false);
+                    }
+                    committed = await commitMetadataAsync();
+                    if (!committed)
+                    {
+                        return new OmniSharpProject.MetadataHydrationCommitResult(false, false);
+                    }
+
+                    // The startup warm already initialized Roslyn's completion providers.
+                    // Compiling two full-reference snapshots here would monopolize the
+                    // single browser worker after readiness. Metadata is now atomically
+                    // visible to all projects; interactive demand will compile only the
+                    // snapshot it actually needs.
+                    return new OmniSharpProject.MetadataHydrationCommitResult(true, true);
+                }
+                catch (Exception e)
+                {
+                    Console.WriteLine($"Could not commit the fully hydrated C# metadata snapshot: {e.Message}");
+                    return new OmniSharpProject.MetadataHydrationCommitResult(committed, false);
+                }
+                finally
+                {
+                    _diagnosticGate.Release();
+                }
+            }
+            finally
+            {
+                _speculativeCompletionGate.Release();
+            }
+        }
+        finally
+        {
+            _completionGate.Release();
+        }
     }
 
     public async Task<byte[]> GetCompletionAsync(string code, string completionRequestString)
@@ -149,63 +414,340 @@ $@"using System;
         return await GetCompletionAsync(code, completionRequestString, string.Empty);
     }
 
+    public async Task<byte[]> SyncCompletionProjectAsync(
+        string code,
+        string projectRequestString,
+        string projectStateKey)
+    {
+        CancelCompletionProjectWarmUp();
+        return await RunCompletionAsync(async () =>
+        {
+            _ = await UpdateCompletionDocumentAsync(code, projectRequestString);
+            _completionProjectRevision = projectStateKey;
+            var response = Payload(
+                new ProjectSyncResponse(
+                    projectStateKey,
+                    _completionProject.PrimaryDocumentVersion,
+                    _completionProject.PrimaryDocumentTextLength),
+                "SyncCompletionProjectAsync");
+            ScheduleCompletionProjectWarmUp(projectStateKey);
+            return response;
+        });
+    }
+
+    public async Task<byte[]> SyncDiagnosticProjectAsync(
+        string code,
+        string projectRequestString,
+        string projectStateKey)
+    {
+        return await RunDiagnosticAsync(async () =>
+        {
+            _ = await UpdateDiagnosticDocumentAsync(code, projectRequestString);
+            return Payload(
+                new ProjectSyncResponse(
+                    projectStateKey,
+                    _diagnosticProject.PrimaryDocumentVersion,
+                    _diagnosticProject.PrimaryDocumentTextLength),
+                "SyncDiagnosticProjectAsync");
+        });
+    }
+
     public async Task<byte[]> GetCompletionAsync(string code, string completionRequestString, string projectRequestString)
     {
+        return await GetCompletionAsync(code, completionRequestString, projectRequestString, string.Empty);
+    }
+
+    public async Task<byte[]> GetCompletionAsync(
+        string code,
+        string completionRequestString,
+        string projectRequestString,
+        string completionListKey)
+    {
+        CancelCompletionProjectWarmUp();
         return await RunCompletionAsync(async () =>
         {
             var completionRequest = DeserializeRequest<CompletionRequest>(completionRequestString);
-            var document = await UpdateCompletionDocumentAsync(code, projectRequestString);
-            var completionResponse = await _completionService.Handle(completionRequest, document);
+            var hasUnversionedProjectSnapshot =
+                !string.IsNullOrWhiteSpace(projectRequestString);
+            if (hasUnversionedProjectSnapshot)
+            {
+                // This legacy overload has no revision parameter. Never retain an opaque
+                // revision that described the project before this full snapshot arrived.
+                _completionProjectRevision = string.Empty;
+            }
 
-            return Payload(completionResponse, "GetCompletionAsync");
+            var document = await UpdateCompletionDocumentAsync(code, projectRequestString);
+            var completionResponse = await _completionService.Handle(
+                completionRequest,
+                document,
+                string.IsNullOrWhiteSpace(completionListKey) ? null : completionListKey);
+
+            var response = Payload(_completionService.Compact(completionResponse), "GetCompletionAsync");
+            if (!hasUnversionedProjectSnapshot)
+            {
+                ScheduleCurrentCompletionProjectWarmUp();
+            }
+
+            return response;
+        });
+    }
+
+    public async Task<byte[]> GetCompletionAsync(
+        string code,
+        string textSyncRequestString,
+        string completionRequestString,
+        string projectRequestString,
+        string completionListKey)
+    {
+        return await GetCompletionAsync(
+            code,
+            textSyncRequestString,
+            completionRequestString,
+            projectRequestString,
+            completionListKey,
+            string.Empty);
+    }
+
+    public async Task<byte[]> GetCompletionAsync(
+        string code,
+        string textSyncRequestString,
+        string completionRequestString,
+        string projectRequestString,
+        string completionListKey,
+        string retainedCompletionListKeysString)
+    {
+        CancelCompletionProjectWarmUp();
+        return await RunCompletionAsync(async () =>
+        {
+            ReconcileCompletionLists(
+                _completionService,
+                retainedCompletionListKeysString);
+            var textSyncRequest = DeserializeRequest<CompletionTextSyncRequest>(textSyncRequestString);
+            var synchronization = await ApplyCompletionTextSyncAsync(
+                _completionProject,
+                textSyncRequest,
+                code,
+                projectRequestString,
+                _completionProjectRevision,
+                "completion");
+            if (!synchronization.Acknowledgement.Success || synchronization.Document == null)
+            {
+                return Payload(
+                    new SynchronizedCompletionResponse(synchronization.Acknowledgement, null),
+                    "GetCompletionAsync");
+            }
+
+            _completionProjectRevision = textSyncRequest.ProjectRevision;
+            var completionRequest = DeserializeRequest<CompletionRequest>(completionRequestString);
+            var completionResponse = await _completionService.Handle(
+                completionRequest,
+                synchronization.Document,
+                string.IsNullOrWhiteSpace(completionListKey) ? null : completionListKey);
+            var response = Payload(
+                new SynchronizedCompletionResponse(
+                    synchronization.Acknowledgement,
+                    _completionService.Compact(completionResponse)),
+                "GetCompletionAsync");
+            ScheduleCompletionProjectWarmUp(textSyncRequest.ProjectRevision);
+            return response;
         });
     }
 
     public async Task<byte[]> GetCompletionResolveAsync(string completionResolveRequestString)
     {
+        return await GetCompletionResolveAsync(completionResolveRequestString, string.Empty);
+    }
+
+    public async Task<byte[]> GetCompletionResolveAsync(string completionResolveRequestString, string completionListKey)
+    {
+        CancelCompletionProjectWarmUp();
         return await RunCompletionAsync(async () =>
         {
             var completionResolveRequest = DeserializeRequest<CompletionResolveRequest>(completionResolveRequestString);
             var document = _completionProject.Workspace.CurrentSolution.GetDocument(_completionProject.DocumentId)!;
-            var completionResponse = await _completionService.Handle(completionResolveRequest, document);
+            var completionResponse = await _completionService.Handle(
+                completionResolveRequest,
+                document,
+                string.IsNullOrWhiteSpace(completionListKey) ? null : completionListKey);
 
-            return Payload(completionResponse, "GetCompletionResolveAsync");
+            var response = Payload(completionResponse, "GetCompletionResolveAsync");
+            ScheduleCurrentCompletionProjectWarmUp();
+            return response;
+        });
+    }
+
+    public async Task<byte[]> GetCompletionRefilterAsync(string filterText, string completionListKey)
+    {
+        CancelCompletionProjectWarmUp();
+        return await RunCompletionAsync(() =>
+        {
+            var response = Payload(
+                _completionService.Refilter(completionListKey, filterText),
+                "GetCompletionRefilterAsync");
+            ScheduleCurrentCompletionProjectWarmUp();
+            return Task.FromResult(response);
         });
     }
 
     public async Task<byte[]> GetSpeculativeCompletionAsync(string code, string completionRequestString, string projectRequestString, string completionListKey)
     {
-        return await RunSpeculativeCompletionAsync(async () =>
+        return await RunSpeculativeCompletionAsync(
+            "GetSpeculativeCompletionAsync",
+            () => Payload(null, "GetSpeculativeCompletionAsync"),
+            async interactiveSuperseded =>
         {
             var completionRequest = DeserializeRequest<CompletionRequest>(completionRequestString);
+            if (!string.IsNullOrWhiteSpace(projectRequestString))
+            {
+                // As above, force the next synchronized speculative request to provide a
+                // full snapshot instead of accepting deltas under a stale revision marker.
+                _speculativeProjectRevision = string.Empty;
+            }
+
             var document = await UpdateSpeculativeCompletionDocumentAsync(code, projectRequestString);
+            if (interactiveSuperseded())
+            {
+                return SpeculativeCancellationPayload("GetSpeculativeCompletionAsync");
+            }
             var completionResponse = await _speculativeCompletionService.Handle(completionRequest, document, completionListKey);
 
-            return Payload(completionResponse, "GetSpeculativeCompletionAsync");
+            return Payload(_speculativeCompletionService.Compact(completionResponse), "GetSpeculativeCompletionAsync");
         });
+    }
+
+    public async Task<byte[]> GetSpeculativeCompletionAsync(
+        string code,
+        string textSyncRequestString,
+        string completionRequestString,
+        string projectRequestString,
+        string completionListKey)
+    {
+        return await GetSpeculativeCompletionAsync(
+            code,
+            textSyncRequestString,
+            completionRequestString,
+            projectRequestString,
+            completionListKey,
+            string.Empty);
+    }
+
+    public async Task<byte[]> GetSpeculativeCompletionAsync(
+        string code,
+        string textSyncRequestString,
+        string completionRequestString,
+        string projectRequestString,
+        string completionListKey,
+        string retainedCompletionListKeysString)
+    {
+        return await RunSpeculativeCompletionAsync(
+            "GetSpeculativeCompletionAsync",
+            () => SpeculativeCancellationPayload("GetSpeculativeCompletionAsync"),
+            async interactiveSuperseded =>
+        {
+            ReconcileCompletionLists(
+                _speculativeCompletionService,
+                retainedCompletionListKeysString);
+            var textSyncRequest = DeserializeRequest<CompletionTextSyncRequest>(textSyncRequestString);
+            var synchronization = await ApplyCompletionTextSyncAsync(
+                _speculativeCompletionProject,
+                textSyncRequest,
+                code,
+                projectRequestString,
+                _speculativeProjectRevision,
+                "speculative completion");
+            if (!synchronization.Acknowledgement.Success || synchronization.Document == null)
+            {
+                return Payload(
+                    new SynchronizedCompletionResponse(synchronization.Acknowledgement, null),
+                    "GetSpeculativeCompletionAsync");
+            }
+
+            _speculativeProjectRevision = textSyncRequest.ProjectRevision;
+            if (interactiveSuperseded())
+            {
+                return SpeculativeCancellationPayload(
+                    "GetSpeculativeCompletionAsync",
+                    synchronization.Acknowledgement);
+            }
+            var completionRequest = DeserializeRequest<CompletionRequest>(completionRequestString);
+            var completionResponse = await _speculativeCompletionService.Handle(
+                completionRequest,
+                synchronization.Document,
+                completionListKey);
+            return Payload(
+                new SynchronizedCompletionResponse(
+                    synchronization.Acknowledgement,
+                    _speculativeCompletionService.Compact(completionResponse)),
+                "GetSpeculativeCompletionAsync");
+        });
+    }
+
+    void ReconcileCompletionLists(
+        OmniSharpCompletionService service,
+        string retainedCompletionListKeysString)
+    {
+        if (string.IsNullOrWhiteSpace(retainedCompletionListKeysString))
+        {
+            return;
+        }
+
+        var retainedKeys = DeserializeRequest<string[]>(retainedCompletionListKeysString)
+            .Where(key => !string.IsNullOrWhiteSpace(key) && key.Length <= 2048)
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+        service.ReconcileCompletionLists(retainedKeys);
     }
 
     public async Task<byte[]> GetSpeculativeCompletionResolveAsync(string completionResolveRequestString, string completionListKey)
     {
-        return await RunSpeculativeCompletionAsync(async () =>
+        return await RunSpeculativeCompletionAsync(
+            "GetSpeculativeCompletionResolveAsync",
+            () => SpeculativeCancellationPayload("GetSpeculativeCompletionResolveAsync"),
+            async interactiveSuperseded =>
         {
             var completionResolveRequest = DeserializeRequest<CompletionResolveRequest>(completionResolveRequestString);
             var document = _speculativeCompletionProject.Workspace.CurrentSolution.GetDocument(_speculativeCompletionProject.DocumentId)!;
+            if (interactiveSuperseded())
+            {
+                return SpeculativeCancellationPayload("GetSpeculativeCompletionResolveAsync");
+            }
             var completionResponse = await _speculativeCompletionService.Handle(completionResolveRequest, document, completionListKey);
 
             return Payload(completionResponse, "GetSpeculativeCompletionResolveAsync");
         });
     }
 
+    public async Task<byte[]> GetSpeculativeCompletionRefilterAsync(string filterText, string completionListKey)
+    {
+        return await RunSpeculativeCompletionAsync(
+            "GetSpeculativeCompletionRefilterAsync",
+            () => SpeculativeCancellationPayload("GetSpeculativeCompletionRefilterAsync"),
+            interactiveSuperseded =>
+            Task.FromResult(interactiveSuperseded()
+                ? SpeculativeCancellationPayload("GetSpeculativeCompletionRefilterAsync")
+                : Payload(
+                    _speculativeCompletionService.Refilter(completionListKey, filterText),
+                    "GetSpeculativeCompletionRefilterAsync")));
+    }
+
+    public Task<byte[]> CancelSpeculativeCompletionAsync()
+    {
+        SignalInteractiveRequest();
+        return Task.FromResult(Payload(true, "CancelSpeculativeCompletionAsync"));
+    }
+
     public async Task<byte[]> GetSignatureHelpAsync(string code, string signatureHelpRequestString)
     {
+        CancelCompletionProjectWarmUp();
         return await RunCompletionAsync(async () =>
         {
             var signatureHelpRequest = DeserializeRequest<SignatureHelpRequest>(signatureHelpRequestString);
             var document = await UpdateDocumentAsync(_completionProject, code);
             var signatureHelpResponse = await _signatureService.Handle(signatureHelpRequest, document);
 
-            return Payload(signatureHelpResponse, "GetSignatureHelpAsync");
+            var response = Payload(signatureHelpResponse, "GetSignatureHelpAsync");
+            ScheduleCurrentCompletionProjectWarmUp();
+            return response;
         });
     }
 
@@ -245,17 +787,18 @@ $@"using System;
 
     public async Task<byte[]> GetDiagnosticsAsync(string code, string diagnosticRequestString)
     {
-        return await RunDiagnosticAsync(async () =>
+        return await RunBackgroundDiagnosticAsync("GetDiagnosticsAsync", async cancellationToken =>
         {
             var document = await UpdateDiagnosticDocumentAsync(code, diagnosticRequestString);
-            var semanticModel = await document.GetSemanticModelAsync();
+            cancellationToken.ThrowIfCancellationRequested();
+            var semanticModel = await document.GetSemanticModelAsync(cancellationToken);
             if (semanticModel == null)
             {
                 return Payload(Array.Empty<DiagnosticDto>(), "GetDiagnosticsAsync");
             }
 
             var diagnostics = semanticModel
-                .GetDiagnostics()
+                .GetDiagnostics(cancellationToken: cancellationToken)
                 .Select(ToDiagnosticDto)
                 .Where(current => current != null)
                 .Cast<DiagnosticDto>()
@@ -347,9 +890,15 @@ $@"using System;
             }
 
             var distinct = references
-                .GroupBy(location => $"{location.Range.Start.Line}:{location.Range.Start.Character}:{location.Range.End.Line}:{location.Range.End.Character}")
+                .GroupBy(location => (
+                    location.Path,
+                    location.Range.Start.Line,
+                    location.Range.Start.Character,
+                    location.Range.End.Line,
+                    location.Range.End.Character))
                 .Select(group => group.First())
-                .OrderBy(location => location.Range.Start.Line)
+                .OrderBy(location => location.Path, StringComparer.Ordinal)
+                .ThenBy(location => location.Range.Start.Line)
                 .ThenBy(location => location.Range.Start.Character)
                 .ToArray();
 
@@ -421,9 +970,15 @@ $@"using System;
             }
 
             var distinct = edits
-                .GroupBy(edit => $"{edit.Range.Start.Line}:{edit.Range.Start.Character}:{edit.Range.End.Line}:{edit.Range.End.Character}")
+                .GroupBy(edit => (
+                    edit.Path,
+                    edit.Range.Start.Line,
+                    edit.Range.Start.Character,
+                    edit.Range.End.Line,
+                    edit.Range.End.Character))
                 .Select(group => group.First())
-                .OrderByDescending(edit => edit.Range.Start.Line)
+                .OrderBy(edit => edit.Path, StringComparer.Ordinal)
+                .ThenByDescending(edit => edit.Range.Start.Line)
                 .ThenByDescending(edit => edit.Range.Start.Character)
                 .ToArray();
 
@@ -572,7 +1127,10 @@ $@"using System;
 
     public async Task<byte[]> IncludeNamespaceAsync(string namespaceName)
     {
+        CancelCompletionProjectWarmUp();
+        SignalInteractiveRequest();
         await _completionGate.WaitAsync();
+        CancelCompletionProjectWarmUp();
         await _speculativeCompletionGate.WaitAsync();
         await _diagnosticGate.WaitAsync();
         try
@@ -600,7 +1158,9 @@ $@"using System;
                     : diagnosticResult.Message
             };
 
-            return Payload(response, "IncludeNamespaceAsync");
+            var payload = Payload(response, "IncludeNamespaceAsync");
+            ScheduleCurrentCompletionProjectWarmUp();
+            return payload;
         }
         finally
         {
@@ -612,9 +1172,13 @@ $@"using System;
 
     async Task<byte[]> RunCompletionAsync(Func<Task<byte[]>> action)
     {
+        SignalInteractiveRequest();
         await _completionGate.WaitAsync();
         try
         {
+            // Close the race where the prior gate owner schedules an idle warm after this
+            // request's pre-gate cancellation but before this request acquires the gate.
+            CancelCompletionProjectWarmUp();
             return await action();
         }
         finally
@@ -623,12 +1187,49 @@ $@"using System;
         }
     }
 
-    async Task<byte[]> RunSpeculativeCompletionAsync(Func<Task<byte[]>> action)
+    void ScheduleCurrentCompletionProjectWarmUp()
     {
+        var projectRevision = _completionProjectRevision;
+        if (!string.IsNullOrWhiteSpace(projectRevision))
+        {
+            ScheduleCompletionProjectWarmUp(projectRevision);
+        }
+    }
+
+    void ScheduleCompletionProjectWarmUp(string projectRevision)
+    {
+        // Browser WASM is single-threaded. Once Roslyn starts a CPU-heavy project warm,
+        // the worker cannot even receive the keystroke that would cancel it. Provider and
+        // framework caches are warmed before readiness; project compilation stays strictly
+        // demand-driven so optional work can never sit ahead of an interactive request.
+    }
+
+    void CancelCompletionProjectWarmUp()
+    {
+        // See ScheduleCompletionProjectWarmUp. Kept as a no-op at call sites so request
+        // ordering remains explicit if a truly preemptible worker is introduced later.
+    }
+
+    async Task<byte[]> RunSpeculativeCompletionAsync(
+        string responseType,
+        Func<byte[]> cancelledResponse,
+        Func<Func<bool>, Task<byte[]>> action)
+    {
+        var acceptedInteractiveEpoch = Volatile.Read(ref _interactiveRequestEpoch);
+        _completionProject.RequestInteractivePriority();
         await _speculativeCompletionGate.WaitAsync();
         try
         {
-            return await action();
+            bool InteractiveSuperseded() =>
+                acceptedInteractiveEpoch != Volatile.Read(ref _interactiveRequestEpoch);
+            // A normal completion/diagnostic accepted after this speculative call was
+            // queued wins permanently. Do not enter Handle(), which would create a fresh
+            // CTS and accidentally resurrect the already-cancelled Roslyn preload.
+            if (InteractiveSuperseded())
+            {
+                return cancelledResponse();
+            }
+            return await action(InteractiveSuperseded);
         }
         finally
         {
@@ -636,8 +1237,30 @@ $@"using System;
         }
     }
 
+    byte[] SpeculativeCancellationPayload(
+        string responseType,
+        CompletionTextSyncAck? synchronization = null)
+    {
+        if (responseType.Equals("GetSpeculativeCompletionAsync", StringComparison.Ordinal))
+        {
+            synchronization ??= new CompletionTextSyncAck(
+                false,
+                false,
+                _speculativeCompletionProject.PrimaryDocumentVersion,
+                _speculativeCompletionProject.PrimaryDocumentTextLength,
+                _speculativeProjectRevision,
+                "Speculative completion was superseded by interactive authoring work.");
+            return Payload(
+                new SynchronizedCompletionResponse(synchronization, null, true),
+                responseType);
+        }
+
+        return Payload(new SpeculativeCancellationResponse(true), responseType);
+    }
+
     async Task<byte[]> RunDiagnosticAsync(Func<Task<byte[]>> action)
     {
+        SignalInteractiveRequest();
         await _diagnosticGate.WaitAsync();
         try
         {
@@ -649,9 +1272,212 @@ $@"using System;
         }
     }
 
-    Task<Document> UpdateDocumentAsync(OmniSharpProject project, string code)
+    async Task<byte[]> RunBackgroundDiagnosticAsync(
+        string responseType,
+        Func<CancellationToken, Task<byte[]>> action)
     {
-        return project.UpdateDocumentAsync(code);
+        var acceptedInteractiveEpoch = Volatile.Read(ref _interactiveRequestEpoch);
+        await _diagnosticGate.WaitAsync();
+        if (acceptedInteractiveEpoch != Volatile.Read(ref _interactiveRequestEpoch))
+        {
+            _diagnosticGate.Release();
+            return Payload(new BackgroundDiagnosticCancellationResponse(true), responseType);
+        }
+
+        var cancellation = new CancellationTokenSource();
+        Interlocked.Exchange(ref _backgroundDiagnosticCancellation, cancellation)?.Dispose();
+        try
+        {
+            return await action(cancellation.Token);
+        }
+        catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
+        {
+            return Payload(new BackgroundDiagnosticCancellationResponse(true), responseType);
+        }
+        finally
+        {
+            Interlocked.CompareExchange(
+                ref _backgroundDiagnosticCancellation,
+                null,
+                cancellation);
+            cancellation.Dispose();
+            _diagnosticGate.Release();
+        }
+    }
+
+    void SignalInteractiveRequest()
+    {
+        Interlocked.Increment(ref _interactiveRequestEpoch);
+        _completionProject.RequestInteractivePriority();
+        _speculativeCompletionService?.CancelPendingRequest();
+        try
+        {
+            Volatile.Read(ref _backgroundDiagnosticCancellation)?.Cancel();
+        }
+        catch (ObjectDisposedException)
+        {
+            // The diagnostic continuation may have completed on this synchronization context.
+        }
+    }
+
+    async Task<CompletionTextSyncApplication> ApplyCompletionTextSyncAsync(
+        OmniSharpProject project,
+        CompletionTextSyncRequest request,
+        string code,
+        string projectRequestString,
+        string currentProjectRevision,
+        string label)
+    {
+        CompletionTextSyncApplication Failure(string message, bool requiresFullSync = true)
+        {
+            return new CompletionTextSyncApplication(
+                new CompletionTextSyncAck(
+                    false,
+                    requiresFullSync,
+                    project.PrimaryDocumentVersion,
+                    project.PrimaryDocumentTextLength,
+                    currentProjectRevision,
+                    message),
+                null);
+        }
+
+        if (string.IsNullOrWhiteSpace(request.ProjectRevision))
+        {
+            return Failure("A project revision is required for synchronized completion.", false);
+        }
+
+        if (request.ExpectedNewTextLength < 0)
+        {
+            return Failure("The synchronized completion target length is invalid.", false);
+        }
+
+        if (request.FullSync)
+        {
+            if (code.Length != request.ExpectedNewTextLength)
+            {
+                return Failure(
+                    $"The full {label} text length did not match its synchronization request.",
+                    false);
+            }
+
+            Document document;
+            if (!string.IsNullOrWhiteSpace(projectRequestString))
+            {
+                document = await UpdateCompletionDocumentAsync(
+                    project,
+                    code,
+                    projectRequestString,
+                    label);
+            }
+            else
+            {
+                if (!string.Equals(
+                        currentProjectRevision,
+                        request.ProjectRevision,
+                        StringComparison.Ordinal))
+                {
+                    return Failure(
+                        $"The {label} project revision changed; resend the full project snapshot.");
+                }
+
+                document = await project.UpdateDocumentAsync(code);
+                await project.EnsureReferencesForDocumentAsync(document, scanAll: true);
+                document = project.Workspace.CurrentSolution.GetDocument(project.DocumentId)
+                    ?? throw new InvalidOperationException($"The {label} document disappeared after reference promotion.");
+            }
+
+            return new CompletionTextSyncApplication(
+                new CompletionTextSyncAck(
+                    true,
+                    false,
+                    project.PrimaryDocumentVersion,
+                    project.PrimaryDocumentTextLength,
+                    request.ProjectRevision,
+                    null),
+                document);
+        }
+
+        if (!string.IsNullOrEmpty(code) || !string.IsNullOrWhiteSpace(projectRequestString))
+        {
+            return Failure(
+                $"Incremental {label} synchronization must not include full text or a project snapshot.",
+                false);
+        }
+
+        if (!string.Equals(currentProjectRevision, request.ProjectRevision, StringComparison.Ordinal))
+        {
+            return Failure($"The {label} project revision changed.");
+        }
+
+        if (request.Changes == null)
+        {
+            return Failure($"Incremental {label} synchronization requires text changes.");
+        }
+
+        long proposedLength = request.ExpectedOldTextLength;
+        foreach (var change in request.Changes)
+        {
+            if (change == null || change.NewText == null)
+            {
+                return Failure($"Incremental {label} synchronization contains a null text change.");
+            }
+
+            proposedLength += (long)change.NewText.Length - change.Length;
+            if (proposedLength is < 0 or > int.MaxValue)
+            {
+                return Failure($"Incremental {label} synchronization would create an invalid text length.");
+            }
+        }
+
+        if (proposedLength != request.ExpectedNewTextLength)
+        {
+            return Failure($"Incremental {label} synchronization predicted the wrong target length.");
+        }
+
+        var update = await project.TryUpdatePrimaryDocumentAsync(
+            request.ExpectedVersion,
+            request.ExpectedOldTextLength,
+            request.Changes);
+        if (!update.Success || update.Document == null)
+        {
+            return new CompletionTextSyncApplication(
+                new CompletionTextSyncAck(
+                    false,
+                    update.RequiresFullSync,
+                    update.Version,
+                    update.TextLength,
+                    currentProjectRevision,
+                    update.Message),
+                null);
+        }
+
+        if (update.TextLength != request.ExpectedNewTextLength)
+        {
+            throw new InvalidOperationException(
+                $"Incremental {label} synchronization produced an unexpected text length.");
+        }
+
+        await project.EnsureReferencesForDocumentAsync(update.Document);
+        var synchronizedDocument = project.Workspace.CurrentSolution.GetDocument(project.DocumentId)
+            ?? throw new InvalidOperationException($"The {label} document disappeared after reference promotion.");
+
+        return new CompletionTextSyncApplication(
+            new CompletionTextSyncAck(
+                true,
+                false,
+                update.Version,
+                update.TextLength,
+                request.ProjectRevision,
+                null),
+            synchronizedDocument);
+    }
+
+    async Task<Document> UpdateDocumentAsync(OmniSharpProject project, string code)
+    {
+        var document = await project.UpdateDocumentAsync(code);
+        await project.EnsureReferencesForDocumentAsync(document);
+        return project.Workspace.CurrentSolution.GetDocument(project.DocumentId)
+            ?? throw new InvalidOperationException("The OmniSharp document disappeared after reference promotion.");
     }
 
     Task<Document> UpdateCompletionDocumentAsync(string code, string projectRequestString)
@@ -664,11 +1490,11 @@ $@"using System;
         return UpdateCompletionDocumentAsync(_speculativeCompletionProject, code, projectRequestString, "speculative completion");
     }
 
-    Task<Document> UpdateCompletionDocumentAsync(OmniSharpProject project, string code, string projectRequestString, string label)
+    async Task<Document> UpdateCompletionDocumentAsync(OmniSharpProject project, string code, string projectRequestString, string label)
     {
         if (string.IsNullOrWhiteSpace(projectRequestString))
         {
-            return project.UpdateDocumentAsync(code);
+            return await UpdateDocumentAsync(project, code);
         }
 
         try
@@ -678,20 +1504,22 @@ $@"using System;
                 .Where(file => !string.IsNullOrWhiteSpace(file.Path))
                 .Select(file => new OmniSharpProject.SourceFileSnapshot(file.Path, file.Content ?? string.Empty))
                 .ToArray();
-            return project.UpdateProjectDocumentsAsync(code, request.CurrentPath, files);
+            var document = await project.UpdateProjectDocumentsAsync(code, request.CurrentPath, files);
+            await project.EnsureReferencesForProjectAsync(document.Project);
+            return project.Workspace.CurrentSolution.GetDocument(project.DocumentId)
+                ?? throw new InvalidOperationException($"The {label} document disappeared after reference promotion.");
         }
         catch (Exception e)
         {
-            Console.WriteLine($"Could not deserialize {label} project snapshot: {e.Message}");
-            return project.UpdateDocumentAsync(code);
+            throw new InvalidOperationException($"Could not apply the {label} project snapshot.", e);
         }
     }
 
-    Task<Document> UpdateDiagnosticDocumentAsync(string code, string diagnosticRequestString)
+    async Task<Document> UpdateDiagnosticDocumentAsync(string code, string diagnosticRequestString)
     {
         if (string.IsNullOrWhiteSpace(diagnosticRequestString))
         {
-            return _diagnosticProject.UpdateDocumentAsync(code);
+            return await UpdateDocumentAsync(_diagnosticProject, code);
         }
 
         try
@@ -701,12 +1529,18 @@ $@"using System;
                 .Where(file => !string.IsNullOrWhiteSpace(file.Path))
                 .Select(file => new OmniSharpProject.SourceFileSnapshot(file.Path, file.Content ?? string.Empty))
                 .ToArray();
-            return _diagnosticProject.UpdateProjectDocumentsAsync(code, request.CurrentPath, files);
+            var document = await _diagnosticProject.UpdateProjectDocumentsAsync(
+                code,
+                request.CurrentPath,
+                files);
+            await _diagnosticProject.EnsureReferencesForProjectAsync(document.Project);
+            return _diagnosticProject.Workspace.CurrentSolution.GetDocument(_diagnosticProject.DocumentId)
+                ?? throw new InvalidOperationException(
+                    "The diagnostic document disappeared after reference promotion.");
         }
         catch (Exception e)
         {
-            Console.WriteLine($"Could not deserialize diagnostic project snapshot: {e.Message}");
-            return _diagnosticProject.UpdateDocumentAsync(code);
+            throw new InvalidOperationException("Could not apply the diagnostic project snapshot.", e);
         }
     }
 
@@ -1356,13 +2190,16 @@ $@"using System;
     MonacoTextEdit? ToRenameEdit(Location location, Document currentDocument, string newName)
     {
         var document = currentDocument.Project.Solution.GetDocument(location.SourceTree);
-        if (document == null || document.Id != currentDocument.Id)
+        if (document == null)
         {
             return null;
         }
 
         var text = document.GetTextAsync().Result;
-        return new MonacoTextEdit(ToRange(text, location.SourceSpan), newName);
+        var path = document.Id == currentDocument.Id
+            ? null
+            : NormalizeLocationPath(document.FilePath);
+        return new MonacoTextEdit(ToRange(text, location.SourceSpan), newName, path);
     }
 
     async Task<string?> FindNamespaceForMissingSymbolAsync(Project project, string symbolName)
@@ -1570,7 +2407,38 @@ $@"using System;
 
     byte[] Payload(object? payload, string type)
     {
-        return Encoding.UTF8.GetBytes(JsonSerializer.Serialize(new ResponsePayload(payload, type), jsonOptions));
+        return Encoding.UTF8.GetBytes(JsonSerializer.Serialize(
+            new ResponsePayload(payload, type, GetResponseMetadataVersion(type)),
+            jsonOptions));
+    }
+
+    int GetResponseMetadataVersion(string responseType)
+    {
+        if (responseType.Equals("IncludeNamespaceAsync", StringComparison.Ordinal))
+        {
+            return Math.Min(
+                _completionProject.AppliedMetadataVersion,
+                Math.Min(
+                    _speculativeCompletionProject.AppliedMetadataVersion,
+                    _diagnosticProject.AppliedMetadataVersion));
+        }
+
+        if (responseType.StartsWith("GetSpeculativeCompletion", StringComparison.Ordinal))
+        {
+            return _speculativeCompletionProject.AppliedMetadataVersion;
+        }
+
+        if (responseType.StartsWith("GetCompletion", StringComparison.Ordinal) ||
+            responseType.Equals("SyncCompletionProjectAsync", StringComparison.Ordinal) ||
+            responseType.Equals("WarmUpCurrentCompletionProjectAsync", StringComparison.Ordinal) ||
+            responseType.Equals("GetSignatureHelpAsync", StringComparison.Ordinal) ||
+            responseType.StartsWith("BeginMetadataHydrationAsync", StringComparison.Ordinal) ||
+            responseType.StartsWith("GetMetadataStateAsync", StringComparison.Ordinal))
+        {
+            return _completionProject.AppliedMetadataVersion;
+        }
+
+        return _diagnosticProject.AppliedMetadataVersion;
     }
 
     #endregion

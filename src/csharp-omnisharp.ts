@@ -28,8 +28,24 @@ class CSharpOmniSharpBridgeError extends Error {
   }
 }
 
+class CSharpObsoleteSemanticResponseError extends Error {
+  readonly reason: string;
+
+  constructor(reason: string) {
+    // Monaco recognizes this exact Error shape as cancellation and suppresses the
+    // expected provider rejection. Keep the richer reason for our debug snapshots.
+    super('Canceled');
+    this.name = 'Canceled';
+    this.reason = reason;
+  }
+}
+
+function rethrowObsoleteCSharpSemanticResponse(error: unknown): void {
+  if (error instanceof CSharpObsoleteSemanticResponseError) throw error;
+}
+
 const CSHARP_OMNISHARP_URLS: Record<CSharpOmniSharpSource, string> = {
-  local: '/omnisharp/index.html',
+  local: new URL('omnisharp/index.html', document.baseURI).href,
 };
 
 function normalizeCSharpOmniSharpSource(source: unknown): CSharpOmniSharpSource {
@@ -40,6 +56,37 @@ function isCSharpOmniSharpBridgeErrorPayload(value: unknown): value is CSharpOmn
   return !!value
     && typeof value === 'object'
     && (value as { __codecraftOmniSharpError?: unknown }).__codecraftOmniSharpError === true;
+}
+
+function csharpOmniSharpMetadataVersion(value: unknown): number | null {
+  return Number.isSafeInteger(value) && (value as number) >= 0 ? value as number : null;
+}
+
+function csharpOmniSharpResponseMetadataVersion(value: unknown): number | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  return csharpOmniSharpMetadataVersion((value as { metadataVersion?: unknown }).metadataVersion);
+}
+
+function csharpOmniSharpMetadataNotificationVersion(value: unknown): number | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const outer = value as Record<string, unknown>;
+  if (
+    Object.keys(outer).length !== 1 ||
+    !Object.prototype.hasOwnProperty.call(outer, 'omnisharpMetadataChanged')
+  ) {
+    return null;
+  }
+
+  const notification = outer.omnisharpMetadataChanged;
+  if (!notification || typeof notification !== 'object' || Array.isArray(notification)) return null;
+  const fields = notification as Record<string, unknown>;
+  if (
+    Object.keys(fields).length !== 1 ||
+    !Object.prototype.hasOwnProperty.call(fields, 'version')
+  ) {
+    return null;
+  }
+  return csharpOmniSharpMetadataVersion(fields.version);
 }
 
 export function getCSharpOmniSharpUrl(source: CSharpOmniSharpSource) {
@@ -53,6 +100,7 @@ export interface CSharpProjectFileSnapshot {
 }
 
 type CSharpProjectFilesProvider = () => CSharpProjectFileSnapshot[];
+type CSharpProjectFilesRevisionProvider = () => unknown;
 
 interface CSharpDiagnosticProjectRequest {
   CurrentPath: string;
@@ -68,10 +116,16 @@ interface CSharpCompletionCacheEntry {
   incomplete?: boolean;
   completionSnapshot?: CSharpCompletionRequestSnapshot;
   lateContext?: CSharpLateCompletionContext | null;
+  renderedFilterRange?: monaco.IRange;
+  presentationFilterRange?: monaco.IRange;
+  preselectedCompletionIndices?: ReadonlySet<number>;
+  sessionReusable?: boolean;
+  completionList?: { key: string; speculative: boolean };
 }
 
 interface CSharpCompletionRequestSnapshot {
   code: string;
+  hash: string;
   modelVersionId: number;
   offset: number;
   structuralVersion: number;
@@ -96,10 +150,42 @@ interface CSharpSerializedProjectRequest {
   serialized: string;
   fileKey: string;
   currentPath: string;
+  revision: string;
+}
+
+interface CSharpCompletionTextSyncRequest {
+  FullSync: boolean;
+  ExpectedVersion: number;
+  ExpectedOldTextLength: number;
+  ExpectedNewTextLength: number;
+  ProjectRevision: string;
+  Changes: Array<{
+    Start: number;
+    Length: number;
+    NewText: string;
+  }>;
+}
+
+interface CSharpCompletionTextState {
+  runtimeSession: number;
+  projectRevision: string;
+  version: number;
+  length: number;
+  code: string;
+}
+
+interface CSharpCompletionTextSyncAck {
+  success?: unknown;
+  requiresFullSync?: unknown;
+  version?: unknown;
+  textLength?: unknown;
+  projectRevision?: unknown;
+  message?: unknown;
 }
 
 interface CSharpPredictiveCompletionSource {
   modelUri: string;
+  projectRevision: string;
   projectFileKey: string;
   environmentVersion: number;
   suggestions: monaco.languages.CompletionItem[];
@@ -109,12 +195,14 @@ interface CSharpPredictiveCompletionSource {
 interface CSharpPredictiveCompletionCacheEntry {
   response: unknown;
   completionListKey: string;
+  code: string;
   codeHash: string;
   offset: number;
   candidate: string;
   prefix: string;
   assumedText: string;
   projectCurrentPath: string;
+  projectRevision: string;
   projectFileKey: string;
   itemCount: number;
   createdAt: number;
@@ -155,6 +243,7 @@ export interface CSharpCompletionPreloadPlanSnapshot {
   column: number;
   completionTrigger: unknown;
   projectCurrentPath: string;
+  projectRevision: string;
   projectFileKey: string;
   projectFileCount: number;
 }
@@ -180,6 +269,7 @@ export interface CSharpCompletionPreloadRequestSnapshot extends CSharpCompletion
 export interface CSharpCompletionPreloadSourceSnapshot {
   modelUri: string;
   modelPath: string;
+  projectRevision: string;
   projectFileKey: string;
   environmentVersion: number;
   suggestionCount: number;
@@ -195,6 +285,7 @@ export interface CSharpCompletionPreloadCacheEntrySnapshot {
   prefix: string;
   assumedText: string;
   projectCurrentPath: string;
+  projectRevision: string;
   projectFileKey: string;
   itemCount: number;
   ageMs: number;
@@ -202,6 +293,7 @@ export interface CSharpCompletionPreloadCacheEntrySnapshot {
 
 export type CSharpCompletionPreloadLookupOutcome =
   | 'normal-cache-hit'
+  | 'session-cache-hit'
   | 'predictive-hit'
   | 'predictive-miss'
   | 'predictive-empty'
@@ -225,6 +317,7 @@ export interface CSharpCompletionPreloadLookupSnapshot {
   contextTriggerKind: number;
   contextTriggerCharacter?: string;
   projectCurrentPath: string;
+  projectRevision: string;
   projectFileKey: string;
   predictiveCacheSize: number;
   activePlanKey: string | null;
@@ -344,8 +437,10 @@ export interface CSharpIdeDebugSnapshot {
   };
   cache: {
     completionCacheSize: number;
+    completionSessionCacheSize: number;
     predictiveCompletionCacheSize: number;
     predictiveCompletionActivePlan: boolean;
+    omnisharpMetadataVersion: number | null;
     completionEnvironmentVersion: number;
     completionWorkerStateKey: string | null;
     diagnosticCacheKey: string | null;
@@ -362,13 +457,20 @@ export interface CSharpIdeDebugOptions {
   onDidChange?: (snapshot: CSharpIdeDebugSnapshot) => void;
 }
 
-const CSHARP_COMPLETION_CACHE_LIMIT = 32;
+// Keep every browser-side list-bearing cache within the keyed Roslyn LRU capacity.
+// A larger JS cache would only retain entries whose resolve/refilter state was already
+// evicted in WASM, guaranteeing a slow full-completion retry when revisited.
+const CSHARP_COMPLETION_CACHE_LIMIT = 6;
+const CSHARP_COMPLETION_SESSION_CACHE_LIMIT = 6;
 const CSHARP_PREDICTIVE_COMPLETION_CACHE_LIMIT = 4;
 const CSHARP_PREDICTIVE_COMPLETION_DELAY_MS = 35;
+const CSHARP_CONTEXT_COMPLETION_PREWARM_DELAY_MS = 35;
 const CSHARP_RUNTIME_RESPONSE_CACHE_LIMIT = 64;
+const CSHARP_OMNISHARP_INITIALIZATION_STALL_TIMEOUT_MS = 300_000;
 const CSHARP_DEBUG_EVENT_LIMIT = 500;
 const CSHARP_DEBUG_FEATURE_EVENT_LIMIT = 120;
 const CSHARP_STALE_COMPLETION_RESPONSE = Symbol('stale-csharp-completion-response');
+type CSharpCompletionPrewarmOutcome = 'completed' | 'superseded' | 'failed';
 
 interface CSharpIdeDebugFeatureDescriptor {
   key: string;
@@ -747,14 +849,17 @@ function hashString(value: string): string {
 }
 
 function stableCacheKey(value: unknown): string {
-  if (value == null || typeof value === 'number' || typeof value === 'boolean') return String(value);
-  if (typeof value === 'string') return value.length > 160 ? `${value.length}:${hashString(value)}` : value;
-  if (Array.isArray(value)) return `[${value.map(stableCacheKey).join(',')}]`;
+  if (value === null) return 'null';
+  if (typeof value === 'undefined') return 'undefined';
+  if (typeof value === 'number') return `number:${Object.is(value, -0) ? '-0' : String(value)}`;
+  if (typeof value === 'boolean') return `boolean:${value}`;
+  if (typeof value === 'string') return `string:${JSON.stringify(value)}`;
+  if (Array.isArray(value)) return `array:[${value.map(stableCacheKey).join(',')}]`;
   if (typeof value === 'object') {
     const record = value as Record<string, unknown>;
-    return `{${Object.keys(record).sort().map(key => `${key}:${stableCacheKey(record[key])}`).join(',')}}`;
+    return `object:{${Object.keys(record).sort().map(key => `${JSON.stringify(key)}:${stableCacheKey(record[key])}`).join(',')}}`;
   }
-  return typeof value;
+  return `${typeof value}:${String(value)}`;
 }
 
 function countLines(value: string) {
@@ -825,7 +930,7 @@ function currentModelPath(model: monaco.editor.ITextModel) {
 // CodeCraft C# OmniSharp-only completion start
 const CSHARP_CONTEXTUAL_COMPLETION_FIX_VERSION = '2026-06-01-bracket-trigger-guard';
 
-const CSHARP_CONTEXTUAL_COMPLETION_TRIGGER_CHARACTERS = [',', ' ', '#', ':', '=', '?', '@'];
+const CSHARP_CONTEXTUAL_COMPLETION_TRIGGER_CHARACTERS = ['.', ',', ' ', '#', ':', '=', '?', '@'];
 
 const CSHARP_LSP_COMPLETION_KIND_TO_MONACO = new Map<number, monaco.languages.CompletionItemKind>([
   [1, monaco.languages.CompletionItemKind.Text],
@@ -884,12 +989,18 @@ const CSHARP_COMPLETION_KIND_NAME_TO_MONACO = new Map<string, monaco.languages.C
   ['typeparameter', monaco.languages.CompletionItemKind.TypeParameter],
 ]);
 
-const csharpCompletionInflightByService = new WeakMap<object, Map<string, Promise<CSharpCompletionCacheEntry | null>>>();
+interface CSharpCompletionInflightEntry {
+  requestSerial: number;
+  promise: Promise<CSharpCompletionCacheEntry | null>;
+}
+
+const csharpCompletionInflightByService = new WeakMap<object, Map<string, CSharpCompletionInflightEntry>>();
+const csharpDecodedCompactCompletionItems = new WeakMap<object, any[]>();
 
 function csharpCompletionInflightFor(service: object) {
   let inflight = csharpCompletionInflightByService.get(service);
   if (!inflight) {
-    inflight = new Map<string, Promise<CSharpCompletionCacheEntry | null>>();
+    inflight = new Map<string, CSharpCompletionInflightEntry>();
     csharpCompletionInflightByService.set(service, inflight);
   }
   return inflight;
@@ -898,6 +1009,18 @@ function csharpCompletionInflightFor(service: object) {
 function csharpCompletionFastHash(value: string): string {
   let hash = 2166136261;
   for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(36);
+}
+
+function csharpCompletionFastHashWithoutSpan(value: string, start: number, end: number): string {
+  const safeStart = Math.max(0, Math.min(value.length, start));
+  const safeEnd = Math.max(safeStart, Math.min(value.length, end));
+  let hash = 2166136261;
+  for (let index = 0; index < value.length; index += 1) {
+    if (index >= safeStart && index < safeEnd) continue;
     hash ^= value.charCodeAt(index);
     hash = Math.imul(hash, 16777619);
   }
@@ -921,7 +1044,67 @@ function csharpCompletionLabel(item: any): string {
   ) ?? '';
 }
 
+function csharpCompactCompletionRange(value: unknown): any | undefined {
+  if (!Array.isArray(value) || value.length !== 4 || !value.every(Number.isFinite)) return undefined;
+  return {
+    startLine: value[0],
+    startColumn: value[1],
+    endLine: value[2],
+    endColumn: value[3],
+  };
+}
+
+function csharpCompactCompletionItems(response: any): any[] | null {
+  if (!response || typeof response !== 'object' || response.v !== 1 || !Array.isArray(response.i)) return null;
+
+  const cached = csharpDecodedCompactCompletionItems.get(response);
+  if (cached) return cached;
+
+  const defaultRange = csharpCompactCompletionRange(response.r);
+  const commitCharacterSets = Array.isArray(response.c) ? response.c : [];
+  const items = response.i.map((compact: unknown, index: number) => {
+    if (!Array.isArray(compact)) return compact;
+
+    const label = csharpCompletionOptionalString(compact[0]) ?? '';
+    const newText = csharpCompletionOptionalString(compact[1]) ?? label;
+    const editRange = csharpCompactCompletionRange(compact[2]) ?? defaultRange;
+    const additionalTextEdits = Array.isArray(compact[4])
+      ? compact[4].map((edit: unknown) => {
+          if (!Array.isArray(edit) || edit.length < 5) return null;
+          const range = csharpCompactCompletionRange(edit.slice(1, 5));
+          const text = csharpCompletionOptionalString(edit[0]);
+          return range && text !== undefined ? { ...range, newText: text } : null;
+        }).filter((edit: unknown) => edit !== null)
+      : undefined;
+    const commitSetIndex = Number(compact[11]);
+    const commitCharacterSet = Number.isInteger(commitSetIndex)
+      ? commitCharacterSets[commitSetIndex]
+      : undefined;
+
+    return {
+      label,
+      ...(editRange ? { textEdit: { ...editRange, newText } } : { insertText: newText }),
+      ...(compact[3] ? { insertTextFormat: compact[3] } : {}),
+      ...(additionalTextEdits?.length ? { additionalTextEdits } : {}),
+      ...(compact[5] != null ? { sortText: compact[5] } : {}),
+      ...(compact[6] != null ? { filterText: compact[6] } : {}),
+      ...(compact[7] != null ? { kind: compact[7] } : {}),
+      ...(compact[8] != null ? { detail: compact[8] } : {}),
+      data: compact[9] ?? index,
+      preselect: compact[10] === 1,
+      ...(typeof commitCharacterSet === 'string'
+        ? { commitCharacters: Array.from(commitCharacterSet) }
+        : {}),
+    };
+  });
+
+  csharpDecodedCompactCompletionItems.set(response, items);
+  return items;
+}
+
 function csharpCompletionItemsFromResponse(response: any): any[] {
+  const compactItems = csharpCompactCompletionItems(response);
+  if (compactItems) return compactItems;
   const items = Array.isArray(response)
     ? response
     : response?.items ?? response?.Items ?? response?.completions ?? response?.Completions ?? response?.suggestions ?? response?.Suggestions ?? [];
@@ -929,7 +1112,7 @@ function csharpCompletionItemsFromResponse(response: any): any[] {
 }
 
 function csharpCompletionResponseIsIncomplete(response: any): boolean {
-  return !!(response?.isIncomplete ?? response?.IsIncomplete ?? response?.incomplete ?? response?.Incomplete);
+  return !!(response?.x ?? response?.isIncomplete ?? response?.IsIncomplete ?? response?.incomplete ?? response?.Incomplete);
 }
 
 function csharpResolvedCompletionItem(response: any, original: any): any {
@@ -1044,6 +1227,33 @@ function csharpCompletionItemInsertRange(range: monaco.IRange | monaco.languages
   return csharpCompletionIsPlainRange(insertRange) ? insertRange : undefined;
 }
 
+function csharpCompletionRangesEqual(left: monaco.IRange | undefined, right: monaco.IRange | undefined): boolean {
+  return !!left && !!right
+    && left.startLineNumber === right.startLineNumber
+    && left.startColumn === right.startColumn
+    && left.endLineNumber === right.endLineNumber
+    && left.endColumn === right.endColumn;
+}
+
+function csharpCompletionRangeMatchesFilter(
+  range: monaco.IRange | monaco.languages.CompletionItemRanges | undefined,
+  filterRange: monaco.IRange
+): boolean {
+  if (csharpCompletionIsPlainRange(range)) return csharpCompletionRangesEqual(range, filterRange);
+  if (!range) return false;
+  return csharpCompletionRangesEqual(range.insert, filterRange)
+    && csharpCompletionRangesEqual(range.replace, filterRange);
+}
+
+function csharpCompletionRebasedRange(
+  range: monaco.IRange | monaco.languages.CompletionItemRanges,
+  filterRange: monaco.IRange
+): monaco.IRange | monaco.languages.CompletionItemRanges {
+  return csharpCompletionIsPlainRange(range)
+    ? filterRange
+    : { insert: filterRange, replace: filterRange };
+}
+
 function csharpCompletionRangeFromTextEdit(
   textEdit: any,
   defaultRange: monaco.IRange | monaco.languages.CompletionItemRanges,
@@ -1065,6 +1275,27 @@ function csharpCompletionMapRangeToCurrent(
   const insert = mapRange((range as monaco.languages.CompletionItemRanges).insert);
   const replace = mapRange((range as monaco.languages.CompletionItemRanges).replace);
   return insert && replace ? { insert, replace } : undefined;
+}
+
+function csharpCompletionRangeContainsSnapshotOffset(
+  range: monaco.IRange | monaco.languages.CompletionItemRanges,
+  snapshot: CSharpCompletionRequestSnapshot,
+): boolean {
+  const containsOffset = (candidate: monaco.IRange) => {
+    const start = offsetAtTextPosition(
+      snapshot.code,
+      candidate.startLineNumber,
+      candidate.startColumn,
+    );
+    const end = offsetAtTextPosition(
+      snapshot.code,
+      candidate.endLineNumber,
+      candidate.endColumn,
+    );
+    return start !== null && end !== null && start <= snapshot.offset && snapshot.offset <= end;
+  };
+  if (csharpCompletionIsPlainRange(range)) return containsOffset(range);
+  return containsOffset(range.insert) && containsOffset(range.replace);
 }
 
 function csharpCompletionItemIsUsable(item: monaco.languages.CompletionItem | null): item is monaco.languages.CompletionItem {
@@ -1139,10 +1370,10 @@ function csharpContextualCompletionCacheKey(
     model.uri.toString(),
     snapshot.modelVersionId,
     snapshot.offset,
-    csharpCompletionFastHash(snapshot.code),
+    snapshot.hash,
     request.CompletionTrigger,
     request.TriggerCharacter ?? '',
-    projectRequest.fileKey,
+    projectRequest.revision,
     context.triggerKind,
     triggerCharacter,
     previousCharacter,
@@ -1166,7 +1397,7 @@ function csharpPredictiveCompletionCacheKey(
     codeHash,
     request.CompletionTrigger,
     request.TriggerCharacter ?? '',
-    projectRequest.fileKey,
+    projectRequest.revision,
     previousCharacter,
     completionEnvironmentVersion,
   ].join('|');
@@ -1204,36 +1435,74 @@ class CSharpLanguageService {
     lateContext: CSharpLateCompletionContext;
   }>();
   private completionResolveResponseCache = new WeakMap<object, Promise<unknown>>();
-  private completionResolveSpeculativeKeys = new WeakMap<object, string>();
+  private completionResolveListKeys = new WeakMap<object, { key: string; speculative: boolean }>();
+  private activeCompletionList: { key: string; speculative: boolean } | null = null;
+  private pendingCompletionListPublicationKeys = new Set<string>();
+  private pendingSpeculativeCompletionListPublicationKeys = new Set<string>();
+  private speculativeCancellationPromise: Promise<void> | null = null;
   private editor: monaco.editor.IStandaloneCodeEditor | null = null;
   private model: monaco.editor.ITextModel | null = null;
   private projectFilesProvider: CSharpProjectFilesProvider = () => [];
+  private projectFilesRevisionProvider: CSharpProjectFilesRevisionProvider | null = null;
   private initialized = false;
   private iframeUrl: string | null = null;
   private providersRegistered = false;
   private initializationPromise: Promise<void> | null = null;
+  private runtimeMessageListener: ((event: MessageEvent) => void) | null = null;
+  private runtimeRequestSerial = 0;
+  private runtimeSessionSerial = 0;
+  private runtimePending = new Map<string, {
+    method: string;
+    callId: string;
+    started: number;
+    timeout: ReturnType<typeof setTimeout>;
+    resolve: (value: unknown) => void;
+  }>();
   private completionRequestSerial = 0;
   private completionStructuralVersion = 0;
   private diagnosticRequestSerial = 0;
   private completionEnvironmentVersion = 0;
+  private omnisharpMetadataVersion: number | null = null;
+  private metadataInvalidationSerial = 0;
   private completionWorkerStateKey: string | null = null;
+  private completionProjectStateKey: string | null = null;
+  private speculativeProjectStateKey: string | null = null;
+  private diagnosticProjectStateKey: string | null = null;
+  private completionTextState: CSharpCompletionTextState | null = null;
+  private speculativeTextState: CSharpCompletionTextState | null = null;
+  private diagnosticTextState: CSharpCompletionTextState | null = null;
   private completionCache = new Map<string, CSharpCompletionCacheEntry>();
+  private completionSessionCache = new Map<string, CSharpCompletionCacheEntry>();
   private predictiveCompletionCache = new Map<string, CSharpPredictiveCompletionCacheEntry>();
   private predictiveCompletionSource: CSharpPredictiveCompletionSource | null = null;
+  private predictiveCompletionRefreshTimer: ReturnType<typeof setTimeout> | null = null;
   private predictiveCompletionTimer: ReturnType<typeof setTimeout> | null = null;
   private predictiveCompletionSerial = 0;
   private predictiveCompletionPlan: CSharpPredictiveCompletionPlan | null = null;
+  private predictiveCompletionRun: {
+    key: string;
+    code: string;
+    serial: number;
+    promise: Promise<void>;
+  } | null = null;
   private predictiveCompletionLastRequest: CSharpCompletionPreloadRequestSnapshot | null = null;
   private predictiveCompletionLastLookup: CSharpCompletionPreloadLookupSnapshot | null = null;
   private runtimeResponseCache = new Map<string, Promise<unknown> | unknown>();
+  private runtimeResponseMetadataVersions = new WeakMap<object, number>();
   private diagnosticCacheKey: string | null = null;
   private diagnosticCacheMarkers: monaco.editor.IMarkerData[] = [];
   private providerDisposables: monaco.IDisposable[] = [];
   private semanticCache = new WeakMap<monaco.editor.ITextModel, { versionId: number; index: CSharpSemanticIndex }>();
   private modelTextCache = new WeakMap<monaco.editor.ITextModel, CSharpModelTextSnapshot>();
   private projectRequestCache: CSharpSerializedProjectRequest | null = null;
+  private projectRequestSource: CSharpProjectFileSnapshot[] | null = null;
+  private projectRequestSourceRevision: unknown;
+  private projectRequestRevisionSerial = 0;
   private projectFileHashCache = new Map<string, { content: string; hash: string; length: number }>();
   private completionDispatchTail: Promise<void> = Promise.resolve();
+  private speculativeDispatchTail: Promise<void> = Promise.resolve();
+  private diagnosticDispatchTail: Promise<void> = Promise.resolve();
+  private completionProjectPrewarmSerial = 0;
   private debugEnabled = false;
   private debugEvents: CSharpIdeDebugEvent[] = [];
   private debugEventSerial = 0;
@@ -1241,7 +1510,10 @@ class CSharpLanguageService {
   private debugNotifyTimer: ReturnType<typeof setTimeout> | null = null;
   private lastDiagnosticProjectRequest: CSharpDiagnosticProjectRequest | null = null;
 
-  private debouncedDiagnostics = debounce(this.getDiagnostics.bind(this), 100);
+  // Diagnostics can monopolize the single WASM thread once Roslyn starts a compilation.
+  // A longer authoring-idle window keeps it behind completion bursts while preserving the
+  // same diagnostics feature as soon as typing has actually paused.
+  private debouncedDiagnostics = debounce(this.getDiagnostics.bind(this), 1500);
   private debouncedCompletions = this.rawProvideCompletionItems.bind(this);
   private debouncedResolve = this.rawResolveCompletionItem.bind(this);
 
@@ -1294,8 +1566,10 @@ class CSharpLanguageService {
       },
       cache: {
         completionCacheSize: this.completionCache.size,
+        completionSessionCacheSize: this.completionSessionCache.size,
         predictiveCompletionCacheSize: this.predictiveCompletionCache.size,
         predictiveCompletionActivePlan: !!this.predictiveCompletionPlan,
+        omnisharpMetadataVersion: this.omnisharpMetadataVersion,
         completionEnvironmentVersion: this.completionEnvironmentVersion,
         completionWorkerStateKey: this.completionWorkerStateKey,
         diagnosticCacheKey: this.diagnosticCacheKey,
@@ -1572,8 +1846,10 @@ class CSharpLanguageService {
         completionRequestSerial: this.completionRequestSerial,
         diagnosticRequestSerial: this.diagnosticRequestSerial,
         completionCacheSize: this.completionCache.size,
+        completionSessionCacheSize: this.completionSessionCache.size,
         predictiveCompletionCacheSize: this.predictiveCompletionCache.size,
         predictiveCompletionActivePlan: !!this.predictiveCompletionPlan,
+        omnisharpMetadataVersion: this.omnisharpMetadataVersion,
         completionEnvironmentVersion: this.completionEnvironmentVersion,
         completionWorkerStateKey: this.completionWorkerStateKey,
         diagnosticCacheKey: this.diagnosticCacheKey,
@@ -1598,6 +1874,7 @@ class CSharpLanguageService {
       column: typeof plan.request?.Column === 'number' ? plan.request.Column + 1 : 0,
       completionTrigger: plan.request?.CompletionTrigger,
       projectCurrentPath: plan.projectRequest.currentPath,
+      projectRevision: plan.projectRequest.revision,
       projectFileKey: plan.projectRequest.fileKey,
       projectFileCount: plan.projectRequest.request.Files.length,
     };
@@ -1614,6 +1891,7 @@ class CSharpLanguageService {
     return {
       modelUri: source.modelUri,
       modelPath: sourceModel ? currentModelPath(sourceModel) : source.modelUri,
+      projectRevision: source.projectRevision,
       projectFileKey: source.projectFileKey,
       environmentVersion: source.environmentVersion,
       suggestionCount: source.suggestions.length,
@@ -1745,6 +2023,7 @@ class CSharpLanguageService {
       prefix: entry.prefix,
       assumedText: entry.assumedText,
       projectCurrentPath: entry.projectCurrentPath,
+      projectRevision: entry.projectRevision,
       projectFileKey: entry.projectFileKey,
       itemCount: entry.itemCount,
       ageMs: Date.now() - entry.createdAt,
@@ -1823,6 +2102,9 @@ class CSharpLanguageService {
     if (outcome === 'normal-cache-hit') {
       return 'Normal completion cache served this request before predictive preload replay was needed.';
     }
+    if (outcome === 'session-cache-hit') {
+      return `A semantic completion session was safely rebased to the current filter prefix and served ${details.matchedItemCount ?? 0} items.`;
+    }
     if (outcome === 'predictive-hit') {
       return `Predictive preload replay hit${atText} and served ${details.matchedItemCount ?? 0} items${typeof details.cacheAgeMs === 'number' ? ` from a ${details.cacheAgeMs}ms old cache entry` : ''}.`;
     }
@@ -1855,7 +2137,7 @@ class CSharpLanguageService {
       cachedEntry?: CSharpPredictiveCompletionCacheEntry | null;
     } = {}
   ): CSharpCompletionPreloadLookupSnapshot {
-    const codeHash = csharpCompletionFastHash(snapshot.code);
+    const codeHash = snapshot.hash;
     const filterRange = this.getCompletionFilterRangeAtPosition(model, position);
     const filterPrefix = model.getValueInRange(filterRange);
     const previousCharacter = csharpCompletionCharacterBefore(model, position) ?? '';
@@ -1868,6 +2150,7 @@ class CSharpLanguageService {
         entryKey === key ||
         entry.codeHash === codeHash ||
         entry.offset === snapshot.offset ||
+        entry.projectRevision === projectRequest.revision ||
         entry.projectFileKey === projectRequest.fileKey
       ))
       .slice(0, 6)
@@ -1887,6 +2170,9 @@ class CSharpLanguageService {
         }
         if (relatedCacheEntries.some(entry => entry.projectFileKey !== projectRequest.fileKey)) {
           mismatchHints.push('A cached preload has a different project file key.');
+        }
+        if (relatedCacheEntries.some(entry => entry.projectRevision !== projectRequest.revision)) {
+          mismatchHints.push('A cached preload belongs to a different exact project revision.');
         }
         if (!mismatchHints.length) {
           mismatchHints.push('Related cached preloads exist, but the full replay key did not match.');
@@ -1917,6 +2203,7 @@ class CSharpLanguageService {
       contextTriggerKind: context.triggerKind,
       contextTriggerCharacter: typeof context.triggerCharacter === 'string' ? context.triggerCharacter : undefined,
       projectCurrentPath: projectRequest.currentPath,
+      projectRevision: projectRequest.revision,
       projectFileKey: projectRequest.fileKey,
       predictiveCacheSize: this.predictiveCompletionCache.size,
       activePlanKey,
@@ -1934,7 +2221,7 @@ class CSharpLanguageService {
 
   private setPredictiveCompletionLastLookup(
     lookup: CSharpCompletionPreloadLookupSnapshot,
-    level: CSharpIdeDebugLevel = lookup.outcome === 'predictive-hit' || lookup.outcome === 'normal-cache-hit'
+    level: CSharpIdeDebugLevel = lookup.outcome === 'predictive-hit' || lookup.outcome === 'normal-cache-hit' || lookup.outcome === 'session-cache-hit'
       ? 'success'
       : lookup.outcome === 'runtime-fallback' || lookup.outcome === 'predictive-miss'
         ? 'warning'
@@ -1981,6 +2268,9 @@ class CSharpLanguageService {
   }
 
   private summarizeError(error: unknown) {
+    if (error instanceof CSharpObsoleteSemanticResponseError) {
+      return `Canceled: ${error.reason}`;
+    }
     if (error instanceof CSharpOmniSharpBridgeError && error.payload !== false) {
       const payload = error.payload;
       const bridgeName = payload.name ? ` (${payload.name})` : '';
@@ -2231,6 +2521,7 @@ class CSharpLanguageService {
     this.clearCompletionState();
 
     try {
+      const targetOrigin = new URL(nextIframeUrl, window.location.href).origin;
       let iframe = document.getElementById(iframeId) as HTMLIFrameElement | null;
       if (iframe && iframe.src !== new URL(nextIframeUrl, window.location.href).href) {
         iframe.remove();
@@ -2238,14 +2529,73 @@ class CSharpLanguageService {
       }
 
       if (!iframe) {
-        const initPromise = new Promise<void>(res => {
-          const listener = (event: MessageEvent) => {
-            if (event.data?.omnisharpInitialized) {
-              res();
-              window.removeEventListener('message', listener);
-            }
+        let initializationListener: ((event: MessageEvent) => void) | null = null;
+        let initializationTimeout: ReturnType<typeof setTimeout> | null = null;
+        let lastInitializationPhase = 'document-load';
+        const initPromise = new Promise<void>((resolve, reject) => {
+          const armStallTimeout = () => {
+            if (initializationTimeout) clearTimeout(initializationTimeout);
+            initializationTimeout = setTimeout(() => {
+              if (initializationListener) {
+                window.removeEventListener('message', initializationListener);
+              }
+              reject(new Error(
+                `OmniSharp runtime made no initialization progress for ${CSHARP_OMNISHARP_INITIALIZATION_STALL_TIMEOUT_MS / 1000}s after '${lastInitializationPhase}'.`
+              ));
+            }, CSHARP_OMNISHARP_INITIALIZATION_STALL_TIMEOUT_MS);
           };
+          const listener = (event: MessageEvent) => {
+            if (event.origin !== targetOrigin || event.source !== iframe?.contentWindow) return;
+            if (event.data?.omnisharpInitialized === true) {
+              if (initializationTimeout) clearTimeout(initializationTimeout);
+              resolve();
+              window.removeEventListener('message', listener);
+              return;
+            }
+
+            const failure = event.data?.omnisharpInitializationFailed;
+            if (
+              failure &&
+              typeof failure === 'object' &&
+              !Array.isArray(failure) &&
+              Object.keys(failure).length === 2 &&
+              typeof failure.phase === 'string' &&
+              failure.phase.length >= 1 &&
+              failure.phase.length <= 64 &&
+              typeof failure.message === 'string' &&
+              failure.message.length >= 1 &&
+              failure.message.length <= 1000
+            ) {
+              if (initializationTimeout) clearTimeout(initializationTimeout);
+              window.removeEventListener('message', listener);
+              reject(new Error(
+                `OmniSharp initialization failed during '${failure.phase}': ${failure.message}`
+              ));
+              return;
+            }
+
+            const progress = event.data?.omnisharpInitializationProgress;
+            if (
+              !progress ||
+              typeof progress !== 'object' ||
+              Array.isArray(progress) ||
+              Object.keys(progress).length !== 1 ||
+              typeof progress.phase !== 'string' ||
+              progress.phase.length < 1 ||
+              progress.phase.length > 64
+            ) return;
+            lastInitializationPhase = progress.phase;
+            armStallTimeout();
+            this.recordDebugEvent({
+              feature: 'lifecycle',
+              phase: 'runtime-initialization-progress',
+              level: 'info',
+              message: `OmniSharp initialization reached '${progress.phase}'.`,
+            });
+          };
+          initializationListener = listener;
           window.addEventListener('message', listener);
+          armStallTimeout();
         });
 
         iframe = document.createElement('iframe');
@@ -2256,19 +2606,103 @@ class CSharpLanguageService {
         iframe.setAttribute('credentialless', '');
         iframe.src = nextIframeUrl;
         iframe.title = 'OmniSharp';
-        document.body.appendChild(iframe);
 
-        await new Promise<void>((res, rej) => {
-          iframe!.onload = () => res();
-          iframe!.onerror = () => rej(new Error('OmniSharp iframe failed to load'));
-        });
+        try {
+          const iframeLoadPromise = new Promise<void>((resolve, reject) => {
+            iframe!.onload = () => {
+              iframe!.onload = null;
+              iframe!.onerror = null;
+              resolve();
+            };
+            iframe!.onerror = () => {
+              iframe!.onload = null;
+              iframe!.onerror = null;
+              reject(new Error('OmniSharp iframe failed to load'));
+            };
+          });
+          document.body.appendChild(iframe);
+          await iframeLoadPromise;
+        } catch (error) {
+          if (initializationTimeout) {
+            clearTimeout(initializationTimeout);
+          }
+          if (initializationListener) {
+            window.removeEventListener('message', initializationListener);
+          }
+          throw error;
+        }
 
         await initPromise;
       }
 
       const iframeRef = iframe;
+      const iframeWindow = iframeRef.contentWindow;
+      if (!iframeWindow) {
+        throw new Error('OmniSharp iframe has no content window.');
+      }
+      this.omnisharpMetadataVersion = null;
+      this.metadataInvalidationSerial += 1;
+      this.runtimeResponseMetadataVersions = new WeakMap<object, number>();
+      const runtimeSession = ++this.runtimeSessionSerial;
+      if (this.runtimeMessageListener) {
+        window.removeEventListener('message', this.runtimeMessageListener);
+      }
+      this.runtimeMessageListener = (event: MessageEvent) => {
+        if (
+          runtimeSession !== this.runtimeSessionSerial ||
+          event.source !== iframeWindow ||
+          event.origin !== targetOrigin
+        ) return;
+
+        const notificationVersion = csharpOmniSharpMetadataNotificationVersion(event.data);
+        if (notificationVersion !== null) {
+          this.observeOmniSharpMetadataVersion(notificationVersion, 'notification');
+          return;
+        }
+
+        const bridgeResponse = event.data?.omnisharp;
+        if (!bridgeResponse || typeof bridgeResponse !== 'object' || Array.isArray(bridgeResponse)) return;
+        const id = bridgeResponse.id;
+        if (typeof id !== 'string' || !id.startsWith(`${runtimeSession}:`)) return;
+        const payload = bridgeResponse.payload;
+        const responseMetadataVersion = csharpOmniSharpMetadataVersion(bridgeResponse.metadataVersion)
+          ?? csharpOmniSharpResponseMetadataVersion(payload);
+        // A trusted same-session call can complete after the caller's latency timeout.
+        // Its metadata promotion still happened inside the worker, so observe that version
+        // even when there is no longer a pending promise to resolve.
+        if (responseMetadataVersion !== null) {
+          this.observeOmniSharpMetadataVersion(responseMetadataVersion, 'response');
+          this.rememberRuntimeResponseMetadataVersion(payload, responseMetadataVersion);
+        }
+        const pending = this.runtimePending.get(id);
+        if (!pending || bridgeResponse.method !== pending.method) return;
+
+        this.runtimePending.delete(id);
+        clearTimeout(pending.timeout);
+        const bridgeError = isCSharpOmniSharpBridgeErrorPayload(payload);
+        const failed = payload === false || bridgeError;
+        this.recordDebugEvent({
+          feature: pending.method,
+          phase: 'runtime-response',
+          level: failed ? 'error' : 'success',
+          message: bridgeError
+            ? `${pending.method} failed in OmniSharp: ${payload.message || payload.name || 'Unknown bridge error.'}`
+            : payload === false
+              ? `${pending.method} returned a false payload.`
+              : `${pending.method} returned from OmniSharp.`,
+          callId: pending.callId,
+          durationMs: Math.round((this.now() - pending.started) * 10) / 10,
+          response: this.summarizeOmniSharpResponse(payload),
+          environment: this.createDebugEnvironmentSnapshot(this.model),
+        });
+        pending.resolve(payload);
+      };
+      window.addEventListener('message', this.runtimeMessageListener);
+
       this.omnisharp = (method: string, ...args: unknown[]) => {
-        if (!iframeRef.contentWindow) return Promise.resolve(false);
+        if (runtimeSession !== this.runtimeSessionSerial || !iframeRef.contentWindow) {
+          return Promise.resolve(false);
+        }
         const started = this.now();
         const callId = `${method}:${this.debugEventSerial + 1}:${Math.random().toString(36).slice(2, 8)}`;
         this.recordDebugEvent({
@@ -2284,55 +2718,39 @@ class CSharpLanguageService {
           environment: this.createDebugEnvironmentSnapshot(this.model),
         });
 
-        return new Promise(res => {
-          const id = Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
-          let handled = false;
-          const handleMessage = (event: MessageEvent) => {
-            if (event.data?.omnisharp?.id === id && !handled) {
-              handled = true;
-              window.removeEventListener('message', handleMessage);
-              const payload = event.data.omnisharp.payload;
-              const bridgeError = isCSharpOmniSharpBridgeErrorPayload(payload);
-              const failed = payload === false || bridgeError;
-              this.recordDebugEvent({
-                feature: method,
-                phase: 'runtime-response',
-                level: failed ? 'error' : 'success',
-                message: bridgeError
-                  ? `${method} failed in OmniSharp: ${payload.message || payload.name || 'Unknown bridge error.'}`
-                  : payload === false
-                    ? `${method} returned a false payload.`
-                    : `${method} returned from OmniSharp.`,
-                callId,
-                durationMs: Math.round((this.now() - started) * 10) / 10,
-                response: this.summarizeOmniSharpResponse(payload),
-                environment: this.createDebugEnvironmentSnapshot(this.model),
-              });
-              res(payload);
-            }
-          };
-          setTimeout(() => {
-            if (!handled) {
-              handled = true;
-              window.removeEventListener('message', handleMessage);
-              this.recordDebugEvent({
-                feature: method,
-                phase: 'runtime-timeout',
-                level: 'error',
-                message: `${method} timed out waiting for OmniSharp.`,
-                callId,
-                durationMs: Math.round((this.now() - started) * 10) / 10,
-                environment: this.createDebugEnvironmentSnapshot(this.model),
-              });
-              res(false);
-            }
+        return new Promise(resolve => {
+          const id = `${runtimeSession}:${++this.runtimeRequestSerial}`;
+          const timeout = setTimeout(() => {
+            const pending = this.runtimePending.get(id);
+            if (!pending) return;
+            this.runtimePending.delete(id);
+            this.recordDebugEvent({
+              feature: method,
+              phase: 'runtime-timeout',
+              level: 'error',
+              message: `${method} timed out waiting for OmniSharp.`,
+              callId,
+              durationMs: Math.round((this.now() - started) * 10) / 10,
+              environment: this.createDebugEnvironmentSnapshot(this.model),
+            });
+            resolve(false);
           }, 10000);
-          window.addEventListener('message', handleMessage);
-          iframeRef.contentWindow!.postMessage({ omnisharp: { method, args, id } }, '*');
+          this.runtimePending.set(id, { method, callId, started, timeout, resolve });
+          iframeWindow.postMessage({ omnisharp: { method, args, id } }, targetOrigin);
         });
       };
 
       this.ensureProvidersRegistered();
+      // Readiness is not allowed to describe an obsolete editor snapshot. A user can
+      // type while the WASM runtime is loading, so repeat a superseded prewarm against
+      // the newest stable model. The bounded loop avoids holding readiness forever under
+      // continuous typing; normal completion still performs exact synchronized fallback.
+      for (let attempt = 0; attempt < 4; attempt += 1) {
+        const activeModel = this.model;
+        if (!activeModel || activeModel.isDisposed() || activeModel.getLanguageId() !== 'csharp') break;
+        const outcome = await this.scheduleCompletionProjectPrewarm(activeModel, true);
+        if (outcome !== 'superseded') break;
+      }
     } catch (error) {
       this.disposeOmniSharpRuntime();
       throw error;
@@ -2353,6 +2771,26 @@ class CSharpLanguageService {
       message: 'OmniSharp runtime disposed.',
       request: { iframeUrl: this.iframeUrl },
     });
+    this.runtimeSessionSerial += 1;
+    if (this.runtimeMessageListener) {
+      window.removeEventListener('message', this.runtimeMessageListener);
+      this.runtimeMessageListener = null;
+    }
+    for (const pending of this.runtimePending.values()) {
+      clearTimeout(pending.timeout);
+      pending.resolve(false);
+    }
+    this.runtimePending.clear();
+    this.completionProjectStateKey = null;
+    this.speculativeProjectStateKey = null;
+    this.diagnosticProjectStateKey = null;
+    this.completionTextState = null;
+    this.speculativeTextState = null;
+    this.diagnosticTextState = null;
+    this.omnisharpMetadataVersion = null;
+    this.speculativeCancellationPromise = null;
+    this.metadataInvalidationSerial += 1;
+    this.runtimeResponseMetadataVersions = new WeakMap<object, number>();
     document.getElementById(iframeId)?.remove();
     this.omnisharp = null;
     this.initialized = false;
@@ -2360,10 +2798,97 @@ class CSharpLanguageService {
     this.clearCompletionState();
   }
 
+  private rememberRuntimeResponseMetadataVersion(response: unknown, version: number) {
+    if (response && typeof response === 'object') {
+      this.runtimeResponseMetadataVersions.set(response, version);
+    }
+  }
+
+  private runtimeResponseMetadataVersion(response: unknown): number | null {
+    if (!response || typeof response !== 'object') return null;
+    return this.runtimeResponseMetadataVersions.get(response)
+      ?? csharpOmniSharpResponseMetadataVersion(response);
+  }
+
+  private observeOmniSharpResponseMetadataVersion(response: unknown): number | null {
+    const version = this.runtimeResponseMetadataVersion(response);
+    if (version === null) return null;
+    this.observeOmniSharpMetadataVersion(version, 'response');
+    this.rememberRuntimeResponseMetadataVersion(response, version);
+    return version;
+  }
+
+  private observeOmniSharpMetadataVersion(
+    version: number,
+    source: 'notification' | 'response'
+  ): boolean {
+    const previousVersion = this.omnisharpMetadataVersion;
+    if (previousVersion === null) {
+      // A fresh runtime has no versioned semantic result to invalidate. Establishing
+      // its first observed generation must not cancel and duplicate the very request
+      // that reported that baseline (diagnostics is commonly first).
+      this.omnisharpMetadataVersion = version;
+      this.recordDebugEvent({
+        feature: 'cache',
+        phase: 'metadata-version-baseline',
+        level: 'info',
+        message: `OmniSharp metadata baseline established at version ${version}.`,
+        request: { source, version },
+      });
+      return false;
+    }
+    if (version <= previousVersion) return false;
+
+    this.omnisharpMetadataVersion = version;
+    this.metadataInvalidationSerial += 1;
+    this.completionEnvironmentVersion += 1;
+    this.completionWorkerStateKey = null;
+
+    // Metadata changes invalidate semantic results, not synchronized source/project state.
+    // In particular, do not advance completionRequestSerial here: a response that reports
+    // the new version was computed against that version and must remain usable.
+    this.completionCache.clear();
+    this.completionSessionCache.clear();
+    csharpCompletionInflightFor(this).clear();
+    this.clearPredictiveCompletionState(true);
+    this.runtimeResponseCache.clear();
+    this.lastCompletions.clear();
+    this.lastCompletionContexts.clear();
+    this.completionResolveResponseCache = new WeakMap<object, Promise<unknown>>();
+    this.completionResolveListKeys = new WeakMap<object, { key: string; speculative: boolean }>();
+    this.diagnosticCacheKey = null;
+
+    this.recordDebugEvent({
+      feature: 'cache',
+      phase: 'metadata-version-changed',
+      level: 'info',
+      message: `OmniSharp metadata advanced to version ${version}; semantic result caches were invalidated.`,
+      request: {
+        source,
+        previousVersion,
+        version,
+        metadataInvalidationSerial: this.metadataInvalidationSerial,
+        completionEnvironmentVersion: this.completionEnvironmentVersion,
+      },
+    });
+
+    const diagnosticModel = this.model;
+    if (
+      diagnosticModel &&
+      !diagnosticModel.isDisposed() &&
+      diagnosticModel.getLanguageId() === 'csharp'
+    ) {
+      this.requestDiagnostics(diagnosticModel);
+    } else {
+      this.diagnosticRequestSerial += 1;
+    }
+    return true;
+  }
+
   private clearCompletionState(options?: {
     structural?: boolean;
     preserveEnvironment?: boolean;
-    preserveResultCaches?: boolean;
+    preserveReusableCaches?: boolean;
   }) {
     this.completionRequestSerial += 1;
     if (options?.structural !== false) {
@@ -2375,10 +2900,14 @@ class CSharpLanguageService {
     this.completionWorkerStateKey = null;
     this.lastCompletions.clear();
     this.lastCompletionContexts.clear();
-    if (!options?.preserveResultCaches) {
-      this.completionCache.clear();
+    // Exact model/runtime entries include Monaco's monotonic version and can never hit
+    // again after an edit. Drop them immediately; only explicitly rebasable session and
+    // predictive completion state is worth retaining between adjacent keystrokes.
+    this.completionCache.clear();
+    this.runtimeResponseCache.clear();
+    if (!options?.preserveReusableCaches) {
+      this.completionSessionCache.clear();
       this.clearPredictiveCompletionState(true);
-      this.runtimeResponseCache.clear();
     }
     this.diagnosticCacheKey = null;
     this.recordDebugEvent({
@@ -2396,6 +2925,10 @@ class CSharpLanguageService {
 
   private clearPredictiveCompletionState(clearCache: boolean) {
     this.predictiveCompletionSerial += 1;
+    if (this.predictiveCompletionRefreshTimer) {
+      clearTimeout(this.predictiveCompletionRefreshTimer);
+      this.predictiveCompletionRefreshTimer = null;
+    }
     if (this.predictiveCompletionTimer) {
       clearTimeout(this.predictiveCompletionTimer);
       this.predictiveCompletionTimer = null;
@@ -2404,14 +2937,43 @@ class CSharpLanguageService {
       ? 'Preload invalidated because completion result caches were cleared.'
       : 'Preload invalidated because the current editor state no longer matches a preload plan.', { includeCached: clearCache });
     this.predictiveCompletionPlan = null;
+    this.predictiveCompletionRun = null;
     this.predictiveCompletionSource = null;
     if (clearCache) {
       this.predictiveCompletionCache.clear();
     }
   }
 
+  private cancelPendingSpeculativeRuntime() {
+    if (
+      !this.omnisharp ||
+      this.speculativeCancellationPromise ||
+      this.pendingSpeculativeCompletionListPublicationKeys.size === 0
+    ) return;
+
+    const cancellation = this.omnisharp('CancelSpeculativeCompletionAsync').then(
+      () => undefined,
+      error => {
+        this.recordDebugEvent({
+          feature: 'completion.predictive',
+          phase: 'cancel-error',
+          level: 'warning',
+          message: 'Could not signal cancellation for obsolete speculative completion work.',
+          error: this.summarizeError(error),
+        });
+      },
+    );
+    this.speculativeCancellationPromise = cancellation;
+    void cancellation.finally(() => {
+      if (this.speculativeCancellationPromise === cancellation) {
+        this.speculativeCancellationPromise = null;
+      }
+    });
+  }
+
   private cacheCompletionResult(key: string, entry: CSharpCompletionCacheEntry) {
     if (!entry.suggestions.length) return;
+    this.completionCache.delete(key);
     this.completionCache.set(key, entry);
     while (this.completionCache.size > CSHARP_COMPLETION_CACHE_LIMIT) {
       const oldestKey = this.completionCache.keys().next().value;
@@ -2420,8 +2982,20 @@ class CSharpLanguageService {
     }
   }
 
+  private cacheCompletionSessionResult(key: string, entry: CSharpCompletionCacheEntry) {
+    if (!entry.suggestions.length || entry.incomplete || !entry.sessionReusable || !entry.completionSnapshot) return;
+    this.completionSessionCache.delete(key);
+    this.completionSessionCache.set(key, entry);
+    while (this.completionSessionCache.size > CSHARP_COMPLETION_SESSION_CACHE_LIMIT) {
+      const oldestKey = this.completionSessionCache.keys().next().value;
+      if (!oldestKey) break;
+      this.completionSessionCache.delete(oldestKey);
+    }
+  }
+
   private cachePredictiveCompletionResult(key: string, entry: CSharpPredictiveCompletionCacheEntry) {
     if (!entry.itemCount) return;
+    this.predictiveCompletionCache.delete(key);
     this.predictiveCompletionCache.set(key, entry);
     while (this.predictiveCompletionCache.size > CSHARP_PREDICTIVE_COMPLETION_CACHE_LIMIT) {
       const oldestKey = this.predictiveCompletionCache.keys().next().value;
@@ -2430,13 +3004,73 @@ class CSharpLanguageService {
     }
   }
 
+  private retainedCompletionListKeys(workspace: 'completion' | 'speculative'): string[] {
+    const speculative = workspace === 'speculative';
+    const keys = new Set<string>();
+    const addEntry = (entry: CSharpCompletionCacheEntry) => {
+      if (entry.completionList?.speculative === speculative) {
+        keys.add(entry.completionList.key);
+      }
+    };
+
+    for (const entry of this.completionCache.values()) addEntry(entry);
+    for (const entry of this.completionSessionCache.values()) addEntry(entry);
+    if (speculative) {
+      for (const entry of this.predictiveCompletionCache.values()) {
+        keys.add(entry.completionListKey);
+      }
+    }
+    if (this.activeCompletionList?.speculative === speculative) {
+      keys.add(this.activeCompletionList.key);
+    }
+    const pendingPublicationKeys = speculative
+      ? this.pendingSpeculativeCompletionListPublicationKeys
+      : this.pendingCompletionListPublicationKeys;
+    for (const key of pendingPublicationKeys) keys.add(key);
+    return Array.from(keys);
+  }
+
   private toCompletionList(entry: CSharpCompletionCacheEntry): monaco.languages.CompletionList {
     this.lastCompletions.clear();
     this.lastCompletionContexts.clear();
-    const suggestions = entry.suggestions.map(item => ({
-      ...item,
-      additionalTextEdits: item.additionalTextEdits?.map(edit => ({ ...edit })),
-    }));
+    this.activeCompletionList = entry.completionList ?? null;
+    const presentationFilterRange = entry.presentationFilterRange;
+    const canonicalFilterRange = entry.renderedFilterRange;
+    const preselectedCompletionIndices = entry.preselectedCompletionIndices;
+    const suggestions = entry.suggestions.map((item, index) => {
+      const lspItem = entry.lspItems[index];
+      const rawData = lspItem?.data ?? lspItem?.Data;
+      const completionIndex = Number.isInteger(rawData) ? rawData : index;
+      let range = item.range;
+      if (presentationFilterRange && canonicalFilterRange) {
+        if (csharpCompletionRangeMatchesFilter(item.range, canonicalFilterRange)) {
+          range = csharpCompletionRebasedRange(item.range, presentationFilterRange);
+        } else if (
+          this.model &&
+          !this.model.isDisposed() &&
+          entry.completionSnapshot &&
+          entry.lateContext
+        ) {
+          range = csharpCompletionMapRangeToCurrent(
+            item.range,
+            candidate => this.mapMainCompletionRangeToCurrent(
+              this.model!,
+              candidate,
+              entry.completionSnapshot!,
+              entry.lateContext!,
+            ) ?? undefined,
+          ) ?? item.range;
+        }
+      }
+      return {
+        ...item,
+        range,
+        ...(preselectedCompletionIndices
+          ? { preselect: preselectedCompletionIndices.has(completionIndex) }
+          : {}),
+        additionalTextEdits: item.additionalTextEdits?.map(edit => ({ ...edit })),
+      };
+    });
     suggestions.forEach((item, index) => {
       const lspItem = entry.lspItems[index];
       if (lspItem) this.lastCompletions.set(item, lspItem);
@@ -2453,6 +3087,13 @@ class CSharpLanguageService {
   private emptyCompletionList(): monaco.languages.CompletionList {
     this.lastCompletions.clear();
     this.lastCompletionContexts.clear();
+    this.activeCompletionList = null;
+    return { suggestions: [] };
+  }
+
+  private cancelledCompletionList(): monaco.languages.CompletionList {
+    // A cancelled, obsolete provider must not erase resolve state belonging to the
+    // completion popup that replaced it.
     return { suggestions: [] };
   }
 
@@ -2484,8 +3125,6 @@ class CSharpLanguageService {
   private clearModelRuntimeState(model: monaco.editor.ITextModel) {
     this.modelTextCache.delete(model);
     this.semanticCache.delete(model);
-    this.projectRequestCache = null;
-    this.runtimeResponseCache.clear();
   }
 
   private cacheRuntimeResponse(key: string, value: Promise<unknown> | unknown) {
@@ -2505,40 +3144,115 @@ class CSharpLanguageService {
     ...args: unknown[]
   ): Promise<unknown> {
     if (!this.omnisharp) return false;
-    const environmentVersion = this.completionEnvironmentVersion;
-    const key = [
-      environmentVersion,
-      method,
-      snapshot.uri,
-      snapshot.modelVersionId,
-      snapshot.length,
-      snapshot.hash,
-      ...cacheParts.map(part => stableCacheKey(part)),
-    ].join(':');
+    const assertCurrentModelSnapshot = () => {
+      if (model.isDisposed() || model.getVersionId() !== snapshot.modelVersionId) {
+        throw new CSharpObsoleteSemanticResponseError(
+          `${method} source snapshot was superseded before its result could be used.`
+        );
+      }
+    };
+    const invoke = (metadataRetryCount: number): Promise<unknown> => {
+      assertCurrentModelSnapshot();
+      const environmentVersion = this.completionEnvironmentVersion;
+      const metadataInvalidationSerial = this.metadataInvalidationSerial;
+      const key = [
+        environmentVersion,
+        method,
+        snapshot.uri,
+        snapshot.modelVersionId,
+        snapshot.length,
+        snapshot.hash,
+        ...cacheParts.map(part => stableCacheKey(part)),
+      ].join(':');
 
-    const cached = this.runtimeResponseCache.get(key);
-    if (cached) return cached;
+      const cached = this.runtimeResponseCache.get(key);
+      if (cached) {
+        return Promise.resolve(cached).then(value => {
+          assertCurrentModelSnapshot();
+          return value;
+        });
+      }
 
-    const promise = this.omnisharp(method, snapshot.code, ...args).then(response => {
-      let checkedResponse: unknown;
-      try {
-        checkedResponse = this.requireOmniSharpResponse(method, response);
-      } catch (error) {
+      const promise = this.omnisharp!(method, snapshot.code, ...args).then(response => {
+        let checkedResponse: unknown;
+        try {
+          checkedResponse = this.requireOmniSharpResponse(method, response);
+        } catch (error) {
+          this.runtimeResponseCache.delete(key);
+          throw error;
+        }
+
+        const responseMetadataVersion = this.observeOmniSharpResponseMetadataVersion(checkedResponse);
+        const responsePredatesCurrentMetadata = (
+          responseMetadataVersion !== null &&
+          this.omnisharpMetadataVersion !== null &&
+          responseMetadataVersion < this.omnisharpMetadataVersion
+        );
+        const unversionedResponseCrossedMetadataChange = (
+          responseMetadataVersion === null &&
+          metadataInvalidationSerial !== this.metadataInvalidationSerial
+        );
+        const metadataInvalidationDelta = (
+          this.metadataInvalidationSerial - metadataInvalidationSerial
+        );
+        const environmentVersionDelta = (
+          this.completionEnvironmentVersion - environmentVersion
+        );
+        const nonMetadataEnvironmentChange = environmentVersionDelta > metadataInvalidationDelta;
+        const responseIsStale = responsePredatesCurrentMetadata || unversionedResponseCrossedMetadataChange;
+
+        this.runtimeResponseCache.delete(key);
+        assertCurrentModelSnapshot();
+        if (nonMetadataEnvironmentChange) {
+          // Re-running only the raw bridge call would reuse the old project snapshot and
+          // arguments. Let Monaco supersede this request instead of relabeling stale work
+          // with the new semantic-environment cache identity.
+          throw new CSharpObsoleteSemanticResponseError(
+            `${method} completed after its semantic environment was superseded.`
+          );
+        }
+        if (responseIsStale) {
+          if (metadataRetryCount < 2) {
+            this.recordDebugEvent({
+              feature: method,
+              phase: 'metadata-retry',
+              level: 'info',
+              message: `Retrying ${method} after a concurrent semantic-environment update.`,
+              request: {
+                metadataRetryCount,
+                responseMetadataVersion,
+                currentMetadataVersion: this.omnisharpMetadataVersion,
+                environmentVersion,
+                currentEnvironmentVersion: this.completionEnvironmentVersion,
+              },
+            });
+            return invoke(metadataRetryCount + 1);
+          }
+          throw new Error(`${method} repeatedly returned a response from an obsolete semantic environment.`);
+        }
+
+        // A response can itself announce the newer metadata generation. In that case it
+        // is already exact, but it belongs under the post-invalidation cache identity.
+        const finalKey = [
+          this.completionEnvironmentVersion,
+          method,
+          snapshot.uri,
+          snapshot.modelVersionId,
+          snapshot.length,
+          snapshot.hash,
+          ...cacheParts.map(part => stableCacheKey(part)),
+        ].join(':');
+        this.cacheRuntimeResponse(finalKey, checkedResponse);
+        return checkedResponse;
+      }, error => {
         this.runtimeResponseCache.delete(key);
         throw error;
-      }
-      if (this.completionEnvironmentVersion !== environmentVersion) {
-        this.runtimeResponseCache.delete(key);
-      } else {
-        this.cacheRuntimeResponse(key, checkedResponse);
-      }
-      return checkedResponse;
-    }, error => {
-      this.runtimeResponseCache.delete(key);
-      throw error;
-    });
-    this.cacheRuntimeResponse(key, promise);
-    return promise;
+      });
+      this.cacheRuntimeResponse(key, promise);
+      return promise;
+    };
+
+    return invoke(0);
   }
 
   private requireOmniSharpResponse(method: string, response: unknown): unknown {
@@ -2565,6 +3279,104 @@ class CSharpLanguageService {
     ].join(':');
   }
 
+  private completionSessionCacheKey(
+    model: monaco.editor.ITextModel,
+    snapshot: CSharpCompletionRequestSnapshot,
+    position: monaco.Position,
+    projectRequest: CSharpSerializedProjectRequest,
+    request: any
+  ): string {
+    const filterRange = this.getCompletionFilterRangeAtPosition(model, position);
+    const filterStart = model.getOffsetAt({
+      lineNumber: filterRange.startLineNumber,
+      column: filterRange.startColumn,
+    });
+    const filterEnd = model.getOffsetAt({
+      lineNumber: filterRange.endLineNumber,
+      column: filterRange.endColumn,
+    });
+    return [
+      'omnisharp-session-v1',
+      model.uri.toString(),
+      filterStart,
+      snapshot.code.length - (filterEnd - filterStart),
+      csharpCompletionFastHashWithoutSpan(snapshot.code, filterStart, filterEnd),
+      projectRequest.currentPath,
+      projectRequest.revision,
+      request.CompletionTrigger,
+      request.TriggerCharacter ?? '',
+      this.completionEnvironmentVersion,
+    ].join('|');
+  }
+
+  private async completionEntryFromSession(
+    model: monaco.editor.ITextModel,
+    entry: CSharpCompletionCacheEntry,
+    cancellationToken?: monaco.CancellationToken
+  ): Promise<CSharpCompletionCacheEntry | null> {
+    if (cancellationToken?.isCancellationRequested || model.isDisposed()) return null;
+    const originalSnapshot = entry.completionSnapshot;
+    const renderedFilterRange = entry.renderedFilterRange;
+    if (!originalSnapshot || !renderedFilterRange || !entry.sessionReusable || entry.incomplete) return null;
+
+    const lateContext = this.getLateCompletionContext(model, originalSnapshot);
+    if (!lateContext) return null;
+
+    const completionList = entry.completionList;
+    if (!completionList || !this.omnisharp) return null;
+    const filterText = model.getValueInRange(lateContext.filterRange);
+    const method = completionList.speculative
+      ? 'GetSpeculativeCompletionRefilterAsync'
+      : 'GetCompletionRefilterAsync';
+    const expectedModelVersionId = model.getVersionId();
+    const expectedRequestSerial = this.completionRequestSerial;
+    const metadataInvalidationSerial = this.metadataInvalidationSerial;
+    const rawRefilterResponse = await this.omnisharp(method, filterText, completionList.key);
+    if (
+      cancellationToken?.isCancellationRequested ||
+      model.isDisposed() ||
+      model.getVersionId() !== expectedModelVersionId ||
+      this.completionRequestSerial !== expectedRequestSerial
+    ) return null;
+
+    const refilterResponse = this.requireOmniSharpResponse(
+      method,
+      rawRefilterResponse,
+    ) as { success?: unknown; preselectedIndices?: unknown };
+    this.observeOmniSharpResponseMetadataVersion(refilterResponse);
+    if (metadataInvalidationSerial !== this.metadataInvalidationSerial) return null;
+
+    // Re-check the cursor and exact late-typing shape after the worker await. Monaco may
+    // cancel a provider without preventing its promise from resolving, and a cursor move
+    // does not necessarily change the model version or request serial.
+    const currentLateContext = this.getLateCompletionContext(model, originalSnapshot);
+    if (
+      !currentLateContext ||
+      currentLateContext.insertedLength !== lateContext.insertedLength ||
+      !csharpCompletionRangesEqual(currentLateContext.filterRange, lateContext.filterRange) ||
+      model.getValueInRange(currentLateContext.filterRange) !== filterText
+    ) return null;
+    if (refilterResponse?.success !== true || !Array.isArray(refilterResponse.preselectedIndices)) {
+      return null;
+    }
+    const preselectedIndices = new Set(
+      refilterResponse.preselectedIndices.filter((value): value is number => Number.isInteger(value)),
+    );
+
+    return {
+      ...entry,
+      completionSnapshot: originalSnapshot,
+      lateContext: currentLateContext,
+      // Keep the canonical object graph immutable. The one unavoidable clone handed to
+      // Monaco performs range rebasing and preselection in toCompletionList.
+      renderedFilterRange,
+      presentationFilterRange: currentLateContext.filterRange,
+      preselectedCompletionIndices: preselectedIndices,
+      sessionReusable: true,
+      completionList,
+    };
+  }
+
   private createCompletionSnapshot(
     model: monaco.editor.ITextModel,
     position: monaco.Position
@@ -2572,6 +3384,7 @@ class CSharpLanguageService {
     const snapshot = this.getModelTextSnapshot(model);
     return {
       code: snapshot.code,
+      hash: snapshot.hash,
       modelVersionId: snapshot.modelVersionId,
       offset: model.getOffsetAt(position),
       structuralVersion: this.completionStructuralVersion,
@@ -2649,13 +3462,14 @@ class CSharpLanguageService {
     if (!editorPosition || !positionsEqual(editorPosition, position)) return false;
 
     const selections = this.editor.getSelections();
-    if (!selections || selections.length !== 1) return false;
-    const selection = selections[0];
-    return (
-      selection.startLineNumber === position.lineNumber &&
-      selection.startColumn === position.column &&
-      selection.endLineNumber === position.lineNumber &&
-      selection.endColumn === position.column
+    if (!selections?.length) return false;
+    // Monaco asks once for the primary caret and applies the accepted completion to
+    // compatible secondary carets itself. Secondary empty selections therefore do not
+    // make the primary request stale; rejecting them silently disabled exact OmniSharp
+    // completion whenever multi-cursor editing was active.
+    return selections.every(selection =>
+      selection.startLineNumber === selection.endLineNumber &&
+      selection.startColumn === selection.endColumn
     );
   }
 
@@ -2675,7 +3489,8 @@ class CSharpLanguageService {
     request: unknown,
     projectRequest: CSharpSerializedProjectRequest,
     requestSerial: number,
-    callId: string
+    callId: string,
+    completionListKey: string
   ): Promise<unknown | typeof CSHARP_STALE_COMPLETION_RESPONSE> {
     const run = this.completionDispatchTail.then(async () => {
       if (!this.shouldDispatchCompletionRequest(model, snapshot, requestSerial)) {
@@ -2695,16 +3510,534 @@ class CSharpLanguageService {
         return CSHARP_STALE_COMPLETION_RESPONSE;
       }
 
-      const response = await this.omnisharp!('GetCompletionAsync', snapshot.code, request, projectRequest.serialized);
-      return this.requireOmniSharpResponse('GetCompletionAsync', response);
+      // Retain only a request that actually reached the worker. Pre-dispatch misses can
+      // queue freely while typing without inflating the reconciliation payload; once
+      // dispatched, the key remains live through response conversion/cache publication.
+      this.pendingCompletionListPublicationKeys.add(completionListKey);
+      return this.requestSynchronizedCompletion(
+        'completion',
+        model,
+        snapshot.code,
+        request,
+        projectRequest,
+        completionListKey,
+      );
     });
 
     this.completionDispatchTail = run.then(() => undefined, () => undefined);
     return run;
   }
 
+  private completionTextStateFor(
+    workspace: 'completion' | 'speculative'
+  ): CSharpCompletionTextState | null {
+    return workspace === 'completion' ? this.completionTextState : this.speculativeTextState;
+  }
+
+  private setCompletionTextState(
+    workspace: 'completion' | 'speculative',
+    state: CSharpCompletionTextState | null
+  ) {
+    if (workspace === 'completion') {
+      this.completionTextState = state;
+    } else {
+      this.speculativeTextState = state;
+    }
+  }
+
+  private createCompletionTextSyncRequest(
+    workspace: 'completion' | 'speculative',
+    targetCode: string,
+    projectRequest: CSharpSerializedProjectRequest,
+    forceFullSync: boolean
+  ): CSharpCompletionTextSyncRequest {
+    const state = this.completionTextStateFor(workspace);
+    if (
+      forceFullSync ||
+      !state ||
+      state.runtimeSession !== this.runtimeSessionSerial ||
+      state.projectRevision !== projectRequest.revision ||
+      state.length !== state.code.length
+    ) {
+      return {
+        FullSync: true,
+        ExpectedVersion: state?.version ?? -1,
+        ExpectedOldTextLength: state?.length ?? 0,
+        ExpectedNewTextLength: targetCode.length,
+        ProjectRevision: projectRequest.revision,
+        Changes: [],
+      };
+    }
+
+    let prefixLength = 0;
+    const maximumPrefixLength = Math.min(state.code.length, targetCode.length);
+    while (
+      prefixLength < maximumPrefixLength &&
+      state.code.charCodeAt(prefixLength) === targetCode.charCodeAt(prefixLength)
+    ) {
+      prefixLength += 1;
+    }
+
+    let previousSuffixStart = state.code.length;
+    let targetSuffixStart = targetCode.length;
+    while (
+      previousSuffixStart > prefixLength &&
+      targetSuffixStart > prefixLength &&
+      state.code.charCodeAt(previousSuffixStart - 1) === targetCode.charCodeAt(targetSuffixStart - 1)
+    ) {
+      previousSuffixStart -= 1;
+      targetSuffixStart -= 1;
+    }
+
+    const changes = state.code === targetCode
+      ? []
+      : [{
+          Start: prefixLength,
+          Length: previousSuffixStart - prefixLength,
+          NewText: targetCode.slice(prefixLength, targetSuffixStart),
+        }];
+    return {
+      FullSync: false,
+      ExpectedVersion: state.version,
+      ExpectedOldTextLength: state.length,
+      ExpectedNewTextLength: targetCode.length,
+      ProjectRevision: projectRequest.revision,
+      Changes: changes,
+    };
+  }
+
+  private commitCompletionTextSync(
+    workspace: 'completion' | 'speculative',
+    targetCode: string,
+    projectRequest: CSharpSerializedProjectRequest,
+    acknowledgement: CSharpCompletionTextSyncAck
+  ) {
+    const version = acknowledgement.version;
+    const textLength = acknowledgement.textLength;
+    if (
+      acknowledgement.success !== true ||
+      !Number.isSafeInteger(version) ||
+      (version as number) < 0 ||
+      !Number.isSafeInteger(textLength) ||
+      textLength !== targetCode.length ||
+      acknowledgement.projectRevision !== projectRequest.revision
+    ) {
+      this.setCompletionTextState(workspace, null);
+      throw new Error(`OmniSharp returned an invalid ${workspace} text synchronization acknowledgement.`);
+    }
+
+    this.setCompletionTextState(workspace, {
+      runtimeSession: this.runtimeSessionSerial,
+      projectRevision: projectRequest.revision,
+      version: version as number,
+      length: textLength as number,
+      code: targetCode,
+    });
+    this.markProjectSnapshotApplied(workspace, projectRequest);
+  }
+
+  private async requestSynchronizedCompletion(
+    workspace: 'completion' | 'speculative',
+    model: monaco.editor.ITextModel,
+    targetCode: string,
+    request: unknown,
+    projectRequest: CSharpSerializedProjectRequest,
+    completionListKey: string
+  ): Promise<unknown> {
+    if (!this.omnisharp) {
+      throw new Error('OmniSharp is unavailable while synchronizing completion text.');
+    }
+
+    const method = workspace === 'completion'
+      ? 'GetCompletionAsync'
+      : 'GetSpeculativeCompletionAsync';
+    let forceFullSync = false;
+    let usedFullSyncRecovery = false;
+    let usedMetadataRetry = false;
+    const assertCurrentProjectSnapshot = () => {
+      const currentProjectRequest = this.createSerializedDiagnosticProjectRequest(model);
+      if (currentProjectRequest.revision !== projectRequest.revision) {
+        throw new CSharpObsoleteSemanticResponseError(
+          `OmniSharp ${workspace} completion project snapshot was superseded.`
+        );
+      }
+    };
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      assertCurrentProjectSnapshot();
+      const sync = this.createCompletionTextSyncRequest(
+        workspace,
+        targetCode,
+        projectRequest,
+        forceFullSync,
+      );
+      const metadataInvalidationSerialBeforeRequest = this.metadataInvalidationSerial;
+      const replacementBytes = sync.Changes.reduce(
+        (total, change) => total + change.NewText.length,
+        0,
+      );
+      this.recordDebugEvent({
+        feature: 'completion.sync',
+        phase: sync.FullSync ? 'full' : 'incremental',
+        level: 'info',
+        message: sync.FullSync
+          ? `Synchronizing the full ${workspace} document.`
+          : `Synchronizing an incremental ${workspace} document change.`,
+        request: {
+          workspace,
+          attempt,
+          expectedVersion: sync.ExpectedVersion,
+          oldLength: sync.ExpectedOldTextLength,
+          newLength: sync.ExpectedNewTextLength,
+          changeCount: sync.Changes.length,
+          replacementBytes,
+          projectRevision: sync.ProjectRevision,
+        },
+      });
+
+      let response: unknown;
+      try {
+        response = this.requireOmniSharpResponse(
+          method,
+          await this.omnisharp(
+            method,
+            sync.FullSync ? targetCode : '',
+            sync,
+            request,
+            sync.FullSync ? projectRequest.serialized : '',
+            completionListKey,
+            this.retainedCompletionListKeys(workspace),
+          ),
+        );
+      } catch (error) {
+        // A timeout or malformed bridge response leaves the remote mutation unknown.
+        this.setCompletionTextState(workspace, null);
+        throw error;
+      }
+
+      assertCurrentProjectSnapshot();
+
+      const responseMetadataVersion = this.observeOmniSharpResponseMetadataVersion(response);
+      const envelope = response as any;
+      const acknowledgement = (envelope?.s ?? envelope?.sync) as CSharpCompletionTextSyncAck | undefined;
+      const completion = envelope?.p ?? envelope?.completion;
+      if (workspace === 'speculative' && (envelope?.c === true || envelope?.cancelled === true)) {
+        // A cancellation after source synchronization still leaves the worker's text
+        // state exact. Retain that acknowledgement, but never treat absence of a list as
+        // corruption requiring a later full-source fallback.
+        if (acknowledgement?.success === true) {
+          this.commitCompletionTextSync(workspace, targetCode, projectRequest, acknowledgement);
+        }
+        throw new CSharpObsoleteSemanticResponseError(
+          'Speculative completion was superseded by interactive authoring work.'
+        );
+      }
+      if (acknowledgement?.success === true) {
+        this.commitCompletionTextSync(workspace, targetCode, projectRequest, acknowledgement);
+        if (completion == null) {
+          throw new Error(`OmniSharp synchronized ${workspace} text without returning a completion payload.`);
+        }
+
+        const responsePredatesCurrentMetadata = (
+          responseMetadataVersion !== null &&
+          this.omnisharpMetadataVersion !== null &&
+          responseMetadataVersion < this.omnisharpMetadataVersion
+        );
+        const unversionedResponseCrossedMetadataChange = (
+          responseMetadataVersion === null &&
+          metadataInvalidationSerialBeforeRequest !== this.metadataInvalidationSerial
+        );
+        if (responsePredatesCurrentMetadata || unversionedResponseCrossedMetadataChange) {
+          if (!usedMetadataRetry) {
+            usedMetadataRetry = true;
+            forceFullSync = false;
+            this.recordDebugEvent({
+              feature: 'completion.sync',
+              phase: 'metadata-retry',
+              level: 'info',
+              message: `Retrying ${workspace} completion after a concurrent metadata update.`,
+              request: {
+                attempt,
+                responseMetadataVersion,
+                currentMetadataVersion: this.omnisharpMetadataVersion,
+                metadataInvalidationSerialBeforeRequest,
+                currentMetadataInvalidationSerial: this.metadataInvalidationSerial,
+              },
+            });
+            continue;
+          }
+          throw new Error(`OmniSharp returned ${workspace} completion from an obsolete metadata version.`);
+        }
+
+        if (responseMetadataVersion !== null) {
+          this.rememberRuntimeResponseMetadataVersion(completion, responseMetadataVersion);
+        }
+        return completion;
+      }
+
+      const canRecover = (
+        !sync.FullSync &&
+        acknowledgement?.requiresFullSync === true &&
+        !usedFullSyncRecovery
+      );
+      if (canRecover) {
+        usedFullSyncRecovery = true;
+        forceFullSync = true;
+        continue;
+      }
+
+      this.setCompletionTextState(workspace, null);
+      const message = typeof acknowledgement?.message === 'string'
+        ? acknowledgement.message
+        : `OmniSharp rejected the ${workspace} text synchronization.`;
+      throw new Error(message);
+    }
+
+    this.setCompletionTextState(workspace, null);
+    throw new Error(`OmniSharp could not synchronize the ${workspace} completion document.`);
+  }
+
+  private enqueueProjectModelCall(
+    workspace: 'completion' | 'diagnostic',
+    method: string,
+    model: monaco.editor.ITextModel,
+    snapshot: CSharpModelTextSnapshot,
+    cacheParts: (projectRequest: CSharpSerializedProjectRequest) => unknown[],
+    ...args: unknown[]
+  ): Promise<unknown> {
+    const execute = async () => {
+      const projectRequest = await this.ensureWorkspaceProjectState(workspace, model, snapshot);
+      const assertCurrentProjectSnapshot = () => {
+        const currentProjectRequest = this.createSerializedDiagnosticProjectRequest(model);
+        if (currentProjectRequest.revision !== projectRequest.revision) {
+          throw new CSharpObsoleteSemanticResponseError(
+            `${method} project snapshot was superseded before its result could be used.`
+          );
+        }
+      };
+      assertCurrentProjectSnapshot();
+      const response = await this.cachedOmniSharpModelCall(
+        method,
+        model,
+        snapshot,
+        cacheParts(projectRequest),
+        ...args,
+      );
+      assertCurrentProjectSnapshot();
+      return response;
+    };
+    return this.enqueueWorkspaceTransaction(workspace, execute);
+  }
+
+  private enqueueWorkspaceTransaction<T>(
+    workspace: 'completion' | 'speculative' | 'diagnostic',
+    execute: () => Promise<T>
+  ): Promise<T> {
+    const previous = workspace === 'completion'
+      ? this.completionDispatchTail
+      : workspace === 'speculative'
+        ? this.speculativeDispatchTail
+        : this.diagnosticDispatchTail;
+    const run = previous.then(execute, execute);
+    const settled = run.then(() => undefined, () => undefined);
+    if (workspace === 'completion') {
+      this.completionDispatchTail = settled;
+    } else if (workspace === 'speculative') {
+      this.speculativeDispatchTail = settled;
+    } else {
+      this.diagnosticDispatchTail = settled;
+    }
+    return run;
+  }
+
+  private scheduleCompletionProjectPrewarm(
+    model: monaco.editor.ITextModel,
+    prefetchActiveCompletionContext = false,
+  ): Promise<CSharpCompletionPrewarmOutcome> {
+    if (!this.omnisharp || model.isDisposed() || model.getLanguageId() !== 'csharp') {
+      return Promise.resolve('failed');
+    }
+    const serial = ++this.completionProjectPrewarmSerial;
+    const startedAt = this.now();
+    const synchronize = this.completionDispatchTail.then(async () => {
+      if (
+        serial !== this.completionProjectPrewarmSerial ||
+        !this.omnisharp ||
+        model.isDisposed() ||
+        this.model !== model ||
+        model.getLanguageId() !== 'csharp'
+      ) {
+        throw new CSharpObsoleteSemanticResponseError(
+          'Completion project prewarm was superseded before synchronization.'
+        );
+      }
+
+      const snapshot = this.getModelTextSnapshot(model);
+      const prewarmPosition = prefetchActiveCompletionContext && this.editor?.getModel() === model
+        ? this.editor.getPosition()
+        : null;
+      const assertCurrentPrewarmSnapshot = () => {
+        if (
+          serial !== this.completionProjectPrewarmSerial ||
+          !this.omnisharp ||
+          model.isDisposed() ||
+          this.model !== model ||
+          model.getLanguageId() !== 'csharp' ||
+          model.getVersionId() !== snapshot.modelVersionId
+        ) {
+          throw new CSharpObsoleteSemanticResponseError(
+            'Completion project prewarm was superseded by a newer active source snapshot.'
+          );
+        }
+        const currentSnapshot = this.getModelTextSnapshot(model);
+        if (
+          currentSnapshot.length !== snapshot.length ||
+          currentSnapshot.hash !== snapshot.hash ||
+          currentSnapshot.code !== snapshot.code
+        ) {
+          throw new CSharpObsoleteSemanticResponseError(
+            'Completion project prewarm source changed before publication.'
+          );
+        }
+      };
+
+      const projectRequest = await this.ensureWorkspaceProjectState('completion', model, snapshot);
+      assertCurrentPrewarmSnapshot();
+      const currentProjectRequest = this.createSerializedDiagnosticProjectRequest(model);
+      if (currentProjectRequest.revision !== projectRequest.revision) {
+        throw new CSharpObsoleteSemanticResponseError(
+          'Completion project prewarm was superseded by a newer exact project snapshot.'
+        );
+      }
+
+      return { snapshot, prewarmPosition, assertCurrentPrewarmSnapshot, projectRequest };
+    });
+    // Only the exact project/source synchronization occupies the normal completion lane.
+    // The potentially expensive root-list prefetch below runs in the cancellable
+    // speculative workspace, so an accepted real completion can overtake it.
+    this.completionDispatchTail = synchronize.then(() => undefined, () => undefined);
+
+    const run = synchronize.then(async ({
+      snapshot,
+      prewarmPosition,
+      assertCurrentPrewarmSnapshot,
+      projectRequest,
+    }) => {
+
+      let prefetchedItemCount = 0;
+      if (
+        prewarmPosition &&
+        this.isEditorAtPosition(model, prewarmPosition)
+      ) {
+        // An actual completion at the exact idle cursor warms Roslyn and retains its full
+        // resolve/refilter state. The first typed identifier can then use the semantic
+        // session cache instead of marshalling the multi-megabyte root list interactively.
+        const context: monaco.languages.CompletionContext = {
+          triggerKind: monaco.languages.CompletionTriggerKind.Invoke,
+        };
+        const completionSnapshot = this.createCompletionSnapshot(model, prewarmPosition);
+        completionSnapshot.structuralVersion = this.completionStructuralVersion;
+        const request = csharpOmniSharpCompletionRequest(model, prewarmPosition, context);
+        const completionListKey = `speculative:${this.runtimeSessionSerial}:prewarm-${serial}`;
+        const response = await this.enqueueWorkspaceTransaction('speculative', async () => {
+          assertCurrentPrewarmSnapshot();
+          if (!this.isEditorAtPosition(model, prewarmPosition)) {
+            throw new CSharpObsoleteSemanticResponseError(
+              'Completion project prewarm cursor moved before dispatch.'
+            );
+          }
+          this.pendingSpeculativeCompletionListPublicationKeys.add(completionListKey);
+          try {
+            return await this.requestSynchronizedCompletion(
+              'speculative',
+              model,
+              snapshot.code,
+              request,
+              projectRequest,
+              completionListKey,
+            );
+          } finally {
+            this.pendingSpeculativeCompletionListPublicationKeys.delete(completionListKey);
+          }
+        });
+        assertCurrentPrewarmSnapshot();
+        if (!this.isEditorAtPosition(model, prewarmPosition)) {
+          throw new CSharpObsoleteSemanticResponseError(
+            'Completion project prewarm cursor moved before publication.'
+          );
+        }
+        const defaultRange = this.getCompletionFilterRangeAtPosition(model, prewarmPosition);
+        const entry = this.completionEntryFromResponse(
+          model,
+          response,
+          defaultRange,
+          completionSnapshot,
+          null,
+          { key: completionListKey, speculative: true },
+        );
+        if (entry.suggestions.length) {
+          const cacheKey = csharpContextualCompletionCacheKey(
+            model,
+            completionSnapshot,
+            prewarmPosition,
+            context,
+            request,
+            projectRequest,
+            this.completionEnvironmentVersion,
+          );
+          const sessionKey = this.completionSessionCacheKey(
+            model,
+            completionSnapshot,
+            prewarmPosition,
+            projectRequest,
+            request,
+          );
+          this.cacheCompletionResult(cacheKey, entry);
+          this.cacheCompletionSessionResult(sessionKey, entry);
+          this.completionWorkerStateKey = cacheKey;
+          this.rememberPredictiveCompletionSource(model, projectRequest, entry);
+          prefetchedItemCount = entry.suggestions.length;
+        }
+      }
+
+      this.recordDebugEvent({
+        feature: 'completion.sync',
+        phase: 'project-prewarm',
+        level: 'success',
+        message: 'C# completion workspace synchronized before the first interactive request.',
+        durationMs: Math.round((this.now() - startedAt) * 10) / 10,
+        request: {
+          projectRevision: projectRequest.revision,
+          projectFileCount: projectRequest.request.Files.length,
+          codeLength: snapshot.length,
+          prefetchedItemCount,
+        },
+      });
+      return 'completed' as const;
+    });
+    const settled = run.catch(error => {
+      const superseded = (
+        serial !== this.completionProjectPrewarmSerial ||
+        error instanceof CSharpObsoleteSemanticResponseError
+      );
+      this.recordDebugEvent({
+        feature: 'completion.sync',
+        phase: 'project-prewarm-failed',
+        level: superseded ? 'warning' : 'error',
+        message: superseded
+          ? 'C# completion prewarm was superseded by newer editor work.'
+          : 'C# completion workspace pre-synchronization did not complete.',
+        durationMs: Math.round((this.now() - startedAt) * 10) / 10,
+        error: this.summarizeError(error),
+      });
+      return superseded ? 'superseded' as const : 'failed' as const;
+    });
+    return settled;
+  }
+
   private async ensureLocalOmniSharpRuntime() {
-    if (!this.omnisharp || this.iframeUrl !== CSHARP_OMNISHARP_URLS.local) {
+    if (this.initializationPromise && this.iframeUrl === CSHARP_OMNISHARP_URLS.local) {
+      await this.initializationPromise;
+    } else if (!this.omnisharp || this.iframeUrl !== CSHARP_OMNISHARP_URLS.local) {
       await this.initialize(CSHARP_OMNISHARP_URLS.local);
     }
     return !!this.omnisharp && this.iframeUrl === CSHARP_OMNISHARP_URLS.local;
@@ -2722,11 +4055,22 @@ class CSharpLanguageService {
       monaco.languages.registerCompletionItemProvider('csharp', {
         triggerCharacters: CSHARP_CONTEXTUAL_COMPLETION_TRIGGER_CHARACTERS,
         resolveCompletionItem: item => this.debugProviderCall('completion.resolve', null, { label: item.label }, () => this.debouncedResolve(item)),
-        provideCompletionItems: (model, position, context) => this.debugProviderCall('completion', model, {
-          position,
-          triggerKind: context.triggerKind,
-          triggerCharacter: context.triggerCharacter,
-        }, () => this.debouncedCompletions(model, position, context)),
+        provideCompletionItems: async (model, position, context, cancellationToken) => {
+          const result = await this.debugProviderCall('completion', model, {
+            position,
+            triggerKind: context.triggerKind,
+            triggerCharacter: context.triggerCharacter,
+            cancellationRequested: cancellationToken.isCancellationRequested,
+          }, () => this.debouncedCompletions(model, position, context, cancellationToken));
+          this.scheduleNativeTriggerPresentationRecovery(
+            model,
+            position,
+            context,
+            cancellationToken,
+            result,
+          );
+          return result;
+        },
       }),
       monaco.languages.registerSignatureHelpProvider('csharp', {
         signatureHelpTriggerCharacters: ['(', ','],
@@ -2814,23 +4158,50 @@ class CSharpLanguageService {
   }
 
   private editorChangeListener: monaco.IDisposable | null = null;
+  private editorCursorChangeListener: monaco.IDisposable | null = null;
   private modelChangeListener: monaco.IDisposable | null = null;
+  private automaticCompletionTriggerTimer: ReturnType<typeof setTimeout> | null = null;
+  private nativeTriggerPresentationTimer: ReturnType<typeof setTimeout> | null = null;
+  private cursorCompletionPrewarmTimer: ReturnType<typeof setTimeout> | null = null;
 
-  setupEditor(editor: monaco.editor.IStandaloneCodeEditor, projectFilesProvider?: CSharpProjectFilesProvider) {
+  setupEditor(
+    editor: monaco.editor.IStandaloneCodeEditor,
+    projectFilesProvider?: CSharpProjectFilesProvider,
+    projectFilesRevisionProvider?: CSharpProjectFilesRevisionProvider
+  ) {
     this.ensureProvidersRegistered();
     editor.updateOptions({
       quickSuggestions: {
-        other: false,
+        other: true,
         comments: false,
         strings: false,
       },
+      quickSuggestionsDelay: 0,
       wordBasedSuggestions: 'off',
       suggest: {
         showWords: false,
       },
     });
+    const projectProviderChanged = (
+      (!!projectFilesProvider && projectFilesProvider !== this.projectFilesProvider) ||
+      (!!projectFilesRevisionProvider && projectFilesRevisionProvider !== this.projectFilesRevisionProvider)
+    );
     if (projectFilesProvider) {
       this.projectFilesProvider = projectFilesProvider;
+    }
+    this.projectFilesRevisionProvider = projectFilesRevisionProvider ?? null;
+    if (this.editor === editor) {
+      if (projectProviderChanged) {
+        this.projectRequestCache = null;
+        this.projectRequestSource = null;
+        this.projectRequestSourceRevision = undefined;
+        this.clearCompletionState();
+        if (this.model && this.model.getLanguageId() === 'csharp') {
+          this.requestDiagnostics(this.model);
+          if (this.omnisharp) this.scheduleCompletionProjectPrewarm(this.model);
+        }
+      }
+      return;
     }
     this.recordDebugEvent({
       feature: 'lifecycle',
@@ -2854,10 +4225,25 @@ class CSharpLanguageService {
       model: this.model ? this.summarizeModel(this.model) : undefined,
     });
     this.diagnosticRequestSerial += 1;
+    this.completionProjectPrewarmSerial += 1;
     this.modelChangeListener?.dispose();
     this.modelChangeListener = null;
+    if (this.automaticCompletionTriggerTimer) {
+      clearTimeout(this.automaticCompletionTriggerTimer);
+      this.automaticCompletionTriggerTimer = null;
+    }
+    if (this.nativeTriggerPresentationTimer) {
+      clearTimeout(this.nativeTriggerPresentationTimer);
+      this.nativeTriggerPresentationTimer = null;
+    }
     this.editorChangeListener?.dispose();
     this.editorChangeListener = null;
+    this.editorCursorChangeListener?.dispose();
+    this.editorCursorChangeListener = null;
+    if (this.cursorCompletionPrewarmTimer) {
+      clearTimeout(this.cursorCompletionPrewarmTimer);
+      this.cursorCompletionPrewarmTimer = null;
+    }
     this.editor = null;
     this.model = null;
     this.clearCompletionState();
@@ -2868,9 +4254,17 @@ class CSharpLanguageService {
     this.editor = editor;
 
     const updateModel = () => {
+      this.completionProjectPrewarmSerial += 1;
       this.modelChangeListener?.dispose();
       this.modelChangeListener = null;
+      const previousModel = this.model;
       this.model = editor.getModel();
+      if (previousModel && previousModel !== this.model) {
+        this.projectRequestCache = null;
+        this.projectRequestSource = null;
+        this.projectRequestSourceRevision = undefined;
+        this.clearCompletionState();
+      }
 
       if (this.model && this.model.getLanguageId() === 'csharp') {
         const model = this.model;
@@ -2882,14 +4276,26 @@ class CSharpLanguageService {
           model: this.summarizeModel(model),
         });
         this.requestDiagnostics(model);
+        if (this.omnisharp) this.scheduleCompletionProjectPrewarm(model);
         this.modelChangeListener = model.onDidChangeContent(event => {
           if (!model.isDisposed() && model.getLanguageId() === 'csharp') {
-            const shouldTriggerMemberCompletion = this.shouldTriggerMemberCompletionAfterChange(model, event);
+            const isBulkEdit = event.isFlush || event.changes.some(change =>
+              change.rangeLength > 1 || change.text.length > 1);
+            if (isBulkEdit || !this.predictiveCompletionPlan) {
+              this.cancelPendingSpeculativeRuntime();
+            }
+            if (isBulkEdit) {
+              // A wholesale replacement cannot be a continuation of an identifier-level
+              // prediction. Invalidate it before launching the new exact-context prewarm,
+              // so deferred cursor reconciliation cannot cancel that newer work.
+              this.clearPredictiveCompletionState(false);
+            }
+            this.completionProjectPrewarmSerial += 1;
             this.clearModelRuntimeState(model);
             this.clearCompletionState({
               structural: false,
               preserveEnvironment: true,
-              preserveResultCaches: true,
+              preserveReusableCaches: true,
             });
             this.recordDebugEvent({
               feature: 'model',
@@ -2899,10 +4305,18 @@ class CSharpLanguageService {
               model: this.summarizeModel(model),
             });
             this.requestDiagnostics(model);
-            this.refreshPredictiveCompletion(model);
-            if (shouldTriggerMemberCompletion) {
-              window.setTimeout(() => this.triggerMemberCompletion(model), 25);
+            // Monaco updates the model before it advances the editor selection. Reconcile
+            // on the next task so createPredictiveCompletionPlan sees the post-keystroke
+            // cursor; doing this synchronously silently misses every character while a
+            // suggest widget remains open.
+            this.schedulePredictiveCompletionRefresh(model);
+            if (this.omnisharp && isBulkEdit) {
+              // Project/file loads and paste-style edits establish a new stable context.
+              // Start an exact speculative list immediately; the next keystroke cancels it
+              // losslessly if the user does not actually pause at that cursor.
+              void this.scheduleCompletionProjectPrewarm(model, true);
             }
+            this.scheduleAutomaticCompletionAfterInput(editor, model, event);
           }
         });
       } else {
@@ -2919,6 +4333,239 @@ class CSharpLanguageService {
 
     updateModel();
     this.editorChangeListener = editor.onDidChangeModel(() => updateModel());
+    this.editorCursorChangeListener = editor.onDidChangeCursorPosition(() => {
+      const model = this.model;
+      if (
+        model &&
+        editor.getModel() === model &&
+        !model.isDisposed() &&
+        model.getLanguageId() === 'csharp'
+      ) {
+        this.scheduleCursorCompletionPrewarm(editor, model);
+      }
+    });
+  }
+
+  private scheduleCursorCompletionPrewarm(
+    editor: monaco.editor.IStandaloneCodeEditor,
+    model: monaco.editor.ITextModel,
+  ) {
+    if (this.cursorCompletionPrewarmTimer) {
+      clearTimeout(this.cursorCompletionPrewarmTimer);
+      this.cursorCompletionPrewarmTimer = null;
+    }
+    if (!this.omnisharp || !editor.hasTextFocus() || this.predictiveCompletionPlan) return;
+
+    const position = editor.getPosition();
+    if (!position || !this.isEditorAtPosition(model, position)) return;
+    const filterRange = this.getCompletionFilterRangeAtPosition(model, position);
+    if (model.getValueInRange(filterRange)) return;
+    const offset = model.getOffsetAt(position);
+    if (offset <= 0) return;
+    const previousPosition = model.getPositionAt(offset - 1);
+    const previousCharacter = model.getValueInRange({
+      startLineNumber: previousPosition.lineNumber,
+      startColumn: previousPosition.column,
+      endLineNumber: position.lineNumber,
+      endColumn: position.column,
+    });
+    if (!/^\s$/.test(previousCharacter)) return;
+
+    const expectedVersion = model.getVersionId();
+    const tryPrewarm = (tokenizationAttempt: number) => {
+      this.cursorCompletionPrewarmTimer = setTimeout(() => {
+        this.cursorCompletionPrewarmTimer = null;
+        const currentPosition = editor.getPosition();
+        if (
+          this.editor !== editor ||
+          this.model !== model ||
+          editor.getModel() !== model ||
+          model.isDisposed() ||
+          model.getVersionId() !== expectedVersion ||
+          !editor.hasTextFocus() ||
+          !currentPosition ||
+          currentPosition.lineNumber !== position.lineNumber ||
+          currentPosition.column !== position.column ||
+          this.predictiveCompletionPlan ||
+          (typeof document !== 'undefined' &&
+            document.querySelector('.suggest-widget.visible'))
+        ) {
+          return;
+        }
+
+        const lexicalState = this.automaticCompletionLexicalState(model, currentPosition);
+        if (lexicalState === 'pending') {
+          if (tokenizationAttempt < 24) tryPrewarm(tokenizationAttempt + 1);
+          return;
+        }
+        if (lexicalState === 'suppress') return;
+        void this.scheduleCompletionProjectPrewarm(model, true);
+      }, tokenizationAttempt === 0
+        ? CSHARP_CONTEXT_COMPLETION_PREWARM_DELAY_MS
+        : 16);
+    };
+    tryPrewarm(0);
+  }
+
+  private scheduleAutomaticCompletionAfterInput(
+    editor: monaco.editor.IStandaloneCodeEditor,
+    model: monaco.editor.ITextModel,
+    event: monaco.editor.IModelContentChangedEvent
+  ) {
+    if (this.automaticCompletionTriggerTimer) {
+      clearTimeout(this.automaticCompletionTriggerTimer);
+      this.automaticCompletionTriggerTimer = null;
+    }
+    if (
+      event.isFlush ||
+      event.isUndoing ||
+      event.isRedoing ||
+      event.changes.length !== 1 ||
+      !editor.hasTextFocus()
+    ) {
+      return;
+    }
+
+    const insertedText = event.changes[0].text;
+    // Context characters are registered on the Monaco provider itself and therefore
+    // already trigger exactly once. Scheduling the identifier fallback for `.`/`@`
+    // as well can race the native request while it is still resolving and duplicate
+    // expensive Roslyn work before the suggest widget has had a chance to open.
+    const triggersCompletion = insertedText.length > 0 &&
+      insertedText.length === String.fromCodePoint(insertedText.codePointAt(0) || 0).length &&
+      isIdentifierPart(insertedText, 0);
+    if (!triggersCompletion) return;
+
+    const expectedVersion = model.getVersionId();
+    const tryTrigger = (tokenizationAttempt: number) => {
+      this.automaticCompletionTriggerTimer = setTimeout(() => {
+        this.automaticCompletionTriggerTimer = null;
+        if (
+          this.editor !== editor ||
+          this.model !== model ||
+          model.isDisposed() ||
+          model.getLanguageId() !== 'csharp' ||
+          model.getVersionId() !== expectedVersion ||
+          !editor.hasTextFocus()
+        ) {
+          return;
+        }
+
+        const selection = editor.getSelection();
+        if (!selection || !selection.isEmpty()) return;
+        const position = editor.getPosition();
+        if (!position) return;
+        const lexicalState = this.automaticCompletionLexicalState(model, position);
+        if (lexicalState === 'pending') {
+          // A wholesale edit can temporarily invalidate Monaco's incremental token store.
+          // Wait for its cheap/background tokenizer rather than guessing inside a raw
+          // string or comment, but keep the deterministic trigger within one interaction.
+          if (tokenizationAttempt < 24) tryTrigger(tokenizationAttempt + 1);
+          return;
+        }
+        if (lexicalState === 'suppress') return;
+        // Monaco already refilters an open semantic list as the identifier grows. Reissuing
+        // a manual invoke on every character resets selection state and creates redundant
+        // provider traffic, so the deterministic trigger is only for opening a new session.
+        if (
+          typeof document !== 'undefined' &&
+          document.querySelector('.suggest-widget.visible')
+        ) return;
+        editor.trigger(
+          'codecraft.csharp.quick-suggestions',
+          'editor.action.triggerSuggest',
+          {},
+        );
+      }, tokenizationAttempt === 0 ? 0 : 16);
+    };
+    tryTrigger(0);
+  }
+
+  private scheduleNativeTriggerPresentationRecovery(
+    model: monaco.editor.ITextModel,
+    position: monaco.Position,
+    context: monaco.languages.CompletionContext,
+    cancellationToken: monaco.CancellationToken,
+    result: monaco.languages.CompletionList,
+  ) {
+    if (
+      context.triggerKind !== monaco.languages.CompletionTriggerKind.TriggerCharacter ||
+      !context.triggerCharacter ||
+      cancellationToken.isCancellationRequested ||
+      !result.suggestions.length ||
+      model.isDisposed()
+    ) {
+      return;
+    }
+
+    if (this.nativeTriggerPresentationTimer) {
+      clearTimeout(this.nativeTriggerPresentationTimer);
+    }
+    const expectedVersion = model.getVersionId();
+    // Cross the native commit-character transaction and its render turn. Triggering in
+    // the immediately following task can still inherit Monaco's transient suppression
+    // flag and discard the already-cached member list a second time.
+    this.nativeTriggerPresentationTimer = setTimeout(() => {
+      this.nativeTriggerPresentationTimer = null;
+      const editor = this.editor;
+      const currentPosition = editor?.getPosition();
+      if (
+        !editor ||
+        this.model !== model ||
+        editor.getModel() !== model ||
+        model.isDisposed() ||
+        model.getVersionId() !== expectedVersion ||
+        !editor.hasTextFocus() ||
+        !currentPosition ||
+        currentPosition.lineNumber !== position.lineNumber ||
+        currentPosition.column !== position.column ||
+        (typeof document !== 'undefined' &&
+          document.querySelector('.suggest-widget.visible'))
+      ) {
+        return;
+      }
+
+      // A trigger character can commit the selected item from the previous list and leave
+      // Monaco's widget suppressed even though its native provider just returned members.
+      // Recover only after that semantic request has completed and populated the reusable
+      // session, so this presentation invoke can never duplicate expensive Roslyn work.
+      editor.trigger(
+        'codecraft.csharp.native-trigger-presentation',
+        'editor.action.triggerSuggest',
+        {},
+      );
+    }, 32);
+  }
+
+  private automaticCompletionLexicalState(
+    model: monaco.editor.ITextModel,
+    position: monaco.Position,
+  ): 'allow' | 'suppress' | 'pending' {
+    try {
+      // Respect the same lexical policy as quickSuggestions.comments/strings=false.
+      // Only use the incremental/cheap tokenizer path: this manual trigger supplements
+      // Monaco's own quick-suggest machinery and must never synchronously tokenize a huge
+      // file or guess from stale tokens inside comments, strings, or raw strings.
+      const tokenization = (model as any).tokenization;
+      if (!tokenization) return 'pending';
+      if (!tokenization.hasAccurateTokensForLine?.(position.lineNumber)) {
+        tokenization.tokenizeIfCheap?.(position.lineNumber);
+      }
+      if (!tokenization.hasAccurateTokensForLine?.(position.lineNumber)) return 'pending';
+      const lineTokens = tokenization.getLineTokens?.(position.lineNumber);
+      if (!lineTokens) return 'pending';
+      const offset = Math.max(0, position.column - 2);
+      const tokenIndex = lineTokens.findTokenIndexAtOffset(offset);
+      const standardTokenType = lineTokens.getStandardTokenType(tokenIndex);
+      // Monaco StandardTokenType: Other=0, Comment=1, String=2, RegEx=4.
+      return standardTokenType === 1 || standardTokenType === 2 || standardTokenType === 4
+        ? 'suppress'
+        : 'allow';
+    } catch {
+      // If Monaco changes this internal facade, skip only the redundant manual trigger;
+      // its normal completion provider and configured quick suggestions remain intact.
+      return 'pending';
+    }
   }
 
   async includeNamespace(namespaceName: string): Promise<{
@@ -2978,6 +4625,7 @@ class CSharpLanguageService {
     if (model.isDisposed() || model.getLanguageId() !== 'csharp') return;
 
     const initialModelVersion = model.getVersionId();
+    const runtimeWasReady = !!this.omnisharp;
     this.recordDebugEvent({
       feature: 'diagnostics',
       phase: 'start',
@@ -2988,6 +4636,20 @@ class CSharpLanguageService {
       environment: this.createDebugEnvironmentSnapshot(model),
     });
     const runtimeReady = await this.ensureLocalOmniSharpRuntime();
+    if (
+      runtimeReady &&
+      !runtimeWasReady &&
+      this.omnisharp &&
+      requestSerial === this.diagnosticRequestSerial &&
+      !model.isDisposed() &&
+      model.getVersionId() === initialModelVersion
+    ) {
+      // Runtime initialization and project pre-sync already perform the expensive startup
+      // work. Establish a fresh authoring-idle interval before the first diagnostic compile
+      // so typing immediately after readiness cannot queue behind it.
+      this.requestDiagnostics(model);
+      return;
+    }
     if (
       !runtimeReady ||
       !this.omnisharp ||
@@ -3015,8 +4677,34 @@ class CSharpLanguageService {
       return;
     }
 
+    // Diagnostics are important, but they are never allowed to overtake completion on
+    // the single WASM worker. Wait until the latest completion transaction is drained,
+    // then revalidate everything before posting. If another completion is appended while
+    // waiting, follow the new tail as well; continuous typing naturally supersedes this
+    // diagnostic through diagnosticRequestSerial.
+    for (;;) {
+      const completionTail = this.completionDispatchTail;
+      await completionTail;
+      if (
+        requestSerial !== this.diagnosticRequestSerial ||
+        model.isDisposed() ||
+        model.getVersionId() !== initialModelVersion
+      ) {
+        return;
+      }
+      if (completionTail === this.completionDispatchTail) break;
+    }
+
     const modelSnapshot = this.getModelTextSnapshot(model);
     const projectRequest = this.createSerializedDiagnosticProjectRequest(model);
+    const assertCurrentDiagnosticProject = () => {
+      const currentProjectRequest = this.createSerializedDiagnosticProjectRequest(model);
+      if (currentProjectRequest.revision !== projectRequest.revision) {
+        throw new CSharpObsoleteSemanticResponseError(
+          'C# diagnostics project snapshot was superseded.'
+        );
+      }
+    };
     this.lastDiagnosticProjectRequest = projectRequest.request;
     const cacheKey = this.createDiagnosticCacheKey(modelSnapshot, projectRequest);
     if (this.diagnosticCacheKey === cacheKey) {
@@ -3053,7 +4741,42 @@ class CSharpLanguageService {
         },
         environment: this.createDebugEnvironmentSnapshot(model),
       });
-      const diagnostics = await this.omnisharp('GetDiagnosticsAsync', modelSnapshot.code, projectRequest.serialized);
+      const diagnostics = await this.enqueueWorkspaceTransaction('diagnostic', async () => {
+        assertCurrentDiagnosticProject();
+        const response = this.requireOmniSharpResponse(
+          'GetDiagnosticsAsync',
+          await this.omnisharp!(
+            'GetDiagnosticsAsync',
+            modelSnapshot.code,
+            this.projectSnapshotPayload('diagnostic', projectRequest),
+          ),
+        );
+        assertCurrentDiagnosticProject();
+        this.observeOmniSharpResponseMetadataVersion(response);
+        this.markProjectSnapshotApplied('diagnostic', projectRequest);
+        // GetDiagnosticsAsync predates the versioned text acknowledgement protocol.
+        // The project snapshot is known, but force the next semantic transaction to
+        // obtain an exact primary-text version before it trusts the diagnostic workspace.
+        this.diagnosticTextState = null;
+        return response;
+      });
+      assertCurrentDiagnosticProject();
+      if (
+        diagnostics &&
+        typeof diagnostics === 'object' &&
+        !Array.isArray(diagnostics) &&
+        (diagnostics as { cancelled?: unknown }).cancelled === true
+      ) {
+        this.recordDebugEvent({
+          feature: 'diagnostics',
+          phase: 'preempted',
+          level: 'info',
+          message: 'Background diagnostics yielded to accepted interactive authoring work.',
+          durationMs: Math.round((this.now() - started) * 10) / 10,
+          environment: this.createDebugEnvironmentSnapshot(model),
+        });
+        return;
+      }
       if (
         requestSerial !== this.diagnosticRequestSerial ||
         model.isDisposed() ||
@@ -3089,6 +4812,24 @@ class CSharpLanguageService {
         environment: this.createDebugEnvironmentSnapshot(model),
       });
     } catch (error) {
+      if (error instanceof CSharpObsoleteSemanticResponseError) {
+        this.recordDebugEvent({
+          feature: 'diagnostics',
+          phase: 'discard-stale-project',
+          level: 'warning',
+          message: error.reason,
+          durationMs: Math.round((this.now() - started) * 10) / 10,
+          environment: this.createDebugEnvironmentSnapshot(model),
+        });
+        if (
+          requestSerial === this.diagnosticRequestSerial &&
+          !model.isDisposed() &&
+          model.getVersionId() === initialModelVersion
+        ) {
+          this.requestDiagnostics(model);
+        }
+        return;
+      }
       this.recordDebugEvent({
         feature: 'diagnostics',
         phase: 'error',
@@ -3108,39 +4849,6 @@ class CSharpLanguageService {
     }
   }
 
-  private shouldTriggerMemberCompletionAfterChange(
-    model: monaco.editor.ITextModel,
-    event: monaco.editor.IModelContentChangedEvent
-  ) {
-    if (!this.editor || this.editor.getModel() !== model) return false;
-    if (event.changes.length !== 1) return false;
-
-    const change = event.changes[0];
-    if (change.rangeLength !== 0) return false;
-
-    const position = new monaco.Position(change.range.startLineNumber, change.range.startColumn + 1);
-    if (change.text === '.') {
-      return csharpCompletionCharacterBefore(model, position) === '.';
-    }
-
-    if (change.text.length !== 1 || !isIdentifierPart(change.text, 0)) return false;
-    const filterRange = this.getCompletionFilterRangeAtPosition(model, position);
-    return filterRange.startColumn > 1
-      && model.getLineContent(position.lineNumber).charAt(filterRange.startColumn - 2) === '.';
-  }
-
-  private triggerMemberCompletion(model: monaco.editor.ITextModel) {
-    if (!this.editor || this.editor.getModel() !== model || model.isDisposed() || model.getLanguageId() !== 'csharp') return;
-    const position = this.editor.getPosition();
-    if (!position) return;
-    const filterRange = this.getCompletionFilterRangeAtPosition(model, position);
-    const hasMemberAccessPrefix = filterRange.startColumn > 1
-      && model.getLineContent(position.lineNumber).charAt(filterRange.startColumn - 2) === '.';
-    if (csharpCompletionCharacterBefore(model, position) !== '.' && !hasMemberAccessPrefix) return;
-    if (!this.isEditorAtPosition(model, position)) return;
-    this.editor.trigger('csharp-omnisharp', 'editor.action.triggerSuggest', {});
-  }
-
   private rememberPredictiveCompletionSource(
     model: monaco.editor.ITextModel,
     projectRequest: CSharpSerializedProjectRequest,
@@ -3152,6 +4860,7 @@ class CSharpLanguageService {
     }
     this.predictiveCompletionSource = {
       modelUri: model.uri.toString(),
+      projectRevision: projectRequest.revision,
       projectFileKey: projectRequest.fileKey,
       environmentVersion: this.completionEnvironmentVersion,
       suggestions: entry.suggestions,
@@ -3159,8 +4868,50 @@ class CSharpLanguageService {
     };
   }
 
-  private refreshPredictiveCompletion(model: monaco.editor.ITextModel) {
-    const plan = this.createPredictiveCompletionPlan(model);
+  private schedulePredictiveCompletionRefresh(model: monaco.editor.ITextModel) {
+    if (this.predictiveCompletionRefreshTimer) {
+      clearTimeout(this.predictiveCompletionRefreshTimer);
+    }
+    const expectedVersion = model.getVersionId();
+    this.predictiveCompletionRefreshTimer = setTimeout(() => {
+      this.predictiveCompletionRefreshTimer = null;
+      if (
+        this.model !== model ||
+        this.editor?.getModel() !== model ||
+        model.isDisposed() ||
+        model.getLanguageId() !== 'csharp' ||
+        model.getVersionId() !== expectedVersion
+      ) {
+        return;
+      }
+
+      const plan = this.createPredictiveCompletionPlan(model);
+      const activePlan = this.predictiveCompletionPlan;
+      const retainsActivePrediction = !!(
+        plan &&
+        activePlan?.key === plan.key &&
+        activePlan.code === plan.code
+      );
+      if (activePlan && !retainsActivePrediction) {
+        this.cancelPendingSpeculativeRuntime();
+      }
+      this.refreshPredictiveCompletion(model, plan);
+
+      // Cursor movement is delivered before this deferred reconciliation has removed
+      // an obsolete predictive plan. In that ordering the cursor listener deliberately
+      // declines to start a second speculative request, so give the exact idle-context
+      // prewarm another chance after predictive state reflects the post-edit caret.
+      const editor = this.editor;
+      if (editor?.getModel() === model) {
+        this.scheduleCursorCompletionPrewarm(editor, model);
+      }
+    }, 0);
+  }
+
+  private refreshPredictiveCompletion(
+    model: monaco.editor.ITextModel,
+    plan: CSharpPredictiveCompletionPlan | null = this.createPredictiveCompletionPlan(model),
+  ) {
     if (!plan) {
       this.predictiveCompletionSerial += 1;
       if (this.predictiveCompletionTimer) {
@@ -3172,15 +4923,19 @@ class CSharpLanguageService {
       return;
     }
 
-    if (this.predictiveCompletionPlan?.key === plan.key) {
+    if (
+      this.predictiveCompletionPlan?.key === plan.key &&
+      this.predictiveCompletionPlan.code === plan.code
+    ) {
       this.noteEquivalentPredictiveCompletionPlan(plan, 'active-plan');
       return;
     }
     const cachedPlan = this.predictiveCompletionCache.get(plan.key);
-    if (cachedPlan) {
+    if (cachedPlan?.code === plan.code) {
       this.noteEquivalentPredictiveCompletionPlan(plan, 'cached-preload', cachedPlan);
       return;
     }
+    if (cachedPlan) this.predictiveCompletionCache.delete(plan.key);
 
     this.predictiveCompletionSerial += 1;
     if (this.predictiveCompletionTimer) {
@@ -3193,7 +4948,7 @@ class CSharpLanguageService {
     });
     this.predictiveCompletionTimer = setTimeout(() => {
       this.predictiveCompletionTimer = null;
-      void this.runPredictiveCompletion(plan, serial);
+      void this.startPredictiveCompletion(plan, serial);
     }, CSHARP_PREDICTIVE_COMPLETION_DELAY_MS);
   }
 
@@ -3215,7 +4970,7 @@ class CSharpLanguageService {
     if (!position || !this.isEditorAtPosition(model, position)) return null;
 
     const projectRequest = this.createSerializedDiagnosticProjectRequest(model);
-    if (projectRequest.fileKey !== source.projectFileKey) return null;
+    if (projectRequest.revision !== source.projectRevision) return null;
     const snapshot = this.getModelTextSnapshot(model);
     const currentOffset = model.getOffsetAt(position);
     const existingMemberAccessPlan = this.createPredictiveCompletionPlanForExistingMemberAccess(
@@ -3271,7 +5026,7 @@ class CSharpLanguageService {
 
     return {
       key,
-      completionListKey: `${key}:${Math.random().toString(36).slice(2)}`,
+      completionListKey: `speculative:${this.runtimeSessionSerial}:${Math.random().toString(36).slice(2)}`,
       code,
       codeHash,
       offset,
@@ -3321,7 +5076,7 @@ class CSharpLanguageService {
       Column: Math.max(0, position.column - 1),
       CompletionTrigger: 1,
     };
-    const codeHash = csharpCompletionFastHash(snapshot.code);
+    const codeHash = snapshot.hash;
     const key = csharpPredictiveCompletionCacheKey(
       model.uri.toString(),
       codeHash,
@@ -3334,7 +5089,7 @@ class CSharpLanguageService {
 
     return {
       key,
-      completionListKey: `${key}:${Math.random().toString(36).slice(2)}`,
+      completionListKey: `speculative:${this.runtimeSessionSerial}:${Math.random().toString(36).slice(2)}`,
       code: snapshot.code,
       codeHash,
       offset: currentOffset,
@@ -3350,20 +5105,23 @@ class CSharpLanguageService {
     prefix: string
   ): string | null {
     const normalizedPrefix = prefix.startsWith('@') ? prefix.slice(1) : prefix;
-    const lowerPrefix = normalizedPrefix.toLocaleLowerCase();
-    if (!lowerPrefix) return null;
+    if (!normalizedPrefix) return null;
 
-    let fallback: string | null = null;
+    let exactMatch: string | null = null;
     for (const suggestion of source.suggestions) {
       if (!this.isPredictiveCompletionCandidateKind(suggestion.kind)) continue;
       const candidate = this.predictiveCompletionCandidateText(suggestion);
       if (!candidate) continue;
       const normalizedCandidate = candidate.startsWith('@') ? candidate.slice(1) : candidate;
-      if (!normalizedCandidate.toLocaleLowerCase().startsWith(lowerPrefix)) continue;
+      if (normalizedCandidate !== normalizedPrefix) continue;
       if (suggestion.preselect) return candidate;
-      if (!fallback) fallback = candidate;
+      if (!exactMatch) exactMatch = candidate;
     }
-    return fallback;
+    // Never speculate `CannotUnloadAppDomainException.` merely because the user typed C.
+    // On a single-threaded WASM worker an ambiguous guess can monopolize Roslyn before
+    // the next real keystroke is received. Exact completed identifiers retain all of the
+    // useful `Console.`/local-variable prediction without that latency inversion.
+    return exactMatch;
   }
 
   private predictiveCompletionCandidateText(item: monaco.languages.CompletionItem): string | null {
@@ -3391,9 +5149,72 @@ class CSharpLanguageService {
       || kind === monaco.languages.CompletionItemKind.Value;
   }
 
+  private startPredictiveCompletion(
+    plan: CSharpPredictiveCompletionPlan,
+    serial: number,
+  ): Promise<void> {
+    const existing = this.predictiveCompletionRun;
+    if (
+      existing &&
+      existing.key === plan.key &&
+      existing.code === plan.code &&
+      existing.serial === serial
+    ) {
+      return existing.promise;
+    }
+
+    const promise = this.runPredictiveCompletion(plan, serial).finally(() => {
+      if (this.predictiveCompletionRun?.promise === promise) {
+        this.predictiveCompletionRun = null;
+      }
+    });
+    this.predictiveCompletionRun = {
+      key: plan.key,
+      code: plan.code,
+      serial,
+      promise,
+    };
+    return promise;
+  }
+
+  private async finishMatchingPredictiveCompletion(
+    predictiveKey: string,
+    code: string,
+  ): Promise<boolean> {
+    const plan = this.predictiveCompletionPlan;
+    if (!plan || plan.key !== predictiveKey || plan.code !== code) return false;
+
+    const serial = this.predictiveCompletionSerial;
+    if (this.predictiveCompletionTimer) {
+      clearTimeout(this.predictiveCompletionTimer);
+      this.predictiveCompletionTimer = null;
+    }
+    try {
+      await this.startPredictiveCompletion(plan, serial);
+    } catch (error) {
+      // Prediction is strictly an accelerator. Any bookkeeping/runtime failure here must
+      // preserve the normal exact completion path below.
+      this.recordDebugEvent({
+        feature: 'completion.predictive',
+        phase: 'handoff-error',
+        level: 'warning',
+        message: 'Could not hand the matching speculative completion to the interactive request.',
+        error: summarizePrimitive(error),
+      });
+      return false;
+    }
+    return this.predictiveCompletionCache.get(predictiveKey)?.code === code;
+  }
+
   private async runPredictiveCompletion(plan: CSharpPredictiveCompletionPlan, serial: number) {
-    if (serial !== this.predictiveCompletionSerial || this.predictiveCompletionCache.has(plan.key)) return;
+    const existingCachedPlan = this.predictiveCompletionCache.get(plan.key);
+    if (
+      serial !== this.predictiveCompletionSerial ||
+      existingCachedPlan?.code === plan.code
+    ) return;
+    if (existingCachedPlan) this.predictiveCompletionCache.delete(plan.key);
     if (!this.omnisharp || !this.editor || !this.model || this.model.isDisposed()) return;
+    const model = this.model;
 
     await this.completionDispatchTail;
     const currentPlan = this.model && !this.model.isDisposed()
@@ -3402,8 +5223,10 @@ class CSharpLanguageService {
     if (
       serial !== this.predictiveCompletionSerial ||
       this.predictiveCompletionPlan?.key !== plan.key ||
-      this.predictiveCompletionCache.has(plan.key) ||
-      currentPlan?.key !== plan.key
+      this.predictiveCompletionPlan.code !== plan.code ||
+      this.predictiveCompletionCache.get(plan.key)?.code === plan.code ||
+      currentPlan?.key !== plan.key ||
+      currentPlan.code !== plan.code
     ) {
       if (this.predictiveCompletionPlan?.key === plan.key) {
         this.predictiveCompletionPlan = null;
@@ -3437,13 +5260,23 @@ class CSharpLanguageService {
     });
 
     try {
-      const response = this.requireOmniSharpResponse('GetSpeculativeCompletionAsync', await this.omnisharp(
-        'GetSpeculativeCompletionAsync',
-        plan.code,
-        plan.request,
-        plan.projectRequest.serialized,
-        plan.completionListKey,
-      ));
+      const response = await this.enqueueWorkspaceTransaction('speculative', async () => {
+        if (
+          serial !== this.predictiveCompletionSerial ||
+          this.predictiveCompletionPlan?.key !== plan.key
+        ) {
+          return null;
+        }
+        this.pendingSpeculativeCompletionListPublicationKeys.add(plan.completionListKey);
+        return this.requestSynchronizedCompletion(
+          'speculative',
+          model,
+          plan.code,
+          plan.request,
+          plan.projectRequest,
+          plan.completionListKey,
+        );
+      });
       const itemCount = csharpCompletionItemsFromResponse(response).length;
       const shouldCache = (
         serial === this.predictiveCompletionSerial &&
@@ -3456,12 +5289,14 @@ class CSharpLanguageService {
         this.cachePredictiveCompletionResult(plan.key, {
           response,
           completionListKey: plan.completionListKey,
+          code: plan.code,
           codeHash: plan.codeHash,
           offset: plan.offset,
           candidate: plan.candidate,
           prefix: plan.prefix,
           assumedText: `${plan.candidate}.`,
           projectCurrentPath: plan.projectRequest.currentPath,
+          projectRevision: plan.projectRequest.revision,
           projectFileKey: plan.projectRequest.fileKey,
           itemCount,
           createdAt: Date.now(),
@@ -3514,6 +5349,8 @@ class CSharpLanguageService {
         durationMs: Math.round((this.now() - startedAt) * 10) / 10,
         error: summarizePrimitive(error),
       });
+    } finally {
+      this.pendingSpeculativeCompletionListPublicationKeys.delete(plan.completionListKey);
     }
   }
 
@@ -3523,7 +5360,7 @@ class CSharpLanguageService {
     defaultRange: monaco.IRange,
     snapshot: CSharpCompletionRequestSnapshot,
     lateContext: CSharpLateCompletionContext | null,
-    speculativeCompletionListKey?: string
+    completionList?: { key: string; speculative: boolean }
   ): CSharpCompletionCacheEntry {
     const suggestions: monaco.languages.CompletionItem[] = [];
     const lspItems: any[] = [];
@@ -3531,8 +5368,8 @@ class CSharpLanguageService {
     for (const rawItem of csharpCompletionItemsFromResponse(response)) {
       const suggestion = this.convertCompletion(model, rawItem, defaultRange, snapshot, lateContext);
       if (!csharpCompletionItemIsUsable(suggestion)) continue;
-      if (speculativeCompletionListKey && rawItem && typeof rawItem === 'object') {
-        this.completionResolveSpeculativeKeys.set(rawItem, speculativeCompletionListKey);
+      if (completionList && rawItem && typeof rawItem === 'object') {
+        this.completionResolveListKeys.set(rawItem, completionList);
       }
       suggestions.push(suggestion);
       lspItems.push(rawItem);
@@ -3542,8 +5379,14 @@ class CSharpLanguageService {
       suggestions,
       lspItems,
       incomplete: csharpCompletionResponseIsIncomplete(response),
-      completionSnapshot: lateContext ? snapshot : undefined,
+      completionSnapshot: snapshot,
       lateContext,
+      renderedFilterRange: defaultRange,
+      presentationFilterRange: undefined,
+      preselectedCompletionIndices: undefined,
+      sessionReusable: suggestions.every(suggestion =>
+        csharpCompletionRangeContainsSnapshotOffset(suggestion.range, snapshot)),
+      completionList,
     };
   }
 
@@ -3556,7 +5399,7 @@ class CSharpLanguageService {
   ): string {
     return csharpPredictiveCompletionCacheKey(
       model.uri.toString(),
-      csharpCompletionFastHash(snapshot.code),
+      snapshot.hash,
       snapshot.offset,
       request,
       projectRequest,
@@ -3581,13 +5424,18 @@ class CSharpLanguageService {
   private async rawProvideCompletionItems(
     model: monaco.editor.ITextModel,
     position: monaco.Position,
-    context: monaco.languages.CompletionContext
+    context: monaco.languages.CompletionContext,
+    cancellationToken?: monaco.CancellationToken
   ): Promise<monaco.languages.CompletionList> {
+    if (cancellationToken?.isCancellationRequested || model.isDisposed()) {
+      return this.cancelledCompletionList();
+    }
     const snapshot = this.createCompletionSnapshot(model, position);
     snapshot.structuralVersion = this.completionStructuralVersion;
 
     const request = csharpOmniSharpCompletionRequest(model, position, context);
     const projectRequest = this.createSerializedDiagnosticProjectRequest(model);
+    const requestEnvironmentVersion = this.completionEnvironmentVersion;
     const cacheKey = csharpContextualCompletionCacheKey(
       model,
       snapshot,
@@ -3595,12 +5443,14 @@ class CSharpLanguageService {
       context,
       request,
       projectRequest,
-      this.completionEnvironmentVersion,
+      requestEnvironmentVersion,
     );
     const predictiveKey = this.predictiveCompletionKeyForCurrentRequest(model, snapshot, position, request, projectRequest);
+    const sessionKey = this.completionSessionCacheKey(model, snapshot, position, projectRequest, request);
 
     const cached = this.completionCache.get(cacheKey);
     if (cached) {
+      this.cacheCompletionResult(cacheKey, cached);
       this.setPredictiveCompletionLastLookup(this.buildPredictiveCompletionLookupSnapshot(
         model,
         snapshot,
@@ -3616,25 +5466,89 @@ class CSharpLanguageService {
           reason: 'Normal completion result cache matched this exact request before predictive preload replay was needed.',
         },
       ));
+      this.cacheCompletionSessionResult(sessionKey, cached);
       this.rememberPredictiveCompletionSource(model, projectRequest, cached);
       this.refreshPredictiveCompletion(model);
       return this.toCompletionList(cached);
     }
 
-    const predictive = this.predictiveCompletionCache.get(predictiveKey);
+    const cachedSession = this.completionSessionCache.get(sessionKey);
+    if (cachedSession) {
+      const sessionEntry = await this.completionEntryFromSession(model, cachedSession, cancellationToken);
+      if (
+        cancellationToken?.isCancellationRequested ||
+        model.isDisposed() ||
+        model.getVersionId() !== snapshot.modelVersionId ||
+        !this.isEditorAtPosition(model, position)
+      ) {
+        // Keep the reusable entry for the request that superseded this one. Cancellation
+        // or another keystroke does not prove that the underlying Roslyn list is invalid.
+        return this.cancelledCompletionList();
+      }
+      if (sessionEntry) {
+        this.completionSessionCache.delete(sessionKey);
+        this.completionSessionCache.set(sessionKey, sessionEntry);
+        this.cacheCompletionResult(cacheKey, sessionEntry);
+        this.setPredictiveCompletionLastLookup(this.buildPredictiveCompletionLookupSnapshot(
+          model,
+          snapshot,
+          position,
+          context,
+          request,
+          projectRequest,
+          predictiveKey,
+          cacheKey,
+          'session-cache-hit',
+          {
+            matchedItemCount: sessionEntry.suggestions.length,
+            reason: 'A complete Roslyn list from the same semantic editing session was rebased to the extended identifier prefix.',
+          },
+        ));
+        this.rememberPredictiveCompletionSource(model, projectRequest, sessionEntry);
+        this.refreshPredictiveCompletion(model);
+        return this.toCompletionList(sessionEntry);
+      }
+      this.completionSessionCache.delete(sessionKey);
+    }
+    if (cancellationToken?.isCancellationRequested || model.isDisposed()) {
+      return this.cancelledCompletionList();
+    }
+
+    // If the user reached the exact future source while its speculative Roslyn request is
+    // still running, finish and consume that request instead of cancelling it and paying
+    // the same cold member-completion/JIT cost again on the normal lane.
+    await this.finishMatchingPredictiveCompletion(predictiveKey, snapshot.code);
+    if (
+      cancellationToken?.isCancellationRequested ||
+      model.isDisposed() ||
+      model.getVersionId() !== snapshot.modelVersionId ||
+      !this.isEditorAtPosition(model, position)
+    ) {
+      return this.cancelledCompletionList();
+    }
+
+    const keyedPredictive = this.predictiveCompletionCache.get(predictiveKey);
+    const predictive = keyedPredictive?.code === snapshot.code ? keyedPredictive : undefined;
+    if (keyedPredictive && !predictive) {
+      // The fast hash is only an index accelerator. Exact source equality is mandatory
+      // before replay so a 32-bit collision can never cross semantic contexts.
+      this.predictiveCompletionCache.delete(predictiveKey);
+    }
     let preloadFallbackReason = 'No predictive preload cache entry matched this completion request.';
     if (predictive) {
+      this.cachePredictiveCompletionResult(predictiveKey, predictive);
       const entry = this.completionEntryFromResponse(
         model,
         predictive.response,
         this.getCompletionFilterRangeAtPosition(model, position),
         snapshot,
         null,
-        predictive.completionListKey,
+        { key: predictive.completionListKey, speculative: true },
       );
       if (entry.suggestions.length) {
         const ageMs = Date.now() - predictive.createdAt;
         this.cacheCompletionResult(cacheKey, entry);
+        this.cacheCompletionSessionResult(sessionKey, entry);
         this.completionWorkerStateKey = cacheKey;
         this.rememberPredictiveCompletionSource(model, projectRequest, entry);
         this.refreshPredictiveCompletion(model);
@@ -3705,7 +5619,10 @@ class CSharpLanguageService {
     }
 
     const runtimeReady = await this.ensureLocalOmniSharpRuntime();
-    if (!runtimeReady || !this.omnisharp || model.isDisposed()) {
+    if (cancellationToken?.isCancellationRequested || model.isDisposed()) {
+      return this.cancelledCompletionList();
+    }
+    if (!runtimeReady || !this.omnisharp) {
       this.setPredictiveCompletionLastLookup(this.buildPredictiveCompletionLookupSnapshot(
         model,
         snapshot,
@@ -3737,7 +5654,23 @@ class CSharpLanguageService {
       },
     ), 'warning');
 
-    const requestSerial = ++this.completionRequestSerial;
+    const inflight = csharpCompletionInflightFor(this);
+    const existingInflight = inflight.get(cacheKey);
+    // A request for the same editor state can be joined only while it is still the newest
+    // request. If the user typed elsewhere and then returned to this state, the older
+    // producer has already been superseded and a fresh request must own a new serial.
+    const reusableInflight = existingInflight?.requestSerial === this.completionRequestSerial
+      ? existingInflight
+      : undefined;
+    if (existingInflight && !reusableInflight) {
+      inflight.delete(cacheKey);
+    }
+    let entryPromise = reusableInflight?.promise;
+    // Exact duplicate providers share both the runtime call and its serial. Advancing the
+    // global serial here would make the shared producer stale and empty for every caller.
+    const requestSerial = reusableInflight
+      ? reusableInflight.requestSerial
+      : ++this.completionRequestSerial;
     const callId = 'completion-' + requestSerial;
     const startedAt = this.now();
     this.recordDebugEvent({
@@ -3754,12 +5687,21 @@ class CSharpLanguageService {
       },
     });
 
-    const inflight = csharpCompletionInflightFor(this);
-    let entryPromise = inflight.get(cacheKey);
-
+    let ownedCompletionListKey: string | null = null;
     if (!entryPromise) {
-      entryPromise = (async (): Promise<CSharpCompletionCacheEntry | null> => {
-        const response = await this.enqueueCompletionRuntimeCall(model, snapshot, request, projectRequest, requestSerial, callId);
+      const completionListKey = `normal:${this.runtimeSessionSerial}:${requestSerial}`;
+      ownedCompletionListKey = completionListKey;
+      let producedPromise: Promise<CSharpCompletionCacheEntry | null>;
+      producedPromise = (async (): Promise<CSharpCompletionCacheEntry | null> => {
+        const response = await this.enqueueCompletionRuntimeCall(
+          model,
+          snapshot,
+          request,
+          projectRequest,
+          requestSerial,
+          callId,
+          completionListKey,
+        );
         if (response === CSHARP_STALE_COMPLETION_RESPONSE) {
           return null;
         }
@@ -3775,16 +5717,37 @@ class CSharpLanguageService {
         }
 
         const defaultRange = lateContext?.filterRange ?? this.getCompletionFilterRangeAtPosition(model, position);
-        return this.completionEntryFromResponse(model, response, defaultRange, snapshot, lateContext);
+        return this.completionEntryFromResponse(
+          model,
+          response,
+          defaultRange,
+          snapshot,
+          lateContext,
+          { key: completionListKey, speculative: false },
+        );
       })().finally(() => {
-        inflight.delete(cacheKey);
+        if (inflight.get(cacheKey)?.promise === producedPromise) {
+          inflight.delete(cacheKey);
+        }
       });
 
-      inflight.set(cacheKey, entryPromise);
+      entryPromise = producedPromise;
+      inflight.set(cacheKey, { requestSerial, promise: producedPromise });
     }
 
     try {
       const entry = await entryPromise;
+      if (cancellationToken?.isCancellationRequested) {
+        this.recordDebugEvent({
+          feature: 'completion',
+          phase: 'provider-cancelled',
+          level: 'info',
+          callId,
+          durationMs: Math.round((this.now() - startedAt) * 10) / 10,
+          message: 'C# completion provider discarded a result after Monaco cancelled the request.',
+        });
+        return this.cancelledCompletionList();
+      }
       if (!entry || model.isDisposed()) {
         this.recordDebugEvent({
           feature: 'completion',
@@ -3804,8 +5767,23 @@ class CSharpLanguageService {
         return this.emptyCompletionList();
       }
 
-      this.cacheCompletionResult(cacheKey, entry);
-      this.completionWorkerStateKey = cacheKey;
+      const resultCacheKey = requestEnvironmentVersion === this.completionEnvironmentVersion
+        ? cacheKey
+        : csharpContextualCompletionCacheKey(
+            model,
+            snapshot,
+            position,
+            context,
+            request,
+            projectRequest,
+            this.completionEnvironmentVersion,
+          );
+      const resultSessionKey = requestEnvironmentVersion === this.completionEnvironmentVersion
+        ? sessionKey
+        : this.completionSessionCacheKey(model, snapshot, position, projectRequest, request);
+      this.cacheCompletionResult(resultCacheKey, entry);
+      this.cacheCompletionSessionResult(resultSessionKey, entry);
+      this.completionWorkerStateKey = resultCacheKey;
       this.rememberPredictiveCompletionSource(model, projectRequest, entry);
       this.refreshPredictiveCompletion(model);
       this.recordDebugEvent({
@@ -3834,6 +5812,10 @@ class CSharpLanguageService {
         error: summarizePrimitive(error),
       });
       return this.emptyCompletionList();
+    } finally {
+      if (ownedCompletionListKey) {
+        this.pendingCompletionListPublicationKeys.delete(ownedCompletionListKey);
+      }
     }
   }
   private async rawResolveCompletionItem(
@@ -3857,7 +5839,12 @@ class CSharpLanguageService {
     });
 
     try {
+      const metadataInvalidationSerial = this.metadataInvalidationSerial;
       const response = await this.getCompletionResolveResponse(lspItem);
+      this.observeOmniSharpResponseMetadataVersion(response);
+      if (metadataInvalidationSerial !== this.metadataInvalidationSerial) {
+        return item;
+      }
       if (!response) {
         this.recordDebugEvent({
           feature: 'completion.resolve',
@@ -3913,8 +5900,8 @@ class CSharpLanguageService {
 
   private getCompletionResolveResponse(lspItem: any): Promise<unknown> {
     if (!this.omnisharp) return Promise.resolve(false);
-    const speculativeCompletionListKey = lspItem && typeof lspItem === 'object'
-      ? this.completionResolveSpeculativeKeys.get(lspItem)
+    const completionList = lspItem && typeof lspItem === 'object'
+      ? this.completionResolveListKeys.get(lspItem)
       : undefined;
     if (!lspItem || typeof lspItem !== 'object') {
       return this.omnisharp('GetCompletionResolveAsync', { Item: lspItem });
@@ -3924,9 +5911,9 @@ class CSharpLanguageService {
     if (cached) return cached;
 
     const request = (
-      speculativeCompletionListKey
-        ? this.omnisharp('GetSpeculativeCompletionResolveAsync', { Item: lspItem }, speculativeCompletionListKey)
-        : this.omnisharp('GetCompletionResolveAsync', { Item: lspItem })
+      completionList?.speculative
+        ? this.omnisharp('GetSpeculativeCompletionResolveAsync', { Item: lspItem }, completionList.key)
+        : this.omnisharp('GetCompletionResolveAsync', { Item: lspItem }, completionList?.key ?? '')
     ).then(response => {
       if (!response) this.completionResolveResponseCache.delete(lspItem);
       return response;
@@ -3946,7 +5933,14 @@ class CSharpLanguageService {
     const req = { Line: position.lineNumber - 1, Column: position.column - 1 };
     const snapshot = this.getModelTextSnapshot(model);
     try {
-      const res = await this.cachedOmniSharpModelCall('GetSignatureHelpAsync', model, snapshot, [req], req);
+      const res = await this.enqueueProjectModelCall(
+        'completion',
+        'GetSignatureHelpAsync',
+        model,
+        snapshot,
+        projectRequest => [req, projectRequest.revision, projectRequest.currentPath],
+        req,
+      );
       if (!res) return this.provideLocalSignatureHelp(model, position);
       const result = res as any;
       return {
@@ -3964,7 +5958,8 @@ class CSharpLanguageService {
         },
         dispose: () => { },
       };
-    } catch {
+    } catch (error) {
+      rethrowObsoleteCSharpSemanticResponse(error);
       return this.provideLocalSignatureHelp(model, position);
     }
   }
@@ -3985,22 +5980,22 @@ class CSharpLanguageService {
     ) {
       try {
         const snapshot = this.getModelTextSnapshot(model);
-        const projectRequest = this.createSerializedDiagnosticProjectRequest(model);
         const positionRequest = this.positionRequest(position);
-        const response = await this.cachedOmniSharpModelCall(
+        const response = await this.enqueueProjectModelCall(
+          'diagnostic',
           'GetQuickInfoAsync',
           model,
           snapshot,
-          [positionRequest, projectRequest.fileKey, projectRequest.currentPath],
-          positionRequest,
-          projectRequest.serialized
+          projectRequest => [positionRequest, projectRequest.revision, projectRequest.currentPath],
+          positionRequest
         );
         if (cancellationToken?.isCancellationRequested || model.isDisposed() || model.getVersionId() !== initialModelVersion) {
           return undefined;
         }
         const hover = this.convertOmniSharpHover(response);
         if (hover) return hover;
-      } catch {
+      } catch (error) {
+        rethrowObsoleteCSharpSemanticResponse(error);
         // Continue with the in-browser C# language index.
       }
     }
@@ -4024,11 +6019,23 @@ class CSharpLanguageService {
     if (this.omnisharp) {
       try {
         const snapshot = this.getModelTextSnapshot(model);
-        const response = await this.cachedOmniSharpModelCall('GetSemanticTokensAsync', model, snapshot, []);
+        const response = await this.enqueueProjectModelCall(
+          'diagnostic',
+          'GetSemanticTokensAsync',
+          model,
+          snapshot,
+          projectRequest => [projectRequest.revision, projectRequest.currentPath],
+        );
         if (!cancellationToken.isCancellationRequested && Array.isArray(response)) {
           return { data: this.encodeOmniSharpSemanticTokens(response as OmniSharpSemanticTokenDto[]) };
         }
-      } catch {
+      } catch (error) {
+        if (error instanceof CSharpObsoleteSemanticResponseError) {
+          // Model edits routinely supersede Monaco's automatic semantic-token request.
+          // This is cancellation, not a provider failure; returning null keeps the old
+          // token result until Monaco asks again and avoids a noisy rejected Promise.
+          return null;
+        }
         // Fall through to the browser-side semantic index.
       }
     }
@@ -4044,19 +6051,19 @@ class CSharpLanguageService {
     if (this.omnisharp) {
       try {
         const snapshot = this.getModelTextSnapshot(model);
-        const projectRequest = this.createSerializedDiagnosticProjectRequest(model);
         const positionRequest = this.positionRequest(position);
-        const response = await this.cachedOmniSharpModelCall(
+        const response = await this.enqueueProjectModelCall(
+          'diagnostic',
           'GetDefinitionAsync',
           model,
           snapshot,
-          [positionRequest, projectRequest.fileKey, projectRequest.currentPath],
-          positionRequest,
-          projectRequest.serialized
+          projectRequest => [positionRequest, projectRequest.revision, projectRequest.currentPath],
+          positionRequest
         );
         const locations = this.convertLocations(model, response);
         if (locations.length) return locations;
-      } catch {
+      } catch (error) {
+        rethrowObsoleteCSharpSemanticResponse(error);
         // Fall through to the browser-side semantic index.
       }
     }
@@ -4080,16 +6087,18 @@ class CSharpLanguageService {
         const snapshot = this.getModelTextSnapshot(model);
         const positionRequest = this.positionRequest(position);
         const includeDeclaration = String(context.includeDeclaration);
-        const response = await this.cachedOmniSharpModelCall(
+        const response = await this.enqueueProjectModelCall(
+          'diagnostic',
           'GetReferencesAsync',
           model,
           snapshot,
-          [positionRequest, includeDeclaration],
+          projectRequest => [positionRequest, includeDeclaration, projectRequest.revision, projectRequest.currentPath],
           positionRequest,
           includeDeclaration
         );
         omnisharpLocations = this.convertLocations(model, response);
-      } catch {
+      } catch (error) {
+        rethrowObsoleteCSharpSemanticResponse(error);
         // Fall through to the browser-side semantic index.
       }
     }
@@ -4119,10 +6128,17 @@ class CSharpLanguageService {
     if (this.omnisharp) {
       try {
         const snapshot = this.getModelTextSnapshot(model);
-        const response = await this.cachedOmniSharpModelCall('GetDocumentSymbolsAsync', model, snapshot, []);
+        const response = await this.enqueueProjectModelCall(
+          'diagnostic',
+          'GetDocumentSymbolsAsync',
+          model,
+          snapshot,
+          projectRequest => [projectRequest.revision, projectRequest.currentPath],
+        );
         const symbols = this.convertDocumentSymbols(response);
         if (symbols.length) return symbols;
-      } catch {
+      } catch (error) {
+        rethrowObsoleteCSharpSemanticResponse(error);
         // Fall through to the browser-side semantic index.
       }
     }
@@ -4138,11 +6154,12 @@ class CSharpLanguageService {
       try {
         const snapshot = this.getModelTextSnapshot(model);
         const positionRequest = this.positionRequest(position);
-        const response = await this.cachedOmniSharpModelCall(
+        const response = await this.enqueueProjectModelCall(
+          'diagnostic',
           'GetRenameInfoAsync',
           model,
           snapshot,
-          [positionRequest],
+          projectRequest => [positionRequest, projectRequest.revision, projectRequest.currentPath],
           positionRequest
         ) as OmniSharpRenameInfoDto | false;
         const range = this.toEditorRange(response && response.range);
@@ -4155,7 +6172,8 @@ class CSharpLanguageService {
             text: '',
           };
         }
-      } catch {
+      } catch (error) {
+        rethrowObsoleteCSharpSemanticResponse(error);
         // Fall through to the browser-side semantic index.
       }
     }
@@ -4185,11 +6203,12 @@ class CSharpLanguageService {
       try {
         const snapshot = this.getModelTextSnapshot(model);
         const positionRequest = this.positionRequest(position);
-        const response = await this.cachedOmniSharpModelCall(
+        const response = await this.enqueueProjectModelCall(
+          'diagnostic',
           'GetRenameEditsAsync',
           model,
           snapshot,
-          [positionRequest, newName],
+          projectRequest => [positionRequest, newName, projectRequest.revision, projectRequest.currentPath],
           positionRequest,
           newName
         ) as OmniSharpRenameEditsDto | false;
@@ -4197,7 +6216,8 @@ class CSharpLanguageService {
           omnisharpEdits = response.edits.flatMap(edit => this.convertWorkspaceEdit(model, edit));
           omnisharpRejectReason = response.rejectReason ?? undefined;
         }
-      } catch {
+      } catch (error) {
+        rethrowObsoleteCSharpSemanticResponse(error);
         // Fall through to the browser-side semantic index.
       }
     }
@@ -4234,17 +6254,17 @@ class CSharpLanguageService {
       try {
         const snapshot = this.getModelTextSnapshot(model);
         const rangeRequest = this.rangeRequest(range);
-        const projectRequest = this.createSerializedDiagnosticProjectRequest(model);
-        const response = await this.cachedOmniSharpModelCall(
+        const response = await this.enqueueProjectModelCall(
+          'diagnostic',
           'GetCodeActionsAsync',
           model,
           snapshot,
-          [rangeRequest, projectRequest.serialized],
-          rangeRequest,
-          projectRequest.serialized
+          projectRequest => [rangeRequest, projectRequest.revision, projectRequest.currentPath],
+          rangeRequest
         );
         actions.push(...this.convertCodeActions(model, response, context.markers));
       } catch (error) {
+        rethrowObsoleteCSharpSemanticResponse(error);
         omnisharpError = error;
         this.recordDebugEvent({
           feature: 'codeActions',
@@ -4316,10 +6336,17 @@ class CSharpLanguageService {
     if (this.omnisharp) {
       try {
         const snapshot = this.getModelTextSnapshot(model);
-        const response = await this.cachedOmniSharpModelCall('GetFoldingRangesAsync', model, snapshot, []);
+        const response = await this.enqueueProjectModelCall(
+          'diagnostic',
+          'GetFoldingRangesAsync',
+          model,
+          snapshot,
+          projectRequest => [projectRequest.revision, projectRequest.currentPath],
+        );
         const ranges = this.convertFoldingRanges(response);
         if (ranges.length) return ranges;
-      } catch {
+      } catch (error) {
+        rethrowObsoleteCSharpSemanticResponse(error);
         // Fall through to the browser-side semantic index.
       }
     }
@@ -4334,12 +6361,19 @@ class CSharpLanguageService {
     const snapshot = this.getModelTextSnapshot(model);
     if (this.omnisharp) {
       try {
-        const formatted = await this.cachedOmniSharpModelCall('GetFormattingAsync', model, snapshot, []);
+        const formatted = await this.enqueueProjectModelCall(
+          'diagnostic',
+          'GetFormattingAsync',
+          model,
+          snapshot,
+          projectRequest => [projectRequest.revision, projectRequest.currentPath],
+        );
         if (typeof formatted === 'string' && formatted !== snapshot.code) {
           return [{ range: model.getFullModelRange(), text: formatted }];
         }
         if (typeof formatted === 'string') return [];
-      } catch {
+      } catch (error) {
+        rethrowObsoleteCSharpSemanticResponse(error);
         // Fall through to lightweight formatter.
       }
     }
@@ -4359,18 +6393,20 @@ class CSharpLanguageService {
     if (this.omnisharp) {
       try {
         const rangeRequest = this.rangeRequest(range);
-        const formatted = await this.cachedOmniSharpModelCall(
+        const formatted = await this.enqueueProjectModelCall(
+          'diagnostic',
           'GetRangeFormattingAsync',
           model,
           snapshot,
-          [rangeRequest],
+          projectRequest => [rangeRequest, projectRequest.revision, projectRequest.currentPath],
           rangeRequest
         );
         if (typeof formatted === 'string' && formatted !== snapshot.code) {
           return [{ range: model.getFullModelRange(), text: formatted }];
         }
         if (typeof formatted === 'string') return [];
-      } catch {
+      } catch (error) {
+        rethrowObsoleteCSharpSemanticResponse(error);
         // Fall through to lightweight formatter.
       }
     }
@@ -4404,16 +6440,18 @@ class CSharpLanguageService {
       try {
         const snapshot = this.getModelTextSnapshot(model);
         const rangeRequest = this.rangeRequest(range);
-        const response = await this.cachedOmniSharpModelCall(
+        const response = await this.enqueueProjectModelCall(
+          'diagnostic',
           'GetInlayHintsAsync',
           model,
           snapshot,
-          [rangeRequest],
+          projectRequest => [rangeRequest, projectRequest.revision, projectRequest.currentPath],
           rangeRequest
         );
         const hints = this.convertInlayHints(response);
         if (hints.length) return { hints, dispose() {} };
-      } catch {
+      } catch (error) {
+        rethrowObsoleteCSharpSemanticResponse(error);
         // Fall through to the browser-side semantic index.
       }
     }
@@ -4857,13 +6895,139 @@ class CSharpLanguageService {
     return this.createSerializedDiagnosticProjectRequest(model).request;
   }
 
+  private projectSnapshotStateKey(projectRequest: CSharpSerializedProjectRequest): string {
+    // The opaque revision changes only after an exact file-content comparison. Do not
+    // rely solely on the fast 32-bit hashes here: even a theoretical collision must
+    // still force a full, atomic project snapshot synchronization.
+    return `${projectRequest.revision}\u0000${projectRequest.currentPath}`;
+  }
+
+  private projectSnapshotPayload(
+    workspace: 'completion' | 'speculative' | 'diagnostic',
+    projectRequest: CSharpSerializedProjectRequest
+  ): string {
+    const stateKey = this.projectSnapshotStateKey(projectRequest);
+    const appliedStateKey = workspace === 'completion'
+      ? this.completionProjectStateKey
+      : workspace === 'speculative'
+        ? this.speculativeProjectStateKey
+        : this.diagnosticProjectStateKey;
+    return appliedStateKey === stateKey ? '' : projectRequest.serialized;
+  }
+
+  private markProjectSnapshotApplied(
+    workspace: 'completion' | 'speculative' | 'diagnostic',
+    projectRequest: CSharpSerializedProjectRequest
+  ) {
+    const stateKey = this.projectSnapshotStateKey(projectRequest);
+    if (workspace === 'completion') {
+      this.completionProjectStateKey = stateKey;
+    } else if (workspace === 'speculative') {
+      this.speculativeProjectStateKey = stateKey;
+    } else {
+      this.diagnosticProjectStateKey = stateKey;
+    }
+  }
+
+  private async ensureWorkspaceProjectState(
+    workspace: 'completion' | 'diagnostic',
+    model: monaco.editor.ITextModel,
+    snapshot: CSharpModelTextSnapshot
+  ): Promise<CSharpSerializedProjectRequest> {
+    if (!this.omnisharp) {
+      throw new Error('OmniSharp is unavailable while synchronizing project state.');
+    }
+
+    const projectRequest = this.createSerializedDiagnosticProjectRequest(model);
+    const payload = this.projectSnapshotPayload(workspace, projectRequest);
+    const textState = workspace === 'completion'
+      ? this.completionTextState
+      : this.diagnosticTextState;
+    const textNeedsSync = (
+      !textState ||
+      textState.runtimeSession !== this.runtimeSessionSerial ||
+      textState.projectRevision !== projectRequest.revision ||
+      textState.code !== snapshot.code
+    );
+    if (!payload && !textNeedsSync) return projectRequest;
+
+    const method = workspace === 'completion'
+      ? 'SyncCompletionProjectAsync'
+      : 'SyncDiagnosticProjectAsync';
+    const response = this.requireOmniSharpResponse(
+      method,
+      await this.omnisharp(method, snapshot.code, payload, projectRequest.revision),
+    ) as {
+      projectStateKey?: unknown;
+      primaryDocumentVersion?: unknown;
+      primaryDocumentTextLength?: unknown;
+      metadataVersion?: unknown;
+    };
+    this.observeOmniSharpResponseMetadataVersion(response);
+    if (response?.projectStateKey !== projectRequest.revision) {
+      throw new Error(`${method} did not acknowledge the requested project state.`);
+    }
+
+    if (workspace === 'completion') {
+      this.commitCompletionTextSync('completion', snapshot.code, projectRequest, {
+        success: true,
+        requiresFullSync: false,
+        version: response.primaryDocumentVersion,
+        textLength: response.primaryDocumentTextLength,
+        projectRevision: projectRequest.revision,
+      });
+    } else {
+      const version = response.primaryDocumentVersion;
+      const textLength = response.primaryDocumentTextLength;
+      if (
+        !Number.isSafeInteger(version) ||
+        (version as number) < 0 ||
+        !Number.isSafeInteger(textLength) ||
+        textLength !== snapshot.length
+      ) {
+        this.diagnosticTextState = null;
+        throw new Error(`${method} returned an invalid primary-text acknowledgement.`);
+      }
+      this.diagnosticTextState = {
+        runtimeSession: this.runtimeSessionSerial,
+        projectRevision: projectRequest.revision,
+        version: version as number,
+        length: textLength as number,
+        code: snapshot.code,
+      };
+      this.markProjectSnapshotApplied(workspace, projectRequest);
+    }
+    return projectRequest;
+  }
+
   private createSerializedDiagnosticProjectRequest(model: monaco.editor.ITextModel): CSharpSerializedProjectRequest {
     const currentPath = currentModelPath(model);
+    const providerFiles = this.projectFilesProvider();
+    const providerRevision = this.projectFilesRevisionProvider?.();
+    const cached = this.projectRequestCache;
+    if (
+      cached &&
+      this.projectFilesRevisionProvider &&
+      this.projectRequestSource === providerFiles &&
+      Object.is(this.projectRequestSourceRevision, providerRevision) &&
+      cached.currentPath === currentPath
+    ) {
+      return cached;
+    }
+
     const seen = new Set<string>([currentPath]);
     const files: CSharpDiagnosticProjectRequest['Files'] = [];
-    const fileKeyParts: string[] = [];
+    let fileKeyHash = 2166136261;
+    const mixFileKey = (value: string) => {
+      for (let index = 0; index < value.length; index += 1) {
+        fileKeyHash ^= value.charCodeAt(index);
+        fileKeyHash = Math.imul(fileKeyHash, 16777619);
+      }
+      fileKeyHash ^= 0;
+      fileKeyHash = Math.imul(fileKeyHash, 16777619);
+    };
 
-    for (const file of this.projectFilesProvider()) {
+    for (const file of providerFiles) {
       if (file.language !== 'csharp') continue;
       const path = normalizeProjectPath(file.path);
       if (!path || seen.has(path)) continue;
@@ -4874,7 +7038,9 @@ class CSharpLanguageService {
         ? cachedHash.hash
         : hashString(content);
       this.projectFileHashCache.set(path, { content, hash, length: content.length });
-      fileKeyParts.push(`${path}:${content.length}:${hash}`);
+      mixFileKey(path);
+      mixFileKey(String(content.length));
+      mixFileKey(hash);
       files.push({ Path: path, Content: content });
     }
 
@@ -4882,16 +7048,37 @@ class CSharpLanguageService {
       if (!seen.has(path)) this.projectFileHashCache.delete(path);
     }
 
-    const fileKey = fileKeyParts.join('|');
-    const cached = this.projectRequestCache;
-    if (cached && cached.currentPath === currentPath && cached.fileKey === fileKey) {
+    // This compact value is telemetry/precheck only. The opaque revision below is reused
+    // solely after an exact ordered Path/Content comparison, so a hash collision can never
+    // become a semantic cache collision.
+    const fileKey = `${files.length}:${(fileKeyHash >>> 0).toString(36)}`;
+    const cachedFiles = cached?.request.Files ?? [];
+    const filesExactlyEqual = cachedFiles.length === files.length && files.every((file, index) => (
+      cachedFiles[index]?.Path === file.Path && cachedFiles[index]?.Content === file.Content
+    ));
+    if (
+      cached &&
+      cached.currentPath === currentPath &&
+      cached.fileKey === fileKey &&
+      filesExactlyEqual
+    ) {
+      this.projectRequestSource = providerFiles;
+      this.projectRequestSourceRevision = providerRevision;
       return cached;
     }
 
     const request = { CurrentPath: currentPath, Files: files };
     const serialized = JSON.stringify(request);
-    const snapshot = { request, serialized, fileKey, currentPath };
+    const snapshot = {
+      request,
+      serialized,
+      fileKey,
+      currentPath,
+      revision: `p${++this.projectRequestRevisionSerial}`,
+    };
     this.projectRequestCache = snapshot;
+    this.projectRequestSource = providerFiles;
+    this.projectRequestSourceRevision = providerRevision;
     return snapshot;
   }
 
@@ -4905,7 +7092,7 @@ class CSharpLanguageService {
       snapshot.length,
       snapshot.hash,
       projectRequest.currentPath,
-      projectRequest.fileKey,
+      projectRequest.revision,
       this.completionEnvironmentVersion,
     ].join(':');
   }

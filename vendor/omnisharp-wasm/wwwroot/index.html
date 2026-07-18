@@ -5,7 +5,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
     <title>OmniSharp</title>
-    <base href="/omnisharp/" />
+    <base href="./" />
     <link rel="icon" type="image/png" href="favicon.png" />
 </head>
 
@@ -16,8 +16,27 @@
     <p>
         If you're reading this, you've stumbled upon a headless API -- OmniSharp! Please refer to <a href="https://github.com/knervous/omnisharp">the documentation</a>
     </p>
-    <script src="_framework/blazor.webassembly.js"></script>
+    <script src="_framework/blazor.webassembly.js" autostart="false"></script>
     <script src="./message-service.js"></script>
+    <script>
+        (async () => {
+            let loadBootResource;
+            try {
+                const { createVerifiedGzipBootResourceLoader } = await import('./boot-resource-loader.js');
+                loadBootResource = createVerifiedGzipBootResourceLoader();
+            } catch (error) {
+                // Compression is an optimization, never a boot requirement. This also
+                // covers older browsers and partially deployed static asset sets.
+                console.warn('Starting OmniSharp with the default Blazor resource loader.', error);
+            }
+
+            if (loadBootResource) {
+                await Blazor.start({ loadBootResource });
+            } else {
+                await Blazor.start();
+            }
+        })();
+    </script>
 </body>
 
 </html>
