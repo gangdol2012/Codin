@@ -18,3 +18,9 @@ View your app in AI Studio: https://ai.studio/apps/7f04cc38-ec4b-423f-9488-6d78e
 2. Run the app:
    `npm run dev`
 3. Open **Settings → AI Assistant** inside the app and enter your API key, provider, and model there
+
+## License
+
+CodeCraft is available under the [MIT License](LICENSE). Bundled runtimes,
+compilers, and other dependencies retain their own licenses; see
+[Third-party notices](THIRD_PARTY_NOTICES.md).

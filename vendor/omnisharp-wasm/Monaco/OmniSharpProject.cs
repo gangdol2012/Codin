@@ -5,6 +5,7 @@ using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text.Json;
 
+using CodeCraft.CSharp;
 using CodeCraft.OmniSharpWasm.Interop;
 
 using Microsoft.CodeAnalysis;
@@ -1821,15 +1822,11 @@ public class OmniSharpProject
         "System.Threading.Tasks",
     };
 
-    private static readonly CSharpParseOptions ParseOptions = CSharpParseOptions.Default
-        .WithKind(SourceCodeKind.Regular)
-        .WithLanguageVersion(LanguageVersion.Preview);
-
-    private static readonly CSharpCompilationOptions CompilationOptions = new CSharpCompilationOptions(
-            OutputKind.ConsoleApplication,
-            concurrentBuild: false,
-            optimizationLevel: OptimizationLevel.Debug)
-        .WithPlatform(Platform.AnyCpu);
+    private static readonly CSharpProjectConfiguration DefaultProjectConfiguration = new();
+    private static readonly CSharpParseOptions ParseOptions =
+        CSharpCompilerSettings.CreateParseOptions(DefaultProjectConfiguration);
+    private static readonly CSharpCompilationOptions CompilationOptions =
+        CSharpCompilerSettings.CreateCompilationOptions(DefaultProjectConfiguration);
 
     private static readonly Lazy<MefHostServices> SharedMefHost = new(
         () => MefHostServices.DefaultHost,
@@ -2204,7 +2201,8 @@ public class OmniSharpProject
     public Task<Document> UpdateProjectDocumentsAsync(
         string code,
         string? activePath,
-        IEnumerable<SourceFileSnapshot>? files)
+        IEnumerable<SourceFileSnapshot>? files,
+        CSharpProjectConfiguration? configuration = null)
     {
         lock (_workspaceGate)
         {
@@ -2228,15 +2226,31 @@ public class OmniSharpProject
                 nextDocuments[path] = file.Content ?? string.Empty;
             }
 
-            if (safeCode == currentCode &&
+            var projectId = DocumentId.ProjectId;
+            var solution = Workspace.CurrentSolution;
+            var project = solution.GetProject(projectId)
+                ?? throw new InvalidOperationException("The OmniSharp project disappeared.");
+            var nextParseOptions = CSharpCompilerSettings.CreateParseOptions(configuration);
+            var nextCompilationOptions = CSharpCompilerSettings.CreateCompilationOptions(configuration);
+            var projectOptionsChanged =
+                !Equals(project.ParseOptions, nextParseOptions)
+                || !Equals(project.CompilationOptions, nextCompilationOptions);
+
+            if (!projectOptionsChanged &&
+                safeCode == currentCode &&
                 nextPrimaryPath == _primaryDocumentPath &&
                 DictionariesEqual(_additionalDocumentContents, nextDocuments))
             {
                 return Task.FromResult(GetCurrentDocumentLocked());
             }
 
-            var projectId = DocumentId.ProjectId;
-            var solution = Workspace.CurrentSolution;
+            if (projectOptionsChanged)
+            {
+                solution = solution
+                    .WithProjectParseOptions(projectId, nextParseOptions)
+                    .WithProjectCompilationOptions(projectId, nextCompilationOptions);
+            }
+
             var nextDocumentIds = new Dictionary<string, DocumentId>(StringComparer.Ordinal);
             SourceText? nextPrimaryText = null;
 

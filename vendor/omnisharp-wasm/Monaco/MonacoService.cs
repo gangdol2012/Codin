@@ -5,6 +5,7 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
+using CodeCraft.CSharp;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CodeActions;
 using Microsoft.CodeAnalysis.CodeFixes;
@@ -97,7 +98,10 @@ public class MonacoService
     public record PositionRequest(int Line, int Column);
     public record RangeRequest(PositionDto Start, PositionDto End);
     public record DiagnosticProjectFileDto(string Path, string Content);
-    public record DiagnosticProjectRequest(string? CurrentPath, DiagnosticProjectFileDto[]? Files);
+    public record DiagnosticProjectRequest(
+        string? CurrentPath,
+        DiagnosticProjectFileDto[]? Files,
+        CSharpProjectConfiguration? Configuration = null);
     public record MonacoLocation(TextRange Range, string? Path = null, string? Name = null, string? Kind = null, string? Detail = null);
     public record MonacoTextEdit(TextRange Range, string Text, string? Path = null);
     public record RenameInfo(bool CanRename, TextRange? Range, string? Text, string? RejectReason);
@@ -1504,7 +1508,11 @@ $@"using System;
                 .Where(file => !string.IsNullOrWhiteSpace(file.Path))
                 .Select(file => new OmniSharpProject.SourceFileSnapshot(file.Path, file.Content ?? string.Empty))
                 .ToArray();
-            var document = await project.UpdateProjectDocumentsAsync(code, request.CurrentPath, files);
+            var document = await project.UpdateProjectDocumentsAsync(
+                code,
+                request.CurrentPath,
+                files,
+                request.Configuration);
             await project.EnsureReferencesForProjectAsync(document.Project);
             return project.Workspace.CurrentSolution.GetDocument(project.DocumentId)
                 ?? throw new InvalidOperationException($"The {label} document disappeared after reference promotion.");
@@ -1532,7 +1540,8 @@ $@"using System;
             var document = await _diagnosticProject.UpdateProjectDocumentsAsync(
                 code,
                 request.CurrentPath,
-                files);
+                files,
+                request.Configuration);
             await _diagnosticProject.EnsureReferencesForProjectAsync(document.Project);
             return _diagnosticProject.Workspace.CurrentSolution.GetDocument(_diagnosticProject.DocumentId)
                 ?? throw new InvalidOperationException(

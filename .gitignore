@@ -5,6 +5,7 @@ tools/**/bin/
 tools/**/obj/
 public/*
 !public/coi-serviceworker.js
+!public/codecraft-mark.svg
 !public/ecj.jar
 !public/favicon.ico
 .vercel

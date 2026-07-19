@@ -819,16 +819,16 @@ public class OmniSharpCompletionService
         {
             case CompletionItemExtensions.ExtensionMethodImportCompletionProvider:
             case CompletionItemExtensions.TypeImportCompletionProvider:
-                var syntax = await document.GetSyntaxTreeAsync();
                 var sourceText = await document.GetTextAsync();
-                var typedSpan = completionService.GetDefaultCompletionListSpan(sourceText, position);
-                var change = await completionService.GetChangeAsync(document, lastCompletionItem, typedSpan);
-                var (additionalTextEdits, offset) = GetAdditionalTextEdits(change, sourceText, (CSharpParseOptions)syntax!.Options, typedSpan, lastCompletionItem.DisplayText, providerName);
-                if (offset > 0)
-                {
-                    Debug.Assert(additionalTextEdits is object);
-                    request.Item.AdditionalTextEdits = additionalTextEdits;
-                }
+                var change = await completionService.GetChangeAsync(
+                    document,
+                    lastCompletionItem,
+                    cancellationToken: cancellationToken);
+                ApplyResolvedImportCompletionChange(
+                    request.Item,
+                    lastCompletionItem,
+                    change,
+                    sourceText);
                 break;
         }
 
@@ -836,6 +836,126 @@ public class OmniSharpCompletionService
         {
             Item = request.Item
         };
+    }
+
+    private void ApplyResolvedImportCompletionChange(
+        CompletionItem target,
+        Microsoft.CodeAnalysis.Completion.CompletionItem roslynItem,
+        CompletionChange change,
+        SourceText sourceText)
+    {
+        // Roslyn import providers intentionally expose both a collapsed TextChange and
+        // the fine-grained TextChanges used to create it. The collapsed edit spans the
+        // import insertion and the identifier replacement, which cannot be represented
+        // as a Monaco completion edit without overlapping ranges. Keep the identifier
+        // replacement as the primary edit and send every other Roslyn change as an
+        // additional edit.
+        var textChanges = change.TextChanges.IsDefaultOrEmpty
+            ? ImmutableArray.Create(change.TextChange)
+            : change.TextChanges;
+        var primaryChangeIndex = FindPrimaryCompletionChange(
+            textChanges,
+            roslynItem.Span,
+            roslynItem.DisplayText);
+        if (primaryChangeIndex < 0)
+        {
+            _logger.LogWarning(
+                "Could not identify the primary import-completion edit for {0}. Roslyn returned {1} fine-grained edit(s).",
+                roslynItem.DisplayText,
+                textChanges.Length);
+            return;
+        }
+
+        var primaryChange = textChanges[primaryChangeIndex];
+        if (!IsValidTextChange(primaryChange, sourceText.Length))
+        {
+            _logger.LogWarning(
+                "Roslyn returned an invalid primary import-completion span {0} for a document of length {1}.",
+                primaryChange.Span,
+                sourceText.Length);
+            return;
+        }
+
+        var additionalTextEdits = ImmutableArray.CreateBuilder<LinePositionSpanTextChange>(
+            Math.Max(0, textChanges.Length - 1));
+        for (var index = 0; index < textChanges.Length; index++)
+        {
+            if (index == primaryChangeIndex)
+            {
+                continue;
+            }
+
+            var additionalChange = textChanges[index];
+            if (!IsValidTextChange(additionalChange, sourceText.Length) ||
+                TextChangesOverlap(primaryChange.Span, additionalChange.Span))
+            {
+                _logger.LogWarning(
+                    "Roslyn returned an invalid or overlapping additional import-completion span {0}; preserving the original completion item.",
+                    additionalChange.Span);
+                return;
+            }
+
+            additionalTextEdits.Add(ToLinePositionSpanTextChange(additionalChange, sourceText));
+        }
+
+        target.TextEdit = ToLinePositionSpanTextChange(primaryChange, sourceText);
+        target.AdditionalTextEdits = additionalTextEdits.Count == 0
+            ? null
+            : additionalTextEdits.MoveToImmutable();
+
+        static int FindPrimaryCompletionChange(
+            ImmutableArray<TextChange> changes,
+            TextSpan completionSpan,
+            string displayText)
+        {
+            // Import providers append the identifier replacement after the import edits.
+            // Prefer a matching span whose text contains the completion label so a
+            // zero-width import at the same position cannot be mistaken for the main edit.
+            for (var index = changes.Length - 1; index >= 0; index--)
+            {
+                var candidate = changes[index];
+                if (candidate.Span == completionSpan &&
+                    candidate.NewText?.Contains(displayText, StringComparison.Ordinal) == true)
+                {
+                    return index;
+                }
+            }
+
+            for (var index = changes.Length - 1; index >= 0; index--)
+            {
+                if (changes[index].Span == completionSpan)
+                {
+                    return index;
+                }
+            }
+
+            return -1;
+        }
+
+        static bool IsValidTextChange(TextChange textChange, int sourceLength) =>
+            textChange.Span.Start >= 0 &&
+            textChange.Span.End >= textChange.Span.Start &&
+            textChange.Span.End <= sourceLength;
+
+        static bool TextChangesOverlap(TextSpan left, TextSpan right) =>
+            left.OverlapsWith(right) ||
+            (left.IsEmpty && right.IsEmpty && left.Start == right.Start);
+
+        static LinePositionSpanTextChange ToLinePositionSpanTextChange(
+            TextChange textChange,
+            SourceText sourceText)
+        {
+            var start = sourceText.Lines.GetLinePosition(textChange.Span.Start);
+            var end = sourceText.Lines.GetLinePosition(textChange.Span.End);
+            return new LinePositionSpanTextChange
+            {
+                NewText = textChange.NewText ?? string.Empty,
+                StartLine = start.Line,
+                StartColumn = start.Character,
+                EndLine = end.Line,
+                EndColumn = end.Character,
+            };
+        }
     }
 
     private (IReadOnlyList<LinePositionSpanTextChange>? edits, int endOffset) GetAdditionalTextEdits(

@@ -1,4 +1,8 @@
 import * as monaco from 'monaco-editor';
+import {
+  DEFAULT_CSHARP_PROJECT_CONFIGURATION,
+  type CSharpProjectConfiguration,
+} from './csharp-project';
 
 const iframeId = `omnisharp-${Math.random().toString(36).slice(2)}`;
 
@@ -99,8 +103,9 @@ export interface CSharpProjectFileSnapshot {
   language: 'csharp';
 }
 
-type CSharpProjectFilesProvider = () => CSharpProjectFileSnapshot[];
-type CSharpProjectFilesRevisionProvider = () => unknown;
+type CSharpProjectFilesProvider = (currentPath?: string) => CSharpProjectFileSnapshot[];
+type CSharpProjectFilesRevisionProvider = (currentPath?: string) => unknown;
+type CSharpProjectConfigurationProvider = (currentPath: string) => CSharpProjectConfiguration;
 
 interface CSharpDiagnosticProjectRequest {
   CurrentPath: string;
@@ -108,6 +113,7 @@ interface CSharpDiagnosticProjectRequest {
     Path: string;
     Content: string;
   }>;
+  Configuration: CSharpProjectConfiguration;
 }
 
 interface CSharpCompletionCacheEntry {
@@ -150,6 +156,7 @@ interface CSharpSerializedProjectRequest {
   serialized: string;
   fileKey: string;
   currentPath: string;
+  configurationKey: string;
   revision: string;
 }
 
@@ -1444,6 +1451,8 @@ class CSharpLanguageService {
   private model: monaco.editor.ITextModel | null = null;
   private projectFilesProvider: CSharpProjectFilesProvider = () => [];
   private projectFilesRevisionProvider: CSharpProjectFilesRevisionProvider | null = null;
+  private projectConfigurationProvider: CSharpProjectConfigurationProvider =
+    () => DEFAULT_CSHARP_PROJECT_CONFIGURATION;
   private initialized = false;
   private iframeUrl: string | null = null;
   private providersRegistered = false;
@@ -1492,6 +1501,7 @@ class CSharpLanguageService {
   private diagnosticCacheKey: string | null = null;
   private diagnosticCacheMarkers: monaco.editor.IMarkerData[] = [];
   private providerDisposables: monaco.IDisposable[] = [];
+  private semanticTokensChanged = new monaco.Emitter<void>();
   private semanticCache = new WeakMap<monaco.editor.ITextModel, { versionId: number; index: CSharpSemanticIndex }>();
   private modelTextCache = new WeakMap<monaco.editor.ITextModel, CSharpModelTextSnapshot>();
   private projectRequestCache: CSharpSerializedProjectRequest | null = null;
@@ -1780,7 +1790,9 @@ class CSharpLanguageService {
     files: CSharpIdeDebugProjectFileSummary[];
   } {
     try {
-      const providerFiles = this.projectFilesProvider();
+      const providerFiles = this.projectFilesProvider(
+        this.model && !this.model.isDisposed() ? currentModelPath(this.model) : undefined
+      );
       return {
         providerFileCount: providerFiles.length,
         files: providerFiles
@@ -3805,6 +3817,15 @@ class CSharpLanguageService {
     ...args: unknown[]
   ): Promise<unknown> {
     const execute = async () => {
+      if (
+        model.isDisposed() ||
+        model.getLanguageId() !== 'csharp' ||
+        model.getVersionId() !== snapshot.modelVersionId
+      ) {
+        throw new CSharpObsoleteSemanticResponseError(
+          `${method} source snapshot was superseded before project synchronization.`
+        );
+      }
       const projectRequest = await this.ensureWorkspaceProjectState(workspace, model, snapshot);
       const assertCurrentProjectSnapshot = () => {
         const currentProjectRequest = this.createSerializedDiagnosticProjectRequest(model);
@@ -4084,9 +4105,14 @@ class CSharpLanguageService {
         }, () => this.provideHover(model, position, cancellationToken)),
       }),
       monaco.languages.registerDocumentSemanticTokensProvider('csharp', {
+        onDidChange: this.semanticTokensChanged.event,
         getLegend: () => CSHARP_SEMANTIC_LEGEND,
         provideDocumentSemanticTokens: (model, _lastResultId, cancellationToken) => {
-          if (cancellationToken.isCancellationRequested || model.isDisposed()) return null;
+          if (cancellationToken.isCancellationRequested || model.isDisposed()) {
+            throw new CSharpObsoleteSemanticResponseError(
+              'The C# semantic-token request was cancelled before it started.'
+            );
+          }
           return this.debugProviderCall('semanticTokens', model, {
             cancellationRequested: cancellationToken.isCancellationRequested,
           }, () => this.provideDocumentSemanticTokens(model, cancellationToken));
@@ -4167,7 +4193,8 @@ class CSharpLanguageService {
   setupEditor(
     editor: monaco.editor.IStandaloneCodeEditor,
     projectFilesProvider?: CSharpProjectFilesProvider,
-    projectFilesRevisionProvider?: CSharpProjectFilesRevisionProvider
+    projectFilesRevisionProvider?: CSharpProjectFilesRevisionProvider,
+    projectConfigurationProvider?: CSharpProjectConfigurationProvider
   ) {
     this.ensureProvidersRegistered();
     editor.updateOptions({
@@ -4184,12 +4211,15 @@ class CSharpLanguageService {
     });
     const projectProviderChanged = (
       (!!projectFilesProvider && projectFilesProvider !== this.projectFilesProvider) ||
-      (!!projectFilesRevisionProvider && projectFilesRevisionProvider !== this.projectFilesRevisionProvider)
+      (!!projectFilesRevisionProvider && projectFilesRevisionProvider !== this.projectFilesRevisionProvider) ||
+      (!!projectConfigurationProvider && projectConfigurationProvider !== this.projectConfigurationProvider)
     );
     if (projectFilesProvider) {
       this.projectFilesProvider = projectFilesProvider;
     }
     this.projectFilesRevisionProvider = projectFilesRevisionProvider ?? null;
+    this.projectConfigurationProvider =
+      projectConfigurationProvider ?? (() => DEFAULT_CSHARP_PROJECT_CONFIGURATION);
     if (this.editor === editor) {
       if (projectProviderChanged) {
         this.projectRequestCache = null;
@@ -4214,6 +4244,46 @@ class CSharpLanguageService {
       },
     });
     this.setupDiagnostics(editor);
+  }
+
+  /**
+   * Re-evaluates the exact C# project snapshot after an explorer-level mutation.
+   *
+   * Active document edits already travel through the incremental text lane and deliberately
+   * keep the sorted multi-file snapshot identity stable. Explorer, git, upload, rename, and
+   * cross-model edits do not touch the active model, so they need this explicit edge to
+   * invalidate project-sensitive results without turning every keystroke into a full sync.
+   */
+  notifyProjectFilesChanged(): boolean {
+    const model = this.model;
+    if (!model || model.isDisposed() || model.getLanguageId() !== 'csharp') return false;
+
+    const previousRevision = this.projectRequestCache?.revision;
+    const nextProjectRequest = this.createSerializedDiagnosticProjectRequest(model);
+    if (previousRevision === nextProjectRequest.revision) return false;
+
+    this.completionProjectPrewarmSerial += 1;
+    this.cancelPendingSpeculativeRuntime();
+    this.clearCompletionState();
+    this.semanticTokensChanged.fire();
+    this.requestDiagnostics(model);
+    if (this.omnisharp) {
+      void this.scheduleCompletionProjectPrewarm(model);
+    }
+
+    this.recordDebugEvent({
+      feature: 'project',
+      phase: 'files-changed',
+      level: 'info',
+      message: 'C# project files changed; project-sensitive authoring state was invalidated.',
+      model: this.summarizeModel(model),
+      request: {
+        previousRevision: previousRevision ?? null,
+        nextRevision: nextProjectRequest.revision,
+        project: this.summarizeProjectRequest(nextProjectRequest.request),
+      },
+    });
+    return true;
   }
 
   clearEditor() {
@@ -6031,16 +6101,20 @@ class CSharpLanguageService {
         }
       } catch (error) {
         if (error instanceof CSharpObsoleteSemanticResponseError) {
-          // Model edits routinely supersede Monaco's automatic semantic-token request.
-          // This is cancellation, not a provider failure; returning null keeps the old
-          // token result until Monaco asks again and avoids a noisy rejected Promise.
-          return null;
+          // Monaco 0.52 interprets a successful null result as an empty semantic-token
+          // document. Surface the standard cancellation shape so it preserves and remaps
+          // the last valid colors while the replacement request catches up.
+          throw error;
         }
         // Fall through to the browser-side semantic index.
       }
     }
 
-    if (cancellationToken.isCancellationRequested || model.isDisposed()) return null;
+    if (cancellationToken.isCancellationRequested || model.isDisposed()) {
+      throw new CSharpObsoleteSemanticResponseError(
+        'The C# semantic-token request was superseded before fallback tokenization.'
+      );
+    }
     return { data: this.getSemanticIndex(model).encodedTokens };
   }
 
@@ -6489,8 +6563,10 @@ class CSharpLanguageService {
     };
   }
 
-  private getCSharpProjectFileSnapshots(): CSharpProjectFileSnapshot[] {
-    return this.projectFilesProvider()
+  private getCSharpProjectFileSnapshots(currentPath?: string): CSharpProjectFileSnapshot[] {
+    const resolvedPath = currentPath
+      ?? (this.model && !this.model.isDisposed() ? currentModelPath(this.model) : undefined);
+    return this.projectFilesProvider(resolvedPath)
       .filter(file => file.language === 'csharp')
       .map(file => ({
         path: normalizeProjectPath(file.path),
@@ -6514,7 +6590,7 @@ class CSharpLanguageService {
   }
 
   private getProjectSemanticEntries(model: monaco.editor.ITextModel): { model: monaco.editor.ITextModel; index: CSharpSemanticIndex }[] {
-    const projectFiles = this.getCSharpProjectFileSnapshots();
+    const projectFiles = this.getCSharpProjectFileSnapshots(currentModelPath(model));
     const projectPaths = new Set(projectFiles.map(file => file.path));
     const candidates = monaco.editor.getModels()
       .filter(candidate => candidate.getLanguageId() === 'csharp')
@@ -6758,7 +6834,8 @@ class CSharpLanguageService {
       .find(candidate => candidate.getLanguageId() === 'csharp' && currentModelPath(candidate) === path);
     if (existing) return existing.uri;
 
-    const projectFile = this.getCSharpProjectFileSnapshots().find(file => file.path === path);
+    const projectFile = this.getCSharpProjectFileSnapshots(currentModelPath(model))
+      .find(file => file.path === path);
     if (projectFile) {
       const projectModel = this.modelForProjectFile(projectFile);
       if (projectModel) return projectModel.uri;
@@ -7002,15 +7079,19 @@ class CSharpLanguageService {
 
   private createSerializedDiagnosticProjectRequest(model: monaco.editor.ITextModel): CSharpSerializedProjectRequest {
     const currentPath = currentModelPath(model);
-    const providerFiles = this.projectFilesProvider();
-    const providerRevision = this.projectFilesRevisionProvider?.();
+    const providerFiles = this.projectFilesProvider(currentPath);
+    const providerRevision = this.projectFilesRevisionProvider?.(currentPath);
+    const configuration = this.projectConfigurationProvider(currentPath)
+      ?? DEFAULT_CSHARP_PROJECT_CONFIGURATION;
+    const configurationKey = JSON.stringify(configuration);
     const cached = this.projectRequestCache;
     if (
       cached &&
       this.projectFilesRevisionProvider &&
       this.projectRequestSource === providerFiles &&
       Object.is(this.projectRequestSourceRevision, providerRevision) &&
-      cached.currentPath === currentPath
+      cached.currentPath === currentPath &&
+      cached.configurationKey === configurationKey
     ) {
       return cached;
     }
@@ -7060,6 +7141,7 @@ class CSharpLanguageService {
       cached &&
       cached.currentPath === currentPath &&
       cached.fileKey === fileKey &&
+      cached.configurationKey === configurationKey &&
       filesExactlyEqual
     ) {
       this.projectRequestSource = providerFiles;
@@ -7067,13 +7149,18 @@ class CSharpLanguageService {
       return cached;
     }
 
-    const request = { CurrentPath: currentPath, Files: files };
+    const request = {
+      CurrentPath: currentPath,
+      Files: files,
+      Configuration: configuration,
+    };
     const serialized = JSON.stringify(request);
     const snapshot = {
       request,
       serialized,
       fileKey,
       currentPath,
+      configurationKey,
       revision: `p${++this.projectRequestRevisionSerial}`,
     };
     this.projectRequestCache = snapshot;

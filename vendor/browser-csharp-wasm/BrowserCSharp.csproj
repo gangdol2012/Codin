@@ -10,9 +10,11 @@
 		<PackageReference Include="Microsoft.AspNetCore.Components.WebAssembly" Version="3.2.0" />
 		<PackageReference Include="Microsoft.AspNetCore.Components.WebAssembly.Build" Version="3.2.0" />
 		<PackageReference Include="Microsoft.AspNetCore.Components.WebAssembly.DevServer" Version="3.2.0" />
-		<PackageReference Include="Microsoft.CodeAnalysis.CSharp.Scripting" Version="3.8.0" />
+		<!-- Keep execution on the same Roslyn language implementation used by authoring. -->
+		<PackageReference Include="Microsoft.CodeAnalysis.CSharp.Scripting" Version="4.9.2" />
 	</ItemGroup>
 	<ItemGroup>
+		<Compile Include="../csharp-shared/CSharpProjectConfiguration.cs" Link="CSharpProjectConfiguration.cs" />
 		<BlazorLinkerDescriptor Include="LinkerConfig.xml" />
 	</ItemGroup>
 

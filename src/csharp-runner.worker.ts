@@ -1,5 +1,7 @@
 export {};
 
+import type { CSharpProjectConfiguration } from './csharp-project';
+
 declare const DotNet: {
   invokeMethodAsync(assemblyName: string, methodName: string, ...args: unknown[]): Promise<unknown>;
 };
@@ -23,6 +25,8 @@ type RuntimeMessage = {
   paths?: string[];
   contents?: string[];
   entryPath?: string;
+  sourcePath?: string;
+  configuration?: CSharpProjectConfiguration | null;
   runtimePaths?: string[];
   runtimeContents?: string[];
   includeNamespaces?: string[];
@@ -269,6 +273,15 @@ async function invokeBrowserCSharp(message: RuntimeMessage) {
 
   switch (message.mode) {
     case 'script':
+      if (message.configuration) {
+        return DotNet.invokeMethodAsync(
+          'BrowserCSharp',
+          'ExecuteScriptConfiguredInteractive',
+          message.code || '',
+          message.sourcePath || 'Script.cs',
+          JSON.stringify(message.configuration),
+        );
+      }
       return DotNet.invokeMethodAsync('BrowserCSharp', 'ExecuteScriptInteractive', message.code || '');
     case 'script-context':
       if (message.resetContext) {
@@ -278,22 +291,42 @@ async function invokeBrowserCSharp(message: RuntimeMessage) {
           // A missing context should not prevent the next interactive run from starting.
         }
       }
-      return DotNet.invokeMethodAsync(
-        'BrowserCSharp',
-        'ExecuteScriptInContextInteractive',
-        message.code || '',
-        message.contextId || 'default',
-      );
+      return message.configuration
+        ? DotNet.invokeMethodAsync(
+          'BrowserCSharp',
+          'ExecuteScriptInContextConfiguredInteractive',
+          message.code || '',
+          message.contextId || 'default',
+          message.sourcePath || 'Script.cs',
+          JSON.stringify(message.configuration),
+        )
+        : DotNet.invokeMethodAsync(
+          'BrowserCSharp',
+          'ExecuteScriptInContextInteractive',
+          message.code || '',
+          message.contextId || 'default',
+        );
     case 'project':
-      return DotNet.invokeMethodAsync(
-        'BrowserCSharp',
-        'ExecuteRegularProjectWithFilesInteractive',
-        message.paths || [],
-        message.contents || [],
-        message.entryPath || '',
-        message.runtimePaths || [],
-        message.runtimeContents || [],
-      );
+      return message.configuration
+        ? DotNet.invokeMethodAsync(
+          'BrowserCSharp',
+          'ExecuteRegularProjectWithFilesConfiguredInteractive',
+          message.paths || [],
+          message.contents || [],
+          message.entryPath || '',
+          message.runtimePaths || [],
+          message.runtimeContents || [],
+          JSON.stringify(message.configuration),
+        )
+        : DotNet.invokeMethodAsync(
+          'BrowserCSharp',
+          'ExecuteRegularProjectWithFilesInteractive',
+          message.paths || [],
+          message.contents || [],
+          message.entryPath || '',
+          message.runtimePaths || [],
+          message.runtimeContents || [],
+        );
     case 'regular':
     default:
       return DotNet.invokeMethodAsync('BrowserCSharp', 'ExecuteRegularInteractive', message.code || '');

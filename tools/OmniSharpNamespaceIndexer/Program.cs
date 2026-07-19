@@ -285,7 +285,10 @@ static StaticAssetDocument? TryCreateDocumentationAsset(string manifestDirectory
 
 static void WriteAtomically(string outputPath, Action<Stream> write)
 {
-    var temporaryPath = outputPath + ".tmp";
+    // Static prebuilds can overlap (for example, an explicit runtime publish followed
+    // immediately by the app's sync step). A fixed ".tmp" path lets one indexer move
+    // another process's file and leaves the loser with FileNotFoundException.
+    var temporaryPath = $"{outputPath}.{Environment.ProcessId}.{Guid.NewGuid():N}.tmp";
     try
     {
         using (var output = new FileStream(

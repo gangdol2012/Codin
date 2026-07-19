@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.Reflection;
 using System.Security.Cryptography;
 using System.Text.Json;
+using CodeCraft.CSharp;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.Host.Mef;
@@ -263,6 +264,106 @@ static async Task RunRegressionTestsAsync()
             AssertEx.False(
                 string.IsNullOrWhiteSpace(resolvedItem.Documentation),
                 "Resolved WriteLine documentation should not be empty.");
+        }),
+        ("type import resolve adds a using directive", async () =>
+        {
+            const string completionListKey = "type-import-list";
+            var completion = await fixture.CompleteAsync(
+                """
+                #nullable enable
+                namespace Demo;
+                class Consumer { private HttpCl<|>? _client; }
+                """,
+                completionListKey);
+            var httpClient = AssertEx.Item(completion.Response, "HttpClient");
+            var resolved = await fixture.Service.Handle(
+                new CompletionResolveRequest { Item = httpClient },
+                completion.Document,
+                completionListKey);
+
+            var resolvedItem = AssertEx.NotNull(resolved.Item, "Resolved HttpClient completion item");
+            AssertEx.Equal("HttpClient", resolvedItem.TextEdit?.NewText, "HttpClient insertion text");
+            AssertEx.True(
+                resolvedItem.AdditionalTextEdits?.Any(edit =>
+                    edit.NewText?.Contains("using System.Net.Http;", StringComparison.Ordinal) == true) == true,
+                "Resolving HttpClient must add a System.Net.Http using edit.");
+
+            var originalSource = (await completion.Document.GetTextAsync()).ToString();
+            var committedSource = ApplyCompletionEdits(originalSource, resolvedItem);
+            AssertEx.Equal(
+                1,
+                CountOccurrences(committedSource, "using System.Net.Http;"),
+                "HttpClient completion must add exactly one using directive");
+            AssertEx.True(
+                committedSource.Contains("private HttpClient? _client;", StringComparison.Ordinal),
+                "HttpClient completion must replace the full typed prefix.");
+            await AssertCompilesWithoutErrorsAsync(
+                completion.Document,
+                committedSource,
+                "Committed HttpClient auto-using source");
+        }),
+        ("extension-method import resolve adds a using directive", async () =>
+        {
+            const string completionListKey = "extension-import-list";
+            var completion = await fixture.CompleteAsync(
+                "class Demo { void M() { var length = new[] { 1 }.FastLen<|>(); } }",
+                new[]
+                {
+                    new OmniSharpProject.SourceFileSnapshot(
+                        "src/SequenceExtensions.cs",
+                        "namespace Helpers; public static class SequenceExtensions { public static int FastLength(this int[] values) => values.Length; }"),
+                },
+                completionListKey);
+            var fastLength = AssertEx.Item(completion.Response, "FastLength");
+            var resolved = await fixture.Service.Handle(
+                new CompletionResolveRequest { Item = fastLength },
+                completion.Document,
+                completionListKey);
+
+            var resolvedItem = AssertEx.NotNull(resolved.Item, "Resolved FastLength completion item");
+            AssertEx.Equal("FastLength", resolvedItem.TextEdit?.NewText, "FastLength insertion text");
+            AssertEx.True(
+                resolvedItem.AdditionalTextEdits?.Any(edit =>
+                    edit.NewText?.Contains("using Helpers;", StringComparison.Ordinal) == true) == true,
+                "Resolving FastLength must add a Helpers using edit.");
+
+            var originalSource = (await completion.Document.GetTextAsync()).ToString();
+            var committedSource = ApplyCompletionEdits(originalSource, resolvedItem);
+            AssertEx.Equal(
+                1,
+                CountOccurrences(committedSource, "using Helpers;"),
+                "FastLength completion must add exactly one using directive");
+            AssertEx.True(
+                committedSource.Contains(".FastLength();", StringComparison.Ordinal),
+                "FastLength completion must replace the full typed prefix.");
+            await AssertCompilesWithoutErrorsAsync(
+                completion.Document,
+                committedSource,
+                "Committed FastLength auto-using source");
+        }),
+        ("already imported type completion does not duplicate its using", async () =>
+        {
+            const string completionListKey = "existing-import-list";
+            var completion = await fixture.CompleteAsync(
+                "using System.Net.Http; class Demo { private HttpCl<|>? _client; }",
+                completionListKey);
+            var httpClient = AssertEx.Item(completion.Response, "HttpClient");
+            var resolved = await fixture.Service.Handle(
+                new CompletionResolveRequest { Item = httpClient },
+                completion.Document,
+                completionListKey);
+
+            var resolvedItem = AssertEx.NotNull(resolved.Item, "Resolved imported HttpClient completion item");
+            var originalSource = (await completion.Document.GetTextAsync()).ToString();
+            var committedSource = ApplyCompletionEdits(originalSource, resolvedItem);
+            AssertEx.Equal(
+                1,
+                CountOccurrences(committedSource, "using System.Net.Http;"),
+                "Resolving an already imported type must not duplicate its using directive");
+            await AssertCompilesWithoutErrorsAsync(
+                completion.Document,
+                committedSource,
+                "Committed already-imported HttpClient source");
         }),
         ("keyed resolve keeps interleaved speculative lists isolated", async () =>
         {
@@ -1662,6 +1763,230 @@ static async Task RunRegressionTestsAsync()
                 HasCompactLabel(recoveryPayload.GetProperty("p"), "WriteLine"),
                 "Full recovery completion should contain WriteLine.");
         }),
+        ("diagnostic configuration changes invalidate options and exact repeats are no-ops", async () =>
+        {
+            using var diagnosticFixture = CompletionFixture.Create();
+            var monacoService = CreateDiagnosticMonacoService(diagnosticFixture);
+            const string source = "namespace ConfigurationChecks; public class Demo { }";
+            var previewConfiguration = new CSharpProjectConfiguration
+            {
+                LanguageVersion = "preview",
+                Nullable = "Enable",
+                AllowUnsafeBlocks = true,
+                DefineConstants = new[] { "FEATURE_ONE", "FEATURE_TWO" },
+                OutputKind = "DynamicallyLinkedLibrary",
+            };
+            var previewRequest = CompletionFixture.Serialize(
+                new MonacoService.DiagnosticProjectRequest(
+                    HarnessConstants.PrimaryPath,
+                    Array.Empty<MonacoService.DiagnosticProjectFileDto>(),
+                    previewConfiguration));
+
+            _ = await monacoService.SyncDiagnosticProjectAsync(
+                source,
+                previewRequest,
+                "configuration-preview");
+            var previewDocument = diagnosticFixture.Project.UseOnlyOnceDocument;
+            var previewSolution = previewDocument.Project.Solution;
+            var previewDocumentId = previewDocument.Id;
+            var previewTextVersion = await previewDocument.GetTextVersionAsync();
+            var previewProjectVersion = previewDocument.Project.Version;
+            var previewPrimaryVersion = diagnosticFixture.Project.PrimaryDocumentVersion;
+            var previewParseOptions = AssertEx.NotNull(
+                previewDocument.Project.ParseOptions as CSharpParseOptions,
+                "Preview diagnostic parse options");
+            var previewCompilationOptions = AssertEx.NotNull(
+                previewDocument.Project.CompilationOptions as CSharpCompilationOptions,
+                "Preview diagnostic compilation options");
+            AssertEx.Equal(
+                LanguageVersion.Preview,
+                previewParseOptions.LanguageVersion,
+                "Preview diagnostic language version");
+            AssertEx.True(
+                previewParseOptions.PreprocessorSymbolNames.SequenceEqual(
+                    new[] { "FEATURE_ONE", "FEATURE_TWO" }),
+                "Preview diagnostic preprocessor symbols");
+            AssertEx.Equal(
+                NullableContextOptions.Enable,
+                previewCompilationOptions.NullableContextOptions,
+                "Preview diagnostic nullable context");
+            AssertEx.True(
+                previewCompilationOptions.AllowUnsafe,
+                "Preview diagnostic unsafe option");
+
+            _ = await monacoService.SyncDiagnosticProjectAsync(
+                source,
+                previewRequest,
+                "configuration-preview-repeat");
+            var repeatedDocument = diagnosticFixture.Project.UseOnlyOnceDocument;
+            AssertEx.Same(
+                previewSolution,
+                repeatedDocument.Project.Solution,
+                "Repeated configuration project Solution identity");
+            AssertEx.Equal(
+                previewDocumentId,
+                repeatedDocument.Id,
+                "Repeated configuration primary DocumentId");
+            AssertEx.Equal(
+                previewTextVersion,
+                await repeatedDocument.GetTextVersionAsync(),
+                "Repeated configuration primary text version");
+            AssertEx.Equal(
+                previewProjectVersion,
+                repeatedDocument.Project.Version,
+                "Repeated configuration project version");
+            AssertEx.Equal(
+                previewPrimaryVersion,
+                diagnosticFixture.Project.PrimaryDocumentVersion,
+                "Repeated configuration synchronization version");
+
+            var legacyConfiguration = new CSharpProjectConfiguration
+            {
+                LanguageVersion = "7.3",
+                Nullable = "Enable",
+                AllowUnsafeBlocks = true,
+                DefineConstants = new[] { "FEATURE_ONE", "FEATURE_TWO" },
+                OutputKind = "DynamicallyLinkedLibrary",
+            };
+            var legacyRequest = CompletionFixture.Serialize(
+                new MonacoService.DiagnosticProjectRequest(
+                    HarnessConstants.PrimaryPath,
+                    Array.Empty<MonacoService.DiagnosticProjectFileDto>(),
+                    legacyConfiguration));
+            _ = await monacoService.SyncDiagnosticProjectAsync(
+                source,
+                legacyRequest,
+                "configuration-csharp-7-3");
+            var legacyDocument = diagnosticFixture.Project.UseOnlyOnceDocument;
+            AssertEx.NotSame(
+                previewSolution,
+                legacyDocument.Project.Solution,
+                "Configuration-only change Solution identity");
+            AssertEx.Equal(
+                previewDocumentId,
+                legacyDocument.Id,
+                "Configuration-only change primary DocumentId");
+            AssertEx.Equal(
+                previewTextVersion,
+                await legacyDocument.GetTextVersionAsync(),
+                "Configuration-only change primary text version");
+            AssertEx.Equal(
+                previewPrimaryVersion,
+                diagnosticFixture.Project.PrimaryDocumentVersion,
+                "Configuration-only change synchronization version");
+            AssertEx.False(
+                previewProjectVersion == legacyDocument.Project.Version,
+                "Configuration-only change must invalidate the Roslyn project version.");
+            AssertEx.Equal(
+                LanguageVersion.CSharp7_3,
+                AssertEx.NotNull(
+                    legacyDocument.Project.ParseOptions as CSharpParseOptions,
+                    "Legacy diagnostic parse options").LanguageVersion,
+                "Configuration-only language version");
+        }),
+        ("diagnostic configuration controls language, constants, nullable, and unsafe diagnostics", async () =>
+        {
+            using var diagnosticFixture = CompletionFixture.Create();
+            var monacoService = CreateDiagnosticMonacoService(diagnosticFixture);
+
+            const string languageSource = "namespace FeatureNamespace; public class Demo { }";
+            var legacyLanguageDiagnostics = await GetDiagnosticIdsAsync(
+                monacoService,
+                languageSource,
+                new CSharpProjectConfiguration
+                {
+                    LanguageVersion = "7.3",
+                    OutputKind = "DynamicallyLinkedLibrary",
+                });
+            AssertEx.True(
+                legacyLanguageDiagnostics.Contains("CS8370"),
+                "C# 7.3 diagnostics must reject file-scoped namespaces with CS8370.");
+            var previewLanguageDiagnostics = await GetDiagnosticIdsAsync(
+                monacoService,
+                languageSource,
+                new CSharpProjectConfiguration
+                {
+                    LanguageVersion = "preview",
+                    OutputKind = "DynamicallyLinkedLibrary",
+                });
+            AssertEx.False(
+                previewLanguageDiagnostics.Contains("CS8370"),
+                "Preview diagnostics must accept file-scoped namespaces.");
+
+            const string conditionalSource =
+                "#if CONFIGURED_FEATURE\n#error CONFIGURED_FEATURE is enabled\n#endif\npublic class Demo { }";
+            var undefinedDiagnostics = await GetDiagnosticIdsAsync(
+                monacoService,
+                conditionalSource,
+                new CSharpProjectConfiguration
+                {
+                    LanguageVersion = "preview",
+                    OutputKind = "DynamicallyLinkedLibrary",
+                });
+            AssertEx.False(
+                undefinedDiagnostics.Contains("CS1029"),
+                "An undefined project constant must exclude its #error branch.");
+            var definedDiagnostics = await GetDiagnosticIdsAsync(
+                monacoService,
+                conditionalSource,
+                new CSharpProjectConfiguration
+                {
+                    LanguageVersion = "preview",
+                    DefineConstants = new[] { "CONFIGURED_FEATURE" },
+                    OutputKind = "DynamicallyLinkedLibrary",
+                });
+            AssertEx.True(
+                definedDiagnostics.Contains("CS1029"),
+                "A configured project constant must include its #error branch with CS1029.");
+
+            const string nullableSource = "public class Demo { public string Value = null; }";
+            var nullableDisabledDiagnostics = await GetDiagnosticIdsAsync(
+                monacoService,
+                nullableSource,
+                new CSharpProjectConfiguration
+                {
+                    Nullable = "Disable",
+                    OutputKind = "DynamicallyLinkedLibrary",
+                });
+            AssertEx.False(
+                nullableDisabledDiagnostics.Contains("CS8625"),
+                "Disabled nullable analysis must not report CS8625.");
+            var nullableEnabledDiagnostics = await GetDiagnosticIdsAsync(
+                monacoService,
+                nullableSource,
+                new CSharpProjectConfiguration
+                {
+                    Nullable = "Enable",
+                    OutputKind = "DynamicallyLinkedLibrary",
+                });
+            AssertEx.True(
+                nullableEnabledDiagnostics.Contains("CS8625"),
+                "Enabled nullable analysis must report CS8625.");
+
+            const string unsafeSource = "public unsafe class Demo { public int* Pointer; }";
+            var unsafeDisabledDiagnostics = await GetDiagnosticIdsAsync(
+                monacoService,
+                unsafeSource,
+                new CSharpProjectConfiguration
+                {
+                    AllowUnsafeBlocks = false,
+                    OutputKind = "DynamicallyLinkedLibrary",
+                });
+            AssertEx.True(
+                unsafeDisabledDiagnostics.Contains("CS0227"),
+                "Disabled unsafe blocks must report CS0227.");
+            var unsafeEnabledDiagnostics = await GetDiagnosticIdsAsync(
+                monacoService,
+                unsafeSource,
+                new CSharpProjectConfiguration
+                {
+                    AllowUnsafeBlocks = true,
+                    OutputKind = "DynamicallyLinkedLibrary",
+                });
+            AssertEx.False(
+                unsafeEnabledDiagnostics.Contains("CS0227"),
+                "Enabled unsafe blocks must suppress CS0227.");
+        }),
         ("exact snapshots are no-ops and changed files keep DocumentIds", async () =>
         {
             const string markedSource =
@@ -1854,6 +2179,101 @@ static Document FindDocument(Solution solution, string path)
     return solution.Projects
         .SelectMany(project => project.Documents)
         .Single(document => string.Equals(document.FilePath, path, StringComparison.Ordinal));
+}
+
+static MonacoService CreateDiagnosticMonacoService(CompletionFixture fixture)
+{
+    var monacoService = fixture.CreateMonacoService();
+    var diagnosticProjectField = typeof(MonacoService).GetField(
+        "_diagnosticProject",
+        BindingFlags.Instance | BindingFlags.NonPublic)
+        ?? throw new InvalidOperationException(
+            "MonacoService field '_diagnosticProject' is unavailable.");
+    diagnosticProjectField.SetValue(monacoService, fixture.Project);
+    return monacoService;
+}
+
+static async Task<HashSet<string>> GetDiagnosticIdsAsync(
+    MonacoService monacoService,
+    string source,
+    CSharpProjectConfiguration configuration)
+{
+    var request = CompletionFixture.Serialize(
+        new MonacoService.DiagnosticProjectRequest(
+            HarnessConstants.PrimaryPath,
+            Array.Empty<MonacoService.DiagnosticProjectFileDto>(),
+            configuration));
+    using var response = JsonDocument.Parse(
+        await monacoService.GetDiagnosticsAsync(source, request));
+    return response.RootElement
+        .GetProperty("payload")
+        .EnumerateArray()
+        .Select(diagnostic => diagnostic.GetProperty("id").GetString())
+        .Where(id => !string.IsNullOrWhiteSpace(id))
+        .Cast<string>()
+        .ToHashSet(StringComparer.Ordinal);
+}
+
+static string ApplyCompletionEdits(string source, CompletionItem item)
+{
+    var sourceText = SourceText.From(source);
+    var edits = new List<LinePositionSpanTextChange>();
+    if (item.AdditionalTextEdits is { Count: > 0 })
+    {
+        edits.AddRange(item.AdditionalTextEdits);
+    }
+
+    edits.Add(AssertEx.NotNull(item.TextEdit, $"{item.Label} primary completion edit"));
+    var textChanges = edits
+        .Select(edit =>
+        {
+            var span = sourceText.Lines.GetTextSpan(new LinePositionSpan(
+                new LinePosition(edit.StartLine, edit.StartColumn),
+                new LinePosition(edit.EndLine, edit.EndColumn)));
+            return new TextChange(span, edit.NewText ?? string.Empty);
+        })
+        .OrderBy(change => change.Span.Start)
+        .ThenBy(change => change.Span.End)
+        .ToArray();
+    return sourceText.WithChanges(textChanges).ToString();
+}
+
+static int CountOccurrences(string source, string value)
+{
+    var count = 0;
+    var searchStart = 0;
+    while ((searchStart = source.IndexOf(value, searchStart, StringComparison.Ordinal)) >= 0)
+    {
+        count++;
+        searchStart += value.Length;
+    }
+
+    return count;
+}
+
+static async Task AssertCompilesWithoutErrorsAsync(
+    Document originalDocument,
+    string source,
+    string context)
+{
+    var compilationOptions = AssertEx.NotNull(
+        originalDocument.Project.CompilationOptions as CSharpCompilationOptions,
+        $"{context} C# compilation options");
+    var solution = originalDocument.Project.Solution
+        .WithDocumentText(originalDocument.Id, SourceText.From(source))
+        .WithProjectCompilationOptions(
+            originalDocument.Project.Id,
+            compilationOptions.WithOutputKind(OutputKind.DynamicallyLinkedLibrary));
+    var compilation = AssertEx.NotNull(
+        await solution.GetDocument(originalDocument.Id)!.Project.GetCompilationAsync(),
+        $"{context} compilation");
+    var errors = compilation.GetDiagnostics()
+        .Where(diagnostic => diagnostic.Severity == DiagnosticSeverity.Error)
+        .ToArray();
+    AssertEx.True(
+        errors.Length == 0,
+        $"{context} must compile without errors: " +
+        string.Join(" | ", errors.Select(diagnostic => diagnostic.ToString())));
 }
 
 static void AssertResponseInvariants(CompletionResponse response)

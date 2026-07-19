@@ -62,12 +62,17 @@ import 'flexlayout-react/style/dark.css';
 import * as Tooltip from '@radix-ui/react-tooltip';
 import * as Separator from '@radix-ui/react-separator';
 import type * as TypeScript from 'typescript';
-import coinstantLogo from '../coinstant-logo.jpg';
 import type {
   CSharpIdeDebugEvent,
   CSharpIdeDebugSnapshot,
   CSharpOmniSharpSource,
 } from './csharp-omnisharp';
+import {
+  resolveCSharpProjectContext,
+  type CSharpProjectConfiguration,
+  type CSharpProjectContext,
+  type CSharpWorkspaceFile,
+} from './csharp-project';
 import {
   deleteSemanticDocumentationRecord,
   formatSemanticDocumentationTimestamp,
@@ -83,6 +88,10 @@ import {
   type SemanticDocumentationRecord,
   type SemanticDocumentationSourceFile,
 } from './semantic-documentation';
+import {
+  removeGitHubAuthFromBackup,
+  sanitizeBackupLocalStorage,
+} from './user-data-backup';
 
 const APP_VERSION = __APP_VERSION__;
 
@@ -3972,20 +3981,25 @@ async function createCodeCraftUserDataExport(
     loadStoredGitState(projectId).catch(() => null),
   ]);
 
+  const safeLocalStorage = sanitizeBackupLocalStorage({
+    ...getCodeCraftLocalStorageSnapshot(projectId),
+    ...localStorageOverrides,
+  }, STORAGE_KEYS.settings, STORAGE_KEYS.gitState);
+  const safeGitState = removeGitHubAuthFromBackup(
+    normalizeGitState(gitStateOverride || storedGitState)
+  );
+
   return {
     format: 'codecraft-user-data',
     version: 1,
     exportedAt: new Date().toISOString(),
-    localStorage: {
-      ...getCodeCraftLocalStorageSnapshot(projectId),
-      ...localStorageOverrides,
-    },
+    localStorage: safeLocalStorage,
     indexedDB: {
       files: normalizeStoredProjectFiles(storedProjectFiles) || [],
       npmPackages,
       pyodidePackageMeta: serializeCachedPyodidePackageMetaRecord(pyodidePackageMeta),
       pyodidePackageSnapshot: serializeCachedPyodideEnvironmentSnapshot(pyodidePackageSnapshot),
-      gitState: normalizeGitState(gitStateOverride || storedGitState),
+      gitState: safeGitState,
     },
     browserBoundData: {
       fileSystemSyncHandlesExported: false,
@@ -6200,6 +6214,23 @@ function normalizeProjectPath(path: string): string {
   return resolved.join('/');
 }
 
+function getCSharpWorkspaceFiles(files: FSItem[]): CSharpWorkspaceFile[] {
+  return files
+    .filter((item): item is FSItem & { type: 'file' } => item.type === 'file')
+    .map(item => ({
+      path: normalizeProjectPath(getFsItemPath(files, item.id)),
+      content: item.content || '',
+    }))
+    .filter(file => !!file.path);
+}
+
+function getCSharpGeneratedGlobalUsingsPath(context: CSharpProjectContext): string {
+  const filename = 'CodeCraft.ProjectGlobalUsings.g.cs';
+  return normalizeProjectPath(
+    context.projectDirectory ? `${context.projectDirectory}/obj/${filename}` : filename
+  );
+}
+
 const CODECRAFT_MONACO_PROJECT_ROOT = '/codecraft-project';
 const CODECRAFT_RUNTIME_PROJECT_ROOT = '__codecraft_project__';
 
@@ -7650,6 +7681,11 @@ export default function App() {
   const pendingSharedEditorTargetRef = useRef<{ tabId: string; itemId: string } | null>(null);
   const sharedEditorVersionRef = useRef(0);
   const monacoProjectModelUrisRef = useRef<Set<string>>(new Set());
+  const monacoProjectModelListenersRef = useRef<Map<string, monaco.IDisposable>>(new Map());
+  const syncingProjectModelsRef = useRef(false);
+  const pendingProjectModelContentRef = useRef<Map<string, string>>(new Map());
+  const projectModelContentSyncScheduledRef = useRef(false);
+  const lastNotifiedCSharpProjectRevisionRef = useRef<unknown>(undefined);
   const pyodideEnsurePromiseRef = useRef<Promise<void> | null>(null);
   const persistedPyodidePackageMetaLoadPromiseRef = useRef<Promise<void> | null>(null);
   const persistedPyodidePackageMetaLoadedRef = useRef(false);
@@ -8115,42 +8151,109 @@ export default function App() {
 
   const csharpProjectFileSnapshotsCacheRef = useRef<{
     source: FSItem[];
+    currentPath: string;
     value: Array<{ path: string; content: string; language: 'csharp' }>;
     byId: Map<string, { path: string; content: string; language: 'csharp' }>;
+    context: CSharpProjectContext;
     revision: number;
   } | null>(null);
   const csharpProjectFileSnapshotsRevisionRef = useRef(0);
+  const csharpProjectContextsCacheRef = useRef<{
+    source: FSItem[];
+    byPath: Map<string, CSharpProjectContext>;
+  } | null>(null);
 
-  const getCSharpProjectFileSnapshots = useCallback(() => {
+  const getCSharpProjectSnapshot = useCallback((requestedPath = '') => {
     const currentFiles = filesRef.current;
+    const currentPath = normalizeProjectPath(requestedPath);
     const cached = csharpProjectFileSnapshotsCacheRef.current;
-    if (cached?.source === currentFiles) return cached.value;
+    if (cached?.source === currentFiles && cached.currentPath === currentPath) return cached;
 
     const byId = new Map<string, { path: string; content: string; language: 'csharp' }>();
     const value: Array<{ path: string; content: string; language: 'csharp' }> = [];
-    for (const file of currentFiles) {
-      if (file.type !== 'file' || getProjectRuntimeLanguageForFile(file) !== 'csharp') continue;
+    const context = resolveCSharpProjectContext(getCSharpWorkspaceFiles(currentFiles), currentPath);
+    const fileIdByPath = new Map(
+      currentFiles
+        .filter((file): file is FSItem & { type: 'file' } => file.type === 'file')
+        .map(file => [normalizeProjectPath(getFsItemPath(currentFiles, file.id)), file.id])
+    );
+    for (const file of context.sourceFiles) {
       const snapshot = {
-        path: normalizeProjectPath(getFsItemPath(currentFiles, file.id)),
-        content: file.content || '',
+        path: normalizeProjectPath(file.path),
+        content: file.content,
         language: 'csharp' as const,
       };
       if (!snapshot.path) continue;
-      byId.set(file.id, snapshot);
+      const fileId = fileIdByPath.get(snapshot.path);
+      if (fileId) byId.set(fileId, snapshot);
       value.push(snapshot);
     }
+    if (currentPath && !value.some(file => file.path === currentPath)) {
+      const currentFileId = fileIdByPath.get(currentPath);
+      const currentFile = currentFileId
+        ? currentFiles.find(file => file.id === currentFileId && file.type === 'file')
+        : undefined;
+      if (currentFile && getProjectRuntimeLanguageForFile(currentFile) === 'csharp') {
+        byId.set(currentFile.id, {
+          path: currentPath,
+          content: currentFile.content || '',
+          language: 'csharp',
+        });
+      }
+    }
+    if (context.generatedGlobalUsingsSource) {
+      value.push({
+        path: getCSharpGeneratedGlobalUsingsPath(context),
+        content: context.generatedGlobalUsingsSource,
+        language: 'csharp',
+      });
+    }
     value.sort((left, right) => left.path.localeCompare(right.path));
-    csharpProjectFileSnapshotsCacheRef.current = {
+    const snapshot = {
       source: currentFiles,
+      currentPath,
       value,
       byId,
+      context,
       revision: ++csharpProjectFileSnapshotsRevisionRef.current,
     };
-    return value;
+    csharpProjectFileSnapshotsCacheRef.current = snapshot;
+    return snapshot;
   }, []);
 
+  const getCSharpProjectFileSnapshots = useCallback(
+    (currentPath?: string) => getCSharpProjectSnapshot(currentPath).value,
+    [getCSharpProjectSnapshot]
+  );
+
   const getCSharpProjectFileSnapshotsRevision = useCallback(
-    () => csharpProjectFileSnapshotsCacheRef.current?.revision,
+    (currentPath?: string) => getCSharpProjectSnapshot(currentPath).revision,
+    [getCSharpProjectSnapshot]
+  );
+
+  const getCSharpProjectConfiguration = useCallback(
+    (currentPath: string) => getCSharpProjectSnapshot(currentPath).context.configuration,
+    [getCSharpProjectSnapshot]
+  );
+
+  const getCSharpProjectContext = useCallback(
+    (requestedPath: string) => {
+      const currentFiles = filesRef.current;
+      const currentPath = normalizeProjectPath(requestedPath);
+      let cache = csharpProjectContextsCacheRef.current;
+      if (cache?.source !== currentFiles) {
+        cache = { source: currentFiles, byPath: new Map() };
+        csharpProjectContextsCacheRef.current = cache;
+      }
+      const cached = cache.byPath.get(currentPath);
+      if (cached) return cached;
+      const context = resolveCSharpProjectContext(
+        getCSharpWorkspaceFiles(currentFiles),
+        currentPath
+      );
+      cache.byPath.set(currentPath, context);
+      return context;
+    },
     []
   );
 
@@ -8204,7 +8307,8 @@ export default function App() {
     csharpAuthoring.csharpService.setupEditor(
       editor,
       getCSharpProjectFileSnapshots,
-      getCSharpProjectFileSnapshotsRevision
+      getCSharpProjectFileSnapshotsRevision,
+      getCSharpProjectConfiguration
     );
     void ensureCSharpAuthoringReady().catch(error => {
       console.warn('Failed to prepare C# language support:', error);
@@ -8214,6 +8318,7 @@ export default function App() {
     getCSharpAuthoringModule,
     getCSharpProjectFileSnapshots,
     getCSharpProjectFileSnapshotsRevision,
+    getCSharpProjectConfiguration,
   ]);
 
   useEffect(() => {
@@ -8458,38 +8563,111 @@ export default function App() {
     configureCodeCraftTypeScriptDefaults();
 
     const nextModelUris = new Set<string>();
-    for (const item of files) {
-      if (item.type !== 'file') continue;
+    syncingProjectModelsRef.current = true;
+    try {
+      for (const item of files) {
+        if (item.type !== 'file') continue;
 
-      const uri = getMonacoProjectModelUri(getPath(item.id));
-      const uriKey = uri.toString();
-      const language = item.language || langFromFilename(item.name);
-      const content = item.content || '';
-      const existingModel = monaco.editor.getModel(uri);
+        const path = normalizeProjectPath(getPath(item.id));
+        const uri = getMonacoProjectModelUri(path);
+        const uriKey = uri.toString();
+        const language = item.language || langFromFilename(item.name);
+        const content = item.content || '';
+        let projectModel = monaco.editor.getModel(uri);
 
-      nextModelUris.add(uriKey);
-      if (!existingModel) {
-        updateCodeCraftModelOptions(monaco.editor.createModel(content, language, uri));
-        continue;
+        nextModelUris.add(uriKey);
+        if (!projectModel) {
+          projectModel = monaco.editor.createModel(content, language, uri);
+          updateCodeCraftModelOptions(projectModel);
+        } else {
+          if (projectModel.getLanguageId() !== language) {
+            monaco.editor.setModelLanguage(projectModel, language);
+          }
+          updateCodeCraftModelOptions(projectModel);
+          if (projectModel.getValue() !== content) {
+            projectModel.setValue(content);
+          }
+        }
+
+        const existingListener = monacoProjectModelListenersRef.current.get(uriKey);
+        if (language !== 'csharp') {
+          existingListener?.dispose();
+          monacoProjectModelListenersRef.current.delete(uriKey);
+        } else if (!existingListener) {
+          const observedModel = projectModel;
+          monacoProjectModelListenersRef.current.set(uriKey, observedModel.onDidChangeContent(() => {
+            if (
+              syncingProjectModelsRef.current ||
+              observedModel.isDisposed() ||
+              editorRef.current?.getModel?.() === observedModel
+            ) {
+              return;
+            }
+
+            pendingProjectModelContentRef.current.set(path, observedModel.getValue());
+            if (projectModelContentSyncScheduledRef.current) return;
+            projectModelContentSyncScheduledRef.current = true;
+            queueMicrotask(() => {
+              projectModelContentSyncScheduledRef.current = false;
+              const updates = new Map(pendingProjectModelContentRef.current);
+              pendingProjectModelContentRef.current.clear();
+              if (updates.size === 0) return;
+
+              const hasChangedFile = filesRef.current.some(file => (
+                file.type === 'file'
+                && updates.has(normalizeProjectPath(getFsItemPath(filesRef.current, file.id)))
+                && (file.content || '') !== updates.get(normalizeProjectPath(getFsItemPath(filesRef.current, file.id)))
+              ));
+              if (!hasChangedFile) return;
+
+              setFiles(current => {
+                let changed = false;
+                const next = current.map(file => {
+                  if (file.type !== 'file') return file;
+                  const filePath = normalizeProjectPath(getFsItemPath(current, file.id));
+                  const nextContent = updates.get(filePath);
+                  if (nextContent === undefined || (file.content || '') === nextContent) return file;
+                  changed = true;
+                  return { ...file, content: nextContent };
+                });
+                return changed ? next : current;
+              });
+            });
+          }));
+        }
       }
 
-      if (existingModel.getLanguageId() !== language) {
-        monaco.editor.setModelLanguage(existingModel, language);
+      for (const uriKey of monacoProjectModelUrisRef.current) {
+        if (nextModelUris.has(uriKey)) continue;
+        monacoProjectModelListenersRef.current.get(uriKey)?.dispose();
+        monacoProjectModelListenersRef.current.delete(uriKey);
+        monaco.editor.getModel(monaco.Uri.parse(uriKey))?.dispose();
       }
-      updateCodeCraftModelOptions(existingModel);
-      if (existingModel.getValue() !== content) {
-        existingModel.setValue(content);
-      }
-    }
-
-    for (const uriKey of monacoProjectModelUrisRef.current) {
-      if (nextModelUris.has(uriKey)) continue;
-      monaco.editor.getModel(monaco.Uri.parse(uriKey))?.dispose();
+    } finally {
+      syncingProjectModelsRef.current = false;
     }
     monacoProjectModelUrisRef.current = nextModelUris;
+
+    // Force the cached provider to observe this explorer/git/model mutation before reading
+    // its revision. Active C# typing advances the cache source in place without changing
+    // this revision, preserving the existing incremental authoring hot path.
+    const activeModel = editorRef.current?.getModel?.() as monaco.editor.ITextModel | null | undefined;
+    if (activeModel?.getLanguageId() === 'csharp') {
+      const activePath = getProjectPathFromMonacoUri(activeModel.uri);
+      getCSharpProjectFileSnapshots(activePath);
+      const csharpProjectRevision = getCSharpProjectFileSnapshotsRevision(activePath);
+      if (!Object.is(lastNotifiedCSharpProjectRevisionRef.current, csharpProjectRevision)) {
+        lastNotifiedCSharpProjectRevisionRef.current = csharpProjectRevision;
+        csharpAuthoringModuleRef.current?.csharpService.notifyProjectFilesChanged();
+      }
+    }
   }, [files]);
 
   useEffect(() => () => {
+    for (const listener of monacoProjectModelListenersRef.current.values()) {
+      listener.dispose();
+    }
+    monacoProjectModelListenersRef.current.clear();
     for (const uriKey of monacoProjectModelUrisRef.current) {
       monaco.editor.getModel(monaco.Uri.parse(uriKey))?.dispose();
     }
@@ -8534,7 +8712,16 @@ export default function App() {
       };
     }
 
-    const includedFiles = getProjectRunFilesForEntry(entryFile, runnableFiles);
+    let includedFiles = getProjectRunFilesForEntry(entryFile, runnableFiles);
+    if (getProjectRuntimeLanguageForFile(entryFile) === 'csharp') {
+      const entryPath = normalizeProjectPath(getFsItemPath(filesRef.current, entryFile.id));
+      const projectContext = getCSharpProjectContext(entryPath);
+      const projectSourcePaths = new Set(projectContext.sourceFiles.map(file => file.path));
+      includedFiles = runnableFiles.filter(file => (
+        getProjectRuntimeLanguageForFile(file) === 'csharp'
+        && projectSourcePaths.has(normalizeProjectPath(getFsItemPath(filesRef.current, file.id)))
+      ));
+    }
     const selectedLanguageSet = new Set<ProjectFileLanguage>(
       includedFiles
         .map(file => getProjectFileLanguageForRuntime(file))
@@ -12514,6 +12701,8 @@ json.dumps(sorted(_imports))
     paths?: string[];
     contents?: string[];
     entryPath?: string;
+    sourcePath?: string;
+    configuration?: CSharpProjectConfiguration | null;
     runtimePaths?: string[];
     runtimeContents?: string[];
     includeNamespaces?: string[];
@@ -13174,9 +13363,16 @@ finally:
       if (BrowserCSharp) {
         await includeCSharpRuntimeNamespaces(BrowserCSharp, runtimeIncludeNamespaces);
       }
-      const contextId = getCSharpScriptContextId(fileId);
       const sourceItem = filesRef.current.find(item => item.id === fileId && item.type === 'file');
       const sourcePath = sourceItem ? getFsItemPath(filesRef.current, sourceItem.id) : 'Program.cs';
+      const csharpProjectContext = getCSharpProjectContext(sourcePath);
+      const projectConfiguration = csharpProjectContext.mode === 'project'
+        ? csharpProjectContext.configuration
+        : null;
+      const configurationContextKey = Math.abs(
+        hashString(JSON.stringify(csharpProjectContext.configuration))
+      ).toString(36);
+      const contextId = `${getCSharpScriptContextId(fileId)}:${configurationContextKey}`;
       const runtimeProjectFiles: ProjectSourceFile[] = [{
         id: fileId,
         name: sourceItem?.name || sourcePath.split('/').pop() || 'Program.cs',
@@ -13184,12 +13380,32 @@ finally:
         content: code,
         language: 'csharp',
       }];
+      if (
+        settings.csharpExecutionMode === 'regular'
+        && csharpProjectContext.generatedGlobalUsingsSource
+      ) {
+        const generatedPath = getCSharpGeneratedGlobalUsingsPath(csharpProjectContext);
+        runtimeProjectFiles.push({
+          id: `__csharp-global-usings__:${csharpProjectContext.projectPath || sourcePath}`,
+          name: generatedPath.split('/').pop() || 'CodeCraft.ProjectGlobalUsings.g.cs',
+          path: generatedPath,
+          content: csharpProjectContext.generatedGlobalUsingsSource,
+          language: 'csharp',
+        });
+      }
       const runtimeFiles = getRuntimeWorkspaceFilesFromExplorer(filesRef.current);
+      const runtimeProjectSourceByPath = new Map(
+        runtimeProjectFiles.map(file => [file.path, file.content])
+      );
       const runtimeFilesWithCurrentSource = runtimeFiles.map(file => (
-        file.path === runtimeProjectFiles[0].path ? { ...file, content: code } : file
+        runtimeProjectSourceByPath.has(file.path)
+          ? { ...file, content: runtimeProjectSourceByPath.get(file.path) || '' }
+          : file
       ));
-      if (!runtimeFilesWithCurrentSource.some(file => file.path === runtimeProjectFiles[0].path)) {
-        runtimeFilesWithCurrentSource.push({ path: runtimeProjectFiles[0].path, content: code });
+      for (const file of runtimeProjectFiles) {
+        if (!runtimeFilesWithCurrentSource.some(runtimeFile => runtimeFile.path === file.path)) {
+          runtimeFilesWithCurrentSource.push({ path: file.path, content: file.content });
+        }
       }
       const initialRuntimeFiles = buildRuntimeWorkspaceInitialFileMap(runtimeFilesWithCurrentSource);
 
@@ -13203,6 +13419,7 @@ finally:
               entryPath: runtimeProjectFiles[0].path,
               runtimePaths: runtimeFilesWithCurrentSource.map(file => file.path),
               runtimeContents: runtimeFilesWithCurrentSource.map(file => file.content),
+              configuration: projectConfiguration,
               includeNamespaces: runtimeIncludeNamespaces,
             });
           }
@@ -13212,11 +13429,19 @@ finally:
               code,
               contextId,
               resetContext: settings.csharpResetScriptContextBeforeRun,
+              sourcePath: runtimeProjectFiles[0].path,
+              configuration: csharpProjectContext.configuration,
               includeNamespaces: runtimeIncludeNamespaces,
             });
           }
           if (settings.csharpExecutionMode === 'script') {
-            return runCSharpInInteractiveWorker({ mode: 'script', code, includeNamespaces: runtimeIncludeNamespaces });
+            return runCSharpInInteractiveWorker({
+              mode: 'script',
+              code,
+              sourcePath: runtimeProjectFiles[0].path,
+              configuration: csharpProjectContext.configuration,
+              includeNamespaces: runtimeIncludeNamespaces,
+            });
           }
           return runCSharpInInteractiveWorker({ mode: 'regular', code, includeNamespaces: runtimeIncludeNamespaces });
         }
@@ -13230,17 +13455,27 @@ finally:
               await BrowserCSharp.clearScriptContext(contextId);
             } catch { }
           }
-          return BrowserCSharp.executeScriptInContext(code, contextId);
+          return BrowserCSharp.executeScriptInContextConfigured(
+            code,
+            contextId,
+            runtimeProjectFiles[0].path,
+            csharpProjectContext.configuration
+          );
         }
         if (settings.csharpExecutionMode === 'script') {
-          return BrowserCSharp.ExecuteScript(code);
+          return BrowserCSharp.executeScriptConfigured(
+            code,
+            runtimeProjectFiles[0].path,
+            csharpProjectContext.configuration
+          );
         }
         return BrowserCSharp.executeRegularProjectWithFiles(
           runtimeProjectFiles.map(file => file.path),
           runtimeProjectFiles.map(file => file.content),
           runtimeProjectFiles[0].path,
           runtimeFilesWithCurrentSource.map(file => file.path),
-          runtimeFilesWithCurrentSource.map(file => file.content)
+          runtimeFilesWithCurrentSource.map(file => file.content),
+          projectConfiguration
         );
       };
 
@@ -13320,10 +13555,41 @@ finally:
         ? ''
         : ' Project run uses regular C# compilation.';
       setExecutionStartupStatus(`Compiling and executing C# project from ${entryFile.path}.${note}`);
-      const runtimeProjectFiles = projectFiles.map(file => ({
+      const csharpProjectContext = getCSharpProjectContext(entryFile.path);
+      const inputFileByPath = new Map(
+        projectFiles.map(file => [normalizeProjectPath(file.path), file])
+      );
+      const scopedProjectFiles = csharpProjectContext.mode === 'project'
+        ? csharpProjectContext.sourceFiles.map((source, index) => {
+          const existing = inputFileByPath.get(source.path);
+          return existing
+            ? { ...existing, content: source.content }
+            : {
+              id: `__csharp-project-source__:${index}:${source.path}`,
+              name: source.path.split('/').pop() || `File${index + 1}.cs`,
+              path: source.path,
+              content: source.content,
+              language: 'csharp' as const,
+            };
+        })
+        : projectFiles;
+      const runtimeProjectFiles = scopedProjectFiles.map(file => ({
         ...file,
         path: normalizeRuntimeWorkspacePath(file.path, file.name || 'Program.cs'),
       }));
+      if (csharpProjectContext.generatedGlobalUsingsSource) {
+        const generatedPath = getCSharpGeneratedGlobalUsingsPath(csharpProjectContext);
+        runtimeProjectFiles.push({
+          id: `__csharp-global-usings__:${csharpProjectContext.projectPath || entryFile.path}`,
+          name: generatedPath.split('/').pop() || 'CodeCraft.ProjectGlobalUsings.g.cs',
+          path: generatedPath,
+          content: csharpProjectContext.generatedGlobalUsingsSource,
+          language: 'csharp',
+        });
+      }
+      const projectConfiguration = csharpProjectContext.mode === 'project'
+        ? csharpProjectContext.configuration
+        : null;
       const runtimeFiles = getRuntimeWorkspaceFilesFromExplorer(filesRef.current);
       const runtimeSourceByPath = new Map(runtimeProjectFiles.map(file => [file.path, file.content]));
       const runtimeFilesWithCurrentSources = runtimeFiles.map(file => (
@@ -13347,6 +13613,7 @@ finally:
             entryPath: normalizeRuntimeWorkspacePath(entryFile.path, entryFile.name || 'Program.cs'),
             runtimePaths: runtimeFilesWithCurrentSources.map(file => file.path),
             runtimeContents: runtimeFilesWithCurrentSources.map(file => file.content),
+            configuration: projectConfiguration,
             includeNamespaces: runtimeIncludeNamespaces,
           })
           : BrowserCSharp!.executeRegularProjectWithFiles(
@@ -13354,7 +13621,8 @@ finally:
             runtimeProjectFiles.map(file => file.content),
             normalizeRuntimeWorkspacePath(entryFile.path, entryFile.name || 'Program.cs'),
             runtimeFilesWithCurrentSources.map(file => file.path),
-            runtimeFilesWithCurrentSources.map(file => file.content)
+            runtimeFilesWithCurrentSources.map(file => file.content),
+            projectConfiguration
           ),
         async () => {
           if (useInteractiveWorker) {
@@ -19641,7 +19909,7 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
       link.click();
       link.remove();
       URL.revokeObjectURL(url);
-      setSettingsUserDataStatus('Exported complete user data.');
+      setSettingsUserDataStatus('Exported user data without API keys or GitHub access tokens.');
     } catch (err) {
       setSettingsUserDataStatus(`Export failed: ${err instanceof Error ? err.message : String(err)}`);
     } finally {
@@ -20197,8 +20465,24 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
                         // its active entry changes; when this file later becomes a dependency,
                         // its cached content is already current.
                         const activeSnapshot = cachedCSharpProject.byId.get(resolvedTabItemId);
-                        if (activeSnapshot) activeSnapshot.content = nextContent;
-                        cachedCSharpProject.source = next;
+                        if (activeSnapshot) {
+                          activeSnapshot.content = nextContent;
+                          cachedCSharpProject.source = next;
+                        }
+                      }
+                      const cachedCSharpContexts = csharpProjectContextsCacheRef.current;
+                      const editedFile = prev.find(file => file.id === resolvedTabItemId);
+                      if (
+                        cachedCSharpContexts?.source === prev
+                        && editedFile?.type === 'file'
+                        && getProjectRuntimeLanguageForFile(editedFile) === 'csharp'
+                      ) {
+                        const editedPath = normalizeProjectPath(getFsItemPath(prev, editedFile.id));
+                        for (const context of cachedCSharpContexts.byPath.values()) {
+                          const source = context.sourceFiles.find(file => file.path === editedPath);
+                          if (source) source.content = nextContent;
+                        }
+                        cachedCSharpContexts.source = next;
                       }
                       return next;
                     });
@@ -21356,9 +21640,22 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
         <header className="h-12 border-b border-white/10 bg-[rgb(28,28,28)] flex items-center justify-between gap-3 px-3 shrink-0 w-full z-10">
           <div className="flex min-w-0 flex-1 items-center gap-1 overflow-hidden">
             {/* Logo */}
-            <div className="flex items-center gap-2 font-semibold text-white shrink-0 pr-2">
-              <img src={coinstantLogo} alt="<cod/in> logo" className="w-6 h-6 rounded-md object-cover" />
-              <span className="text-sm tracking-wide hidden sm:inline-block text-zinc-100">{'<cod/in>'}</span>
+            <div
+              role="img"
+              aria-label="cod slash in"
+              className="flex items-center gap-2 font-semibold text-white shrink-0 pr-2"
+            >
+              <img src="/codecraft-mark.svg" alt="" aria-hidden="true" className="w-6 h-6 shrink-0" />
+              <span
+                aria-hidden="true"
+                className="hidden items-center font-mono text-sm font-semibold tracking-[-0.035em] sm:inline-flex"
+              >
+                <span aria-hidden="true" className="text-zinc-500">&lt;</span>
+                <span aria-hidden="true" className="text-zinc-100">cod</span>
+                <span aria-hidden="true" className="px-px text-rose-400">/</span>
+                <span aria-hidden="true" className="text-zinc-100">in</span>
+                <span aria-hidden="true" className="text-zinc-500">&gt;</span>
+              </span>
             </div>
 
             <Separator.Root orientation="vertical" className="h-5 w-px bg-zinc-800 mx-1 shrink-0" />
@@ -23408,7 +23705,7 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
 	                  <div className="rounded-2xl border border-white/10 bg-white/5 p-4 space-y-4">
 	                    <div>
 	                      <div className="text-sm font-medium text-white">Complete Backup</div>
-	                      <div className="text-xs text-zinc-500 mt-1">Includes projects, settings, chats, layout, saved packages, npm package cache, and Python package cache. Folder permissions are browser-bound and must be reconnected after import.</div>
+	                      <div className="text-xs text-zinc-500 mt-1">Includes projects, settings, chats, layout, saved packages, npm package cache, and Python package cache. Stored API keys and GitHub access tokens are excluded. Folder permissions and credentials must be reconnected after import.</div>
 	                    </div>
 	                    <input
 	                      ref={userDataImportInputRef}
@@ -23493,7 +23790,20 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
               </div>
 
               <div className="p-6 border-t border-white/5 bg-white/2 flex items-center justify-between gap-4">
-                <div className="text-xs text-zinc-500">Version {APP_VERSION}</div>
+                <div className="text-xs text-zinc-500">
+                  <div>Version {APP_VERSION}</div>
+                  <div className="mt-1">
+                    <a
+                      href={`${import.meta.env.BASE_URL}THIRD_PARTY_NOTICES.txt`}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="text-zinc-400 hover:text-zinc-200 underline underline-offset-2"
+                    >
+                      Third-party notices
+                    </a>
+                    <span> · Java powered by CheerpJ</span>
+                  </div>
+                </div>
                 <button
                   onClick={() => setIsSettingsOpen(false)}
                   className="px-6 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-sm font-semibold transition-all shadow-lg shadow-indigo-900/20"

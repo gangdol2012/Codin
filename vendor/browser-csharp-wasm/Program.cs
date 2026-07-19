@@ -9,6 +9,7 @@ using System.Text;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
+using CodeCraft.CSharp;
 using Microsoft.AspNetCore.Components.WebAssembly.Hosting;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
@@ -23,6 +24,7 @@ namespace BrowserCSharp
 		private const string frameworkBinUri = "_framework/_bin";
 		private const string namespaceIndexUri = "_framework/_bin/codecraft-namespace-index.json";
 		private const string codecraftWorkspaceRoot = "/workspace";
+		private const string defaultScriptSourcePath = "Script.cs";
 		private static readonly IImmutableSet<string> autoIncludedReferenceKeys = ImmutableHashSet.Create(
 			"mscorlib",
 			"netstandard",
@@ -40,6 +42,31 @@ namespace BrowserCSharp
 		private static IJSRuntime jsRuntime;
 
 		private static IDictionary<string, ScriptContext> previousCompilations = new Dictionary<string, ScriptContext>();
+
+		private static readonly JsonSerializerOptions projectConfigurationJsonOptions = new JsonSerializerOptions
+		{
+			PropertyNameCaseInsensitive = true
+		};
+
+		private static CSharpProjectConfiguration ParseProjectConfiguration(string configurationJson)
+		{
+			if (String.IsNullOrWhiteSpace(configurationJson))
+			{
+				return null;
+			}
+
+			try
+			{
+				return JsonSerializer.Deserialize<CSharpProjectConfiguration>(
+					configurationJson,
+					projectConfigurationJsonOptions
+				);
+			}
+			catch (Exception error)
+			{
+				throw new ArgumentException("The C# project configuration payload is invalid.", nameof(configurationJson), error);
+			}
+		}
 
 		public static void Main()
 		{
@@ -272,7 +299,7 @@ namespace BrowserCSharp
 				}
 				else
 				{
-					return new ExecutionResult(null, null, String.Join('\n', compilationResult.Errors.Select(x => x.GetMessage())));
+					return new ExecutionResult(null, null, FormatCompilerDiagnostics(compilationResult.Errors));
 				}
 			}
 
@@ -292,7 +319,7 @@ namespace BrowserCSharp
 				}
 				else
 				{
-					return new ExecutionResult(null, null, String.Join('\n', compilationResult.Errors.Select(x => x.GetMessage())));
+					return new ExecutionResult(null, null, FormatCompilerDiagnostics(compilationResult.Errors));
 				}
 			}
 
@@ -315,7 +342,7 @@ namespace BrowserCSharp
 				}
 				else
 				{
-					return new ExecutionResult(null, null, String.Join('\n', compilationResult.Errors.Select(x => x.GetMessage())));
+					return new ExecutionResult(null, null, FormatCompilerDiagnostics(compilationResult.Errors));
 				}
 			}
 
@@ -338,8 +365,130 @@ namespace BrowserCSharp
 				}
 				else
 				{
-					return new ExecutionResult(null, null, String.Join('\n', compilationResult.Errors.Select(x => x.GetMessage())));
+					return new ExecutionResult(null, null, FormatCompilerDiagnostics(compilationResult.Errors));
 				}
+			}
+
+			return Task.Run(execute);
+		}
+
+		[JSInvokable]
+		public static Task<ExecutionResult> ExecuteScriptConfigured(
+			string code,
+			string sourcePath,
+			string configurationJson)
+		{
+			async Task<ExecutionResult> execute()
+			{
+				CompilationResult compilationResult = await CompileScript(
+					code,
+					null,
+					sourcePath,
+					ParseProjectConfiguration(configurationJson)
+				).ConfigureAwait(false);
+
+				return compilationResult.Success
+					? await RunScript(compilationResult.Assembly, compilationResult.Compilation).ConfigureAwait(false)
+					: new ExecutionResult(null, null, FormatCompilerDiagnostics(compilationResult.Errors));
+			}
+
+			return Task.Run(execute);
+		}
+
+		[JSInvokable]
+		public static Task<ExecutionResult> ExecuteScriptConfiguredInteractive(
+			string code,
+			string sourcePath,
+			string configurationJson)
+		{
+			async Task<ExecutionResult> execute()
+			{
+				CompilationResult compilationResult = await CompileScript(
+					code,
+					null,
+					sourcePath,
+					ParseProjectConfiguration(configurationJson)
+				).ConfigureAwait(false);
+
+				return compilationResult.Success
+					? await RunScript(
+						compilationResult.Assembly,
+						compilationResult.Compilation,
+						new object[] { null, null },
+						true
+					).ConfigureAwait(false)
+					: new ExecutionResult(null, null, FormatCompilerDiagnostics(compilationResult.Errors));
+			}
+
+			return Task.Run(execute);
+		}
+
+		[JSInvokable]
+		public static Task<ExecutionResult> ExecuteScriptInContextConfigured(
+			string code,
+			string contextId,
+			string sourcePath,
+			string configurationJson)
+		{
+			async Task<ExecutionResult> execute()
+			{
+				ScriptContext context = previousCompilations.TryGetValue(contextId, out ScriptContext existing)
+					? existing
+					: ScriptContext.Empty;
+				CompilationResult compilationResult = await CompileScript(
+					code,
+					context,
+					sourcePath,
+					ParseProjectConfiguration(configurationJson)
+				).ConfigureAwait(false);
+				if (!compilationResult.Success)
+				{
+					return new ExecutionResult(null, null, FormatCompilerDiagnostics(compilationResult.Errors));
+				}
+
+				context = context.AddCompilation(compilationResult.Compilation);
+				previousCompilations[contextId] = context;
+				return await RunScript(
+					compilationResult.Assembly,
+					compilationResult.Compilation,
+					context.States
+				).ConfigureAwait(false);
+			}
+
+			return Task.Run(execute);
+		}
+
+		[JSInvokable]
+		public static Task<ExecutionResult> ExecuteScriptInContextConfiguredInteractive(
+			string code,
+			string contextId,
+			string sourcePath,
+			string configurationJson)
+		{
+			async Task<ExecutionResult> execute()
+			{
+				ScriptContext context = previousCompilations.TryGetValue(contextId, out ScriptContext existing)
+					? existing
+					: ScriptContext.Empty;
+				CompilationResult compilationResult = await CompileScript(
+					code,
+					context,
+					sourcePath,
+					ParseProjectConfiguration(configurationJson)
+				).ConfigureAwait(false);
+				if (!compilationResult.Success)
+				{
+					return new ExecutionResult(null, null, FormatCompilerDiagnostics(compilationResult.Errors));
+				}
+
+				context = context.AddCompilation(compilationResult.Compilation);
+				previousCompilations[contextId] = context;
+				return await RunScript(
+					compilationResult.Assembly,
+					compilationResult.Compilation,
+					context.States,
+					true
+				).ConfigureAwait(false);
 			}
 
 			return Task.Run(execute);
@@ -382,7 +531,7 @@ namespace BrowserCSharp
 					return await RunRegularProgram(compilationResult.Assembly, compilationResult.Compilation).ConfigureAwait(false);
 				}
 
-				return new ExecutionResult(null, null, String.Join('\n', compilationResult.Errors.Select(x => x.GetMessage())));
+				return new ExecutionResult(null, null, FormatCompilerDiagnostics(compilationResult.Errors));
 			}
 
 			return Task.Run(execute);
@@ -403,7 +552,7 @@ namespace BrowserCSharp
 					return await RunRegularProgram(compilationResult.Assembly, compilationResult.Compilation, true).ConfigureAwait(false);
 				}
 
-				return new ExecutionResult(null, null, String.Join('\n', compilationResult.Errors.Select(x => x.GetMessage())));
+				return new ExecutionResult(null, null, FormatCompilerDiagnostics(compilationResult.Errors));
 			}
 
 			return Task.Run(execute);
@@ -433,7 +582,7 @@ namespace BrowserCSharp
 					return await RunRegularProgram(compilationResult.Assembly, compilationResult.Compilation).ConfigureAwait(false);
 				}
 
-				return new ExecutionResult(null, null, String.Join('\n', compilationResult.Errors.Select(x => x.GetMessage())));
+				return new ExecutionResult(null, null, FormatCompilerDiagnostics(compilationResult.Errors));
 			}
 
 			return Task.Run(execute);
@@ -463,7 +612,7 @@ namespace BrowserCSharp
 					return await RunRegularProgram(compilationResult.Assembly, compilationResult.Compilation, true).ConfigureAwait(false);
 				}
 
-				return new ExecutionResult(null, null, String.Join('\n', compilationResult.Errors.Select(x => x.GetMessage())));
+				return new ExecutionResult(null, null, FormatCompilerDiagnostics(compilationResult.Errors));
 			}
 
 			return Task.Run(execute);
@@ -480,7 +629,15 @@ namespace BrowserCSharp
 		{
 			async Task<ProjectExecutionResult> execute()
 			{
-				return await ExecuteRegularProjectWithFilesCore(paths, contents, entryPath, runtimePaths, runtimeContents, false).ConfigureAwait(false);
+				return await ExecuteRegularProjectWithFilesCore(
+					paths,
+					contents,
+					entryPath,
+					runtimePaths,
+					runtimeContents,
+					false,
+					null
+				).ConfigureAwait(false);
 			}
 
 			return Task.Run(execute);
@@ -497,7 +654,67 @@ namespace BrowserCSharp
 		{
 			async Task<ProjectExecutionResult> execute()
 			{
-				return await ExecuteRegularProjectWithFilesCore(paths, contents, entryPath, runtimePaths, runtimeContents, true).ConfigureAwait(false);
+				return await ExecuteRegularProjectWithFilesCore(
+					paths,
+					contents,
+					entryPath,
+					runtimePaths,
+					runtimeContents,
+					true,
+					null
+				).ConfigureAwait(false);
+			}
+
+			return Task.Run(execute);
+		}
+
+		[JSInvokable]
+		public static Task<ProjectExecutionResult> ExecuteRegularProjectWithFilesConfigured(
+			string[] paths,
+			string[] contents,
+			string entryPath,
+			string[] runtimePaths,
+			string[] runtimeContents,
+			string configurationJson
+		)
+		{
+			async Task<ProjectExecutionResult> execute()
+			{
+				return await ExecuteRegularProjectWithFilesCore(
+					paths,
+					contents,
+					entryPath,
+					runtimePaths,
+					runtimeContents,
+					false,
+					ParseProjectConfiguration(configurationJson)
+				).ConfigureAwait(false);
+			}
+
+			return Task.Run(execute);
+		}
+
+		[JSInvokable]
+		public static Task<ProjectExecutionResult> ExecuteRegularProjectWithFilesConfiguredInteractive(
+			string[] paths,
+			string[] contents,
+			string entryPath,
+			string[] runtimePaths,
+			string[] runtimeContents,
+			string configurationJson
+		)
+		{
+			async Task<ProjectExecutionResult> execute()
+			{
+				return await ExecuteRegularProjectWithFilesCore(
+					paths,
+					contents,
+					entryPath,
+					runtimePaths,
+					runtimeContents,
+					true,
+					ParseProjectConfiguration(configurationJson)
+				).ConfigureAwait(false);
 			}
 
 			return Task.Run(execute);
@@ -509,7 +726,8 @@ namespace BrowserCSharp
 			string entryPath,
 			string[] runtimePaths,
 			string[] runtimeContents,
-			bool interactive
+			bool interactive,
+			CSharpProjectConfiguration projectConfiguration
 		)
 		{
 			if (paths == null || contents == null || paths.Length == 0 || paths.Length != contents.Length)
@@ -531,14 +749,18 @@ namespace BrowserCSharp
 			string normalizedEntryPath = NormalizeWorkspaceRelativePath(entryPath);
 			WriteProjectFilesToWorkspace(runtimeFiles);
 
-			CompilationResult compilationResult = await CompileRegularProgram(sourceFiles, normalizedEntryPath).ConfigureAwait(false);
+			CompilationResult compilationResult = await CompileRegularProgram(
+				sourceFiles,
+				normalizedEntryPath,
+				projectConfiguration
+			).ConfigureAwait(false);
 
 			if (!compilationResult.Success)
 			{
 				return new ProjectExecutionResult(
 					null,
 					null,
-					String.Join('\n', compilationResult.Errors.Select(x => x.GetMessage())),
+					FormatCompilerDiagnostics(compilationResult.Errors),
 					CollectWorkspaceFiles()
 				);
 			}
@@ -640,10 +862,19 @@ namespace BrowserCSharp
 				.ToArray();
 		}
 
-		private static async Task<CompilationResult> CompileRegularProgram(IReadOnlyList<KeyValuePair<string, string>> sourceFiles, string entryPath)
+		private static async Task<CompilationResult> CompileRegularProgram(
+			IReadOnlyList<KeyValuePair<string, string>> sourceFiles,
+			string entryPath,
+			CSharpProjectConfiguration projectConfiguration = null)
 		{
 			PortableExecutableReference[] refs = await loadedReferences.ConfigureAwait(false);
-			CompilationResult first = TryCompileRegular(sourceFiles, refs, entryPath);
+			CompilationResult first = TryCompileRegular(sourceFiles, refs, entryPath, projectConfiguration);
+			if (projectConfiguration != null)
+			{
+				// A real project follows compiler entry-point semantics exactly. In particular,
+				// do not silently select a Main method or wrap invalid project code.
+				return first;
+			}
 			if (first.Success && first.Compilation.GetEntryPoint(CancellationToken.None) != null)
 			{
 				return first;
@@ -656,7 +887,7 @@ namespace BrowserCSharp
 					? new KeyValuePair<string, string>(file.Key, WrapAsConsoleProgram(file.Value))
 					: file)
 				.ToArray();
-			CompilationResult wrapped = TryCompileRegular(wrappedSources, refs, targetEntryPath);
+			CompilationResult wrapped = TryCompileRegular(wrappedSources, refs, targetEntryPath, null);
 			return wrapped.Success ? wrapped : first;
 		}
 
@@ -677,22 +908,26 @@ namespace BrowserCSharp
 		private static CompilationResult TryCompileRegular(
 			IReadOnlyList<KeyValuePair<string, string>> sourceFiles,
 			PortableExecutableReference[] refs,
-			string entryPath
+			string entryPath,
+			CSharpProjectConfiguration projectConfiguration
 		)
 		{
-			CSharpParseOptions parseOptions = CSharpParseOptions.Default
-				.WithKind(SourceCodeKind.Regular)
-				.WithLanguageVersion(LanguageVersion.Preview);
+			CSharpProjectConfiguration effectiveConfiguration =
+				projectConfiguration ?? new CSharpProjectConfiguration();
+			CSharpParseOptions parseOptions =
+				CSharpCompilerSettings.CreateParseOptions(effectiveConfiguration);
 			SyntaxTree[] syntaxTrees = sourceFiles
 				.Select(file => CSharpSyntaxTree.ParseText(file.Value ?? String.Empty, parseOptions, path: file.Key))
 				.ToArray();
-			CSharpCompilationOptions options = new CSharpCompilationOptions(OutputKind.ConsoleApplication)
-				.WithPlatform(Platform.AnyCpu)
-				.WithOptimizationLevel(OptimizationLevel.Release);
-			string mainTypeName = InferRegularProjectMainTypeName(syntaxTrees, entryPath);
-			if (!String.IsNullOrWhiteSpace(mainTypeName))
+			CSharpCompilationOptions options =
+				CSharpCompilerSettings.CreateCompilationOptions(effectiveConfiguration);
+			if (projectConfiguration == null)
 			{
-				options = options.WithMainTypeName(mainTypeName);
+				string mainTypeName = InferRegularProjectMainTypeName(syntaxTrees, entryPath);
+				if (!String.IsNullOrWhiteSpace(mainTypeName))
+				{
+					options = options.WithMainTypeName(mainTypeName);
+				}
 			}
 			CSharpCompilation compilation = CSharpCompilation.Create(
 				Path.GetRandomFileName(),
@@ -871,13 +1106,33 @@ namespace BrowserCSharp
 				.FirstOrDefault(method => method.Name == entryPoint.MetadataName && method.GetParameters().Length == parameterCount);
 		}
 
-		private static async Task<CompilationResult> CompileScript(string code, ScriptContext? context = null)
+		private static async Task<CompilationResult> CompileScript(
+			string code,
+			ScriptContext? context = null,
+			string sourcePath = defaultScriptSourcePath,
+			CSharpProjectConfiguration projectConfiguration = null)
 		{
+			string normalizedSourcePath = String.IsNullOrWhiteSpace(sourcePath)
+				? defaultScriptSourcePath
+				: sourcePath;
+			CSharpProjectConfiguration effectiveConfiguration =
+				projectConfiguration ?? new CSharpProjectConfiguration();
 			CSharpCompilation compilation = CSharpCompilation.CreateScriptCompilation(
 				Path.GetRandomFileName(),
-				CSharpSyntaxTree.ParseText(code, CSharpParseOptions.Default.WithKind(SourceCodeKind.Script).WithLanguageVersion(LanguageVersion.Preview)),
+				CSharpSyntaxTree.ParseText(
+					code,
+					CSharpCompilerSettings.CreateParseOptions(
+						effectiveConfiguration,
+						SourceCodeKind.Script
+					),
+					path: normalizedSourcePath),
 				await loadedReferences.ConfigureAwait(false),
-				new CSharpCompilationOptions(outputKind: OutputKind.DynamicallyLinkedLibrary),
+				CSharpCompilerSettings
+					.CreateCompilationOptions(
+						effectiveConfiguration,
+						OutputKind.DynamicallyLinkedLibrary
+					)
+					.WithMainTypeName(null),
 				context?.Compilation
 			);
 
@@ -1038,6 +1293,11 @@ namespace BrowserCSharp
 		private static string FormatExecutionException(Exception exception)
 		{
 			return UnwrapExecutionException(exception).ToString();
+		}
+
+		private static string FormatCompilerDiagnostics(IEnumerable<Diagnostic> diagnostics)
+		{
+			return String.Join(Environment.NewLine, diagnostics.Select(diagnostic => diagnostic.ToString()));
 		}
 
 		private static string ToNonEmptyString(string value)

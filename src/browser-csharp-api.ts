@@ -1,4 +1,5 @@
 import { BrowserCSharp as BrowserCSharpBase, type ScriptResult } from 'browser-csharp';
+import type { CSharpProjectConfiguration } from './csharp-project';
 
 declare global {
   // Provided by blazor.webassembly.js after load (same timing as BrowserCSharp.ExecuteScript).
@@ -15,6 +16,10 @@ const assemblyName = 'BrowserCSharp';
 
 function invoke<T>(method: string, ...args: unknown[]): Promise<T> {
   return DotNet.invokeMethodAsync<T>(assemblyName, method, ...args);
+}
+
+function serializeProjectConfiguration(configuration: CSharpProjectConfiguration) {
+  return JSON.stringify(configuration);
 }
 
 /**
@@ -48,8 +53,64 @@ export const BrowserCSharp = {
     return invoke<ScriptResult>('ExecuteScriptInteractive', code);
   },
 
+  executeScriptConfigured(
+    code: string,
+    sourcePath: string,
+    configuration: CSharpProjectConfiguration
+  ): Promise<ScriptResult> {
+    return invoke<ScriptResult>(
+      'ExecuteScriptConfigured',
+      code,
+      sourcePath,
+      serializeProjectConfiguration(configuration)
+    );
+  },
+
+  executeScriptConfiguredInteractive(
+    code: string,
+    sourcePath: string,
+    configuration: CSharpProjectConfiguration
+  ): Promise<ScriptResult> {
+    return invoke<ScriptResult>(
+      'ExecuteScriptConfiguredInteractive',
+      code,
+      sourcePath,
+      serializeProjectConfiguration(configuration)
+    );
+  },
+
   executeScriptInContextInteractive(code: string, contextId: string): Promise<ScriptResult> {
     return invoke<ScriptResult>('ExecuteScriptInContextInteractive', code, contextId);
+  },
+
+  executeScriptInContextConfigured(
+    code: string,
+    contextId: string,
+    sourcePath: string,
+    configuration: CSharpProjectConfiguration
+  ): Promise<ScriptResult> {
+    return invoke<ScriptResult>(
+      'ExecuteScriptInContextConfigured',
+      code,
+      contextId,
+      sourcePath,
+      serializeProjectConfiguration(configuration)
+    );
+  },
+
+  executeScriptInContextConfiguredInteractive(
+    code: string,
+    contextId: string,
+    sourcePath: string,
+    configuration: CSharpProjectConfiguration
+  ): Promise<ScriptResult> {
+    return invoke<ScriptResult>(
+      'ExecuteScriptInContextConfiguredInteractive',
+      code,
+      contextId,
+      sourcePath,
+      serializeProjectConfiguration(configuration)
+    );
   },
 
   /** Forget accumulated compilations for a REPL `contextId` (see `executeScriptInContext`). */
@@ -88,8 +149,20 @@ export const BrowserCSharp = {
     contents: string[],
     entryPath: string,
     runtimePaths: string[],
-    runtimeContents: string[]
+    runtimeContents: string[],
+    configuration?: CSharpProjectConfiguration | null
   ): Promise<ScriptResult & { files?: RuntimeFileSnapshot[] }> {
+    if (configuration) {
+      return invoke<ScriptResult & { files?: RuntimeFileSnapshot[] }>(
+        'ExecuteRegularProjectWithFilesConfigured',
+        paths,
+        contents,
+        entryPath,
+        runtimePaths,
+        runtimeContents,
+        serializeProjectConfiguration(configuration)
+      );
+    }
     return invoke<ScriptResult & { files?: RuntimeFileSnapshot[] }>(
       'ExecuteRegularProjectWithFiles',
       paths,
@@ -105,8 +178,20 @@ export const BrowserCSharp = {
     contents: string[],
     entryPath: string,
     runtimePaths: string[],
-    runtimeContents: string[]
+    runtimeContents: string[],
+    configuration?: CSharpProjectConfiguration | null
   ): Promise<ScriptResult & { files?: RuntimeFileSnapshot[] }> {
+    if (configuration) {
+      return invoke<ScriptResult & { files?: RuntimeFileSnapshot[] }>(
+        'ExecuteRegularProjectWithFilesConfiguredInteractive',
+        paths,
+        contents,
+        entryPath,
+        runtimePaths,
+        runtimeContents,
+        serializeProjectConfiguration(configuration)
+      );
+    }
     return invoke<ScriptResult & { files?: RuntimeFileSnapshot[] }>(
       'ExecuteRegularProjectWithFilesInteractive',
       paths,
