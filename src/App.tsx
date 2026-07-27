@@ -2495,7 +2495,7 @@ const codinGetTool: AssistantToolDefinition = {
 
 const docsFindTool: AssistantToolDefinition = {
   name: "docsFind",
-  description: "Find generated C# semantic documentation that matches a natural-language description.",
+  description: "Find generated C# semantic documentation that matches a natural-language description and return a confidence level.",
   parameters: {
     type: 'object',
     description: "Run the docs find semantic documentation search.",
@@ -2519,6 +2519,10 @@ const docsFindTool: AssistantToolDefinition = {
       hideDocumentation: {
         type: 'boolean',
         description: "Whether to hide documentation excerpts in the result.",
+      },
+      hideConfidence: {
+        type: 'boolean',
+        description: "Whether to skip the final confident, likely, or possible assessment for successful results. No-match results always return none.",
       },
     },
     required: ['description'],
@@ -5926,6 +5930,7 @@ interface AppSettings {
   docsFindTypeMatchCount: number;
   docsFindMemberMatchCount: number;
   docsFindIncludeAccessorDocs: boolean;
+  docsFindEvaluateConfidence: boolean;
 }
 
 type AssistantDocumentationLookupByChatId = Record<string, boolean>;
@@ -6041,6 +6046,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   docsFindTypeMatchCount: DEFAULT_DOCS_FIND_TYPE_MATCH_COUNT,
   docsFindMemberMatchCount: DEFAULT_DOCS_FIND_MEMBER_MATCH_COUNT,
   docsFindIncludeAccessorDocs: true,
+  docsFindEvaluateConfidence: true,
 };
 
 const LEGACY_CSHARP_AUTHORING_SOURCE_KEY = 'csharp' + 'Intelli' + 'SageSource';
@@ -7593,6 +7599,7 @@ export default function App() {
           : DEFAULT_SETTINGS.docsFindMemberMatchCount
       ),
       docsFindIncludeAccessorDocs: merged.docsFindIncludeAccessorDocs !== false,
+      docsFindEvaluateConfidence: merged.docsFindEvaluateConfidence !== false,
     };
   });
   const [settingsPipPackages, setSettingsPipPackages] = useState<SavedPipPackage[]>(() => loadSavedPipPackages());
@@ -14645,16 +14652,25 @@ finally:
     reason: string;
   }
 
+  type DocsFindConfidence = 'confident' | 'likely' | 'possible' | 'none';
+
   interface DocsFindCommandOptions {
     description: string;
     typeLimit: number;
     memberLimit: number;
     hideReason: boolean;
     hideDocumentation: boolean;
+    evaluateConfidence: boolean;
     errors: string[];
   }
 
-  const DOCS_FIND_USAGE = 'Usage: docs find [--types N] [--members N] [--hide-reason] [--hide-docs] <description>';
+  interface DocsFindExecutionResult {
+    lines: string[];
+    confidence: DocsFindConfidence | null;
+    resultCount: number;
+  }
+
+  const DOCS_FIND_USAGE = 'Usage: docs find [--types N] [--members N] [--hide-reason] [--hide-docs] [--confidence|--hide-confidence] <description>';
   const DOCS_GET_USAGE = 'Usage: docs get <item-name>';
   const CODIN_GET_USAGE = 'Usage: codin get <CSharpSymbolPath>';
 
@@ -14745,6 +14761,7 @@ finally:
     let memberLimit = normalizeDocsFindMemberMatchCount(settings.docsFindMemberMatchCount);
     let hideReason = false;
     let hideDocumentation = false;
+    let evaluateConfidence = settings.docsFindEvaluateConfidence;
 
     const readCountOption = (index: number, label: string, normalize: (value: number) => number) => {
       const value = rawArgs[index + 1];
@@ -14775,6 +14792,14 @@ finally:
         hideDocumentation = true;
         continue;
       }
+      if (arg === '--confidence' || arg === '--evaluate-confidence' || arg === '--show-confidence') {
+        evaluateConfidence = true;
+        continue;
+      }
+      if (arg === '--hide-confidence' || arg === '--no-confidence') {
+        evaluateConfidence = false;
+        continue;
+      }
       if (arg === '--types' || arg === '--type-matches' || arg === '--type-count' || arg === '--classes' || arg === '-t') {
         const parsed = readCountOption(index, arg, normalizeDocsFindTypeMatchCount);
         typeLimit = parsed.value;
@@ -14800,6 +14825,7 @@ finally:
       memberLimit,
       hideReason,
       hideDocumentation,
+      evaluateConfidence,
       errors,
     };
   };
@@ -14900,6 +14926,31 @@ finally:
     return {};
   };
 
+  const normalizeDocsFindConfidence = (value: unknown): DocsFindConfidence | null => {
+    if (typeof value !== 'string') return null;
+    const normalized = value.trim().toLowerCase();
+    return normalized === 'confident'
+      || normalized === 'likely'
+      || normalized === 'possible'
+      || normalized === 'none'
+      ? normalized
+      : null;
+  };
+
+  const parseDocsFindConfidence = (response: string): DocsFindConfidence | null => {
+    const parsed = extractDocsFindJson(response);
+    const structured = normalizeDocsFindConfidence((parsed as any).confidence);
+    if (structured) return structured;
+    const bareResponse = response.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
+    return normalizeDocsFindConfidence(bareResponse);
+  };
+
+  const docsFindResponseIsNoMatch = (response: string) => {
+    const parsed = extractDocsFindJson(response);
+    return (parsed as any).noMatch === true
+      || normalizeDocsFindConfidence((parsed as any).confidence) === 'none';
+  };
+
   const parseDocsFindSelections = (
     response: string,
     candidates: DocsFindCandidate[],
@@ -14972,11 +15023,37 @@ finally:
     `You are ranking generated C# semantic documentation for an IDE terminal command.\n` +
     `User description: ${description}\n\n` +
     `${stage}\n` +
+    `You may abort this search if you are sure none of the candidates match the user's searched thing. ` +
+    `To abort, return ONLY {"noMatch":true,"confidence":"none","matches":[]}. Do not abort merely because the match is uncertain.\n` +
     `Choose up to ${limit} best matching candidate IDs, in best-first order. Use semantic meaning, not only lexical overlap.\n` +
-    `Return ONLY JSON in this exact shape: {"matches":[{"id":"candidate id","reason":"short reason"}]}\n\n` +
+    `Otherwise return ONLY JSON in this exact shape: {"noMatch":false,"matches":[{"id":"candidate id","reason":"short reason"}]}\n\n` +
     `Candidates:\n\n${candidates.map(formatDocsFindCandidateBlock).join('\n\n---\n\n')}`,
     effectiveAutoDocumentationPromptTokenLimit,
   );
+
+  const buildDocsFindConfidencePrompt = (
+    description: string,
+    selections: DocsFindSelection[],
+    candidates: DocsFindCandidate[],
+  ) => {
+    const candidateById = new Map(candidates.map(candidate => [candidate.item.id, candidate]));
+    const selectedCandidates = selections
+      .map(selection => candidateById.get(selection.id))
+      .filter((candidate): candidate is DocsFindCandidate => !!candidate);
+    return limitSemanticPrompt(
+      `You are making the final confidence assessment for a generated C# semantic documentation search.\n` +
+      `User description: ${description}\n\n` +
+      `Evaluate the selected documentation results together and return exactly one confidence level:\n` +
+      `- confident: the documentation confidently matches the searched thing.\n` +
+      `- likely: the documentation can match the searched thing.\n` +
+      `- possible: the documentation might match the searched thing in some circumstances.\n` +
+      `- none: you are sure there is no matching thing in the selected results.\n` +
+      `If the level is none, the search will discard every result.\n` +
+      `Return ONLY JSON with confidence set to one of "confident", "likely", "possible", or "none". Example: {"confidence":"likely"}\n\n` +
+      `Selected results:\n\n${selectedCandidates.map(formatDocsFindCandidateBlock).join('\n\n---\n\n')}`,
+      effectiveAutoDocumentationPromptTokenLimit,
+    );
+  };
 
   const collectDocsFindMemberCandidates = (
     record: SemanticDocumentationRecord,
@@ -15042,21 +15119,42 @@ finally:
     return lines;
   };
 
-  const executeDocsFindCommand = async (rawArgs: string[]): Promise<string[]> => {
+  const createDocsFindNoMatchResult = (query: string, explanation: string): DocsFindExecutionResult => ({
+    lines: [
+      `Docs find: ${query}`,
+      'Confidence: none',
+      '',
+      `No results. ${explanation}`,
+    ],
+    confidence: 'none',
+    resultCount: 0,
+  });
+
+  const executeDocsFindCommand = async (rawArgs: string[]): Promise<DocsFindExecutionResult> => {
     const commandOptions = parseDocsFindCommandOptions(rawArgs);
     const query = commandOptions.description;
-    if (commandOptions.errors.length > 0) return [...commandOptions.errors, DOCS_FIND_USAGE];
-    if (!query) return [DOCS_FIND_USAGE];
+    if (commandOptions.errors.length > 0) {
+      return { lines: [...commandOptions.errors, DOCS_FIND_USAGE], confidence: null, resultCount: 0 };
+    }
+    if (!query) return { lines: [DOCS_FIND_USAGE], confidence: null, resultCount: 0 };
     const record = await getSemanticDocumentationRecordForFind();
     if (!record || record.items.length === 0) {
-      return ['No semantic documentation is available. Open Semantic Documentation and generate C# docs first.'];
+      return {
+        lines: ['No semantic documentation is available. Open Semantic Documentation and generate C# docs first.'],
+        confidence: null,
+        resultCount: 0,
+      };
     }
 
     const typeCandidates = record.items
       .filter(item => item.kind === 'type')
       .map(item => ({ item, documentation: item.documentation }));
     if (typeCandidates.length === 0) {
-      return ['No type documentation is available. Regenerate semantic documentation first.'];
+      return {
+        lines: ['No type documentation is available. Regenerate semantic documentation first.'],
+        confidence: null,
+        resultCount: 0,
+      };
     }
 
     const stage1Response = await requestSemanticDocumentationText(buildDocsFindRankingPrompt(
@@ -15065,9 +15163,16 @@ finally:
       commandOptions.typeLimit,
       'Stage 1: rank classes, structs, enums, interfaces, records, and similar top-level type documentation.',
     ));
+    if (docsFindResponseIsNoMatch(stage1Response)) {
+      return createDocsFindNoMatchResult(query, 'The model determined during type ranking that no documentation matches.');
+    }
     const typeSelections = parseDocsFindSelections(stage1Response, typeCandidates, commandOptions.typeLimit);
     if (typeSelections.length === 0) {
-      return ['The model did not return any matching types. Try a more specific description.'];
+      return {
+        lines: ['The model did not return any matching types. Try a more specific description.'],
+        confidence: null,
+        resultCount: 0,
+      };
     }
 
     const memberCandidates = collectDocsFindMemberCandidates(record, typeSelections);
@@ -15076,30 +15181,61 @@ finally:
         .map(selection => typeCandidates.find(candidate => candidate.item.id === selection.id)?.item.name)
         .filter(Boolean)
         .join(', ');
-      return [`No documented members were found below the selected type${typeSelections.length === 1 ? '' : 's'}: ${selectedNames}.`];
+      return createDocsFindNoMatchResult(
+        query,
+        `No documented members were found below the selected type${typeSelections.length === 1 ? '' : 's'}: ${selectedNames}.`,
+      );
     }
 
     const stage2Response = await requestSemanticDocumentationText(buildDocsFindRankingPrompt(
       query,
       memberCandidates,
       commandOptions.memberLimit,
-      'Final stage: rank fields, properties, methods, accessors, and similar member documentation below the selected types.',
+      'Stage 2: rank fields, properties, methods, accessors, and similar member documentation below the selected types.',
     ));
+    if (docsFindResponseIsNoMatch(stage2Response)) {
+      return createDocsFindNoMatchResult(query, 'The model determined during member ranking that no documentation matches.');
+    }
     const memberSelections = parseDocsFindSelections(stage2Response, memberCandidates, commandOptions.memberLimit);
     if (memberSelections.length === 0) {
-      return ['The model did not return any matching members. Try a more specific description.'];
+      return {
+        lines: ['The model did not return any matching members. Try a more specific description.'],
+        confidence: null,
+        resultCount: 0,
+      };
+    }
+
+    let confidence: DocsFindConfidence | null = null;
+    if (commandOptions.evaluateConfidence) {
+      const confidenceResponse = await requestSemanticDocumentationText(buildDocsFindConfidencePrompt(
+        query,
+        memberSelections,
+        memberCandidates,
+      ));
+      confidence = parseDocsFindConfidence(confidenceResponse);
+      if (!confidence) {
+        throw new Error('The model did not return a valid docs find confidence level.');
+      }
+      if (confidence === 'none') {
+        return createDocsFindNoMatchResult(query, 'The final confidence assessment determined that no documentation matches.');
+      }
     }
 
     const selectedTypeNames = typeSelections
       .map(selection => typeCandidates.find(candidate => candidate.item.id === selection.id)?.item.name)
       .filter(Boolean)
       .join(', ');
-    return [
-      `Docs find: ${query}`,
-      `Selected type scope: ${selectedTypeNames}`,
-      '',
-      ...formatDocsFindResultLines(`Final results (top ${memberSelections.length}):`, memberSelections, memberCandidates, commandOptions),
-    ];
+    return {
+      lines: [
+        `Docs find: ${query}`,
+        ...(confidence ? [`Confidence: ${confidence}`] : []),
+        `Selected type scope: ${selectedTypeNames}`,
+        '',
+        ...formatDocsFindResultLines(`Final results (top ${memberSelections.length}):`, memberSelections, memberCandidates, commandOptions),
+      ],
+      confidence,
+      resultCount: memberSelections.length,
+    };
   };
 
   const startSemanticDocumentationGeneration = async (forceNewDraft = false) => {
@@ -15625,19 +15761,26 @@ finally:
           }
           if (args.hideReason === true) rawDocsFindArgs.push('--hide-reason');
           if (args.hideDocumentation === true) rawDocsFindArgs.push('--hide-docs');
+          if (args.hideConfidence === true) rawDocsFindArgs.push('--hide-confidence');
+          if (args.hideConfidence === false) rawDocsFindArgs.push('--confidence');
           if (description) rawDocsFindArgs.push(description);
           const command = `docs find${rawDocsFindArgs.length > 0 ? ` ${rawDocsFindArgs.map(quoteTerminalArg).join(' ')}` : ''}`;
           try {
-            const lines = await executeDocsFindCommand(rawDocsFindArgs);
+            const docsFindResult = await executeDocsFindCommand(rawDocsFindArgs);
+            const lines = docsFindResult.lines;
             appendTerminalCommandResult(command, lines);
             return {
-              summary: description
-                ? `Found documentation matches for \`${description}\`.`
-                : 'docs find needs a description.',
+              summary: description && docsFindResult.confidence === 'none'
+                ? `No documentation matched \`${description}\`.`
+                : description
+                  ? `Found documentation matches for \`${description}\`.`
+                  : 'docs find needs a description.',
               detail: lines.join('\n'),
               result: {
                 ok: true,
                 query: description,
+                confidence: docsFindResult.confidence,
+                resultCount: docsFindResult.resultCount,
                 output: lines,
               },
             };
@@ -15884,7 +16027,7 @@ finally:
         if (call.name === 'terminalHelp') {
           const helpLines = [
             'Standard commands: ls, pwd, cd, mkdir, touch, open, cat, rm, clear, help, date, echo, whoami',
-            'Documentation: docs find [--types N] [--members N] [--hide-reason] [--hide-docs] <description>',
+            'Documentation: docs find [--types N] [--members N] [--hide-reason] [--hide-docs] [--confidence|--hide-confidence] <description>',
             'Documentation: docs get <item-name>',
             'Code navigation: codin get <CSharpSymbolPath> (C#)',
             'Python: pip install <package> [-force] | pip upgrade <package> [-version <ver>] | pip uninstall <package> | pip include <module> | pip list',
@@ -18433,8 +18576,8 @@ finally:
       if (subCmd === 'find') {
         setTerminalOutput([...newOutput, `Finding documentation matches with ${getAssistantProviderLabel(settings.assistantProvider)} · ${effectiveAutoDocumentationModel || 'no model'}...`]);
         try {
-          const lines = await executeDocsFindCommand(args.slice(2));
-          setTerminalOutput(prev => [...prev, ...lines]);
+          const docsFindResult = await executeDocsFindCommand(args.slice(2));
+          setTerminalOutput(prev => [...prev, ...docsFindResult.lines]);
         } catch (error) {
           setTerminalOutput(prev => [...prev, `docs find error: ${error instanceof Error ? error.message : String(error)}`]);
         }
@@ -19298,7 +19441,7 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
         setTerminalOutput([...newOutput, 'Usage: nuget include <namespace> | nuget list']);
       }
     } else if (cmd === 'help') {
-      setTerminalOutput([...newOutput, 'Standard commands: ls, pwd, cd, mkdir, touch, open, cat, rm, clear, help, date, echo', 'Documentation: docs find [--types N] [--members N] [--hide-reason] [--hide-docs] <description>', 'Documentation: docs get <item-name>', 'Code navigation: codin get <CSharpSymbolPath> (C#)', 'Source control: git status|add|restore|reset|commit|log|show|branch|checkout|switch|merge|tag|stash|remote|fetch|pull|push|ls-remote|clean|diff|config|rev-parse|clone, gh auth|repo|pr|issue', 'Python: pip install <package> [-force] | pip upgrade <package> [-version <ver>] | pip uninstall <package> | pip include <module> | pip list', 'JavaScript/TypeScript: npm install <package...> | npm uninstall <package...> | npm include <module> [url] | npm remove <module> | npm list', 'C#: nuget include <namespace> | nuget list', 'JavaScript/TypeScript: use Run or Project Run on .js, .jsx, .ts, and .tsx files', 'C/C++: use Run or Project Run on .c, .cpp, .cc, .cxx, and matching header files', 'Java: use Run or Project Run on .java files']);
+      setTerminalOutput([...newOutput, 'Standard commands: ls, pwd, cd, mkdir, touch, open, cat, rm, clear, help, date, echo', 'Documentation: docs find [--types N] [--members N] [--hide-reason] [--hide-docs] [--confidence|--hide-confidence] <description>', 'Documentation: docs get <item-name>', 'Code navigation: codin get <CSharpSymbolPath> (C#)', 'Source control: git status|add|restore|reset|commit|log|show|branch|checkout|switch|merge|tag|stash|remote|fetch|pull|push|ls-remote|clean|diff|config|rev-parse|clone, gh auth|repo|pr|issue', 'Python: pip install <package> [-force] | pip upgrade <package> [-version <ver>] | pip uninstall <package> | pip include <module> | pip list', 'JavaScript/TypeScript: npm install <package...> | npm uninstall <package...> | npm include <module> [url] | npm remove <module> | npm list', 'C#: nuget include <namespace> | nuget list', 'JavaScript/TypeScript: use Run or Project Run on .js, .jsx, .ts, and .tsx files', 'C/C++: use Run or Project Run on .c, .cpp, .cc, .cxx, and matching header files', 'Java: use Run or Project Run on .java files']);
     } else if (cmd === 'date') {
       setTerminalOutput([...newOutput, new Date().toLocaleString()]);
     } else if (cmd === 'echo') {
@@ -22620,6 +22763,31 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
                         <div className={cn(
                           "absolute top-1 w-3 h-3 bg-white rounded-full transition-all",
                           settings.docsFindIncludeAccessorDocs ? "right-1" : "left-1"
+                        )} />
+                      </button>
+                    </div>
+
+                    <div className="flex items-center justify-between gap-4 rounded-xl border border-white/10 bg-black/20 px-4 py-3">
+                      <div>
+                        <div className="text-sm font-medium text-white">Evaluate Docs Find Confidence</div>
+                        <div className="text-xs text-zinc-500">
+                          Adds a final confident, likely, or possible assessment. A definite no-match always returns none and no results.
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setSettings(current => ({
+                          ...current,
+                          docsFindEvaluateConfidence: !current.docsFindEvaluateConfidence,
+                        }))}
+                        className={cn(
+                          "w-10 h-5 rounded-full transition-all relative",
+                          settings.docsFindEvaluateConfidence ? "bg-indigo-600" : "bg-zinc-700"
+                        )}
+                      >
+                        <div className={cn(
+                          "absolute top-1 w-3 h-3 bg-white rounded-full transition-all",
+                          settings.docsFindEvaluateConfidence ? "right-1" : "left-1"
                         )} />
                       </button>
                     </div>
