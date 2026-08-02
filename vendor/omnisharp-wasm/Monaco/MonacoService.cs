@@ -46,6 +46,7 @@ public class MonacoService
     int _interactiveRequestEpoch;
     string _completionProjectRevision = string.Empty;
     string _speculativeProjectRevision = string.Empty;
+    string _diagnosticProjectRevision = string.Empty;
 
     readonly JsonSerializerOptions jsonOptions = new JsonSerializerOptions
     {
@@ -116,6 +117,11 @@ public class MonacoService
         bool FullyHydrated,
         bool HydrationRunning);
     public record ProjectSyncResponse(string ProjectStateKey, long PrimaryDocumentVersion, int PrimaryDocumentTextLength);
+    public record DiagnosticProjectSyncRequiredResponse(
+        bool RequiresFullSync,
+        string ProjectStateKey,
+        long PrimaryDocumentVersion,
+        int PrimaryDocumentTextLength);
     public record CompletionTextSyncRequest(
         bool FullSync,
         long ExpectedVersion,
@@ -446,10 +452,30 @@ $@"using System;
     {
         return await RunDiagnosticAsync(async () =>
         {
+            var requestedProjectRevision = projectStateKey ?? string.Empty;
+            var hasProjectSnapshot = !string.IsNullOrWhiteSpace(projectRequestString);
+            if (!hasProjectSnapshot &&
+                !requestedProjectRevision.Equals(
+                    _diagnosticProjectRevision,
+                    StringComparison.Ordinal))
+            {
+                return Payload(
+                    new ProjectSyncResponse(
+                        _diagnosticProjectRevision,
+                        _diagnosticProject.PrimaryDocumentVersion,
+                        _diagnosticProject.PrimaryDocumentTextLength),
+                    "SyncDiagnosticProjectAsync");
+            }
+
             _ = await UpdateDiagnosticDocumentAsync(code, projectRequestString);
+            if (hasProjectSnapshot)
+            {
+                _diagnosticProjectRevision = requestedProjectRevision;
+            }
+
             return Payload(
                 new ProjectSyncResponse(
-                    projectStateKey,
+                    _diagnosticProjectRevision,
                     _diagnosticProject.PrimaryDocumentVersion,
                     _diagnosticProject.PrimaryDocumentTextLength),
                 "SyncDiagnosticProjectAsync");
@@ -786,14 +812,63 @@ $@"using System;
 
     public async Task<byte[]> GetDiagnosticsAsync(string code)
     {
-        return await GetDiagnosticsAsync(code, string.Empty);
+        return await GetDiagnosticsCoreAsync(
+            code,
+            string.Empty,
+            requestedProjectRevision: null);
     }
 
     public async Task<byte[]> GetDiagnosticsAsync(string code, string diagnosticRequestString)
     {
+        return await GetDiagnosticsCoreAsync(
+            code,
+            diagnosticRequestString,
+            requestedProjectRevision: null);
+    }
+
+    public async Task<byte[]> GetDiagnosticsAsync(
+        string code,
+        string diagnosticRequestString,
+        string projectStateKey)
+    {
+        return await GetDiagnosticsCoreAsync(
+            code,
+            diagnosticRequestString,
+            projectStateKey ?? string.Empty);
+    }
+
+    async Task<byte[]> GetDiagnosticsCoreAsync(
+        string code,
+        string diagnosticRequestString,
+        string? requestedProjectRevision)
+    {
         return await RunBackgroundDiagnosticAsync("GetDiagnosticsAsync", async cancellationToken =>
         {
+            var hasProjectSnapshot = !string.IsNullOrWhiteSpace(diagnosticRequestString);
+            if (requestedProjectRevision != null &&
+                !hasProjectSnapshot &&
+                !requestedProjectRevision.Equals(
+                    _diagnosticProjectRevision,
+                    StringComparison.Ordinal))
+            {
+                return Payload(
+                    new DiagnosticProjectSyncRequiredResponse(
+                        true,
+                        _diagnosticProjectRevision,
+                        _diagnosticProject.PrimaryDocumentVersion,
+                        _diagnosticProject.PrimaryDocumentTextLength),
+                    "GetDiagnosticsAsync");
+            }
+
             var document = await UpdateDiagnosticDocumentAsync(code, diagnosticRequestString);
+            if (hasProjectSnapshot)
+            {
+                // A legacy, unversioned full snapshot invalidates any previously acknowledged
+                // revision. A versioned snapshot becomes authoritative as soon as its atomic
+                // workspace mutation succeeds, even if later diagnostic analysis is cancelled.
+                _diagnosticProjectRevision = requestedProjectRevision ?? string.Empty;
+            }
+
             cancellationToken.ThrowIfCancellationRequested();
             var semanticModel = await document.GetSemanticModelAsync(cancellationToken);
             if (semanticModel == null)
@@ -1542,6 +1617,12 @@ $@"using System;
                 request.CurrentPath,
                 files,
                 request.Configuration);
+            // This helper is also used by legacy/unversioned authoring operations such as
+            // quick info, definitions, and code actions. Once any full project snapshot is
+            // applied, no previously acknowledged versioned diagnostic revision can still
+            // describe the workspace. Version-aware callers replace this empty revision
+            // with their requested revision after the complete update succeeds.
+            _diagnosticProjectRevision = string.Empty;
             await _diagnosticProject.EnsureReferencesForProjectAsync(document.Project);
             return _diagnosticProject.Workspace.CurrentSolution.GetDocument(_diagnosticProject.DocumentId)
                 ?? throw new InvalidOperationException(

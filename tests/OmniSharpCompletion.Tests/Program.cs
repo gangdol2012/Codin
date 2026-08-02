@@ -1478,6 +1478,290 @@ static async Task RunRegressionTestsAsync()
                     .GetBoolean(),
                 "Queued background diagnostics must yield to accepted interactive authoring work.");
         }),
+        ("cancelled diagnostic snapshots require authoritative full resynchronization", async () =>
+        {
+            using var diagnosticFixture = CompletionFixture.Create();
+            var monacoService = CreateDiagnosticMonacoService(diagnosticFixture);
+
+            const string firstPath = "src/First.cs";
+            const string secondPath = "src/Second.cs";
+            const string firstSource = """
+                public class Consumer
+                {
+                    public int Read(Shared value) => value.Value;
+                }
+                """;
+            const string secondSource = """
+                public class Shared
+                {
+                    public int Value;
+                    public int Read() => Value;
+                }
+                """;
+
+            static string ProjectRequest(
+                string currentPath,
+                string additionalPath,
+                string additionalSource) =>
+                CompletionFixture.Serialize(
+                    new MonacoService.DiagnosticProjectRequest(
+                        currentPath,
+                        new[]
+                        {
+                            new MonacoService.DiagnosticProjectFileDto(
+                                additionalPath,
+                                additionalSource)
+                        }));
+
+            static JsonElement ResponsePayload(JsonDocument response) =>
+                response.RootElement.GetProperty("payload");
+
+            static FieldInfo PrivateField(string name) =>
+                typeof(MonacoService).GetField(
+                    name,
+                    BindingFlags.Instance | BindingFlags.NonPublic)
+                ?? throw new InvalidOperationException(
+                    $"MonacoService field '{name}' is unavailable.");
+
+            var firstRequest = ProjectRequest(firstPath, secondPath, secondSource);
+            using (var initialResponse = JsonDocument.Parse(
+                       await monacoService.GetDiagnosticsAsync(
+                           firstSource,
+                           firstRequest,
+                           "diagnostic-first")))
+            {
+                AssertEx.Equal(
+                    JsonValueKind.Array,
+                    ResponsePayload(initialResponse).ValueKind,
+                    "Initial versioned diagnostic response");
+            }
+
+            var revisionField = PrivateField("_diagnosticProjectRevision");
+            AssertEx.Equal(
+                "diagnostic-first",
+                (string)revisionField.GetValue(monacoService)!,
+                "Initial authoritative diagnostic revision");
+
+            var diagnosticGate = (SemaphoreSlim)PrivateField("_diagnosticGate")
+                .GetValue(monacoService)!;
+            await diagnosticGate.WaitAsync();
+            Task<byte[]> cancelledSwitch;
+            try
+            {
+                cancelledSwitch = monacoService.GetDiagnosticsAsync(
+                    secondSource,
+                    ProjectRequest(secondPath, firstPath, firstSource),
+                    "diagnostic-second");
+                await Task.Yield();
+                _ = await monacoService.CancelSpeculativeCompletionAsync();
+            }
+            finally
+            {
+                diagnosticGate.Release();
+            }
+
+            using (var cancellationResponse = JsonDocument.Parse(await cancelledSwitch))
+            {
+                AssertEx.True(
+                    ResponsePayload(cancellationResponse)
+                        .GetProperty("cancelled")
+                        .GetBoolean(),
+                    "A pre-gate cancelled diagnostic snapshot must report cancellation.");
+            }
+
+            AssertEx.Equal(
+                "diagnostic-first",
+                (string)revisionField.GetValue(monacoService)!,
+                "A pre-gate cancellation must not acknowledge an unapplied diagnostic snapshot");
+
+            var solutionAfterCancellation = diagnosticFixture.Project.Workspace.CurrentSolution;
+            var projectAfterCancellation = AssertEx.NotNull(
+                solutionAfterCancellation.GetProject(diagnosticFixture.Project.DocumentId.ProjectId),
+                "Diagnostic project after cancellation");
+            AssertEx.Equal(
+                2,
+                projectAfterCancellation.Documents.Count(),
+                "Cancelled diagnostic switch document count");
+            var firstDocumentBeforeSwitch = FindDocument(
+                solutionAfterCancellation,
+                firstPath);
+            var secondDocumentBeforeSwitch = FindDocument(
+                solutionAfterCancellation,
+                secondPath);
+            AssertEx.Equal(
+                firstSource,
+                (await firstDocumentBeforeSwitch.GetTextAsync()).ToString(),
+                "Cancelled diagnostic switch primary text");
+            AssertEx.Equal(
+                secondSource,
+                (await secondDocumentBeforeSwitch.GetTextAsync()).ToString(),
+                "Cancelled diagnostic switch additional text");
+
+            using (var staleDiagnosticResponse = JsonDocument.Parse(
+                       await monacoService.GetDiagnosticsAsync(
+                           secondSource,
+                           string.Empty,
+                           "diagnostic-second")))
+            {
+                var stalePayload = ResponsePayload(staleDiagnosticResponse);
+                AssertEx.True(
+                    stalePayload.GetProperty("requiresFullSync").GetBoolean(),
+                    "A stale empty diagnostic update must request a full project snapshot.");
+                AssertEx.Equal(
+                    "diagnostic-first",
+                    stalePayload.GetProperty("projectStateKey").GetString()!,
+                    "A stale diagnostic response must return the authoritative revision");
+                AssertEx.Equal(
+                    diagnosticFixture.Project.PrimaryDocumentVersion,
+                    stalePayload.GetProperty("primaryDocumentVersion").GetInt64(),
+                    "A stale diagnostic response must return the authoritative document version");
+                AssertEx.Equal(
+                    diagnosticFixture.Project.PrimaryDocumentTextLength,
+                    stalePayload.GetProperty("primaryDocumentTextLength").GetInt32(),
+                    "A stale diagnostic response must return the authoritative document length");
+            }
+
+            using (var staleSyncResponse = JsonDocument.Parse(
+                       await monacoService.SyncDiagnosticProjectAsync(
+                           secondSource,
+                           string.Empty,
+                           "diagnostic-second")))
+            {
+                AssertEx.Equal(
+                    "diagnostic-first",
+                    ResponsePayload(staleSyncResponse)
+                        .GetProperty("projectStateKey")
+                        .GetString()!,
+                    "An empty stale diagnostic sync must refuse to acknowledge the requested revision");
+            }
+
+            var solutionAfterStaleUpdates = diagnosticFixture.Project.Workspace.CurrentSolution;
+            AssertEx.Equal(
+                firstSource,
+                (await FindDocument(solutionAfterStaleUpdates, firstPath).GetTextAsync()).ToString(),
+                "Stale empty diagnostic updates must not write the new file into the old primary path");
+            AssertEx.Equal(
+                secondSource,
+                (await FindDocument(solutionAfterStaleUpdates, secondPath).GetTextAsync()).ToString(),
+                "Stale empty diagnostic updates must preserve the existing additional document");
+
+            using (var resyncResponse = JsonDocument.Parse(
+                       await monacoService.SyncDiagnosticProjectAsync(
+                           secondSource,
+                           ProjectRequest(secondPath, firstPath, firstSource),
+                           "diagnostic-second")))
+            {
+                AssertEx.Equal(
+                    "diagnostic-second",
+                    ResponsePayload(resyncResponse)
+                        .GetProperty("projectStateKey")
+                        .GetString()!,
+                    "A full diagnostic resync must acknowledge the requested revision");
+            }
+
+            AssertEx.Equal(
+                "diagnostic-second",
+                (string)revisionField.GetValue(monacoService)!,
+                "Full resync authoritative diagnostic revision");
+
+            var resynchronizedSolution = diagnosticFixture.Project.Workspace.CurrentSolution;
+            var resynchronizedProject = AssertEx.NotNull(
+                resynchronizedSolution.GetProject(diagnosticFixture.Project.DocumentId.ProjectId),
+                "Resynchronized diagnostic project");
+            AssertEx.Equal(
+                2,
+                resynchronizedProject.Documents.Count(),
+                "Resynchronized diagnostic document count");
+            AssertEx.Equal(
+                1,
+                resynchronizedProject.Documents.Count(document =>
+                    string.Equals(document.FilePath, firstPath, StringComparison.Ordinal)),
+                "Resynchronized first document path count");
+            AssertEx.Equal(
+                1,
+                resynchronizedProject.Documents.Count(document =>
+                    string.Equals(document.FilePath, secondPath, StringComparison.Ordinal)),
+                "Resynchronized second document path count");
+            AssertEx.Equal(
+                firstDocumentBeforeSwitch.Id,
+                FindDocument(resynchronizedSolution, firstPath).Id,
+                "Resynchronized first document identity");
+            AssertEx.Equal(
+                secondDocumentBeforeSwitch.Id,
+                FindDocument(resynchronizedSolution, secondPath).Id,
+                "Resynchronized second document identity");
+            AssertEx.Equal(
+                firstSource,
+                (await FindDocument(resynchronizedSolution, firstPath).GetTextAsync()).ToString(),
+                "Resynchronized first document text");
+            AssertEx.Equal(
+                secondSource,
+                (await FindDocument(resynchronizedSolution, secondPath).GetTextAsync()).ToString(),
+                "Resynchronized second document text");
+
+            using var finalDiagnostics = JsonDocument.Parse(
+                await monacoService.GetDiagnosticsAsync(
+                    secondSource,
+                    string.Empty,
+                    "diagnostic-second"));
+            var finalPayload = ResponsePayload(finalDiagnostics);
+            AssertEx.Equal(
+                JsonValueKind.Array,
+                finalPayload.ValueKind,
+                "Matching diagnostic revision response");
+            var diagnosticIds = finalPayload
+                .EnumerateArray()
+                .Select(diagnostic => diagnostic.GetProperty("id").GetString())
+                .Where(id => !string.IsNullOrWhiteSpace(id))
+                .Cast<string>()
+                .ToHashSet(StringComparer.Ordinal);
+            AssertEx.False(
+                diagnosticIds.Contains("CS0101") ||
+                diagnosticIds.Contains("CS0111") ||
+                diagnosticIds.Contains("CS0229"),
+                "A recovered diagnostic project must not contain duplicate-symbol or self-ambiguity diagnostics.");
+
+            var definitionOffset = secondSource.LastIndexOf("Value", StringComparison.Ordinal);
+            var definitionPosition = SourceText.From(secondSource)
+                .Lines
+                .GetLinePosition(definitionOffset);
+            const string legacyFirstSource = """
+                public class Consumer
+                {
+                    public int Read(Shared value) => value.Value;
+                }
+
+                // Applied by a legacy authoring operation.
+                """;
+            _ = await monacoService.GetDefinitionAsync(
+                secondSource,
+                CompletionFixture.Serialize(
+                    new MonacoService.PositionRequest(
+                        definitionPosition.Line,
+                        definitionPosition.Character)),
+                ProjectRequest(secondPath, firstPath, legacyFirstSource));
+            AssertEx.Equal(
+                string.Empty,
+                (string)revisionField.GetValue(monacoService)!,
+                "A legacy full snapshot from another diagnostic authoring operation must invalidate the versioned revision");
+
+            using var legacyInvalidationResponse = JsonDocument.Parse(
+                await monacoService.GetDiagnosticsAsync(
+                    secondSource,
+                    string.Empty,
+                    "diagnostic-second"));
+            AssertEx.True(
+                ResponsePayload(legacyInvalidationResponse)
+                    .GetProperty("requiresFullSync")
+                    .GetBoolean(),
+                "Diagnostics must require a full resync after a legacy authoring operation changes the project.");
+            AssertEx.Equal(
+                string.Empty,
+                ResponsePayload(legacyInvalidationResponse)
+                    .GetProperty("projectStateKey")
+                    .GetString()!,
+                "Legacy project mutation authoritative diagnostic revision");
+        }),
         ("legacy project snapshots invalidate synchronized revisions", async () =>
         {
             using var primaryFixture = CompletionFixture.Create();

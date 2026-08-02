@@ -112,6 +112,13 @@ interface ParsedCSharpProject {
   compileItemOperations: CompileItemOperation[];
 }
 
+interface EvaluatedCSharpProject {
+  file: CSharpWorkspaceFile;
+  parsed: ParsedCSharpProject;
+  sourceFiles: CSharpWorkspaceFile[];
+  nestedProjectPaths: string[];
+}
+
 const BASE_IMPLICIT_USINGS = [
   'System',
   'System.Collections.Generic',
@@ -205,36 +212,61 @@ function canonicalizeWorkspaceFiles(files: readonly CSharpWorkspaceFile[]): CSha
   return result;
 }
 
-function selectProjectFile(
-  files: readonly CSharpWorkspaceFile[],
-  currentPath: string
-): CSharpWorkspaceFile | null {
-  const currentDirectory = pathDirectory(currentPath);
-  const candidates = files
+function evaluateWorkspaceProjects(
+  files: readonly CSharpWorkspaceFile[]
+): EvaluatedCSharpProject[] {
+  return files
     .filter(file => isCSharpProjectPath(file.path))
-    .filter(file => isPathInDirectory(currentDirectory, pathDirectory(file.path)))
-    .sort((left, right) => {
-      const depthDifference = pathDepth(pathDirectory(right.path)) - pathDepth(pathDirectory(left.path));
-      return depthDifference || compareText(left.path, right.path);
+    .map(file => {
+      const parsed = evaluateProjectXml(file.content);
+      const scope = scopeProjectSources(files, file.path, parsed);
+      return {
+        file,
+        parsed,
+        sourceFiles: scope.sourceFiles,
+        nestedProjectPaths: scope.nestedProjectPaths,
+      };
     });
-  const first = candidates[0];
-  if (!first) return null;
+}
 
-  const nearestDirectoryDepth = pathDepth(pathDirectory(first.path));
-  const nearestCandidates = candidates.filter(
-    candidate => pathDepth(pathDirectory(candidate.path)) === nearestDirectoryDepth
-  );
-  if (nearestCandidates.length === 1 || !isCSharpSourcePath(currentPath)) return first;
+function compareProjectAffinity(
+  left: EvaluatedCSharpProject,
+  right: EvaluatedCSharpProject,
+  currentDirectory: string
+): number {
+  const leftDirectory = pathDirectory(left.file.path);
+  const rightDirectory = pathDirectory(right.file.path);
+  const leftIsAncestor = isPathInDirectory(currentDirectory, leftDirectory);
+  const rightIsAncestor = isPathInDirectory(currentDirectory, rightDirectory);
+  if (leftIsAncestor !== rightIsAncestor) return leftIsAncestor ? -1 : 1;
 
-  // Same-directory projects are ambiguous by ancestry alone. Prefer a Compile
-  // membership match; retain lexical order when more than one
-  // project legitimately includes the file.
-  return nearestCandidates.find(candidate => {
-    const parsed = evaluateProjectXml(candidate.content);
-    return scopeProjectSources(files, candidate.path, parsed)
-      .sourceFiles
-      .some(file => file.path === currentPath);
-  }) ?? first;
+  const depthDifference = pathDepth(rightDirectory) - pathDepth(leftDirectory);
+  return depthDifference || compareText(left.file.path, right.file.path);
+}
+
+function selectProject(
+  projects: readonly EvaluatedCSharpProject[],
+  currentPath: string
+): EvaluatedCSharpProject | null {
+  const currentDirectory = pathDirectory(currentPath);
+  if (isCSharpSourcePath(currentPath)) {
+    // Compile ownership is stronger evidence than directory ancestry. In particular,
+    // classic projects commonly link files from ../shared, so an opened linked file
+    // must retain the project that explicitly includes it instead of falling into the
+    // workspace-wide unmanaged compilation.
+    const owners = projects
+      .filter(project => project.sourceFiles.some(file => file.path === currentPath))
+      .sort((left, right) => compareProjectAffinity(left, right, currentDirectory));
+    if (owners.length > 0) return owners[0];
+  }
+
+  // An excluded or newly created file can still borrow the nearest ancestor's project
+  // options even though it is not yet a Compile item.
+  return projects
+    .filter(project =>
+      isPathInDirectory(currentDirectory, pathDirectory(project.file.path)))
+    .sort((left, right) => compareProjectAffinity(left, right, currentDirectory))[0]
+    ?? null;
 }
 
 function isDefaultBuildOutputSource(path: string, projectDirectory: string): boolean {
@@ -755,6 +787,9 @@ function readSdkNames(project: XmlElement): string[] {
   add(project.attributes.sdk);
   for (const child of project.children) {
     if (child.name === 'sdk') add(child.attributes.name);
+    // MSBuild also permits the SDK to be declared on explicit Sdk.props/Sdk.targets
+    // imports instead of Project@Sdk. Those projects still receive SDK default items.
+    if (child.name === 'import') add(child.attributes.sdk);
   }
   return [...new Set(names)].sort(compareText);
 }
@@ -1229,7 +1264,7 @@ function evaluateProjectXml(content: string): ParsedCSharpProject {
         outputKind: 'DynamicallyLinkedLibrary',
       },
       sdkNames: [],
-      enableDefaultCompileItems: true,
+      enableDefaultCompileItems: false,
       compileItemOperations: [],
     };
   }
@@ -1331,7 +1366,7 @@ function evaluateProjectXml(content: string): ParsedCSharpProject {
   processChildren(project.children);
   const enableDefaultItems = parseBoolean(
     properties.get('enabledefaultitems'),
-    true
+    usesDotNetCSharpSdk(sdkNames)
   );
   const enableDefaultCompileItems = parseBoolean(
     properties.get('enabledefaultcompileitems'),
@@ -1456,14 +1491,20 @@ export function resolveCSharpProjectContext(
 ): CSharpProjectContext {
   const files = canonicalizeWorkspaceFiles(workspaceFiles);
   const currentPath = normalizeWorkspacePath(currentCSharpPath);
-  const projectFile = selectProjectFile(files, currentPath);
+  const projects = evaluateWorkspaceProjects(files);
+  const selectedProject = selectProject(projects, currentPath);
+  const projectFile = selectedProject?.file ?? null;
   const projectPath = projectFile?.path ?? null;
-  const parsedProject = projectFile ? evaluateProjectXml(projectFile.content) : null;
-  const { sourceFiles, nestedProjectPaths } = scopeProjectSources(
-    files,
-    projectPath,
-    parsedProject ?? undefined
+  const parsedProject = selectedProject?.parsed ?? null;
+  const ownedSourcePaths = new Set(
+    projects.flatMap(project => project.sourceFiles.map(file => file.path))
   );
+  const sourceFiles = selectedProject
+    ? selectedProject.sourceFiles
+    : files
+      .filter(file => isCSharpSourcePath(file.path))
+      .filter(file => !ownedSourcePaths.has(file.path));
+  const nestedProjectPaths = selectedProject?.nestedProjectPaths ?? [];
   const configuration = parsedProject
     ? parsedProject.configuration
     : {

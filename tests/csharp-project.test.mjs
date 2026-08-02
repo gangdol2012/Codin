@@ -40,15 +40,15 @@ test('unmanaged C# keeps the legacy defaults and includes every C# source', () =
 
 test('the nearest ancestor project wins and nested projects and build outputs are excluded', () => {
   const context = resolveCSharpProjectContext([
-    { path: 'Root.csproj', content: '<Project />' },
+    { path: 'Root.csproj', content: '<Project Sdk="Microsoft.NET.Sdk" />' },
     { path: 'RootProgram.cs', content: 'class RootProgram {}' },
-    { path: 'apps/tool/Z.Tool.csproj', content: '<Project><PropertyGroup><OutputType>Exe</OutputType></PropertyGroup></Project>' },
-    { path: 'apps/tool/A.Tool.csproj', content: '<Project><PropertyGroup><OutputType>Exe</OutputType></PropertyGroup></Project>' },
+    { path: 'apps/tool/Z.Tool.csproj', content: '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><OutputType>Exe</OutputType></PropertyGroup></Project>' },
+    { path: 'apps/tool/A.Tool.csproj', content: '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><OutputType>Exe</OutputType></PropertyGroup></Project>' },
     { path: 'apps/tool/src/Program.cs', content: 'class Program {}' },
     { path: 'apps/tool/Shared.cs', content: 'class Shared {}' },
     { path: 'apps/tool/obj/Generated.cs', content: 'class Generated {}' },
     { path: 'apps/tool/bin/Release/Generated.cs', content: 'class GeneratedAgain {}' },
-    { path: 'apps/tool/tests/Tests.csproj', content: '<Project />' },
+    { path: 'apps/tool/tests/Tests.csproj', content: '<Project Sdk="Microsoft.NET.Sdk" />' },
     { path: 'apps/tool/tests/Test.cs', content: 'class Test {}' },
     { path: 'apps/sibling/Sibling.cs', content: 'class Sibling {}' },
   ], 'apps/tool/src/Program.cs');
@@ -94,6 +94,138 @@ test('same-directory projects are selected by C# compile membership before lexic
   assert.equal(context.projectPath, 'Z.csproj');
   assert.deepEqual(context.sourceFiles.map(file => file.path), ['Z.cs']);
   assert.equal(context.configuration.languageVersion, 'Preview');
+});
+
+test('classic same-directory projects own only their explicit Compile items', () => {
+  const files = [
+    {
+      path: 'Assembly-CSharp-Editor.csproj',
+      content: `
+        <Project ToolsVersion="Current">
+          <ItemGroup><Compile Include="Assets/Editor/EditorTool.cs" /></ItemGroup>
+        </Project>`,
+    },
+    {
+      path: 'Assembly-CSharp.csproj',
+      content: `
+        <Project ToolsVersion="Current">
+          <ItemGroup><Compile Include="Assets/Game.cs" /></ItemGroup>
+        </Project>`,
+    },
+    {
+      path: 'Assets/Game.cs',
+      content: 'public class RuntimeOnly {}',
+    },
+    {
+      path: 'Assets/Editor/EditorTool.cs',
+      content: 'public class EditorOnly {}',
+    },
+  ];
+
+  const runtime = resolveCSharpProjectContext(files, 'Assets/Game.cs');
+  assert.equal(runtime.projectPath, 'Assembly-CSharp.csproj');
+  assert.deepEqual(runtime.sourceFiles.map(file => file.path), ['Assets/Game.cs']);
+
+  const editor = resolveCSharpProjectContext(files, 'Assets/Editor/EditorTool.cs');
+  assert.equal(editor.projectPath, 'Assembly-CSharp-Editor.csproj');
+  assert.deepEqual(editor.sourceFiles.map(file => file.path), ['Assets/Editor/EditorTool.cs']);
+
+  const explicitDefaultItems = resolveCSharpProjectContext([
+    {
+      path: 'Legacy.csproj',
+      content: `
+        <Project ToolsVersion="Current">
+          <PropertyGroup><EnableDefaultCompileItems>true</EnableDefaultCompileItems></PropertyGroup>
+        </Project>`,
+    },
+    { path: 'One.cs', content: 'class One {}' },
+    { path: 'Two.cs', content: 'class Two {}' },
+  ], 'One.cs');
+  assert.deepEqual(
+    explicitDefaultItems.sourceFiles.map(file => file.path),
+    ['One.cs', 'Two.cs']
+  );
+});
+
+test('explicit SDK imports retain SDK default Compile items', () => {
+  const context = resolveCSharpProjectContext([
+    {
+      path: 'ImportedSdk.csproj',
+      content: `
+        <Project>
+          <Import Project="Sdk.props" Sdk="Microsoft.NET.Sdk" />
+          <PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup>
+          <Import Project="Sdk.targets" Sdk="Microsoft.NET.Sdk" />
+        </Project>`,
+    },
+    { path: 'Program.cs', content: 'class Program {}' },
+    { path: 'Nested/Helper.cs', content: 'class Helper {}' },
+  ], 'Program.cs');
+
+  assert.equal(context.projectPath, 'ImportedSdk.csproj');
+  assert.deepEqual(
+    context.sourceFiles.map(file => file.path),
+    ['Nested/Helper.cs', 'Program.cs']
+  );
+});
+
+test('an out-of-tree linked source retains its owning project when opened', () => {
+  const context = resolveCSharpProjectContext([
+    {
+      path: 'app/App.csproj',
+      content: `
+        <Project ToolsVersion="Current">
+          <ItemGroup>
+            <Compile Include="Program.cs" />
+            <Compile Include="../shared/Common.cs" />
+          </ItemGroup>
+        </Project>`,
+    },
+    { path: 'app/Program.cs', content: 'class Program { Common Value = new(); }' },
+    { path: 'shared/Common.cs', content: 'class Common {}' },
+    {
+      path: 'other/Other.csproj',
+      content: `
+        <Project ToolsVersion="Current">
+          <ItemGroup><Compile Include="Program.cs" /></ItemGroup>
+        </Project>`,
+    },
+    { path: 'other/Program.cs', content: 'class Program {}' },
+  ], 'shared/Common.cs');
+
+  assert.equal(context.mode, 'project');
+  assert.equal(context.projectPath, 'app/App.csproj');
+  assert.deepEqual(
+    context.sourceFiles.map(file => file.path),
+    ['app/Program.cs', 'shared/Common.cs']
+  );
+});
+
+test('unmanaged sources do not absorb files owned by unrelated projects', () => {
+  const context = resolveCSharpProjectContext([
+    { path: 'loose/Program.cs', content: 'class LooseProgram {}' },
+    { path: 'loose/Helper.cs', content: 'class LooseHelper {}' },
+    {
+      path: 'app/App.csproj',
+      content: `
+        <Project ToolsVersion="Current">
+          <ItemGroup><Compile Include="Program.cs" /></ItemGroup>
+        </Project>`,
+    },
+    { path: 'app/Program.cs', content: 'class Program {}' },
+    {
+      path: 'library/Library.csproj',
+      content: '<Project Sdk="Microsoft.NET.Sdk" />',
+    },
+    { path: 'library/Library.cs', content: 'class Library {}' },
+  ], 'loose/Program.cs');
+
+  assert.equal(context.mode, 'unmanaged');
+  assert.equal(context.projectPath, null);
+  assert.deepEqual(
+    context.sourceFiles.map(file => file.path),
+    ['loose/Helper.cs', 'loose/Program.cs']
+  );
 });
 
 test('Release and AnyCPU properties are evaluated in project order', () => {

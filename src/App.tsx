@@ -92,6 +92,7 @@ import {
   removeGitHubAuthFromBackup,
   sanitizeBackupLocalStorage,
 } from './user-data-backup';
+import { getCodeCraftProjectPathFromUriPath } from './monaco-project-path';
 
 const APP_VERSION = __APP_VERSION__;
 
@@ -6256,12 +6257,7 @@ function getMonacoProjectModelPath(path: string) {
 }
 
 function getProjectPathFromMonacoUri(uri: monaco.Uri) {
-  const uriPath = decodeURIComponent(uri.path || '');
-  const projectMarker = `${CODECRAFT_MONACO_PROJECT_ROOT}/`;
-  const projectIndex = uriPath.indexOf(projectMarker);
-  return projectIndex >= 0
-    ? normalizeProjectPath(uriPath.slice(projectIndex + projectMarker.length))
-    : '';
+  return getCodeCraftProjectPathFromUriPath(uri.path || '');
 }
 
 function isMonacoRangeLike(value: unknown): value is monaco.IRange {

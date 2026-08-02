@@ -2226,7 +2226,8 @@ public class OmniSharpProject
                 nextDocuments[path] = file.Content ?? string.Empty;
             }
 
-            var projectId = DocumentId.ProjectId;
+            var originalPrimaryDocumentId = DocumentId;
+            var projectId = originalPrimaryDocumentId.ProjectId;
             var solution = Workspace.CurrentSolution;
             var project = solution.GetProject(projectId)
                 ?? throw new InvalidOperationException("The OmniSharp project disappeared.");
@@ -2251,38 +2252,129 @@ public class OmniSharpProject
                     .WithProjectCompilationOptions(projectId, nextCompilationOptions);
             }
 
+            var primaryPathChanged = nextPrimaryPath != _primaryDocumentPath;
+            var nextPrimaryDocumentId = !primaryPathChanged
+                ? originalPrimaryDocumentId
+                : _additionalDocumentIds.TryGetValue(nextPrimaryPath, out var existingPrimaryDocumentId)
+                    ? existingPrimaryDocumentId
+                    : string.IsNullOrWhiteSpace(_primaryDocumentPath)
+                        ? originalPrimaryDocumentId
+                        : DocumentId.CreateNewId(projectId, nextPrimaryPath);
             var nextDocumentIds = new Dictionary<string, DocumentId>(StringComparer.Ordinal);
-            SourceText? nextPrimaryText = null;
-
-            if (safeCode != currentCode)
+            foreach (var path in nextDocuments.Keys)
             {
-                nextPrimaryText = ApplySingleTextDifference(_primarySourceText, currentCode, safeCode);
-                solution = solution.WithDocumentText(
-                    DocumentId,
-                    nextPrimaryText,
-                    PreservationMode.PreserveIdentity);
+                if (!string.IsNullOrWhiteSpace(_primaryDocumentPath) &&
+                    path.Equals(_primaryDocumentPath, StringComparison.Ordinal) &&
+                    originalPrimaryDocumentId != nextPrimaryDocumentId)
+                {
+                    nextDocumentIds[path] = originalPrimaryDocumentId;
+                }
+                else if (_additionalDocumentIds.TryGetValue(path, out var existingDocumentId) &&
+                         existingDocumentId != nextPrimaryDocumentId)
+                {
+                    nextDocumentIds[path] = existingDocumentId;
+                }
+                else
+                {
+                    nextDocumentIds[path] = DocumentId.CreateNewId(projectId, path);
+                }
             }
 
-            if (!string.IsNullOrWhiteSpace(nextPrimaryPath) && nextPrimaryPath != _primaryDocumentPath)
-            {
-                solution = solution
-                    .WithDocumentName(DocumentId, SourceNameForPath(nextPrimaryPath))
-                    .WithDocumentFilePath(DocumentId, nextPrimaryPath);
-            }
-
-            foreach (var stalePath in _additionalDocumentIds.Keys
-                         .Where(path => !nextDocuments.ContainsKey(path))
+            // A Roslyn document identity belongs to one physical source file. Moving one
+            // DocumentId from A to B while simultaneously adding a new A document can make
+            // Workspace.TryApplyChanges reuse B's text loader for both paths. Select the
+            // existing ID for each path instead, and only add/remove IDs for genuinely
+            // added/removed files.
+            var retainedDocumentIds = nextDocumentIds.Values
+                .Append(nextPrimaryDocumentId)
+                .ToHashSet();
+            foreach (var staleDocumentId in project.DocumentIds
+                         .Where(documentId => !retainedDocumentIds.Contains(documentId))
                          .ToArray())
             {
-                solution = solution.RemoveDocument(_additionalDocumentIds[stalePath]);
+                solution = solution.RemoveDocument(staleDocumentId);
+            }
+
+            SourceText nextPrimaryText;
+            var existingPrimaryDocument = solution.GetDocument(nextPrimaryDocumentId);
+            if (existingPrimaryDocument == null)
+            {
+                nextPrimaryText = SourceText.From(safeCode);
+                solution = solution.AddDocument(
+                    nextPrimaryDocumentId,
+                    SourceNameForPath(nextPrimaryPath),
+                    nextPrimaryText,
+                    SourceFoldersForPath(nextPrimaryPath),
+                    filePath: nextPrimaryPath);
+            }
+            else
+            {
+                var previousPrimaryContent =
+                    nextPrimaryDocumentId == originalPrimaryDocumentId
+                        ? currentCode
+                        : _additionalDocumentContents.TryGetValue(
+                            nextPrimaryPath,
+                            out var existingPrimaryContent)
+                            ? existingPrimaryContent
+                            : null;
+                if (previousPrimaryContent != safeCode)
+                {
+                    nextPrimaryText =
+                        nextPrimaryDocumentId == originalPrimaryDocumentId &&
+                        !primaryPathChanged
+                            ? ApplySingleTextDifference(_primarySourceText, currentCode, safeCode)
+                            : SourceText.From(safeCode);
+                    solution = solution.WithDocumentText(
+                        nextPrimaryDocumentId,
+                        nextPrimaryText,
+                        nextPrimaryDocumentId == originalPrimaryDocumentId &&
+                        !primaryPathChanged
+                            ? PreservationMode.PreserveIdentity
+                            : PreservationMode.PreserveValue);
+                }
+                else if (existingPrimaryDocument.TryGetText(out var existingPrimaryText) &&
+                         existingPrimaryText != null)
+                {
+                    nextPrimaryText = existingPrimaryText;
+                }
+                else
+                {
+                    nextPrimaryText = SourceText.From(safeCode);
+                }
+
+                if (!string.IsNullOrWhiteSpace(nextPrimaryPath) &&
+                    (!string.Equals(
+                         existingPrimaryDocument.FilePath,
+                         nextPrimaryPath,
+                         StringComparison.Ordinal) ||
+                     !string.Equals(
+                         existingPrimaryDocument.Name,
+                         SourceNameForPath(nextPrimaryPath),
+                         StringComparison.Ordinal)))
+                {
+                    solution = solution
+                        .WithDocumentName(
+                            nextPrimaryDocumentId,
+                            SourceNameForPath(nextPrimaryPath))
+                        .WithDocumentFilePath(nextPrimaryDocumentId, nextPrimaryPath);
+                }
             }
 
             foreach (var (path, content) in nextDocuments)
             {
-                if (_additionalDocumentIds.TryGetValue(path, out var documentId))
+                var documentId = nextDocumentIds[path];
+                var existingDocument = solution.GetDocument(documentId);
+                if (existingDocument != null)
                 {
-                    nextDocumentIds[path] = documentId;
-                    if (!_additionalDocumentContents.TryGetValue(path, out var previousContent) || previousContent != content)
+                    var previousContent =
+                        documentId == originalPrimaryDocumentId
+                            ? currentCode
+                            : _additionalDocumentContents.TryGetValue(
+                                path,
+                                out var existingContent)
+                                ? existingContent
+                                : null;
+                    if (previousContent != content)
                     {
                         solution = solution.WithDocumentText(documentId, SourceText.From(content));
                     }
@@ -2290,10 +2382,8 @@ public class OmniSharpProject
                     continue;
                 }
 
-                var newDocumentId = DocumentId.CreateNewId(projectId, path);
-                nextDocumentIds[path] = newDocumentId;
                 solution = solution.AddDocument(
-                    newDocumentId,
+                    documentId,
                     SourceNameForPath(path),
                     SourceText.From(content),
                     SourceFoldersForPath(path),
@@ -2302,7 +2392,8 @@ public class OmniSharpProject
 
             if (Workspace.TryApplyChanges(solution))
             {
-                if (nextPrimaryText != null)
+                DocumentId = nextPrimaryDocumentId;
+                if (primaryPathChanged || safeCode != currentCode)
                 {
                     _primarySourceText = nextPrimaryText;
                     _primaryDocumentText = safeCode;
