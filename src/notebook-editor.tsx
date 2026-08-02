@@ -17,7 +17,6 @@ import {
   ChevronRight,
   CircleStop,
   Clipboard,
-  Code2,
   Copy,
   FileJson,
   HelpCircle,
@@ -139,6 +138,10 @@ const EMPTY_METADATA: Record<string, unknown> = {};
 
 function classNames(...values: Array<string | false | null | undefined>) {
   return values.filter(Boolean).join(' ');
+}
+
+function closeContainingMenu(target: HTMLElement) {
+  target.closest('details')?.removeAttribute('open');
 }
 
 function maxExecutionCount(notebook: NotebookDocument | null) {
@@ -437,7 +440,7 @@ function NotebookOutputView({ output }: { output: NotebookOutput }) {
 function CellOutputs({ outputs }: { outputs: NotebookOutput[] }) {
   if (!outputs.length) return null;
   return (
-    <div className="space-y-2 border-t border-white/5 bg-black/15 px-4 py-3">
+    <div className="space-y-2 border-t border-white/[0.07] px-4 py-3">
       {outputs.map((output, index) => <NotebookOutputView key={index} output={output} />)}
     </div>
   );
@@ -453,11 +456,22 @@ function ModalShell({
   onClose: () => void;
 }) {
   return (
-    <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/70 p-6 backdrop-blur-sm">
+    <div
+      className="absolute inset-0 z-50 flex items-center justify-center bg-black/70 p-6 backdrop-blur-sm"
+      role="dialog"
+      aria-modal="true"
+      aria-label={title}
+      onKeyDown={event => {
+        if (event.key === 'Escape') onClose();
+      }}
+      onMouseDown={event => {
+        if (event.target === event.currentTarget) onClose();
+      }}
+    >
       <div className="flex max-h-[85%] w-full max-w-3xl flex-col overflow-hidden rounded-2xl border border-white/10 bg-zinc-900 shadow-2xl">
         <div className="flex h-11 shrink-0 items-center justify-between border-b border-white/10 px-4">
           <div className="text-sm font-semibold text-white">{title}</div>
-          <button type="button" onClick={onClose} className="rounded p-1 text-zinc-500 hover:bg-white/10 hover:text-white">
+          <button type="button" aria-label={`Close ${title}`} onClick={onClose} className="rounded p-1 text-zinc-500 hover:bg-white/10 hover:text-white">
             <X size={16} />
           </button>
         </div>
@@ -631,6 +645,7 @@ interface NotebookCellViewProps {
   selected: boolean;
   running: boolean;
   language: NotebookLanguage;
+  defaultLanguage: NotebookLanguage;
   notebookPath: string;
   fontSize: number;
   theme: string;
@@ -640,6 +655,7 @@ interface NotebookCellViewProps {
   onSelect: () => void;
   onSourceChange: (source: string) => void;
   onRun: (mode: CellRunMode) => void;
+  onInterrupt: () => void;
   onMount: (cellId: string, editor: monaco.editor.IStandaloneCodeEditor) => void;
   onTypeChange: (type: NotebookCellType) => void;
   onLanguageChange: (language: NotebookLanguage) => void;
@@ -649,6 +665,7 @@ interface NotebookCellViewProps {
   onCopy: () => void;
   onCut: () => void;
   onAddBelow: () => void;
+  onAddMarkdownBelow: () => void;
   onSplit: () => void;
   onMergeAbove: () => void;
   onToggleSource: () => void;
@@ -663,6 +680,7 @@ function NotebookCellView({
   selected,
   running,
   language,
+  defaultLanguage,
   notebookPath,
   fontSize,
   theme,
@@ -672,6 +690,7 @@ function NotebookCellView({
   onSelect,
   onSourceChange,
   onRun,
+  onInterrupt,
   onMount,
   onTypeChange,
   onLanguageChange,
@@ -681,6 +700,7 @@ function NotebookCellView({
   onCopy,
   onCut,
   onAddBelow,
+  onAddMarkdownBelow,
   onSplit,
   onMergeAbove,
   onToggleSource,
@@ -700,143 +720,217 @@ function NotebookCellView({
       : language === 'csharp' ? 'csharp' : 'python';
   const lineCount = Math.max(1, source.split(/\r?\n/).length);
   const editorHeight = Math.min(520, Math.max(86, lineCount * Math.max(19, fontSize + 7) + 28));
+  const contextualActions = selected
+    ? 'visible pointer-events-auto opacity-100'
+    : 'invisible pointer-events-none opacity-0 group-hover/cell:visible group-hover/cell:pointer-events-auto group-hover/cell:opacity-100 group-focus-within/cell:visible group-focus-within/cell:pointer-events-auto group-focus-within/cell:opacity-100';
+  const languageOverride = isCode && language !== defaultLanguage;
 
   return (
     <section
       data-notebook-cell-id={cell.id}
       onMouseDown={onSelect}
+      role="group"
+      aria-label={`${cell.cell_type} cell ${index + 1}`}
       className={classNames(
-        'group/cell relative rounded-xl border bg-[rgb(31,31,31)] shadow-sm transition-colors',
-        selected ? 'border-indigo-500/60 ring-1 ring-indigo-500/20' : 'border-white/10 hover:border-white/20'
+        'group/cell relative grid grid-cols-[48px_minmax(0,1fr)] items-start gap-2 rounded-lg py-2 pr-2 transition-colors',
+        selected ? 'bg-white/[0.025]' : 'hover:bg-white/[0.015]'
       )}
     >
-      <div className="flex min-h-9 items-center gap-1 border-b border-white/5 px-2 text-[11px] text-zinc-500">
-        <button
-          type="button"
-          title="Run cell (Ctrl/Cmd+Enter)"
-          onClick={event => { event.stopPropagation(); onRun('stay'); }}
-          disabled={running || !isCode}
-          className="rounded p-1 text-zinc-400 hover:bg-white/10 hover:text-white disabled:opacity-30"
-        >
-          {running ? <CircleStop size={14} className="animate-pulse text-amber-300" /> : <Play size={14} />}
-        </button>
-        <span className={classNames('w-11 text-right font-mono', running && 'text-amber-300')}>
-          {isCode ? `[${running ? '*' : cell.execution_count ?? ' '}]` : `${index + 1}`}
-        </span>
-        <select
-          value={cell.cell_type}
-          onChange={event => onTypeChange(event.target.value as NotebookCellType)}
-          onMouseDown={event => event.stopPropagation()}
-          className="rounded border border-transparent bg-transparent px-1 py-0.5 text-[11px] text-zinc-400 outline-none hover:border-white/10 hover:bg-white/5"
-        >
-          <option value="code">Code</option>
-          <option value="markdown">Markdown</option>
-          <option value="raw">Raw</option>
-        </select>
+      <div className="flex flex-col items-center pt-5 text-[10px] text-zinc-600">
         {isCode ? (
-          <select
-            value={language}
-            onChange={event => onLanguageChange(event.target.value as NotebookLanguage)}
-            onMouseDown={event => event.stopPropagation()}
-            className="rounded border border-transparent bg-transparent px-1 py-0.5 text-[11px] text-zinc-500 outline-none hover:border-white/10 hover:bg-white/5"
+          <button
+            type="button"
+            aria-label={running ? 'Interrupt running cell' : `Run cell ${index + 1}`}
+            title={running ? 'Interrupt execution' : 'Run cell (Ctrl/Cmd+Enter)'}
+            onClick={event => {
+              event.stopPropagation();
+              if (running) onInterrupt(); else onRun('stay');
+            }}
+            className={classNames(
+              'flex h-8 w-8 items-center justify-center rounded-full border transition-colors',
+              running
+                ? 'border-amber-400/50 bg-amber-400/10 text-amber-300 hover:bg-amber-400/20'
+                : selected
+                  ? 'border-emerald-500/50 bg-emerald-500/10 text-emerald-300 hover:bg-emerald-500/20'
+                  : 'border-white/15 text-zinc-500 hover:border-emerald-500/50 hover:bg-emerald-500/10 hover:text-emerald-300'
+            )}
           >
-            <option value="python">Python</option>
-            <option value="csharp">C# Script</option>
-          </select>
-        ) : null}
-        <div className="flex-1" />
-        {cell.cell_type === 'markdown' ? (
-          <button type="button" onClick={event => { event.stopPropagation(); onToggleMarkdownPreview(); }} className="rounded px-1.5 py-1 hover:bg-white/10 hover:text-white">
-            {markdownPreview ? 'Edit' : 'Preview'}
+            {running ? <CircleStop size={14} className="animate-pulse" /> : <Play size={14} className="ml-0.5" />}
           </button>
+        ) : (
+          <span className="mt-2 font-mono">{index + 1}</span>
+        )}
+        {isCode ? (
+          <span className={classNames('mt-1.5 font-mono', running && 'text-amber-300')}>
+            {running ? '[*]' : cell.execution_count == null ? '[ ]' : `[${cell.execution_count}]`}
+          </span>
         ) : null}
-        <button type="button" title={collapsedSource ? 'Expand source' : 'Collapse source'} onClick={event => { event.stopPropagation(); onToggleSource(); }} className="rounded p-1 hover:bg-white/10 hover:text-white">
-          {collapsedSource ? <ChevronRight size={13} /> : <ChevronDown size={13} />}
-        </button>
-        <button type="button" title="Move up" onClick={event => { event.stopPropagation(); onMove(-1); }} className="rounded p-1 opacity-0 hover:bg-white/10 hover:text-white group-hover/cell:opacity-100"><ArrowUp size={13} /></button>
-        <button type="button" title="Move down" onClick={event => { event.stopPropagation(); onMove(1); }} className="rounded p-1 opacity-0 hover:bg-white/10 hover:text-white group-hover/cell:opacity-100"><ArrowDown size={13} /></button>
-        <button type="button" title="Duplicate cell" onClick={event => { event.stopPropagation(); onDuplicate(); }} className="rounded p-1 opacity-0 hover:bg-white/10 hover:text-white group-hover/cell:opacity-100"><Copy size={13} /></button>
-        <button type="button" title="Delete cell" onClick={event => { event.stopPropagation(); onDelete(); }} className="rounded p-1 opacity-0 hover:bg-rose-500/10 hover:text-rose-300 group-hover/cell:opacity-100"><Trash2 size={13} /></button>
-        <details className="relative" onClick={event => event.stopPropagation()}>
-          <summary className="list-none rounded p-1 opacity-0 hover:bg-white/10 hover:text-white group-hover/cell:opacity-100"><MoreHorizontal size={14} /></summary>
-          <div className="absolute right-0 top-7 z-20 w-44 rounded-lg border border-white/10 bg-zinc-900 p-1 text-xs shadow-xl">
-            <button type="button" onClick={onCopy} className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left hover:bg-white/5"><Copy size={12} /> Copy cell</button>
-            <button type="button" onClick={onCut} className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left hover:bg-white/5"><Scissors size={12} /> Cut cell</button>
-            <button type="button" onClick={onSplit} className="w-full rounded px-2 py-1.5 text-left hover:bg-white/5">Split at cursor</button>
-            <button type="button" onClick={onMergeAbove} className="w-full rounded px-2 py-1.5 text-left hover:bg-white/5">Merge with cell above</button>
-            <button type="button" onClick={onEditMetadata} className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left hover:bg-white/5"><Braces size={12} /> Edit metadata</button>
-          </div>
-        </details>
       </div>
 
-      {!collapsedSource ? (
-        cell.cell_type === 'markdown' && markdownPreview ? (
-          <div className="prose prose-invert prose-sm max-w-none px-6 py-4 text-zinc-300" onDoubleClick={onToggleMarkdownPreview}>
-            {source.trim() ? (
-              <ReactMarkdown urlTransform={url => attachmentUrl(cell, url)}>{source}</ReactMarkdown>
-            ) : <span className="text-sm italic text-zinc-600">Empty Markdown cell — double-click to edit.</span>}
-          </div>
-        ) : (
-          <div style={{ height: editorHeight }} className="overflow-hidden">
-            <Editor
-              key={`${cell.id}:${editorLanguage}`}
-              path={modelPath}
-              defaultPath={modelPath}
-              height="100%"
-              language={editorLanguage}
-              defaultLanguage={editorLanguage}
-              value={source}
-              theme={theme}
-              onMount={editor => onMount(cell.id, editor)}
-              onChange={next => onSourceChange(next ?? '')}
-              options={{
-                automaticLayout: true,
-                fontSize,
-                fontFamily: '"JetBrains Mono", "Fira Code", monospace',
-                minimap: { enabled: false },
-                lineNumbers: 'on',
-                lineNumbersMinChars: 3,
-                folding: true,
-                glyphMargin: false,
-                scrollBeyondLastLine: false,
-                scrollbar: { alwaysConsumeMouseWheel: false },
-                overviewRulerLanes: 0,
-                renderLineHighlight: 'line',
-                wordWrap: cell.cell_type === 'code' ? 'off' : 'on',
-                padding: { top: 8, bottom: 8 },
-                fixedOverflowWidgets: true,
-                suggest: { preview: true },
-                'semanticHighlighting.enabled': true,
-              } as monaco.editor.IStandaloneEditorConstructionOptions}
-            />
-          </div>
-        )
-      ) : (
-        <button type="button" onClick={onToggleSource} className="block w-full px-4 py-2 text-left text-xs italic text-zinc-600 hover:text-zinc-400">
-          {source.split(/\r?\n/)[0] || 'Empty source'}{source.includes('\n') ? ' …' : ''}
-        </button>
-      )}
+      <div className="relative min-w-0 pt-3">
+        {languageOverride ? (
+          <span className="absolute left-3 top-0 z-10 rounded-md border border-white/10 bg-zinc-900 px-1.5 py-0.5 text-[9px] font-medium uppercase tracking-wide text-zinc-500">
+            {language === 'csharp' ? 'C#' : 'Python'}
+          </span>
+        ) : null}
 
-      {isCode && outputs.length > 0 ? (
-        <div>
-          <button type="button" onClick={event => { event.stopPropagation(); onToggleOutput(); }} className="flex w-full items-center gap-1 border-t border-white/5 px-3 py-1 text-[10px] text-zinc-600 hover:text-zinc-400">
-            {collapsedOutput ? <ChevronRight size={11} /> : <ChevronDown size={11} />}
-            {outputs.length} output{outputs.length === 1 ? '' : 's'}
-          </button>
-          {!collapsedOutput ? <CellOutputs outputs={outputs} /> : null}
+        <div className={classNames(
+          'absolute right-2 top-0 z-30 flex h-7 items-center gap-0.5 rounded-lg border border-white/10 bg-zinc-900/95 px-1 text-[10px] text-zinc-400 shadow-lg transition-opacity',
+          contextualActions
+        )}>
+          {cell.cell_type === 'markdown' ? (
+            <button
+              type="button"
+              onClick={event => { event.stopPropagation(); onToggleMarkdownPreview(); }}
+              className="rounded px-1.5 py-1 hover:bg-white/10 hover:text-white"
+            >
+              {markdownPreview ? 'Edit' : 'Preview'}
+            </button>
+          ) : null}
+          <button type="button" aria-label="Move cell up" title="Move cell up" onClick={event => { event.stopPropagation(); onMove(-1); }} className="rounded p-1 hover:bg-white/10 hover:text-white"><ArrowUp size={13} /></button>
+          <button type="button" aria-label="Move cell down" title="Move cell down" onClick={event => { event.stopPropagation(); onMove(1); }} className="rounded p-1 hover:bg-white/10 hover:text-white"><ArrowDown size={13} /></button>
+          <details className="relative" onClick={event => event.stopPropagation()}>
+            <summary aria-label="More cell actions" title="More cell actions" className="cursor-pointer list-none rounded p-1 hover:bg-white/10 hover:text-white"><MoreHorizontal size={14} /></summary>
+            <div role="menu" className={classNames(
+              'absolute right-0 z-40 max-h-64 w-56 overflow-y-auto rounded-xl border border-white/10 bg-zinc-900 p-1.5 text-xs shadow-2xl custom-scrollbar',
+              index === 0 ? 'top-7' : 'bottom-7'
+            )}>
+              <div className="space-y-1 px-2 pb-1.5 pt-1">
+                <label className="flex items-center justify-between gap-3 text-[11px] text-zinc-500">
+                  Cell type
+                  <select
+                    value={cell.cell_type}
+                    aria-label="Cell type"
+                    onChange={event => {
+                      onTypeChange(event.target.value as NotebookCellType);
+                      closeContainingMenu(event.currentTarget);
+                    }}
+                    className="rounded-md border border-white/10 bg-black/30 px-2 py-1 text-[11px] text-zinc-300 outline-none focus:border-indigo-500"
+                  >
+                    <option value="code">Code</option>
+                    <option value="markdown">Text</option>
+                    <option value="raw">Raw</option>
+                  </select>
+                </label>
+                {isCode ? (
+                  <label className="flex items-center justify-between gap-3 text-[11px] text-zinc-500">
+                    Language
+                    <select
+                      value={language}
+                      aria-label="Cell language"
+                      onChange={event => {
+                        onLanguageChange(event.target.value as NotebookLanguage);
+                        closeContainingMenu(event.currentTarget);
+                      }}
+                      className="rounded-md border border-white/10 bg-black/30 px-2 py-1 text-[11px] text-zinc-300 outline-none focus:border-indigo-500"
+                    >
+                      <option value="python">Python</option>
+                      <option value="csharp">C# Script</option>
+                    </select>
+                  </label>
+                ) : null}
+              </div>
+              <div className="my-1 h-px bg-white/[0.07]" />
+              <button role="menuitem" type="button" onClick={event => { closeContainingMenu(event.currentTarget); onToggleSource(); }} className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-white/5">
+                {collapsedSource ? <ChevronRight size={12} /> : <ChevronDown size={12} />} {collapsedSource ? 'Expand source' : 'Collapse source'}
+              </button>
+              {isCode && outputs.length > 0 ? (
+                <button role="menuitem" type="button" onClick={event => { closeContainingMenu(event.currentTarget); onToggleOutput(); }} className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-white/5">
+                  {collapsedOutput ? <ChevronRight size={12} /> : <ChevronDown size={12} />} {collapsedOutput ? 'Show output' : 'Collapse output'}
+                </button>
+              ) : null}
+              <button role="menuitem" type="button" onClick={event => { closeContainingMenu(event.currentTarget); onDuplicate(); }} className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-white/5"><Copy size={12} /> Duplicate cell</button>
+              <button role="menuitem" type="button" onClick={event => { closeContainingMenu(event.currentTarget); onCopy(); }} className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-white/5"><Clipboard size={12} /> Copy cell</button>
+              <button role="menuitem" type="button" onClick={event => { closeContainingMenu(event.currentTarget); onCut(); }} className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-white/5"><Scissors size={12} /> Cut cell</button>
+              <button role="menuitem" type="button" onClick={event => { closeContainingMenu(event.currentTarget); onSplit(); }} className="w-full rounded-md px-2 py-1.5 text-left hover:bg-white/5">Split at cursor</button>
+              <button role="menuitem" type="button" onClick={event => { closeContainingMenu(event.currentTarget); onMergeAbove(); }} className="w-full rounded-md px-2 py-1.5 text-left hover:bg-white/5">Merge with cell above</button>
+              <button role="menuitem" type="button" onClick={event => { closeContainingMenu(event.currentTarget); onEditMetadata(); }} className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-white/5"><Braces size={12} /> Cell metadata</button>
+              <div className="my-1 h-px bg-white/[0.07]" />
+              <button role="menuitem" type="button" onClick={event => { closeContainingMenu(event.currentTarget); onDelete(); }} className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-rose-300 hover:bg-rose-500/10"><Trash2 size={12} /> Delete cell</button>
+            </div>
+          </details>
         </div>
-      ) : null}
 
-      {selected ? (
-        <button
-          type="button"
-          title="Insert code cell below"
-          onClick={event => { event.stopPropagation(); onAddBelow(); }}
-          className="absolute -bottom-3 left-1/2 z-10 flex h-6 -translate-x-1/2 items-center gap-1 rounded-full border border-indigo-500/30 bg-zinc-900 px-2 text-[10px] text-indigo-300 opacity-0 shadow group-hover/cell:opacity-100 hover:bg-indigo-500/10"
-        >
-          <Plus size={11} /> Code
-        </button>
-      ) : null}
+        <div className={classNames(
+          'overflow-hidden rounded-lg border bg-[rgb(31,31,31)] transition-colors',
+          selected ? 'border-indigo-500/55 ring-1 ring-indigo-500/15' : 'border-white/10 group-hover/cell:border-white/15'
+        )}>
+          {!collapsedSource ? (
+            cell.cell_type === 'markdown' && markdownPreview ? (
+              <div className="prose prose-invert prose-sm max-w-none px-6 py-5 text-zinc-300" onDoubleClick={onToggleMarkdownPreview}>
+                {source.trim() ? (
+                  <ReactMarkdown urlTransform={url => attachmentUrl(cell, url)}>{source}</ReactMarkdown>
+                ) : <span className="text-sm italic text-zinc-600">Empty text cell — double-click to edit.</span>}
+              </div>
+            ) : (
+              <div style={{ height: editorHeight }} className="overflow-hidden">
+                <Editor
+                  key={`${cell.id}:${editorLanguage}`}
+                  path={modelPath}
+                  defaultPath={modelPath}
+                  height="100%"
+                  language={editorLanguage}
+                  defaultLanguage={editorLanguage}
+                  value={source}
+                  theme={theme}
+                  onMount={editor => onMount(cell.id, editor)}
+                  onChange={next => onSourceChange(next ?? '')}
+                  options={{
+                    automaticLayout: true,
+                    fontSize,
+                    fontFamily: '"JetBrains Mono", "Fira Code", monospace',
+                    minimap: { enabled: false },
+                    lineNumbers: 'on',
+                    lineNumbersMinChars: 3,
+                    folding: true,
+                    glyphMargin: false,
+                    scrollBeyondLastLine: false,
+                    scrollbar: { alwaysConsumeMouseWheel: false },
+                    overviewRulerLanes: 0,
+                    renderLineHighlight: 'line',
+                    wordWrap: cell.cell_type === 'code' ? 'off' : 'on',
+                    padding: { top: 10, bottom: 10 },
+                    fixedOverflowWidgets: true,
+                    suggest: { preview: true },
+                    'semanticHighlighting.enabled': true,
+                  } as monaco.editor.IStandaloneEditorConstructionOptions}
+                />
+              </div>
+            )
+          ) : (
+            <button type="button" aria-expanded="false" onClick={onToggleSource} className="block w-full px-4 py-2.5 text-left text-xs italic text-zinc-600 hover:text-zinc-400">
+              {source.split(/\r?\n/)[0] || 'Empty source'}{source.includes('\n') ? ' …' : ''}
+            </button>
+          )}
+
+          {isCode && outputs.length > 0 ? (
+            collapsedOutput ? (
+              <button type="button" aria-expanded="false" onClick={event => { event.stopPropagation(); onToggleOutput(); }} className="flex w-full items-center gap-1.5 border-t border-white/[0.07] px-4 py-2 text-[10px] text-zinc-600 hover:bg-white/[0.02] hover:text-zinc-400">
+                <ChevronRight size={11} /> Show {outputs.length} output{outputs.length === 1 ? '' : 's'}
+              </button>
+            ) : <CellOutputs outputs={outputs} />
+          ) : null}
+        </div>
+
+        <div className={classNames(
+          'absolute -bottom-4 left-1/2 z-20 flex -translate-x-1/2 items-center rounded-full border border-white/10 bg-zinc-900 p-0.5 text-[10px] shadow-lg transition-opacity',
+          selected
+            ? 'visible opacity-100'
+            : 'invisible opacity-0 group-hover/cell:visible group-hover/cell:opacity-100 group-focus-within/cell:visible group-focus-within/cell:opacity-100'
+        )}>
+          <button
+            type="button"
+            onClick={event => { event.stopPropagation(); onAddBelow(); }}
+            className="flex items-center gap-1 rounded-full px-2 py-1 text-zinc-400 hover:bg-white/10 hover:text-white"
+          ><Plus size={11} /> Code</button>
+          <span className="h-3 w-px bg-white/10" />
+          <button
+            type="button"
+            onClick={event => { event.stopPropagation(); onAddMarkdownBelow(); }}
+            className="flex items-center gap-1 rounded-full px-2 py-1 text-zinc-400 hover:bg-white/10 hover:text-white"
+          ><Plus size={11} /> Text</button>
+        </div>
+      </div>
     </section>
   );
 }
@@ -1511,7 +1605,11 @@ export function NotebookEditor({
   const pasteCell = useCallback((below = true) => {
     const clipboard = clipboardRef.current;
     const current = notebookRef.current;
-    if (!clipboard || !current) return;
+    if (!current) return;
+    if (!clipboard) {
+      setStatus('Copy or cut a cell before pasting.');
+      return;
+    }
     const selected = current.cells.findIndex(cell => cell.id === selectedCellId);
     const insertion = selected < 0 ? current.cells.length : selected + (below ? 1 : 0);
     const copy = createNotebookCell(
@@ -1531,6 +1629,7 @@ export function NotebookEditor({
     }
     emitNotebook(next);
     focusCell(copy.id);
+    setStatus(`Pasted ${copy.cell_type} cell.`);
   }, [emitNotebook, focusCell, selectedCellId]);
 
   const splitCell = useCallback((cellId: string) => {
@@ -1665,7 +1764,6 @@ export function NotebookEditor({
     );
   }
 
-  const selectedCell = notebook.cells.find(cell => cell.id === selectedCellId) ?? null;
   const metadataValue = metadataTarget === 'notebook'
     ? notebook.metadata
     : metadataTarget
@@ -1682,69 +1780,99 @@ export function NotebookEditor({
       }}
       className="relative flex h-full min-h-0 flex-col overflow-hidden bg-[rgb(28,28,28)] text-zinc-300 outline-none"
     >
-      <div className="flex h-11 shrink-0 items-center gap-1 overflow-x-auto border-b border-white/10 bg-[rgb(30,30,30)] px-2 custom-scrollbar">
-        <button
-          type="button"
-          onClick={() => void runSelected()}
-          disabled={!!runningCellId}
-          className="flex shrink-0 items-center gap-1.5 rounded-lg bg-indigo-600 px-2.5 py-1.5 text-xs font-medium text-white hover:bg-indigo-500 disabled:opacity-40"
-          title="Run selected cell (Ctrl/Cmd+Enter)"
-        >
-          <Play size={13} /> Run
-        </button>
-        <button type="button" onClick={() => void runAll()} disabled={!!runningCellId} className="shrink-0 rounded-lg px-2 py-1.5 text-xs text-zinc-400 hover:bg-white/5 hover:text-white disabled:opacity-40">Run all</button>
-        <button
-          type="button"
-          disabled={selectedIndex <= 0 || !!runningCellId}
-          onClick={() => void enqueueCells(notebook.cells.slice(0, selectedIndex).filter(cell => cell.cell_type === 'code').map(cell => cell.id))}
-          className="shrink-0 rounded-lg px-2 py-1.5 text-xs text-zinc-500 hover:bg-white/5 hover:text-white disabled:opacity-30"
-        >Run above</button>
-        <button
-          type="button"
-          disabled={selectedIndex < 0 || selectedIndex >= notebook.cells.length - 1 || !!runningCellId}
-          onClick={() => void enqueueCells(notebook.cells.slice(selectedIndex + 1).filter(cell => cell.cell_type === 'code').map(cell => cell.id))}
-          className="shrink-0 rounded-lg px-2 py-1.5 text-xs text-zinc-500 hover:bg-white/5 hover:text-white disabled:opacity-30"
-        >Run below</button>
-        <div className="mx-1 h-5 w-px shrink-0 bg-white/10" />
-        <button type="button" onClick={interrupt} disabled={!runningCellId} title="Interrupt execution" className="rounded p-1.5 text-zinc-500 hover:bg-rose-500/10 hover:text-rose-300 disabled:opacity-30"><CircleStop size={14} /></button>
-        <button type="button" onClick={() => void restart()} title="Restart local script contexts" className="rounded p-1.5 text-zinc-500 hover:bg-white/5 hover:text-white"><RefreshCw size={14} /></button>
-        <button type="button" onClick={() => void restartAndRunAll()} disabled={!!runningCellId} className="flex shrink-0 items-center gap-1 rounded-lg px-2 py-1.5 text-xs text-zinc-500 hover:bg-white/5 hover:text-white disabled:opacity-30" title="Restart contexts, then run all cells"><RotateCcw size={13} /> Run all</button>
-        <div className="mx-1 h-5 w-px shrink-0 bg-white/10" />
+      <div className="flex h-11 shrink-0 items-center gap-1.5 border-b border-white/10 bg-[rgb(30,30,30)] px-3">
         <button
           type="button"
           onClick={() => addCellAt(selectedIndex < 0 ? notebook.cells.length : selectedIndex + 1, 'code')}
-          className="flex shrink-0 items-center gap-1 rounded-lg px-2 py-1.5 text-xs text-zinc-400 hover:bg-white/5 hover:text-white"
-        ><Plus size={13} /> Code</button>
+          className="flex shrink-0 items-center gap-1 rounded-lg px-2.5 py-1.5 text-xs font-medium text-zinc-300 hover:bg-white/5 hover:text-white"
+        >
+          <Plus size={13} /> Code
+        </button>
         <button
           type="button"
           onClick={() => addCellAt(selectedIndex < 0 ? notebook.cells.length : selectedIndex + 1, 'markdown')}
-          className="flex shrink-0 items-center gap-1 rounded-lg px-2 py-1.5 text-xs text-zinc-500 hover:bg-white/5 hover:text-white"
-        ><Plus size={13} /> Markdown</button>
-        <button type="button" onClick={() => pasteCell(true)} disabled={!clipboardRef.current} title="Paste cell below" className="rounded p-1.5 text-zinc-500 hover:bg-white/5 hover:text-white disabled:opacity-30"><Clipboard size={14} /></button>
-        <button type="button" onClick={() => updateNotebook(clearNotebookCellOutputs)} className="shrink-0 rounded-lg px-2 py-1.5 text-xs text-zinc-500 hover:bg-white/5 hover:text-white">Clear outputs</button>
-        <div className="flex-1" />
-        <select
-          value={defaultLanguage}
-          onChange={event => updateNotebook(current => setNotebookLanguage(current, event.target.value as NotebookLanguage))}
-          className="shrink-0 rounded-lg border border-white/10 bg-black/20 px-2 py-1.5 text-xs text-zinc-300 outline-none focus:border-indigo-500"
-          title="Default notebook language"
+          className="flex shrink-0 items-center gap-1 rounded-lg px-2.5 py-1.5 text-xs font-medium text-zinc-400 hover:bg-white/5 hover:text-white"
         >
-          <option value="python">Python 3 · local script</option>
-          <option value="csharp">C# · Roslyn script context</option>
-        </select>
-        <button type="button" title="Notebook metadata" onClick={() => setMetadataTarget('notebook')} className="rounded p-1.5 text-zinc-500 hover:bg-white/5 hover:text-white"><Settings2 size={14} /></button>
-        <button type="button" title="Magic command reference" onClick={() => setShowMagicHelp(true)} className="rounded p-1.5 text-zinc-500 hover:bg-white/5 hover:text-white"><HelpCircle size={14} /></button>
+          <Plus size={13} /> Text
+        </button>
+
+        <div className="mx-1 h-5 w-px shrink-0 bg-white/10" />
+        <div className="flex shrink-0 items-stretch rounded-lg shadow-sm">
+          <button
+            type="button"
+            onClick={() => runningCellId ? interrupt() : void runAll()}
+            className={classNames(
+              'flex items-center gap-1.5 rounded-l-lg border px-2.5 py-1.5 text-xs font-medium text-white transition-colors',
+              runningCellId
+                ? 'border-amber-500/40 bg-amber-600/80 hover:bg-amber-500/80'
+                : 'border-emerald-600 bg-emerald-700 hover:bg-emerald-600'
+            )}
+          >
+            {runningCellId ? <CircleStop size={13} className="animate-pulse" /> : <Play size={13} />}
+            {runningCellId ? 'Stop' : 'Run all'}
+          </button>
+          <details className="relative">
+            <summary
+              aria-label="More run actions"
+              title="More run actions"
+              className={classNames(
+                'flex h-full cursor-pointer list-none items-center rounded-r-lg border border-l-0 px-1.5 text-white transition-colors',
+                runningCellId
+                  ? 'border-amber-500/40 bg-amber-600/80 hover:bg-amber-500/80'
+                  : 'border-emerald-600 bg-emerald-700 hover:bg-emerald-600'
+              )}
+            >
+              <ChevronDown size={12} />
+            </summary>
+            <div role="menu" className="absolute left-0 top-9 z-40 w-56 rounded-xl border border-white/10 bg-zinc-900 p-1.5 text-xs text-zinc-300 shadow-2xl">
+              <button role="menuitem" type="button" disabled={!!runningCellId} onClick={event => { closeContainingMenu(event.currentTarget); void runSelected(); }} className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-white/5 disabled:opacity-40"><Play size={12} /> Run selected cell</button>
+              <button role="menuitem" type="button" disabled={selectedIndex <= 0 || !!runningCellId} onClick={event => { closeContainingMenu(event.currentTarget); void enqueueCells(notebook.cells.slice(0, selectedIndex).filter(cell => cell.cell_type === 'code').map(cell => cell.id)); }} className="w-full rounded-md px-2 py-1.5 text-left hover:bg-white/5 disabled:opacity-40">Run cells above</button>
+              <button role="menuitem" type="button" disabled={selectedIndex < 0 || selectedIndex >= notebook.cells.length - 1 || !!runningCellId} onClick={event => { closeContainingMenu(event.currentTarget); void enqueueCells(notebook.cells.slice(selectedIndex + 1).filter(cell => cell.cell_type === 'code').map(cell => cell.id)); }} className="w-full rounded-md px-2 py-1.5 text-left hover:bg-white/5 disabled:opacity-40">Run cells below</button>
+              {runningCellId ? (
+                <button role="menuitem" type="button" onClick={event => { closeContainingMenu(event.currentTarget); interrupt(); }} className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-amber-300 hover:bg-amber-500/10"><CircleStop size={12} /> Interrupt execution</button>
+              ) : null}
+              <div className="my-1 h-px bg-white/[0.07]" />
+              <button role="menuitem" type="button" onClick={event => { closeContainingMenu(event.currentTarget); void restart(); }} className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-white/5"><RefreshCw size={12} /> Restart local context</button>
+              <button role="menuitem" type="button" disabled={!!runningCellId} onClick={event => { closeContainingMenu(event.currentTarget); void restartAndRunAll(); }} className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-white/5 disabled:opacity-40"><RotateCcw size={12} /> Restart and run all</button>
+              <button role="menuitem" type="button" onClick={event => { closeContainingMenu(event.currentTarget); updateNotebook(clearNotebookCellOutputs); }} className="w-full rounded-md px-2 py-1.5 text-left hover:bg-white/5">Clear all outputs</button>
+            </div>
+          </details>
+        </div>
+
+        <div className="flex-1" />
+        <div className="relative flex shrink-0 items-center gap-1.5 rounded-full border border-white/10 bg-black/20 pl-2.5 pr-1 text-xs text-zinc-300 hover:border-white/20">
+          <span className={classNames('h-1.5 w-1.5 rounded-full', runningCellId ? 'animate-pulse bg-amber-400' : 'bg-emerald-500')} />
+          <select
+            value={defaultLanguage}
+            aria-label="Local notebook runtime"
+            onChange={event => updateNotebook(current => setNotebookLanguage(current, event.target.value as NotebookLanguage))}
+            className="appearance-none bg-transparent py-1.5 pl-0 pr-5 text-[11px] text-zinc-300 outline-none"
+            title="Default notebook language and local runtime"
+          >
+            <option value="python">Local · Python 3</option>
+            <option value="csharp">Local · C# Script</option>
+          </select>
+          <ChevronDown size={11} className="pointer-events-none absolute right-2 text-zinc-600" />
+        </div>
+
+        <details className="relative shrink-0">
+          <summary aria-label="More notebook actions" title="More notebook actions" className="flex cursor-pointer list-none items-center rounded-lg p-1.5 text-zinc-500 hover:bg-white/5 hover:text-white">
+            <MoreHorizontal size={15} />
+          </summary>
+          <div role="menu" className="absolute right-0 top-9 z-40 w-56 rounded-xl border border-white/10 bg-zinc-900 p-1.5 text-xs text-zinc-300 shadow-2xl">
+            <button role="menuitem" type="button" onClick={event => { closeContainingMenu(event.currentTarget); pasteCell(true); }} className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-white/5"><Clipboard size={12} /> Paste cell below</button>
+            <button role="menuitem" type="button" onClick={event => { closeContainingMenu(event.currentTarget); setMetadataTarget('notebook'); }} className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-white/5"><Settings2 size={12} /> Notebook metadata</button>
+            <button role="menuitem" type="button" onClick={event => { closeContainingMenu(event.currentTarget); setShowMagicHelp(true); }} className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-white/5"><HelpCircle size={12} /> Magic command reference</button>
+            <div className="my-1 h-px bg-white/[0.07]" />
+            <div className="px-2 py-1 text-[10px] leading-4 text-zinc-600">
+              Shift+Enter runs and advances. Esc enters command mode. A/B insert cells.
+            </div>
+          </div>
+        </details>
       </div>
 
       <div className="min-h-0 flex-1 overflow-y-auto custom-scrollbar">
-        <div className="mx-auto w-full max-w-6xl space-y-4 px-5 py-5 pb-24">
-          <div className="flex items-center gap-2 px-1 text-[11px] text-zinc-600">
-            <Code2 size={12} />
-            <span>{filePath}</span>
-            <span>·</span>
-            <span>{notebook.cells.length} cell{notebook.cells.length === 1 ? '' : 's'}</span>
-            <span>· local execution, no kernel connection</span>
-          </div>
+        <div className="mx-auto w-full max-w-5xl space-y-3 px-4 py-3 pb-24 sm:px-6">
           {notebook.cells.map((cell, index) => {
             const language = cellLanguage(cell, defaultLanguage);
             return (
@@ -1755,6 +1883,7 @@ export function NotebookEditor({
                 selected={cell.id === selectedCellId}
                 running={cell.id === runningCellId}
                 language={language}
+                defaultLanguage={defaultLanguage}
                 notebookPath={filePath}
                 fontSize={fontSize}
                 theme={theme}
@@ -1764,6 +1893,7 @@ export function NotebookEditor({
                 onSelect={() => setSelectedCellId(cell.id)}
                 onSourceChange={source => updateNotebook(current => setNotebookCellSource(current, cell.id, source))}
                 onRun={mode => { void runCell(cell.id, mode); }}
+                onInterrupt={interrupt}
                 onMount={mountCellEditor}
                 onTypeChange={type => {
                   updateNotebook(current => setNotebookCellType(current, cell.id, type));
@@ -1780,6 +1910,7 @@ export function NotebookEditor({
                 onCopy={() => copyCell(cell.id)}
                 onCut={() => copyCell(cell.id, true)}
                 onAddBelow={() => addCellAt(index + 1, 'code')}
+                onAddMarkdownBelow={() => addCellAt(index + 1, 'markdown')}
                 onSplit={() => splitCell(cell.id)}
                 onMergeAbove={() => mergeCellAbove(cell.id)}
                 onToggleSource={() => setCollapsedSources(values => {
@@ -1802,19 +1933,21 @@ export function NotebookEditor({
             );
           })}
           {notebook.cells.length === 0 ? (
-            <button
-              type="button"
-              onClick={() => addCellAt(0, 'code')}
-              className="flex w-full items-center justify-center gap-2 rounded-xl border border-dashed border-white/10 py-16 text-sm text-zinc-600 hover:border-indigo-500/30 hover:bg-indigo-500/5 hover:text-indigo-300"
-            ><Plus size={16} /> Add the first code cell</button>
+            <div className="flex min-h-64 flex-col items-center justify-center gap-3 rounded-xl border border-dashed border-white/10 text-zinc-500">
+              <div className="text-sm">Start this notebook with a cell</div>
+              <div className="flex items-center gap-2">
+                <button type="button" onClick={() => addCellAt(0, 'code')} className="flex items-center gap-1.5 rounded-lg bg-emerald-700 px-3 py-1.5 text-xs font-medium text-white hover:bg-emerald-600"><Plus size={13} /> Code</button>
+                <button type="button" onClick={() => addCellAt(0, 'markdown')} className="flex items-center gap-1.5 rounded-lg border border-white/10 px-3 py-1.5 text-xs text-zinc-300 hover:bg-white/5"><Plus size={13} /> Text</button>
+              </div>
+            </div>
           ) : null}
         </div>
       </div>
 
-      <div className="flex h-7 shrink-0 items-center gap-2 border-t border-white/10 bg-[rgb(26,26,26)] px-3 text-[10px] text-zinc-600">
+      <div className="flex h-7 shrink-0 items-center gap-2 border-t border-white/10 bg-[rgb(26,26,26)] px-3 text-[10px] text-zinc-600" aria-live="polite">
         <span className={classNames('h-1.5 w-1.5 rounded-full', runningCellId ? 'animate-pulse bg-amber-400' : 'bg-emerald-500')} />
         <span className="truncate">{status}</span>
-        <span className="ml-auto shrink-0">{commandMode ? 'Command mode' : 'Edit mode'} · Shift+Enter run/advance · Esc command mode · A/B insert · D,D delete</span>
+        <span className="ml-auto shrink-0">{commandMode ? 'Command' : 'Edit'} mode</span>
       </div>
 
       {showMagicHelp ? <MagicHelp language={defaultLanguage} onClose={() => setShowMagicHelp(false)} /> : null}
