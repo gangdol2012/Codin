@@ -1,6 +1,8 @@
-export {};
-
-import type { CSharpProjectConfiguration } from './csharp-project';
+// Keep this worker a classic script: the embedded Blazor loader uses
+// importScripts(), which is unavailable in module workers. An `import type`
+// still made Vite emit `export {}` in development, so use a non-emitting import
+// type expression instead.
+type CSharpProjectConfiguration = import('./csharp-project').CSharpProjectConfiguration;
 
 declare const DotNet: {
   invokeMethodAsync(assemblyName: string, methodName: string, ...args: unknown[]): Promise<unknown>;

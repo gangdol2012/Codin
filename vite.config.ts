@@ -71,6 +71,11 @@ export default defineConfig(() => {
     },
     optimizeDeps: {
       exclude: ['monaco-pyright-lsp'],
+      // monaco-pyright-lsp is kept unbundled because it owns its worker URLs,
+      // but its CommonJS browser transport still needs Vite's named-export
+      // interop in development. Without this, opening a Python Monaco model
+      // fails on BrowserMessageReader before authoring can start.
+      include: ['vscode-languageserver', 'vscode-languageserver/browser'],
     },
     server: {
       port: 3000,

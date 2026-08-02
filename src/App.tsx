@@ -48,6 +48,7 @@ import {
   Zap
 } from 'lucide-react';
 import Editor, { DiffEditor } from '@monaco-editor/react';
+import NotebookEditor from './notebook-editor';
 import { configureMonacoSuggestionAcceptance } from './monaco-suggest';
 import { CODECRAFT_MONACO_THEME } from './python-coloring';
 import { motion, AnimatePresence } from 'motion/react';
@@ -1067,7 +1068,8 @@ const EXT_TO_LANGUAGE: Record<string, string> = {
   lua: 'lua',
   dockerfile: 'dockerfile',
   toml: 'ini', ini: 'ini', cfg: 'ini',
-  txt: 'plaintext'
+  txt: 'plaintext',
+  ipynb: 'json'
 };
 
 function langFromFilename(name: string): string {
@@ -1081,12 +1083,21 @@ function getFilenameExtension(name: string) {
   return parts.length > 1 ? parts.pop() || '' : '';
 }
 
+function isNotebookPath(path: string) {
+  return getFilenameExtension(path) === 'ipynb';
+}
+
+function isNotebookFileItem(item: Pick<FSItem, 'type' | 'name'> | null | undefined) {
+  return item?.type === 'file' && isNotebookPath(item.name);
+}
+
 function getFileIconMeta(path: string, language?: string) {
   const filename = path.split('/').pop()?.toLowerCase() || path.toLowerCase();
   const extension = getFilenameExtension(path);
   const resolvedLanguage = (language || langFromFilename(filename)).toLowerCase();
 
   if (filename === 'package.json' || filename === 'package-lock.json') return { Icon: Boxes, className: 'text-emerald-400' };
+  if (extension === 'ipynb') return { Icon: FileJson, className: 'text-orange-300' };
   if (/^(?:vite|wrangler|tailwind|postcss|eslint|prettier|tsconfig|jsconfig|babel|rollup|webpack|vercel)\b/.test(filename)) return { Icon: FileCog, className: 'text-zinc-400' };
   if (/^(?:dockerfile|containerfile)$/.test(filename)) return { Icon: Boxes, className: 'text-cyan-400' };
 
@@ -5540,6 +5551,52 @@ function formatRuntimeReturnValue(value: unknown) {
   return String(value).trim();
 }
 
+function createNotebookErrorOutput(error: unknown, fallbackName: string): NotebookRuntimeOutput {
+  const rawMessage = error instanceof Error ? (error.stack || error.message) : String(error);
+  const message = rawMessage || 'Execution failed.';
+  const lines = message.split(/\r?\n/).filter(Boolean);
+  const firstLine = lines[0] || message;
+  const separator = firstLine.indexOf(':');
+  const inferredName = separator > 0 && /^[A-Za-z_][\w.]*$/.test(firstLine.slice(0, separator).trim())
+    ? firstLine.slice(0, separator).trim()
+    : fallbackName;
+  const inferredValue = separator > 0 && inferredName !== fallbackName
+    ? firstLine.slice(separator + 1).trim()
+    : firstLine;
+  return {
+    output_type: 'error',
+    ename: inferredName,
+    evalue: inferredValue,
+    traceback: lines.length > 0 ? lines : [message],
+  };
+}
+
+function appendNotebookStreamOutput(
+  outputs: NotebookRuntimeOutput[],
+  name: 'stdout' | 'stderr',
+  text: string
+) {
+  if (!text) return;
+  const previous = outputs[outputs.length - 1];
+  if (previous?.output_type === 'stream' && previous.name === name) {
+    previous.text += text;
+    return;
+  }
+  outputs.push({ output_type: 'stream', name, text });
+}
+
+function getNotebookDirectory(path: string) {
+  const normalized = normalizeProjectPath(path);
+  const lastSlash = normalized.lastIndexOf('/');
+  return lastSlash >= 0 ? normalized.slice(0, lastSlash) : '';
+}
+
+function resolveNotebookRelativePath(notebookPath: string, relativePath: string) {
+  const normalizedRelative = relativePath.replace(/\\/g, '/').trim();
+  const base = normalizedRelative.startsWith('/') ? '' : getNotebookDirectory(notebookPath);
+  return normalizeProjectPath(base ? `${base}/${normalizedRelative}` : normalizedRelative);
+}
+
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value);
 }
@@ -5888,6 +5945,56 @@ interface OutputPanelInteraction {
   placeholder?: string;
   submitLabel?: string;
   cancelLabel?: string;
+}
+
+type NotebookRuntimeLanguage = 'python' | 'csharp';
+
+type NotebookRuntimeOutput =
+  | { output_type: 'stream'; name: 'stdout' | 'stderr'; text: string }
+  | {
+    output_type: 'display_data';
+    data: Record<string, unknown>;
+    metadata: Record<string, unknown>;
+    transient?: Record<string, unknown>;
+  }
+  | {
+    output_type: 'execute_result';
+    data: Record<string, unknown>;
+    metadata: Record<string, unknown>;
+    execution_count: number | null;
+  }
+  | { output_type: 'error'; ename: string; evalue: string; traceback: string[] };
+
+interface NotebookRuntimeExecutionRequest {
+  notebookId: string;
+  fileId: string;
+  filePath: string;
+  cellId: string;
+  virtualPath: string;
+  language: NotebookRuntimeLanguage;
+  code: string;
+  source: string;
+  executionCount: number;
+  signal?: AbortSignal;
+}
+
+interface NotebookRuntimeExecutionResult {
+  outputs: NotebookRuntimeOutput[];
+  durationMs: number;
+  status?: string;
+  sessionRestarted?: boolean;
+}
+
+interface NotebookEditorController {
+  runSelected: () => Promise<void>;
+  runAll: () => Promise<void>;
+  interrupt: () => void;
+  restart: () => Promise<void>;
+}
+
+interface PythonNotebookSession {
+  globals: any;
+  cwd: string;
 }
 
 interface AppSettings {
@@ -7638,6 +7745,7 @@ export default function App() {
   const [syncMeta, setSyncMeta] = useState<SyncMeta[]>(loadSyncMeta);
   const pendingEdit = pendingEdits[0] ?? null;
   const editorRef = useRef<any>(null);
+  const sharedEditorInstanceRef = useRef<any>(null);
   const pendingEditorNavigationRef = useRef<{
     uri: string;
     itemId: string;
@@ -7680,6 +7788,12 @@ export default function App() {
   const csharpRuntimeReadyRef = useRef<Promise<void> | null>(null);
   const csharpInteractiveWorkerRef = useRef<Worker | null>(null);
   const csharpInteractiveWorkerRunRejectRef = useRef<((error: Error) => void) | null>(null);
+  const notebookCSharpWorkerRef = useRef<Worker | null>(null);
+  const notebookCSharpWorkerRunRejectRef = useRef<((error: Error) => void) | null>(null);
+  const notebookCSharpSessionEpochRef = useRef<Map<string, number>>(new Map());
+  const notebookCSharpInitializedContextsRef = useRef<Set<string>>(new Set());
+  const notebookExecutionQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const notebookControllersRef = useRef<Map<string, NotebookEditorController>>(new Map());
   const skipEditorSyncRef = useRef(false);
   const pendingSharedEditorTargetRef = useRef<{ tabId: string; itemId: string } | null>(null);
   const sharedEditorVersionRef = useRef(0);
@@ -8476,8 +8590,18 @@ export default function App() {
     });
   }, [applyPendingEditorNavigation, bindLanguageServicesToEditor, clearCSharpEditorBinding, clearCxxEditorBinding, clearJavaEditorBinding, clearPyrightEditorBinding, createSharedEditorTarget]);
 
+  const handleSharedEditorMount = useCallback((editor: any) => {
+    sharedEditorInstanceRef.current = editor;
+    handleEditorMount(editor);
+    editor.onDidDispose(() => {
+      if (sharedEditorInstanceRef.current === editor) {
+        sharedEditorInstanceRef.current = null;
+      }
+    });
+  }, [handleEditorMount]);
+
   const disposeMountedSharedEditor = useCallback(() => {
-    const editor = editorRef.current;
+    const editor = sharedEditorInstanceRef.current;
     if (!editor) return false;
     editor.dispose();
     return true;
@@ -8850,7 +8974,8 @@ export default function App() {
 
   const resolvedProjectRun = getResolvedProjectRun();
   const activeRunnableFile = getActiveRunnableFile();
-  const canRunCurrentFile = !isRunning && activeRunnableFile !== null;
+  const activeNotebookFile = isNotebookFileItem(activeItem) ? activeItem : null;
+  const canRunCurrentFile = !isRunning && (activeRunnableFile !== null || activeNotebookFile !== null);
   const canRunProject = !isRunning && !resolvedProjectRun.error;
 
   // Helper to find item by path or name
@@ -9405,7 +9530,12 @@ export default function App() {
   }, [isSettingsOpen]);
 
   useEffect(() => {
-    if (!activeEditorTabId || !activeEditorTabItemId || activeEditorTabItem?.type !== 'file') {
+    if (
+      !activeEditorTabId
+      || !activeEditorTabItemId
+      || activeEditorTabItem?.type !== 'file'
+      || isNotebookFileItem(activeEditorTabItem)
+    ) {
       pendingSharedEditorTargetRef.current = null;
       setMountedSharedEditorTarget(null);
       void disposeMountedSharedEditor();
@@ -9716,6 +9846,12 @@ export default function App() {
       csharpInteractiveWorkerRunRejectRef.current = null;
       csharpInteractiveWorkerRef.current?.terminate();
       csharpInteractiveWorkerRef.current = null;
+      notebookCSharpWorkerRunRejectRef.current?.(new Error('C# notebook runner was stopped.'));
+      notebookCSharpWorkerRunRejectRef.current = null;
+      notebookCSharpWorkerRef.current?.terminate();
+      notebookCSharpWorkerRef.current = null;
+      notebookCSharpSessionEpochRef.current.clear();
+      notebookCSharpInitializedContextsRef.current.clear();
     };
   }, []);
 
@@ -9770,7 +9906,9 @@ export default function App() {
     const changedFiles = getRuntimeWorkspaceChangedFiles(initialFiles, finalFiles);
     if (changedFiles.length === 0) return;
 
-    setFiles(prev => upsertRuntimeWorkspaceFilesIntoExplorer(prev, changedFiles));
+    const nextFiles = upsertRuntimeWorkspaceFilesIntoExplorer(filesRef.current, changedFiles);
+    filesRef.current = nextFiles;
+    setFiles(nextFiles);
     appendExecutionStartupStatus(
       `Synced ${changedFiles.length} runtime file${changedFiles.length === 1 ? '' : 's'} into the Explorer workspace.`
     );
@@ -11823,6 +11961,7 @@ json.dumps(_extract(${JSON.stringify(pkgName)}))
 
   const pyodideRestoredRef = useRef(false);
   const pyodideIdleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pythonNotebookNamespacesRef = useRef<Map<string, PythonNotebookSession>>(new Map());
   const pythonStubContributionsRef = useRef<Record<string, UserFolder>>({});
   const pyodideCachedPackageMetaRef = useRef<Record<string, CachedPyodidePackageMeta>>({});
   const pyodidePackageSnapshotRef = useRef<CachedPyodideEnvironmentSnapshot | null>(null);
@@ -11998,6 +12137,10 @@ json.dumps(_extract(${JSON.stringify(pkgName)}))
 
   const unloadPyodide = () => {
     clearPyodideIdleTimer();
+    for (const notebookSession of pythonNotebookNamespacesRef.current.values()) {
+      try { notebookSession.globals?.destroy?.(); } catch { }
+    }
+    pythonNotebookNamespacesRef.current.clear();
     const hostWindow = getPyodideHostWindow();
     const py = (window as any).pyodide || (hostWindow as any)?.pyodide;
     if (py) {
@@ -12664,13 +12807,16 @@ json.dumps(sorted(_imports))
     }
   };
 
-  const ensurePyodideUsesTypeshedSurface = async (code: string) => {
+  const ensurePyodideUsesTypeshedSurface = async (code: string, runtimeOnlyModules: string[] = []) => {
     const importedModules = await collectImportedPythonModules(code);
     if (importedModules.length === 0) return;
 
     const pyright = await ensurePythonAuthoringReady();
     const allowedModules = new Set(await pyright.getCurrentPythonTypeModules());
-    const missingModules = importedModules.filter(moduleName => !allowedModules.has(moduleName));
+    const runtimeOnly = new Set(runtimeOnlyModules);
+    const missingModules = importedModules.filter(moduleName => (
+      !allowedModules.has(moduleName) && !runtimeOnly.has(moduleName)
+    ));
 
     if (missingModules.length > 0) {
       throw new Error(
@@ -12779,6 +12925,118 @@ json.dumps(sorted(_imports))
     };
 
     worker.postMessage({ type: 'run', ...payload });
+  });
+
+  const getNotebookCSharpWorker = () => {
+    if (!notebookCSharpWorkerRef.current) {
+      notebookCSharpWorkerRef.current = new Worker(new URL('./csharp-runner.worker.ts', import.meta.url));
+    }
+    return notebookCSharpWorkerRef.current;
+  };
+
+  const terminateNotebookCSharpWorker = (error = new Error('C# notebook runner was stopped.')) => {
+    const rejectActiveRun = notebookCSharpWorkerRunRejectRef.current;
+    notebookCSharpWorkerRunRejectRef.current = null;
+    notebookCSharpWorkerRef.current?.terminate();
+    notebookCSharpWorkerRef.current = null;
+    notebookCSharpInitializedContextsRef.current.clear();
+    rejectActiveRun?.(error);
+  };
+
+  const runCSharpInNotebookWorker = (
+    payload: {
+      code: string;
+      contextId: string;
+      resetContext?: boolean;
+      sourcePath: string;
+      configuration: CSharpProjectConfiguration;
+      includeNamespaces?: string[];
+    },
+    handlers: {
+      onStdout?: (text: string) => void;
+      onStderr?: (text: string) => void;
+      signal?: AbortSignal;
+    } = {}
+  ): Promise<any> => new Promise((resolve, reject) => {
+    if (notebookCSharpWorkerRunRejectRef.current) {
+      reject(new Error('Another C# notebook cell is already running.'));
+      return;
+    }
+    if (handlers.signal?.aborted) {
+      reject(new DOMException('Notebook execution was interrupted.', 'AbortError'));
+      return;
+    }
+
+    const worker = getNotebookCSharpWorker();
+    let settled = false;
+    const handleAbort = () => {
+      terminateNotebookCSharpWorker(new DOMException('Notebook execution was interrupted.', 'AbortError'));
+    };
+    const finish = (callback: () => void) => {
+      if (settled) return;
+      settled = true;
+      handlers.signal?.removeEventListener('abort', handleAbort);
+      notebookCSharpWorkerRunRejectRef.current = null;
+      worker.onmessage = null;
+      worker.onerror = null;
+      callback();
+    };
+
+    notebookCSharpWorkerRunRejectRef.current = error => finish(() => reject(error));
+    handlers.signal?.addEventListener('abort', handleAbort, { once: true });
+
+    worker.onmessage = event => {
+      const message = event.data || {};
+      if (message.type === 'stdout' && typeof message.text === 'string') {
+        handlers.onStdout?.(message.text);
+        return;
+      }
+      if (message.type === 'stderr' && typeof message.text === 'string') {
+        handlers.onStderr?.(message.text);
+        return;
+      }
+      if (
+        message.type === 'stdin-request'
+        && message.headerBuffer instanceof SharedArrayBuffer
+        && message.payloadBuffer instanceof SharedArrayBuffer
+      ) {
+        void performRuntimeInteraction(
+          'csharp',
+          settings.csharpIOMode,
+          'stdin',
+          typeof message.prompt === 'string' && message.prompt ? message.prompt : 'C# stdin> ',
+          ''
+        ).then(value => {
+          completeSharedBufferInteraction(
+            message.headerBuffer,
+            message.payloadBuffer,
+            { value: value ?? '' }
+          );
+        }).catch(error => {
+          completeSharedBufferInteraction(
+            message.headerBuffer,
+            message.payloadBuffer,
+            { __codecraftError: error instanceof Error ? error.message : String(error) }
+          );
+        });
+        return;
+      }
+      if (message.type === 'done') {
+        finish(() => resolve(message.result));
+        return;
+      }
+      if (message.type === 'error') {
+        finish(() => reject(new Error(
+          typeof message.message === 'string' ? message.message : 'C# notebook execution failed.'
+        )));
+      }
+    };
+
+    worker.onerror = event => {
+      terminateNotebookCSharpWorker(new Error(event.message || 'C# notebook execution failed.'));
+    };
+
+    worker.postMessage({ type: 'run', mode: 'script-context', ...payload });
   });
 
   const installPyodideExecutionTimeoutGuard = (pyodide: any, timeoutMs: number) => {
@@ -13061,6 +13319,364 @@ json.dumps(_codecraft_files)
     }
   };
 
+  const createPythonNotebookSession = (pyodide: any, notebookId: string): PythonNotebookSession => {
+    const existing = pythonNotebookNamespacesRef.current.get(notebookId);
+    if (existing) return existing;
+
+    const globals = pyodide.runPython('dict()');
+    globals.set('__name__', '__main__');
+    globals.set('__package__', null);
+    const session = { globals, cwd: '/workspace' } satisfies PythonNotebookSession;
+    pythonNotebookNamespacesRef.current.set(notebookId, session);
+    return session;
+  };
+
+  const preparePythonNotebookHistory = async (
+    pyodide: any,
+    session: PythonNotebookSession,
+    request: NotebookRuntimeExecutionRequest
+  ) => {
+    session.globals.set('__codecraft_cell_source__', request.source);
+    session.globals.set('__codecraft_execution_count__', request.executionCount);
+    session.globals.set('__file__', `/workspace/${normalizeRuntimeWorkspacePath(request.virtualPath, 'notebook-cell.py')}`);
+    await pyodide.runPythonAsync(`
+if "In" not in globals() or not isinstance(In, list):
+    In = [""]
+if "Out" not in globals() or not isinstance(Out, dict):
+    Out = {}
+while len(In) <= __codecraft_execution_count__:
+    In.append("")
+In[__codecraft_execution_count__] = __codecraft_cell_source__
+_ih = In
+_oh = Out
+__codecraft_display_values__ = []
+
+def __codecraft_display(*values, raw=False, metadata=None, display_id=None, **_kwargs):
+    for value in values:
+        __codecraft_display_values__.append((value, bool(raw), metadata or {}, display_id))
+
+def __codecraft_clear_output(wait=False):
+    __codecraft_display_values__.clear()
+
+display = __codecraft_display
+clear_output = __codecraft_clear_output
+`, { globals: session.globals, filename: request.virtualPath });
+    session.globals.delete('__codecraft_cell_source__');
+  };
+
+  const collectPythonNotebookDisplays = async (
+    pyodide: any,
+    session: PythonNotebookSession,
+    result: any,
+    executionCount: number
+  ): Promise<NotebookRuntimeOutput[]> => {
+    const hasResult = result !== undefined && result !== null;
+    if (hasResult) session.globals.set('__codecraft_last_result__', result);
+    session.globals.set('__codecraft_has_last_result__', hasResult);
+    session.globals.set('__codecraft_result_execution_count__', executionCount);
+
+    const serialized = await pyodide.runPythonAsync(`
+import base64 as __cc_base64
+import io as __cc_io
+import json as __cc_json
+import sys as __cc_sys
+
+def __cc_json_safe(value):
+    if isinstance(value, bytes):
+        return __cc_base64.b64encode(value).decode("ascii")
+    try:
+        __cc_json.dumps(value)
+        return value
+    except Exception:
+        return str(value)
+
+def __cc_mime_bundle(value, raw=False, supplied_metadata=None):
+    metadata = supplied_metadata if isinstance(supplied_metadata, dict) else {}
+    if raw and isinstance(value, dict):
+        return {
+            "data": {str(key): __cc_json_safe(item) for key, item in value.items()},
+            "metadata": metadata,
+        }
+
+    data = {}
+    mime_bundle = getattr(value, "_repr_mimebundle_", None)
+    if callable(mime_bundle):
+        try:
+            bundle_value = mime_bundle(include=None, exclude=None)
+            if isinstance(bundle_value, tuple) and len(bundle_value) == 2:
+                bundle_value, bundle_metadata = bundle_value
+                if isinstance(bundle_metadata, dict):
+                    metadata = bundle_metadata
+            if isinstance(bundle_value, dict):
+                data.update({str(key): __cc_json_safe(item) for key, item in bundle_value.items()})
+        except Exception:
+            pass
+
+    for mime, method_name in (
+        ("text/html", "_repr_html_"),
+        ("text/markdown", "_repr_markdown_"),
+        ("text/latex", "_repr_latex_"),
+        ("image/svg+xml", "_repr_svg_"),
+        ("image/png", "_repr_png_"),
+        ("image/jpeg", "_repr_jpeg_"),
+        ("application/json", "_repr_json_"),
+    ):
+        if mime in data:
+            continue
+        method = getattr(value, method_name, None)
+        if not callable(method):
+            continue
+        try:
+            represented = method()
+            if represented is not None:
+                data[mime] = __cc_json_safe(represented)
+        except Exception:
+            pass
+
+    if "text/plain" not in data:
+        try:
+            data["text/plain"] = repr(value)
+        except Exception:
+            data["text/plain"] = str(value)
+    return {"data": data, "metadata": metadata}
+
+__cc_outputs = []
+for __cc_value, __cc_raw, __cc_metadata, __cc_display_id in list(__codecraft_display_values__):
+    __cc_bundle = __cc_mime_bundle(__cc_value, __cc_raw, __cc_metadata)
+    __cc_output = {
+        "output_type": "display_data",
+        "data": __cc_bundle["data"],
+        "metadata": __cc_bundle["metadata"],
+    }
+    if __cc_display_id:
+        __cc_output["transient"] = {"display_id": str(__cc_display_id)}
+    __cc_outputs.append(__cc_output)
+
+if "matplotlib.pyplot" in __cc_sys.modules:
+    try:
+        __cc_plt = __cc_sys.modules["matplotlib.pyplot"]
+        for __cc_number in list(__cc_plt.get_fignums()):
+            __cc_figure = __cc_plt.figure(__cc_number)
+            __cc_buffer = __cc_io.BytesIO()
+            __cc_figure.savefig(__cc_buffer, format="png", bbox_inches="tight")
+            __cc_outputs.append({
+                "output_type": "display_data",
+                "data": {"image/png": __cc_base64.b64encode(__cc_buffer.getvalue()).decode("ascii")},
+                "metadata": {},
+            })
+        __cc_plt.close("all")
+    except Exception:
+        pass
+
+if __codecraft_has_last_result__:
+    __cc_previous = globals().get("_", None)
+    globals()["___"] = globals().get("__", None)
+    globals()["__"] = __cc_previous
+    globals()["_"] = __codecraft_last_result__
+    Out[__codecraft_result_execution_count__] = __codecraft_last_result__
+    __cc_bundle = __cc_mime_bundle(__codecraft_last_result__)
+    __cc_outputs.append({
+        "output_type": "execute_result",
+        "data": __cc_bundle["data"],
+        "metadata": __cc_bundle["metadata"],
+        "execution_count": __codecraft_result_execution_count__,
+    })
+
+__codecraft_display_values__.clear()
+__cc_serialized = __cc_json.dumps(__cc_outputs)
+for __cc_name in (
+    "__codecraft_last_result__",
+    "__codecraft_has_last_result__",
+    "__codecraft_result_execution_count__",
+):
+    globals().pop(__cc_name, None)
+__cc_serialized
+`, { globals: session.globals, filename: '<codecraft-notebook-display>' });
+
+    try {
+      const parsed = JSON.parse(String(serialized || '[]'));
+      return Array.isArray(parsed) ? parsed as NotebookRuntimeOutput[] : [];
+    } catch {
+      return [];
+    } finally {
+      try { result?.destroy?.(); } catch { }
+    }
+  };
+
+  const executePythonNotebookCell = async (
+    request: NotebookRuntimeExecutionRequest
+  ): Promise<NotebookRuntimeExecutionResult> => {
+    const startedAt = performance.now();
+    const timeoutMs = normalizeExecutionTimeoutMs(settings.pythonExecutionTimeoutMs);
+    const outputs: NotebookRuntimeOutput[] = [];
+    const decoder = new TextDecoder();
+    const flushStdout = () => {
+      try { appendNotebookStreamOutput(outputs, 'stdout', decoder.decode()); } catch { }
+    };
+    const projectRoot = '/workspace';
+    let initialRuntimeFiles = new Map<string, string>();
+    let activePyodide: any = null;
+    let activeSession: PythonNotebookSession | null = null;
+    let executionStarted = false;
+
+    try {
+      await ensurePyodideWithPackages(message => setExecutionStartupStatus(message));
+      clearPyodideIdleTimer();
+      const pyodide = (window as any).pyodide;
+      if (!pyodide) throw new Error('Python runtime is unavailable.');
+      activePyodide = pyodide;
+      const usesMicropip = /\b(?:import\s+micropip|from\s+micropip\b|micropip\.)/.test(request.code);
+      if (usesMicropip) {
+        await pyodide.loadPackage('micropip');
+      }
+      await ensurePyodideUsesTypeshedSurface(request.code, usesMicropip ? ['micropip'] : []);
+
+      pyodide.setStdout({
+        write: (buffer: Uint8Array) => {
+          const safeBuffer = buffer.buffer instanceof SharedArrayBuffer ? new Uint8Array(buffer) : buffer;
+          appendNotebookStreamOutput(outputs, 'stdout', decoder.decode(safeBuffer, { stream: true }));
+          return buffer.length;
+        },
+      });
+      pyodide.setStderr({
+        batched: (text: string) => appendNotebookStreamOutput(
+          outputs,
+          'stderr',
+          text.endsWith('\n') ? text : `${text}\n`
+        ),
+      });
+
+      if (settings.pythonIOMode === 'interactive-output-panel') {
+        selectDockPanel('output');
+        pyodide.setStdin({
+          stdin: () => { throw new Error('Python stdin must be read through the interactive Output panel.'); },
+          isatty: true,
+        });
+        await installPyodideInlineInputOverride(pyodide, requestPythonInteractiveOutputInput);
+      } else {
+        pyodide.setStdin({ stdin: () => requestPythonInput(''), isatty: true });
+      }
+
+      const runtimeFiles = getRuntimeWorkspaceFilesFromExplorer(filesRef.current);
+      initialRuntimeFiles = buildRuntimeWorkspaceInitialFileMap(runtimeFiles);
+      try { pyodide.runPython('import os; os.chdir("/")'); } catch { }
+      writePythonRuntimeFiles(pyodide, projectRoot, runtimeFiles);
+
+      const session = createPythonNotebookSession(pyodide, request.notebookId);
+      activeSession = session;
+      const requestedCwd = session.cwd || projectRoot;
+      session.globals.set('__codecraft_requested_cwd__', requestedCwd);
+      session.globals.set('__codecraft_project_root__', projectRoot);
+      session.globals.set('__codecraft_notebook_dir__', getNotebookDirectory(request.filePath));
+      await pyodide.runPythonAsync(`
+import os
+import sys
+
+__cc_notebook_dir = os.path.join(__codecraft_project_root__, __codecraft_notebook_dir__.strip("/"))
+for __cc_candidate in (__cc_notebook_dir, __codecraft_project_root__):
+    if __cc_candidate and __cc_candidate not in sys.path:
+        sys.path.insert(0, __cc_candidate)
+if os.path.isdir(__codecraft_requested_cwd__):
+    os.chdir(__codecraft_requested_cwd__)
+elif os.path.isdir(__cc_notebook_dir):
+    os.chdir(__cc_notebook_dir)
+else:
+    os.chdir(__codecraft_project_root__)
+`, { globals: session.globals, filename: '<codecraft-notebook-setup>' });
+      session.globals.delete('__codecraft_requested_cwd__');
+      session.globals.delete('__codecraft_project_root__');
+      session.globals.delete('__codecraft_notebook_dir__');
+
+      await preparePythonNotebookHistory(pyodide, session, request);
+      installPyodideExecutionTimeoutGuard(pyodide, timeoutMs);
+      executionStarted = true;
+
+      const executeCode = () => pyodide.runPythonAsync(request.code, {
+        globals: session.globals,
+        locals: session.globals,
+        filename: request.virtualPath,
+      });
+      const executeWithAbort = async () => {
+        if (!request.signal) return executeCode();
+        if (request.signal.aborted) throw new DOMException('Notebook execution was interrupted.', 'AbortError');
+        return new Promise<any>((resolve, reject) => {
+          const handleAbort = () => {
+            unloadPyodide();
+            reject(new DOMException('Notebook execution was interrupted.', 'AbortError'));
+          };
+          request.signal?.addEventListener('abort', handleAbort, { once: true });
+          void executeCode().then(resolve, reject).finally(() => {
+            request.signal?.removeEventListener('abort', handleAbort);
+          });
+        });
+      };
+
+      const result = await withExecutionTimeout(
+        'Python notebook execution',
+        timeoutMs,
+        executeWithAbort,
+        () => unloadPyodide()
+      );
+      flushStdout();
+      outputs.push(...await collectPythonNotebookDisplays(pyodide, session, result, request.executionCount));
+      session.cwd = String(await pyodide.runPythonAsync('import os; os.getcwd()', { globals: session.globals }));
+      syncRuntimeWorkspaceFilesToExplorer(
+        initialRuntimeFiles,
+        await collectPyodideRuntimeWorkspaceFiles(pyodide, projectRoot)
+      );
+      setExecutionStartupStatus('');
+      return { outputs, durationMs: performance.now() - startedAt };
+    } catch (error) {
+      flushStdout();
+      if (
+        executionStarted
+        && activePyodide
+        && activeSession
+        && (window as any).pyodide === activePyodide
+      ) {
+        // Jupyter keeps display/file/cwd side effects produced before an
+        // exception. Recover them while the local process is still healthy.
+        try {
+          outputs.push(...await collectPythonNotebookDisplays(
+            activePyodide,
+            activeSession,
+            null,
+            request.executionCount
+          ));
+        } catch { }
+        try {
+          activeSession.cwd = String(await activePyodide.runPythonAsync(
+            'import os; os.getcwd()',
+            { globals: activeSession.globals }
+          ));
+        } catch { }
+        try {
+          syncRuntimeWorkspaceFilesToExplorer(
+            initialRuntimeFiles,
+            await collectPyodideRuntimeWorkspaceFiles(activePyodide, projectRoot)
+          );
+        } catch { }
+      }
+      const normalizedError = normalizePythonExecutionError(error, timeoutMs);
+      outputs.push(createNotebookErrorOutput(normalizedError, 'PythonError'));
+      setExecutionStartupStatus('');
+      return {
+        outputs,
+        durationMs: performance.now() - startedAt,
+        sessionRestarted: !(window as any).pyodide,
+      };
+    } finally {
+      if ((window as any).pyodide) {
+        clearPyodideInlineInputOverride((window as any).pyodide);
+        clearPyodideExecutionTimeoutGuard((window as any).pyodide);
+      }
+      // Notebook globals are intentionally persistent. The normal Python lifecycle
+      // setting still controls ordinary file runs, but notebook execution keeps the
+      // local scripted context alive until Restart or Interrupt.
+      clearPyodideIdleTimer();
+    }
+  };
+
   const runPythonProject = async (
     projectFiles: ProjectSourceFile[],
     entryFile: ProjectSourceFile
@@ -13339,6 +13955,271 @@ finally:
     const namespaces = [...new Set(namespaceNames.map(name => name.trim()).filter(Boolean))];
     if (namespaces.length === 0) return [];
     return BrowserCSharp.includeNamespaces(namespaces);
+  };
+
+  const inlineNotebookCSharpLoads = (
+    code: string,
+    notebookPath: string,
+    seen = new Set<string>()
+  ): string => code.split(/\r?\n/).map(line => {
+    const directive = line.match(/^\s*(?:#load|#!import)\s+(?:--file\s+)?["']([^"']+)["']\s*;?\s*$/i);
+    if (!directive) return line;
+
+    const requestedPath = resolveNotebookRelativePath(notebookPath, directive[1]);
+    if (!requestedPath) {
+      throw new Error(`C# notebook import has an invalid path: ${directive[1]}`);
+    }
+    if (seen.has(requestedPath)) {
+      throw new Error(`C# notebook import cycle detected at ${requestedPath}.`);
+    }
+    const sourceFile = filesRef.current.find(item => (
+      item.type === 'file'
+      && normalizeProjectPath(getFsItemPath(filesRef.current, item.id)) === requestedPath
+    ));
+    if (!sourceFile) {
+      throw new Error(`C# notebook import was not found in the project: ${requestedPath}`);
+    }
+    if (!/\.(?:cs|csx)$/i.test(sourceFile.name)) {
+      throw new Error(`C# notebook imports support .cs and .csx files, not ${sourceFile.name}.`);
+    }
+
+    const nextSeen = new Set(seen);
+    nextSeen.add(requestedPath);
+    const imported = inlineNotebookCSharpLoads(sourceFile.content || '', requestedPath, nextSeen);
+    return `#line 1 ${JSON.stringify(requestedPath)}\n${imported}\n#line default`;
+  }).join('\n');
+
+  const executeCSharpNotebookCell = async (
+    request: NotebookRuntimeExecutionRequest
+  ): Promise<NotebookRuntimeExecutionResult> => {
+    const startedAt = performance.now();
+    const outputs: NotebookRuntimeOutput[] = [];
+    const timeoutMs = normalizeExecutionTimeoutMs(settings.csharpExecutionTimeoutMs);
+
+    try {
+      if (/^\s*#r\s+["']nuget:/im.test(request.code)) {
+        throw new Error(
+          'NuGet #r directives require a native package resolver and are not available in the browser-local C# runtime. Use Settings → C# → nuget include for bundled namespaces.'
+        );
+      }
+      if (/^\s*#i\s+/im.test(request.code)) {
+        throw new Error('C# #i search-path directives are not available in the browser-local runtime. Use a project-relative #load path.');
+      }
+
+      setExecutionStartupStatus('Loading the local C# notebook runtime...');
+      if (settings.csharpIOMode === 'interactive-output-panel') {
+        selectDockPanel('output');
+      }
+
+      const sourcePath = normalizeRuntimeWorkspacePath(request.virtualPath, 'notebook-cell.csx');
+      const projectContext = getCSharpProjectContext(sourcePath);
+      const configurationKey = Math.abs(
+        hashString(JSON.stringify(projectContext.configuration))
+      ).toString(36);
+      const sessionBase = `${activeProjectId}:${request.notebookId}:${configurationKey}`;
+      const epoch = notebookCSharpSessionEpochRef.current.get(sessionBase) || 0;
+      if (!notebookCSharpSessionEpochRef.current.has(sessionBase)) {
+        notebookCSharpSessionEpochRef.current.set(sessionBase, epoch);
+      }
+      const contextId = `codecraft-csharp-notebook:${sessionBase}:${epoch}`;
+      const isFirstSubmission = !notebookCSharpInitializedContextsRef.current.has(contextId);
+
+      let code = inlineNotebookCSharpLoads(request.code, request.filePath);
+      if (isFirstSubmission && projectContext.generatedGlobalUsingsSource) {
+        const projectUsings = projectContext.generatedGlobalUsingsSource.replace(/\bglobal\s+using\b/g, 'using');
+        code = `${projectUsings}\n#line 1 ${JSON.stringify(sourcePath)}\n${code}`;
+      }
+
+      let streamedStdout = '';
+      let streamedStderr = '';
+      const result = await withExecutionTimeout(
+        'C# notebook execution',
+        timeoutMs,
+        () => runCSharpInNotebookWorker({
+          code,
+          contextId,
+          sourcePath,
+          configuration: projectContext.configuration,
+          includeNamespaces: loadSavedCSharpNamespaces(),
+        }, {
+          signal: request.signal,
+          onStdout: text => { streamedStdout += text; },
+          onStderr: text => { streamedStderr += text; },
+        }),
+        () => terminateNotebookCSharpWorker(
+          createExecutionTimeoutError('C# notebook execution', timeoutMs)
+        )
+      );
+
+      const stdOut = streamedStdout || String(result?.stdOut || '');
+      const runtimeStdErr = String(result?.stdErr || '');
+      appendNotebookStreamOutput(outputs, 'stdout', stdOut);
+      appendNotebookStreamOutput(outputs, 'stderr', streamedStderr);
+
+      const hasCompilationError = /\berror\s+CS\d+/i.test(runtimeStdErr);
+      if (!hasCompilationError) {
+        // Roslyn advances a submission context before running it, so even a cell
+        // that throws at runtime owns the first-submission imports from now on.
+        notebookCSharpInitializedContextsRef.current.add(contextId);
+      }
+      if (runtimeStdErr) {
+        outputs.push(createNotebookErrorOutput(runtimeStdErr, hasCompilationError ? 'CompilationError' : 'CSharpError'));
+      }
+
+      const returnValue = formatRuntimeReturnValue(result?.result);
+      if (returnValue) {
+        const data: Record<string, unknown> = { 'text/plain': returnValue };
+        if (result?.result && typeof result.result === 'object') {
+          try { data['application/json'] = result.result; } catch { }
+        }
+        outputs.push({
+          output_type: 'execute_result',
+          data,
+          metadata: {},
+          execution_count: request.executionCount,
+        });
+      }
+
+      setExecutionStartupStatus('');
+      return { outputs, durationMs: performance.now() - startedAt };
+    } catch (error) {
+      setExecutionStartupStatus('');
+      outputs.push(createNotebookErrorOutput(error, 'CSharpError'));
+      return {
+        outputs,
+        durationMs: performance.now() - startedAt,
+        sessionRestarted: !notebookCSharpWorkerRef.current,
+      };
+    }
+  };
+
+  const executeNotebookCell = async (
+    request: NotebookRuntimeExecutionRequest
+  ): Promise<NotebookRuntimeExecutionResult> => {
+    const previous = notebookExecutionQueueRef.current;
+    let releaseQueue!: () => void;
+    notebookExecutionQueueRef.current = new Promise<void>(resolve => {
+      releaseQueue = resolve;
+    });
+
+    await previous.catch(() => {});
+    try {
+      if (request.signal?.aborted) {
+        return {
+          outputs: [createNotebookErrorOutput(
+            new DOMException('Notebook execution was interrupted.', 'AbortError'),
+            'Interrupted'
+          )],
+          durationMs: 0,
+          sessionRestarted: true,
+        };
+      }
+      return request.language === 'csharp'
+        ? executeCSharpNotebookCell(request)
+        : executePythonNotebookCell(request);
+    } finally {
+      releaseQueue();
+    }
+  };
+
+  const restartNotebookRuntime = async (notebookId: string) => {
+    // Never invalidate a globals proxy or Roslyn context while a queued cell is
+    // still using it. NotebookEditor aborts first for an explicit restart; this
+    // await also makes programmatic restart calls safe.
+    await notebookExecutionQueueRef.current.catch(() => {});
+
+    // Pyodide is process-wide: clearing only one globals dictionary leaves
+    // sys.modules, environment variables, monkey patches, and cwd behind. A real
+    // notebook restart therefore unloads the shared local process and recreates
+    // every Python notebook session on demand.
+    if ((window as any).pyodide || pythonNotebookNamespacesRef.current.size > 0) {
+      unloadPyodide();
+    }
+
+    const csharpSessionPrefix = `${activeProjectId}:${notebookId}:`;
+    for (const [sessionBase, epoch] of notebookCSharpSessionEpochRef.current) {
+      if (sessionBase.startsWith(csharpSessionPrefix)) {
+        notebookCSharpSessionEpochRef.current.set(sessionBase, epoch + 1);
+      }
+    }
+    for (const contextId of [...notebookCSharpInitializedContextsRef.current]) {
+      if (contextId.startsWith(`codecraft-csharp-notebook:${csharpSessionPrefix}`)) {
+        notebookCSharpInitializedContextsRef.current.delete(contextId);
+      }
+    }
+    setExecutionStartupStatus('Notebook script contexts restarted (shared local Python sessions were reset).');
+    window.setTimeout(() => setExecutionStartupStatus(''), 1200);
+  };
+
+  const interruptNotebookRuntime = (_notebookId: string) => {
+    // Both local runtimes are process-like singletons. Terminating them is the
+    // dependable way to interrupt tight WASM/native loops; all notebook contexts
+    // are consequently restarted, matching a kernel-death notification.
+    if ((window as any).pyodide) unloadPyodide();
+    if (notebookCSharpWorkerRef.current) {
+      terminateNotebookCSharpWorker(new DOMException('Notebook execution was interrupted.', 'AbortError'));
+    }
+    notebookCSharpSessionEpochRef.current.clear();
+    notebookCSharpInitializedContextsRef.current.clear();
+    setExecutionStartupStatus('Notebook execution interrupted; local script contexts were restarted.');
+  };
+
+  const readNotebookWorkspaceFile = (notebookPath: string, requestedPath: string) => {
+    const resolvedPath = resolveNotebookRelativePath(notebookPath, requestedPath);
+    const file = filesRef.current.find(item => (
+      item.type === 'file'
+      && normalizeProjectPath(getFsItemPath(filesRef.current, item.id)) === resolvedPath
+    ));
+    return file?.type === 'file' ? file.content || '' : null;
+  };
+
+  const listNotebookWorkspaceFiles = (notebookPath: string, requestedPath = '') => {
+    const directoryPath = requestedPath.trim()
+      ? resolveNotebookRelativePath(notebookPath, requestedPath)
+      : getNotebookDirectory(notebookPath);
+    const prefix = directoryPath ? `${directoryPath}/` : '';
+    const entries = new Set<string>();
+    for (const item of filesRef.current) {
+      const itemPath = normalizeProjectPath(getFsItemPath(filesRef.current, item.id));
+      if (itemPath === directoryPath && item.type === 'file') {
+        entries.add(item.name);
+        continue;
+      }
+      if (!itemPath.startsWith(prefix)) continue;
+      const relative = itemPath.slice(prefix.length);
+      const firstSegment = relative.split('/')[0];
+      if (firstSegment) entries.add(firstSegment);
+    }
+    return [...entries].sort((left, right) => left.localeCompare(right));
+  };
+
+  const writeNotebookWorkspaceFile = (
+    notebookPath: string,
+    requestedPath: string,
+    content: string,
+    append: boolean
+  ) => {
+    const resolvedPath = resolveNotebookRelativePath(notebookPath, requestedPath);
+    if (!resolvedPath || isNotebookPath(resolvedPath) && resolvedPath === normalizeProjectPath(notebookPath)) {
+      throw new Error('A notebook cell cannot overwrite its own .ipynb document with %%writefile.');
+    }
+    const currentFiles = filesRef.current;
+    const existing = currentFiles.find(item => (
+      item.type === 'file'
+      && normalizeProjectPath(getFsItemPath(currentFiles, item.id)) === resolvedPath
+    ));
+    const nextContent = append && existing?.type === 'file'
+      ? `${existing.content || ''}${content}`
+      : content;
+    const nextFiles = upsertRuntimeWorkspaceFilesIntoExplorer(
+      currentFiles,
+      [{ path: resolvedPath, content: nextContent }]
+    );
+    // Magic commands are sequential, so make the canonical snapshot visible
+    // before the following %run/%load or runtime cell is allowed to start.
+    filesRef.current = nextFiles;
+    setFiles(nextFiles);
+    return resolvedPath;
   };
 
   const runCSharp = async (code: string, fileId: string) => {
@@ -13956,6 +14837,26 @@ finally:
   };
 
   const handleRun = async () => {
+    if (activeNotebookFile) {
+      const controller = notebookControllersRef.current.get(activeNotebookFile.id);
+      if (!controller) {
+        clearOutputPreview();
+        setExecutionStartupStatus('');
+        setOutput('Error: The active notebook is still initializing. Focus a cell and try again.');
+        return;
+      }
+
+      setIsRunning(true);
+      try {
+        await controller.runSelected();
+      } catch (error) {
+        setOutput(`Error: ${error instanceof Error ? error.message : 'Notebook execution failed'}`);
+      } finally {
+        setIsRunning(false);
+      }
+      return;
+    }
+
     const currentFile = activeRunnableFile?.type === 'file'
       ? activeRunnableFile as FSItem & { type: 'file' }
       : null;
@@ -20578,6 +21479,35 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
                 </div>
               </div>
             </div>
+          ) : isNotebookFileItem(tabItem) ? (
+            <div className="min-h-0 flex-1 overflow-hidden bg-[rgb(28,28,28)]">
+              <NotebookEditor
+                fileId={tabItem.id}
+                filePath={getPath(tabItem.id)}
+                content={tabItem.content || ''}
+                fontSize={settings.fontSize}
+                theme={CODECRAFT_MONACO_THEME}
+                onMountEditor={handleEditorMount}
+                onExecute={executeNotebookCell}
+                onRestart={restartNotebookRuntime}
+                onInterrupt={interruptNotebookRuntime}
+                onReadWorkspaceFile={readNotebookWorkspaceFile}
+                onWriteWorkspaceFile={writeNotebookWorkspaceFile}
+                onListWorkspaceFiles={listNotebookWorkspaceFiles}
+                onRegisterController={(controller) => {
+                  if (controller) notebookControllersRef.current.set(tabItem.id, controller);
+                  else notebookControllersRef.current.delete(tabItem.id);
+                }}
+                onChange={(nextContent) => {
+                  const currentFiles = filesRef.current;
+                  const nextFiles = currentFiles.map(file => (
+                    file.id === tabItem.id ? { ...file, content: nextContent } : file
+                  ));
+                  filesRef.current = nextFiles;
+                  setFiles(nextFiles);
+                }}
+              />
+            </div>
           ) : (
             <div className="flex-1 overflow-hidden bg-[rgb(28,28,28)] w-full min-h-0 relative">
               {shouldRenderSharedEditor ? (
@@ -20592,7 +21522,7 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
                   language={tabItem.language}
                   theme={CODECRAFT_MONACO_THEME}
                   value={tabItem.content}
-                  onMount={handleEditorMount}
+                  onMount={handleSharedEditorMount}
                   onChange={(value) => {
                     const nextContent = value || '';
                     setFiles(prev => {
@@ -22998,6 +23928,10 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
                         </div>
                       </label>
 
+                      <div className="rounded-xl border border-indigo-500/20 bg-indigo-500/5 px-3 py-2 text-xs leading-relaxed text-indigo-200/80">
+                        Python notebook cells always use a persistent notebook-local script context. Use the notebook toolbar to interrupt or restart it; timeout, I/O, packages, and project authoring settings still apply.
+                      </div>
+
                       <label className="block space-y-2">
                         <div className="text-xs font-medium uppercase tracking-wide text-zinc-500">I/O Mode</div>
                         <select
@@ -23102,6 +24036,10 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
                               : 'Runs as a Roslyn script and keeps state per file between runs.'}
                         </div>
                       </label>
+
+                      <div className="rounded-xl border border-indigo-500/20 bg-indigo-500/5 px-3 py-2 text-xs leading-relaxed text-indigo-200/80">
+                        C# notebook cells always run as chained Roslyn script-context submissions, independent of this normal-file mode. Project references, global usings, authoring, timeout, and I/O settings still apply.
+                      </div>
 
                       <label className="block space-y-2">
                         <div className="text-xs font-medium uppercase tracking-wide text-zinc-500">I/O Mode</div>
