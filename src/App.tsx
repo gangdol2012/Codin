@@ -49,7 +49,21 @@ import {
 } from 'lucide-react';
 import Editor, { DiffEditor } from '@monaco-editor/react';
 import NotebookEditor from './notebook-editor';
+import {
+  NOTEBOOK_CLI_USAGE_LINES,
+  executeNotebookRequest,
+  formatNotebookForAssistant,
+  parseNotebookCliArgs,
+  type NotebookCommandRequest,
+  type NotebookCommandResult,
+} from './notebook-cli';
+import { parseNotebookAssistantRequest } from './notebook-assistant';
 import { configureMonacoSuggestionAcceptance } from './monaco-suggest';
+import {
+  applyNotebookWorkspaceContentUpdate,
+  resolveNotebookWorkspaceFile,
+} from './notebook-workspace';
+import { tryParseTerminalArgs } from './terminal-args';
 import { CODECRAFT_MONACO_THEME } from './python-coloring';
 import { motion, AnimatePresence } from 'motion/react';
 import { clsx, type ClassValue } from 'clsx';
@@ -1713,6 +1727,11 @@ function normalizeCursorLocalToolName(value: unknown) {
     case 'codinget':
     case 'codin':
       return 'codinGet';
+    case 'notebook':
+    case 'notebookcommand':
+    case 'editnotebook':
+    case 'ipynb':
+      return 'notebook';
     default:
       return rawName;
   }
@@ -1798,6 +1817,21 @@ function normalizeCursorLocalToolArgs(toolName: string, value: unknown): Record<
     return {
       ...source,
       symbolPath: source.symbolPath ?? source.path ?? source.query ?? source.name ?? source.text,
+    };
+  }
+
+  if (toolName === 'notebook') {
+    const cellAlias = ['cell', 'cellId', 'cellRef', 'selector']
+      .find(key => Object.prototype.hasOwnProperty.call(source, key));
+    return {
+      ...source,
+      action: source.action ?? source.operation ?? source.command ?? source.subcommand,
+      path: source.path ?? source.pathOrName ?? source.filePath ?? source.file ?? source.notebook,
+      ...(cellAlias ? { cell: source[cellAlias] } : {}),
+      source: source.source ?? source.content ?? source.text,
+      cellType: source.cellType ?? source.type,
+      index: source.index ?? source.position ?? source.targetIndex,
+      language: source.language ?? source.kernel,
     };
   }
 
@@ -1899,7 +1933,7 @@ function buildCursorLocalToolBridgeInstruction(tools: AssistantToolDefinition[])
     <codecraft-tools>
     {"message":"optional short user-facing progress note","toolCalls":[{"name":"toolName","args":{"argumentName":"value"}}]}
     </codecraft-tools>
-    If you need to edit code, use proposeEdit with the complete new file content. CodeCraft will apply that request inside the IDE review flow.
+    If you need to edit a regular text source file, use proposeEdit with the complete new file content. For a .ipynb file, use the notebook tool so CodeCraft can edit cells without replacing raw JSON.
     If the task is complete and no local tool is needed, respond normally without a <codecraft-tools> block.
     Allowed CodeCraft local tools:
     ${JSON.stringify(toolSchemas, null, 2)}
@@ -2032,10 +2066,10 @@ function getOpenAIChatReasoningRequestOptions(
 
 const proposeEditTool: AssistantToolDefinition = {
   name: "proposeEdit",
-  description: "Propose changes to a file for user review.",
+  description: "Propose changes to a regular text file for user review. Do not use this for .ipynb files; use the notebook tool so cells and notebook metadata are handled safely.",
   parameters: {
     type: 'object',
-    description: "Propose changes to a file for user review.",
+    description: "Propose changes to a regular text file for user review. Notebook files must use the notebook tool.",
     properties: {
       pathOrName: {
         type: 'string',
@@ -2153,7 +2187,7 @@ const moveItemTool: AssistantToolDefinition = {
 
 const runTerminalCommandTool: AssistantToolDefinition = {
   name: "runTerminalCommand",
-  description: "Run any command supported by the built-in terminal emulator, including git, gh, docs, codin, pip, npm, nuget, and help.",
+  description: "Run any command supported by the built-in terminal emulator, including notebook, git, gh, docs, codin, pip, npm, nuget, and help.",
   parameters: {
     type: 'object',
     description: "Run any command supported by the built-in terminal emulator.",
@@ -2164,6 +2198,49 @@ const runTerminalCommandTool: AssistantToolDefinition = {
       },
     },
     required: ["command"],
+  },
+};
+
+const notebookTool: AssistantToolDefinition = {
+  name: "notebook",
+  description: "Inspect or edit a Jupyter .ipynb notebook by cell without reading or replacing its raw JSON. Cell references are stable cell IDs or explicit 1-based references such as #2.",
+  parameters: {
+    type: 'object',
+    description: "Run a notebook-aware operation. Use show before editing when you do not already have the current cell IDs.",
+    properties: {
+      action: {
+        type: 'string',
+        description: "Notebook operation to perform.",
+        enum: ['show', 'validate', 'set-source', 'add', 'delete', 'move', 'set-type', 'duplicate', 'clear-outputs', 'set-language'],
+      },
+      path: {
+        type: 'string',
+        description: "Workspace path to the .ipynb file. Relative paths resolve only from the Terminal working directory; prefix a project-tree path with / to address it from workspace root.",
+      },
+      cell: {
+        type: 'string',
+        description: "Cell ID or explicit 1-based cell reference such as #2. Required for cell-specific operations.",
+      },
+      source: {
+        type: 'string',
+        description: "Exact cell source for set-source or add. Multiline text, quotes, Unicode, and backslashes are passed without shell escaping.",
+      },
+      cellType: {
+        type: 'string',
+        description: "Cell type for add or set-type.",
+        enum: ['code', 'markdown', 'raw'],
+      },
+      index: {
+        type: 'number',
+        description: "Optional 1-based destination position for add, move, or duplicate.",
+      },
+      language: {
+        type: 'string',
+        description: "Notebook language for set-language.",
+        enum: ['python', 'csharp'],
+      },
+    },
+    required: ['action', 'path'],
   },
 };
 
@@ -2565,6 +2642,7 @@ const STANDARD_ASSISTANT_TOOLS: AssistantToolDefinition[] = [
   moveItemTool,
   lsTool,
   runTerminalCommandTool,
+  notebookTool,
   codinGetTool,
   docsGetTool,
   docsFindTool,
@@ -2579,6 +2657,7 @@ const CHAIN_OF_THOUGHT_ASSISTANT_TOOLS: AssistantToolDefinition[] = [
   moveItemTool,
   lsTool,
   runTerminalCommandTool,
+  notebookTool,
   terminalPwdTool,
   terminalCdTool,
   terminalMkdirTool,
@@ -4858,6 +4937,65 @@ function getFsItemPath(items: FSItem[], id: string | undefined): string {
   return parentPath ? `${parentPath}/${item.name}` : item.name;
 }
 
+interface NotebookWorkspaceCommandHost {
+  /** Snapshot the caller/model saw when it decided on this operation. */
+  items: FSItem[];
+  /** Latest workspace state, used only when committing or serving a fresh read. */
+  getCurrentItems: () => FSItem[];
+  cwdId: string | null;
+  updateItems: (items: FSItem[]) => void;
+  writeTerminalResult: (command: string, lines: string[]) => void;
+}
+
+function executeNotebookWorkspaceRequest(
+  host: NotebookWorkspaceCommandHost,
+  requestedPath: string,
+  request: NotebookCommandRequest,
+  displayedCommand: string,
+): NotebookCommandResult {
+  const isReadOnly = request.command === 'show' || request.command === 'validate';
+  const items = isReadOnly ? host.getCurrentItems() : host.items;
+  const resolution = resolveNotebookWorkspaceFile(items, host.cwdId, requestedPath);
+  if ('error' in resolution) {
+    const result: NotebookCommandResult = {
+      ok: false,
+      changed: false,
+      content: '',
+      lines: [resolution.error],
+      path: resolution.path,
+      command: request.command,
+    };
+    host.writeTerminalResult(displayedCommand, result.lines);
+    return result;
+  }
+
+  const result = executeNotebookRequest(resolution.item.content || '', request, { path: resolution.path });
+  if (result.ok && !isReadOnly) {
+    const update = applyNotebookWorkspaceContentUpdate(
+      host.getCurrentItems(),
+      resolution.item.id,
+      resolution.item.content || '',
+      result.content,
+    );
+    if (update.ok === false) {
+      const conflictResult: NotebookCommandResult = {
+        ok: false,
+        changed: false,
+        content: resolution.item.content || '',
+        lines: [update.error],
+        path: resolution.path,
+        command: request.command,
+        error: { code: 'conflict', message: update.error },
+      };
+      host.writeTerminalResult(displayedCommand, conflictResult.lines);
+      return conflictResult;
+    }
+    if (update.changed) host.updateItems(update.items);
+  }
+  host.writeTerminalResult(displayedCommand, result.lines);
+  return result;
+}
+
 function normalizeRuntimeWorkspacePath(path: string, fallback = 'main.txt') {
   return normalizeProjectPath(path || fallback) || fallback;
 }
@@ -5626,9 +5764,12 @@ function formatAssistantAttachmentSummary(files: AssistantAttachmentFile[]) {
 
 function formatAssistantAttachmentPromptSection(files: AssistantAttachmentFile[]) {
   if (files.length === 0) return '';
-  return `\n\nAttached files for this user message. Each file name below is its path:\n${files.map(file => (
-    `\n<attached_file path="${file.path.replace(/"/g, '&quot;')}">\n${file.content || ''}\n</attached_file>`
-  )).join('\n')}`;
+  return `\n\nAttached files for this user message. Each file name below is its path:\n${files.map(file => {
+    const visibleContent = isNotebookPath(file.path)
+      ? formatNotebookForAssistant(file.content || '', { path: file.path })
+      : file.content || '';
+    return `\n<attached_file path="${file.path.replace(/"/g, '&quot;')}">\n${visibleContent}\n</attached_file>`;
+  }).join('\n')}`;
 }
 
 function readDataTransferDirectoryEntries(reader: any): Promise<any[]> {
@@ -5895,6 +6036,14 @@ interface AssistantToolExecutionResult {
   summary: string;
   detail: string;
   result?: unknown;
+}
+
+interface TerminalCommandOutcome {
+  command: string;
+  ok: boolean;
+  changed?: boolean;
+  lines: string[];
+  path?: string;
 }
 
 interface ResolvedProjectRun {
@@ -7780,6 +7929,7 @@ export default function App() {
   terminalOutputRef.current = terminalOutput;
   const terminalCwdRef = useRef<string | null>(terminalCwd);
   terminalCwdRef.current = terminalCwd;
+  const terminalCommandOutcomeRef = useRef<TerminalCommandOutcome | null>(null);
   const gitStateRef = useRef(gitState);
   gitStateRef.current = gitState;
   const gitStatePersistenceReadyRef = useRef(false);
@@ -9972,6 +10122,12 @@ export default function App() {
     const activeSnapshotItem = assistantActiveItemId
       ? assistantFiles.find(file => file.id === assistantActiveItemId) || null
       : null;
+    const activeSnapshotPath = activeSnapshotItem ? getPathFromSnapshot(activeSnapshotItem.id) : '';
+    const activeSnapshotVisibleContent = activeSnapshotItem?.type === 'file'
+      ? isNotebookPath(activeSnapshotPath)
+        ? formatNotebookForAssistant(activeSnapshotItem.content || '', { path: activeSnapshotPath })
+        : activeSnapshotItem.content || ''
+      : '';
     const history = messages.map(msg => `${msg.role.toUpperCase()}: ${msg.content}`).join('\n');
     const toolProgress = toolProgressNotes.length > 0
       ? `\nTurn Progress:\n${toolProgressNotes.map((note, index) => `${index + 1}. ${note}`).join('\n')}\nUse the updated workspace state above when deciding the next action. If the task is complete, respond to the user normally.`
@@ -10001,16 +10157,19 @@ export default function App() {
         omittedProjectFileCount += 1;
         return [];
       }
+      const assistantVisibleContent = isNotebookPath(path)
+        ? formatNotebookForAssistant(content, { path })
+        : content;
       const pathOverhead = path.length + language.length + 120;
       const fileBudget = Math.max(0, Math.min(maxProjectContextCharsPerFile, remainingProjectContextChars - pathOverhead));
       if (fileBudget <= 0) {
         omittedProjectFileCount += 1;
         return [];
       }
-      const truncated = content.length > fileBudget;
+      const truncated = assistantVisibleContent.length > fileBudget;
       const visibleContent = truncated
-        ? `${content.slice(0, fileBudget)}\n... [truncated ${content.length - fileBudget} character${content.length - fileBudget === 1 ? '' : 's'}]`
-        : content;
+        ? `${assistantVisibleContent.slice(0, fileBudget)}\n... [truncated ${assistantVisibleContent.length - fileBudget} character${assistantVisibleContent.length - fileBudget === 1 ? '' : 's'}]`
+        : assistantVisibleContent;
       remainingProjectContextChars -= visibleContent.length + pathOverhead;
       const escapedPath = path.replace(/"/g, '&quot;');
       const activeAttribute = file.id === assistantActiveItemId ? ' active="true"' : '';
@@ -10026,6 +10185,7 @@ export default function App() {
     `;
     const assistantCodingGuidance = `
         C# runtime constraint: Do not generate or modify code that sets System.Console.OutputEncoding, Console.OutputEncoding, or similar console encoding properties. CodeCraft manages console output encoding internally.
+        ${hasAssistantTools ? 'Jupyter notebook rule: Never use proposeEdit, terminalCat, or raw JSON replacement for a .ipynb file. Use the notebook tool instead. Prefix a path shown in the project tree with / so it resolves from workspace root. Call notebook with action="show" to inspect readable cells and stable cell IDs, then use set-source, add, delete, move, set-type, duplicate, clear-outputs, or set-language as needed. The same cell-aware operations are available to users in the Terminal through the notebook command.' : ''}
         When local tools are available, use docsGet for exact generated semantic-documentation lookups by item name. Use docsFind only for natural-language documentation search.
         ${useSemanticDocumentationFirst && hasCSharpSemanticDocumentation ? `
         The user enabled documentation-first lookup for this C# request.
@@ -10045,7 +10205,7 @@ export default function App() {
         Use local terminal tools to inspect the project one command at a time instead of assuming unseen files or folders.
         Use docsGet when the user asks for generated documentation for an exact item name.
         Use runTerminalCommand for any command supported by CodeCraft's built-in terminal, including source-control, package, documentation, and navigation commands.
-        When you want to change code, use 'proposeEdit' so the user can review it.
+        When you want to change a regular text source file, use 'proposeEdit' so the user can review it. For .ipynb files, follow the notebook rule above instead.
         Keep user-facing explanations separate from tool and edit logs.
         If you need more context, discover it through the available terminal tools.
         You have at most ${maxChainOfThoughtDepth} tool rounds available for this turn, so prioritize your steps.
@@ -10054,8 +10214,8 @@ export default function App() {
         Current terminal working directory: ${assistantTerminalCwd ? `/${getPathFromSnapshot(assistantTerminalCwd)}` : '/'}
         ${projectWorkspaceContext}
 
-        Active Item: ${activeSnapshotItem ? getPathFromSnapshot(activeSnapshotItem.id) : 'None selected'}
-        ${activeSnapshotItem ? (activeSnapshotItem.type === 'file' ? `Active file content:\n${activeSnapshotItem.content || ''}` : 'The active item is a folder.') : 'No file is currently active.'}
+        Active Item: ${activeSnapshotItem ? activeSnapshotPath : 'None selected'}
+        ${activeSnapshotItem ? (activeSnapshotItem.type === 'file' ? `Active file content:\n${activeSnapshotVisibleContent}` : 'The active item is a folder.') : 'No file is currently active.'}
 
         Chat History:
         ${history || '(empty)'}
@@ -10078,8 +10238,8 @@ export default function App() {
         Current terminal working directory: ${assistantTerminalCwd ? `/${getPathFromSnapshot(assistantTerminalCwd)}` : '/'}
         ${projectWorkspaceContext}
 
-        Active Item: ${activeSnapshotItem ? getPathFromSnapshot(activeSnapshotItem.id) : 'None selected'}
-        ${activeSnapshotItem ? (activeSnapshotItem.type === 'file' ? `Active file content:\n${activeSnapshotItem.content || ''}` : 'The active item is a folder.') : 'No file is currently active.'}
+        Active Item: ${activeSnapshotItem ? activeSnapshotPath : 'None selected'}
+        ${activeSnapshotItem ? (activeSnapshotItem.type === 'file' ? `Active file content:\n${activeSnapshotVisibleContent}` : 'The active item is a folder.') : 'No file is currently active.'}
 
         Chat History:
         ${history || '(empty)'}
@@ -10101,8 +10261,8 @@ export default function App() {
         Current terminal working directory: ${assistantTerminalCwd ? `/${getPathFromSnapshot(assistantTerminalCwd)}` : '/'}
         ${projectWorkspaceContext}
 
-        Active Item: ${activeSnapshotItem ? getPathFromSnapshot(activeSnapshotItem.id) : 'None selected'}
-        ${activeSnapshotItem ? (activeSnapshotItem.type === 'file' ? `Active file content:\n${activeSnapshotItem.content || ''}` : 'The active item is a folder.') : 'No file is currently active.'}
+        Active Item: ${activeSnapshotItem ? activeSnapshotPath : 'None selected'}
+        ${activeSnapshotItem ? (activeSnapshotItem.type === 'file' ? `Active file content:\n${activeSnapshotVisibleContent}` : 'The active item is a folder.') : 'No file is currently active.'}
 
         Chat History:
         ${history || '(empty)'}
@@ -10119,7 +10279,7 @@ export default function App() {
         Keep continuity with the existing chat history for this chat.
         You have access to tools to propose edits, navigate, move cursor, directly create/delete/move files or folders, retrieve generated documentation with docsGet, and run built-in terminal commands.
         Do not suggest terminal-style commands for filesystem operations when a tool can be used, unless the user specifically asks for it.
-        When you want to change code, use 'proposeEdit' so the user can review it.
+        When you want to change a regular text source file, use 'proposeEdit' so the user can review it. For .ipynb files, follow the notebook rule above instead.
         You may use multiple tool calls in a single response when the task needs several actions.
         If you have a plan, progress update, or explanation, include it in the same response as your tool calls. That text is shown to the user immediately.
         Do not save every explanation for one final summary if the work is happening in multiple steps.
@@ -10129,8 +10289,8 @@ export default function App() {
 
         ${projectWorkspaceContext}
 
-        Active Item: ${activeSnapshotItem ? getPathFromSnapshot(activeSnapshotItem.id) : 'None selected'}
-        ${activeSnapshotItem ? (activeSnapshotItem.type === 'file' ? `Content:\n${activeSnapshotItem.content || ''}` : 'This is a folder.') : 'No file is currently active.'}
+        Active Item: ${activeSnapshotItem ? activeSnapshotPath : 'None selected'}
+        ${activeSnapshotItem ? (activeSnapshotItem.type === 'file' ? `Content:\n${activeSnapshotVisibleContent}` : 'This is a folder.') : 'No file is currently active.'}
 
         Chat History:
         ${history || '(empty)'}
@@ -16407,8 +16567,10 @@ finally:
       };
 
       const appendTerminalCommandResult = (command: string, lines: string[] = []) => {
-        const cwdLabel = assistantTerminalCwd ? getPathFromSnapshot(assistantTerminalCwd) : '~';
-        const nextOutput = [...assistantTerminalOutput, `${cwdLabel} $ ${command}`, ...lines];
+        const liveItems = filesRef.current;
+        const liveCwd = terminalCwdRef.current;
+        const cwdLabel = liveCwd ? getFsItemPath(liveItems, liveCwd) : '~';
+        const nextOutput = [...terminalOutputRef.current, `${cwdLabel} $ ${command}`, ...lines];
         writeTerminalOutput(nextOutput);
       };
 
@@ -16420,13 +16582,24 @@ finally:
         assistantFiles = filesRef.current.map(file => ({ ...file }));
         assistantTerminalCwd = terminalCwdRef.current;
         assistantTerminalOutput = terminalOutputRef.current.slice();
+        const commandOutcome = terminalCommandOutcomeRef.current?.command === command.trim()
+          ? terminalCommandOutcomeRef.current
+          : null;
+        const succeeded = commandOutcome?.ok ?? true;
+        const resolvedSummary = succeeded
+          ? summary
+          : commandOutcome?.lines[0] || `Terminal command failed: ${command}`;
+        const resolvedDetail = commandOutcome
+          ? commandOutcome.lines.join('\n') || detail
+          : detail;
         return {
-          summary,
-          detail,
+          summary: resolvedSummary,
+          detail: resolvedDetail,
           result: {
-            ok: true,
-            summary,
-            detail,
+            ok: succeeded,
+            summary: resolvedSummary,
+            detail: resolvedDetail,
+            ...(commandOutcome ? { changed: commandOutcome.changed ?? false, path: commandOutcome.path } : {}),
             output: assistantTerminalOutput.slice(beforeOutputLength),
             currentWorkingDirectory: assistantTerminalCwd ? `/${getPathFromSnapshot(assistantTerminalCwd)}` : '/',
           },
@@ -16439,6 +16612,18 @@ finally:
           const { pathOrName, newContent } = args as any;
           const targetFile = typeof pathOrName === 'string' ? findItemInSnapshot(pathOrName) : undefined;
           if (targetFile && targetFile.type === 'file' && typeof newContent === 'string') {
+            if (isNotebookFileItem(targetFile)) {
+              const path = getPathFromSnapshot(targetFile.id);
+              return {
+                summary: `Use the notebook tool to edit \`${path}\` by cell.`,
+                detail: `Rejected raw JSON replacement for ${path}. Call notebook show, then use a cell-aware notebook action.`,
+                result: {
+                  ok: false,
+                  path,
+                  error: 'Notebook files must be edited with the notebook tool.',
+                },
+              };
+            }
             enqueuePendingEdit({
               fileId: targetFile.id,
               originalContent: targetFile.content || '',
@@ -16728,6 +16913,51 @@ finally:
           }
         }
 
+        if (call.name === 'notebook') {
+          const parsed = parseNotebookAssistantRequest(args);
+          if (parsed.ok === false) {
+            const action = typeof args.action === 'string' && args.action.trim() ? args.action.trim() : '(missing-action)';
+            const path = typeof args.path === 'string' && args.path.trim() ? ` ${quoteTerminalArg(args.path.trim())}` : '';
+            appendTerminalCommandResult(`notebook ${action}${path}`, [parsed.error]);
+            return {
+              summary: parsed.error,
+              detail: parsed.error,
+              result: { ok: false, error: parsed.error },
+            };
+          }
+
+          selectDockPanel('terminal');
+          const notebookResult = executeNotebookWorkspaceRequest({
+            items: assistantFiles,
+            getCurrentItems: () => filesRef.current,
+            cwdId: assistantTerminalCwd,
+            updateItems: updateAssistantFiles,
+            writeTerminalResult: appendTerminalCommandResult,
+          }, parsed.path, parsed.request, parsed.displayedCommand);
+          assistantFiles = filesRef.current.map(file => ({ ...file }));
+          assistantTerminalCwd = terminalCwdRef.current;
+          assistantTerminalOutput = terminalOutputRef.current.slice();
+          const detail = notebookResult.lines.join('\n');
+          const summary = notebookResult.ok
+            ? notebookResult.changed
+              ? `Updated notebook \`${notebookResult.path || parsed.path}\` with ${parsed.request.command}.`
+              : `Completed notebook ${parsed.request.command} for \`${notebookResult.path || parsed.path}\` without changing it.`
+            : notebookResult.lines[0] || `Notebook ${parsed.request.command} failed.`;
+          return {
+            summary,
+            detail,
+            result: {
+              ok: notebookResult.ok,
+              changed: notebookResult.changed,
+              path: notebookResult.path || parsed.path,
+              command: notebookResult.command || parsed.request.command,
+              ...(notebookResult.cellId ? { cellId: notebookResult.cellId } : {}),
+              lines: notebookResult.lines,
+              ...(notebookResult.error ? { error: notebookResult.error } : {}),
+            },
+          };
+        }
+
         if (call.name === 'runTerminalCommand') {
           const { command } = args as any;
           if (typeof command === 'string' && command.trim()) {
@@ -16873,11 +17103,18 @@ finally:
             appendTerminalCommandResult(`cat ${pathOrName}`, [message]);
             return { summary: message, detail: message, result: { ok: false } };
           }
-          const content = target.content || '';
+          const targetPath = getPathFromSnapshot(target.id);
+          const content = isNotebookFileItem(target)
+            ? formatNotebookForAssistant(target.content || '', { path: targetPath })
+            : target.content || '';
           appendTerminalCommandResult(`cat ${pathOrName}`, [content]);
           return {
-            summary: `Read \`${getPathFromSnapshot(target.id)}\`.`,
-            detail: `Read ${getPathFromSnapshot(target.id)}.`,
+            summary: isNotebookFileItem(target)
+              ? `Read notebook cells from \`${targetPath}\` without exposing raw JSON.`
+              : `Read \`${targetPath}\`.`,
+            detail: isNotebookFileItem(target)
+              ? `Presented a cell-aware view of ${targetPath}. Use the notebook tool for edits.`
+              : `Read ${targetPath}.`,
             result: { ok: true, content },
           };
         }
@@ -16927,6 +17164,8 @@ finally:
             'Documentation: docs find [--types N] [--members N] [--hide-reason] [--hide-docs] [--confidence|--hide-confidence] <description>',
             'Documentation: docs get <item-name>',
             'Code navigation: codin get <CSharpSymbolPath> (C#)',
+            'Jupyter notebooks:',
+            ...NOTEBOOK_CLI_USAGE_LINES,
             'Python: pip install <package> [-force] | pip upgrade <package> [-version <ver>] | pip uninstall <package> | pip include <module> | pip list',
             'JavaScript/TypeScript: npm install <package...> | npm uninstall <package...> | npm include <module> [url] | npm remove <module> | npm list',
             'C#: nuget include <namespace> | nuget list',
@@ -17003,7 +17242,8 @@ finally:
           if (!packageName) {
             return { summary: 'npm install needs a package name.', detail: 'npm install needs a package name.', result: { ok: false } };
           }
-          const packageSpecs = getNpmPackageArgs(parseTerminalArgs(packageName));
+          const parsedPackageArgs = tryParseTerminalArgs(packageName);
+          const packageSpecs = getNpmPackageArgs(parsedPackageArgs.ok ? parsedPackageArgs.args : [packageName]);
           const command = `npm install ${(packageSpecs.length > 0 ? packageSpecs : [packageName]).map(quoteTerminalArg).join(' ')}`;
           return runRawTerminalCommand(command, `Executed \`${command}\`.`, `Executed ${command}.`);
         }
@@ -17029,7 +17269,8 @@ finally:
           if (!packageName) {
             return { summary: 'npm uninstall needs a package name.', detail: 'npm uninstall needs a package name.', result: { ok: false } };
           }
-          const packageSpecs = getNpmPackageArgs(parseTerminalArgs(packageName));
+          const parsedPackageArgs = tryParseTerminalArgs(packageName);
+          const packageSpecs = getNpmPackageArgs(parsedPackageArgs.ok ? parsedPackageArgs.args : [packageName]);
           const command = `npm uninstall ${(packageSpecs.length > 0 ? packageSpecs : [packageName]).map(quoteTerminalArg).join(' ')}`;
           return runRawTerminalCommand(command, `Executed \`${command}\`.`, `Executed ${command}.`);
         }
@@ -17854,20 +18095,6 @@ finally:
 
     setRenamingId(null);
     setRenamingName('');
-  };
-
-  const parseTerminalArgs = (input: string): string[] => {
-    const tokens = input.match(/"[^"\\]*(?:\\.[^"\\]*)*"|'[^'\\]*(?:\\.[^'\\]*)*'|\S+/g) || [];
-    return tokens.map(token => {
-      if ((token.startsWith('"') && token.endsWith('"')) || (token.startsWith("'") && token.endsWith("'"))) {
-        const quote = token[0];
-        let value = token.slice(1, -1);
-        if (quote === '"') value = value.replace(/\\"/g, '"');
-        if (quote === "'") value = value.replace(/\\'/g, "'");
-        return value.replace(/\\\\/g, "\\");
-      }
-      return token.replace(/\\ /g, " ");
-    });
   };
 
   const getNpmPackageArgs = (rawArgs: string[]) => {
@@ -19372,9 +19599,25 @@ finally:
 
   const executeTerminalCommand = async (rawCommand: string, clearInputAfter = false) => {
     const fullInput = rawCommand.trim();
-    const args = fullInput ? parseTerminalArgs(fullInput) : [];
-    const cmd = (args[0] || '').toLowerCase();
+    terminalCommandOutcomeRef.current = null;
     const newOutput = [...terminalOutput, `${terminalCwd ? getPath(terminalCwd) : '~'} $ ${rawCommand}`];
+    const parsedArgs = tryParseTerminalArgs(fullInput);
+    if (parsedArgs.ok === false) {
+      const lines = [parsedArgs.error];
+      const nextOutput = [...newOutput, ...lines];
+      terminalOutputRef.current = nextOutput;
+      setTerminalOutput(nextOutput);
+      terminalCommandOutcomeRef.current = {
+        command: fullInput,
+        ok: false,
+        changed: false,
+        lines,
+      };
+      if (clearInputAfter) setTerminalInput('');
+      return;
+    }
+    const args = parsedArgs.args;
+    const cmd = (args[0] || '').toLowerCase();
 
     if (cmd === 'clear') {
       setTerminalOutput([]);
@@ -19441,11 +19684,23 @@ finally:
       }
     } else if (cmd === 'cat') {
       const name = args[1];
-      const file = files.find(f => f.name === name && f.type === 'file' && f.parentId === terminalCwd);
+      const currentItems = filesRef.current;
+      const currentCwd = terminalCwdRef.current;
+      const file = currentItems.find(f => f.name === name && f.type === 'file' && f.parentId === currentCwd);
+      const cwdLabel = currentCwd ? getFsItemPath(currentItems, currentCwd) : '~';
+      const commandOutput = [...terminalOutputRef.current, `${cwdLabel} $ ${rawCommand}`];
       if (file) {
-        setTerminalOutput([...newOutput, file.content || '']);
+        const path = getFsItemPath(currentItems, file.id);
+        const visibleContent = isNotebookFileItem(file)
+          ? formatNotebookForAssistant(file.content || '', { path })
+          : file.content || '';
+        const nextOutput = [...commandOutput, visibleContent];
+        terminalOutputRef.current = nextOutput;
+        setTerminalOutput(nextOutput);
       } else {
-        setTerminalOutput([...newOutput, `cat: ${name}: No such file`]);
+        const nextOutput = [...commandOutput, `cat: ${name}: No such file`];
+        terminalOutputRef.current = nextOutput;
+        setTerminalOutput(nextOutput);
       }
     } else if (cmd === 'rm') {
       const name = args[1];
@@ -19497,6 +19752,43 @@ finally:
         }
       } else {
         setTerminalOutput([...newOutput, CODIN_GET_USAGE]);
+      }
+    } else if (cmd === 'notebook' || cmd === 'ipynb') {
+      const writeNotebookTerminalResult = (command: string, lines: string[]) => {
+        const currentItems = filesRef.current;
+        const currentCwd = terminalCwdRef.current;
+        const cwdLabel = currentCwd ? getFsItemPath(currentItems, currentCwd) : '~';
+        const nextOutput = [...terminalOutputRef.current, `${cwdLabel} $ ${command}`, ...lines];
+        terminalOutputRef.current = nextOutput;
+        setTerminalOutput(nextOutput);
+      };
+      const parsed = parseNotebookCliArgs(args);
+      if (parsed.ok === false) {
+        writeNotebookTerminalResult(fullInput, parsed.lines);
+        terminalCommandOutcomeRef.current = {
+          command: fullInput,
+          ok: false,
+          changed: false,
+          lines: parsed.lines,
+        };
+      } else {
+        const notebookResult = executeNotebookWorkspaceRequest({
+          items: filesRef.current,
+          getCurrentItems: () => filesRef.current,
+          cwdId: terminalCwdRef.current,
+          updateItems: nextItems => {
+            filesRef.current = nextItems;
+            setFiles(nextItems);
+          },
+          writeTerminalResult: writeNotebookTerminalResult,
+        }, parsed.invocation.path, parsed.invocation.request, fullInput);
+        terminalCommandOutcomeRef.current = {
+          command: fullInput,
+          ok: notebookResult.ok,
+          changed: notebookResult.changed,
+          lines: notebookResult.lines,
+          path: notebookResult.path,
+        };
       }
     } else if (cmd === 'pip') {
       const subCmd = args[1];
@@ -20338,7 +20630,7 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
         setTerminalOutput([...newOutput, 'Usage: nuget include <namespace> | nuget list']);
       }
     } else if (cmd === 'help') {
-      setTerminalOutput([...newOutput, 'Standard commands: ls, pwd, cd, mkdir, touch, open, cat, rm, clear, help, date, echo', 'Documentation: docs find [--types N] [--members N] [--hide-reason] [--hide-docs] [--confidence|--hide-confidence] <description>', 'Documentation: docs get <item-name>', 'Code navigation: codin get <CSharpSymbolPath> (C#)', 'Source control: git status|add|restore|reset|commit|log|show|branch|checkout|switch|merge|tag|stash|remote|fetch|pull|push|ls-remote|clean|diff|config|rev-parse|clone, gh auth|repo|pr|issue', 'Python: pip install <package> [-force] | pip upgrade <package> [-version <ver>] | pip uninstall <package> | pip include <module> | pip list', 'JavaScript/TypeScript: npm install <package...> | npm uninstall <package...> | npm include <module> [url] | npm remove <module> | npm list', 'C#: nuget include <namespace> | nuget list', 'JavaScript/TypeScript: use Run or Project Run on .js, .jsx, .ts, and .tsx files', 'C/C++: use Run or Project Run on .c, .cpp, .cc, .cxx, and matching header files', 'Java: use Run or Project Run on .java files']);
+      setTerminalOutput([...newOutput, 'Standard commands: ls, pwd, cd, mkdir, touch, open, cat, rm, clear, help, date, echo', 'Documentation: docs find [--types N] [--members N] [--hide-reason] [--hide-docs] [--confidence|--hide-confidence] <description>', 'Documentation: docs get <item-name>', 'Code navigation: codin get <CSharpSymbolPath> (C#)', 'Jupyter notebooks:', ...NOTEBOOK_CLI_USAGE_LINES, 'Source control: git status|add|restore|reset|commit|log|show|branch|checkout|switch|merge|tag|stash|remote|fetch|pull|push|ls-remote|clean|diff|config|rev-parse|clone, gh auth|repo|pr|issue', 'Python: pip install <package> [-force] | pip upgrade <package> [-version <ver>] | pip uninstall <package> | pip include <module> | pip list', 'JavaScript/TypeScript: npm install <package...> | npm uninstall <package...> | npm include <module> [url] | npm remove <module> | npm list', 'C#: nuget include <namespace> | nuget list', 'JavaScript/TypeScript: use Run or Project Run on .js, .jsx, .ts, and .tsx files', 'C/C++: use Run or Project Run on .c, .cpp, .cc, .cxx, and matching header files', 'Java: use Run or Project Run on .java files']);
     } else if (cmd === 'date') {
       setTerminalOutput([...newOutput, new Date().toLocaleString()]);
     } else if (cmd === 'echo') {
@@ -20688,7 +20980,12 @@ json.dumps({"modules": list(_import_names), "count": _file_count})
   };
 
   const handleSettingsNpmPackageApply = async () => {
-    const packageSpecs = getNpmPackageArgs(parseTerminalArgs(settingsNpmPackageInput));
+    const parsedPackageArgs = tryParseTerminalArgs(settingsNpmPackageInput);
+    if (parsedPackageArgs.ok === false) {
+      setSettingsNpmPackageStatus(parsedPackageArgs.error);
+      return;
+    }
+    const packageSpecs = getNpmPackageArgs(parsedPackageArgs.args);
     if (packageSpecs.length === 0) {
       setSettingsNpmPackageStatus('Enter one or more npm package names first.');
       return;
