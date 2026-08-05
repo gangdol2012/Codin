@@ -69,6 +69,7 @@ import {
   type NotebookExecutePlan,
   type NotebookExecutionPlan,
 } from './notebook-magics';
+import { resolveEditingMarkdownCellAfterClick } from './notebook-markdown-interaction';
 
 export type NotebookRuntimeOutput = NotebookOutput;
 
@@ -670,7 +671,8 @@ interface NotebookCellViewProps {
   onMergeAbove: () => void;
   onToggleSource: () => void;
   onToggleOutput: () => void;
-  onToggleMarkdownPreview: () => void;
+  onEditMarkdown: () => void;
+  onPreviewMarkdown: () => void;
   onEditMetadata: () => void;
 }
 
@@ -705,7 +707,8 @@ function NotebookCellView({
   onMergeAbove,
   onToggleSource,
   onToggleOutput,
-  onToggleMarkdownPreview,
+  onEditMarkdown,
+  onPreviewMarkdown,
   onEditMetadata,
 }: NotebookCellViewProps) {
   const source = notebookSourceToString(cell.source);
@@ -781,7 +784,10 @@ function NotebookCellView({
           {cell.cell_type === 'markdown' ? (
             <button
               type="button"
-              onClick={event => { event.stopPropagation(); onToggleMarkdownPreview(); }}
+              onClick={event => {
+                event.stopPropagation();
+                if (markdownPreview) onEditMarkdown(); else onPreviewMarkdown();
+              }}
               className="rounded px-1.5 py-1 hover:bg-white/10 hover:text-white"
             >
               {markdownPreview ? 'Edit' : 'Preview'}
@@ -857,13 +863,17 @@ function NotebookCellView({
         )}>
           {!collapsedSource ? (
             cell.cell_type === 'markdown' && markdownPreview ? (
-              <div className="prose prose-invert prose-sm max-w-none px-6 py-5 text-zinc-300" onDoubleClick={onToggleMarkdownPreview}>
+              <div className="prose prose-invert prose-sm max-w-none px-6 py-5 text-zinc-300" onDoubleClick={onEditMarkdown}>
                 {source.trim() ? (
                   <ReactMarkdown urlTransform={url => attachmentUrl(cell, url)}>{source}</ReactMarkdown>
                 ) : <span className="text-sm italic text-zinc-600">Empty text cell — double-click to edit.</span>}
               </div>
             ) : (
-              <div style={{ height: editorHeight }} className="overflow-hidden">
+              <div
+                data-markdown-editor-cell-id={cell.cell_type === 'markdown' ? cell.id : undefined}
+                style={{ height: editorHeight }}
+                className="overflow-hidden"
+              >
                 <Editor
                   key={`${cell.id}:${editorLanguage}`}
                   path={modelPath}
@@ -999,9 +1009,7 @@ export function NotebookEditor({
   const [metadataTarget, setMetadataTarget] = useState<'notebook' | string | null>(null);
   const [collapsedSources, setCollapsedSources] = useState<Set<string>>(new Set());
   const [collapsedOutputs, setCollapsedOutputs] = useState<Set<string>>(new Set());
-  const [markdownPreviews, setMarkdownPreviews] = useState<Set<string>>(() => new Set(
-    initialParse.notebook?.cells.filter(cell => cell.cell_type === 'markdown').map(cell => cell.id) ?? []
-  ));
+  const [editingMarkdownCellId, setEditingMarkdownCellId] = useState<string | null>(null);
   const [commandMode, setCommandMode] = useState(true);
   const rootRef = useRef<HTMLDivElement>(null);
   const notebookRef = useRef<NotebookDocument | null>(initialParse.notebook);
@@ -1014,6 +1022,7 @@ export function NotebookEditor({
   const historyRef = useRef<NotebookHistoryEntry[]>([]);
   const clipboardRef = useRef<NotebookClipboard | null>(null);
   const lastDeleteKeyRef = useRef(0);
+  const pendingMarkdownFocusRef = useRef<string | null>(null);
 
   const emitNotebook = useCallback((next: NotebookDocument) => {
     notebookRef.current = next;
@@ -1066,6 +1075,16 @@ export function NotebookEditor({
     if (selectedCellId && notebook.cells.some(cell => cell.id === selectedCellId)) return;
     setSelectedCellId(notebook.cells[0]?.id ?? null);
   }, [notebook, selectedCellId]);
+
+  useEffect(() => {
+    if (!editingMarkdownCellId) return;
+    const editingCell = notebook?.cells.find(cell => cell.id === editingMarkdownCellId);
+    if (editingCell?.cell_type === 'markdown') return;
+    if (pendingMarkdownFocusRef.current === editingMarkdownCellId) {
+      pendingMarkdownFocusRef.current = null;
+    }
+    setEditingMarkdownCellId(null);
+  }, [editingMarkdownCellId, notebook]);
 
   const replaceWithNotebook = useCallback((next: NotebookDocument) => {
     setParseError('');
@@ -1443,9 +1462,6 @@ export function NotebookEditor({
     const next = insertNotebookCell(current, index, cell);
     emitNotebook(next);
     setSelectedCellId(cell.id);
-    if (type === 'markdown') {
-      setMarkdownPreviews(values => new Set(values).add(cell.id));
-    }
     window.setTimeout(() => {
       const editor = editorByCellRef.current.get(cell.id);
       editor?.focus();
@@ -1460,6 +1476,25 @@ export function NotebookEditor({
       section?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
       editorByCellRef.current.get(cellId)?.focus();
     }, 0);
+  }, []);
+
+  const editMarkdownCell = useCallback((cellId: string) => {
+    const mountedEditor = editorByCellRef.current.get(cellId);
+    if (mountedEditor?.getDomNode()?.isConnected) {
+      pendingMarkdownFocusRef.current = null;
+      mountedEditor.focus();
+    } else {
+      pendingMarkdownFocusRef.current = cellId;
+    }
+    setSelectedCellId(cellId);
+    setEditingMarkdownCellId(cellId);
+  }, []);
+
+  const previewMarkdownCell = useCallback((cellId: string) => {
+    if (pendingMarkdownFocusRef.current === cellId) {
+      pendingMarkdownFocusRef.current = null;
+    }
+    setEditingMarkdownCellId(current => current === cellId ? null : current);
   }, []);
 
   const afterCellRun = useCallback((cellId: string, mode: CellRunMode) => {
@@ -1571,6 +1606,10 @@ export function NotebookEditor({
       setCommandMode(true);
       rootRef.current?.focus();
     });
+    if (pendingMarkdownFocusRef.current === cellId) {
+      pendingMarkdownFocusRef.current = null;
+      editor.focus();
+    }
   }, [onMountEditor, runCell]);
 
   const selectedIndex = notebook?.cells.findIndex(cell => cell.id === selectedCellId) ?? -1;
@@ -1669,6 +1708,24 @@ export function NotebookEditor({
     focusCell(previous.id);
   }, [emitNotebook, focusCell]);
 
+  const handleNotebookClickCapture = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
+    if (!editingMarkdownCellId) return;
+    const target = event.target;
+    const activeMarkdownEditor = target instanceof Element
+      ? target.closest<HTMLElement>('[data-markdown-editor-cell-id]')
+      : null;
+    const activeMarkdownCellId = activeMarkdownEditor?.dataset.markdownEditorCellId ?? null;
+    const nextEditingCellId = resolveEditingMarkdownCellAfterClick(
+      editingMarkdownCellId,
+      activeMarkdownCellId
+    );
+    if (nextEditingCellId === editingMarkdownCellId) return;
+    if (pendingMarkdownFocusRef.current === editingMarkdownCellId) {
+      pendingMarkdownFocusRef.current = null;
+    }
+    setEditingMarkdownCellId(nextEditingCellId);
+  }, [editingMarkdownCellId]);
+
   const handleCommandKey = useCallback((event: React.KeyboardEvent<HTMLDivElement>) => {
     if (!commandMode || event.metaKey || event.ctrlKey || event.altKey) return;
     const target = event.target as HTMLElement;
@@ -1681,7 +1738,8 @@ export function NotebookEditor({
 
     if (event.key === 'Enter' && selected) {
       event.preventDefault();
-      editorByCellRef.current.get(selected.id)?.focus();
+      if (selected.cell_type === 'markdown') editMarkdownCell(selected.id);
+      else editorByCellRef.current.get(selected.id)?.focus();
       setCommandMode(false);
       return;
     }
@@ -1710,7 +1768,6 @@ export function NotebookEditor({
     if (key === 'm' && selected) {
       event.preventDefault();
       updateNotebook(value => setNotebookCellType(value, selected.id, 'markdown'));
-      setMarkdownPreviews(values => new Set(values).add(selected.id));
       return;
     }
     if (key === 'y' && selected) {
@@ -1749,7 +1806,7 @@ export function NotebookEditor({
         setStatus('Press D again to delete the selected cell.');
       }
     }
-  }, [addCellAt, commandMode, copyCell, deleteCell, focusCell, pasteCell, selectedCellId, updateNotebook]);
+  }, [addCellAt, commandMode, copyCell, deleteCell, editMarkdownCell, focusCell, pasteCell, selectedCellId, updateNotebook]);
 
   if (!notebook) {
     return (
@@ -1774,6 +1831,7 @@ export function NotebookEditor({
     <div
       ref={rootRef}
       tabIndex={0}
+      onClickCapture={handleNotebookClickCapture}
       onKeyDown={handleCommandKey}
       onFocus={event => {
         if (event.target === rootRef.current) setCommandMode(true);
@@ -1889,7 +1947,7 @@ export function NotebookEditor({
                 theme={theme}
                 collapsedSource={collapsedSources.has(cell.id)}
                 collapsedOutput={collapsedOutputs.has(cell.id)}
-                markdownPreview={markdownPreviews.has(cell.id)}
+                markdownPreview={editingMarkdownCellId !== cell.id}
                 onSelect={() => setSelectedCellId(cell.id)}
                 onSourceChange={source => updateNotebook(current => setNotebookCellSource(current, cell.id, source))}
                 onRun={mode => { void runCell(cell.id, mode); }}
@@ -1897,11 +1955,6 @@ export function NotebookEditor({
                 onMount={mountCellEditor}
                 onTypeChange={type => {
                   updateNotebook(current => setNotebookCellType(current, cell.id, type));
-                  setMarkdownPreviews(values => {
-                    const next = new Set(values);
-                    if (type === 'markdown') next.add(cell.id); else next.delete(cell.id);
-                    return next;
-                  });
                 }}
                 onLanguageChange={nextLanguage => updateNotebook(current => withCellLanguage(current, cell.id, nextLanguage))}
                 onMove={offset => updateNotebook(current => moveNotebookCell(current, cell.id, index + offset))}
@@ -1923,11 +1976,8 @@ export function NotebookEditor({
                   if (next.has(cell.id)) next.delete(cell.id); else next.add(cell.id);
                   return next;
                 })}
-                onToggleMarkdownPreview={() => setMarkdownPreviews(values => {
-                  const next = new Set(values);
-                  if (next.has(cell.id)) next.delete(cell.id); else next.add(cell.id);
-                  return next;
-                })}
+                onEditMarkdown={() => editMarkdownCell(cell.id)}
+                onPreviewMarkdown={() => previewMarkdownCell(cell.id)}
                 onEditMetadata={() => setMetadataTarget(cell.id)}
               />
             );
