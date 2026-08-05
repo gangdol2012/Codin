@@ -32,7 +32,7 @@ export function configureMonacoSuggestionAcceptance(editor: monaco.editor.IStand
   editor.addCommand(
     monaco.KeyCode.Enter,
     () => editor.trigger('monaco-suggest', 'acceptSelectedSuggestion', undefined),
-    'suggestWidgetVisible && suggestWidgetHasFocusedSuggestion && textInputFocus'
+    `editorId == '${editor.getId()}' && suggestWidgetVisible && suggestWidgetHasFocusedSuggestion && textInputFocus`
   );
 
   editor.addCommand(
